@@ -1,0 +1,72 @@
+[project]
+name = "insitubatch"
+version = "0.1.0"
+description = "Train in place on n-dimensional cloud tensors: the data-loader orchestration layer on top of solved async IO (obstore / zarr v3 / icechunk)."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "David Stuebe", email = "stu3b3+emfdavid@gmail.com" }
+]
+requires-python = ">=3.12"
+keywords = ["zarr", "xarray", "pytorch", "dataloader", "obstore", "machine-learning", "cloud", "async"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.26",
+    "zarr>=3.0",
+    "xarray>=2024.9",
+    "obstore>=0.3",
+]
+
+[project.optional-dependencies]
+# Torch handoff surface (IterableDataset / torchdata.nodes). Kept optional so the
+# core engine stays framework-agnostic and importable without torch.
+torch = [
+    "torch>=2.2",
+    "torchdata>=0.10",
+]
+# GPU-native path (zero-copy chunk -> cupy -> dlpack -> torch, optional nvCOMP
+# decode). Pulls CUDA wheels; only resolvable on a CUDA box, hence isolated here.
+gpu = [
+    "cupy-cuda12x>=13.0",
+    "kvikio-cu12>=24.10",
+]
+# Virtual-zarr views over GRIB/NetCDF so the engine only ever speaks zarr-async.
+virtual = [
+    "virtualizarr>=1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
