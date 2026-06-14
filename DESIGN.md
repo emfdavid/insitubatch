@@ -11,7 +11,8 @@ anymore. obstore / icechunk / tensorstore already saturate the NIC (~37 Gbps rea
 on a large EC2 box; flat throughput from 800 KB to 50 MB chunks). The unsolved
 part is the **training-loader orchestration that consumes that fast IO** —
 read-planning, chunk-aligned splits, shuffle, bounded buffering, batch assembly,
-torch handoff — without the per-chunk **Python tax** throttling everything.
+framework handoff (torch today; JAX/TF planned) — without the per-chunk **Python
+tax** throttling everything.
 
 Evidence the IO race is over and the loader race is open:
 
@@ -107,7 +108,10 @@ knob can be tuned empirically.
 ## Memory model
 
 Peak residency ≈ `max(max_inflight, block_chunks) × chunk_nbytes` — **independent
-of batch size and epoch length**. That directly answers the "low overhead vs
+of batch size and epoch length**. Prefetch (M1.5) adds a bounded queue
+(`prefetch_depth` batches) and the chunk cache (M-C) adds an explicit, bounded
+budget (RAM, optionally spilled to NVMe). Every term is a tunable cap; none scale
+with batch size or epoch length. That directly answers the "low overhead vs
 chunk/batch size" goal.
 
 ## Module map
@@ -122,15 +126,35 @@ chunk/batch size" goal.
 | `shuffle.py` | chunk permutation + shuffle-block order + quality metric |
 | `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
 | `source.py` | `InSituDataset` (IterableDataset), optional torch handoff |
+| `transforms.py` *(planned, M-T)* | chunk/batch transform stages, `StandardScaler`, `Regrid`, `fit_standard_scaler` |
+| *chunk cache* *(planned, M-C)* | prepped-chunk cache keyed `(array, chunk_index, fingerprint)`; RAM → NVMe |
 
 ## Open questions / spikes
 
-- **Decompression is the next wall** once obstore saturates the NIC: CPU
-  Blosc/zstd (GIL-released) vs GPU nvCOMP. Early benchmark needed.
-- **GIL**: even with Rust IO, Python decode/assembly can choke. Treat
-  free-threaded 3.13t as *upside*, not a dependency; still must win on stock
-  CPython via async + coalescing.
-- **Multi-variable co-scheduling** when variables have different chunkings.
+- **Decompression — resolved stance (was "the next wall").** The chunk cache
+  changes the calculus: for reuse-heavy workloads (multi-epoch / fat-chunk / HPO /
+  scoring) decode is paid *once* per chunk then served from the host cache, so it
+  is a warm-up cost, not a steady-state wall. It only stays a per-step wall in the
+  cold / streaming / doesn't-fit-cache regime. **Decision: the default chunk stage
+  is firmly CPU** (numcodecs decode + vectorized chunk_transform, GIL-released,
+  threaded → overlaps IO) feeding a **host** cache (RAM→NVMe, cheap + spillable).
+  GPU decode (nvCOMP) is a *separate* **Config B (Phase-2, GPU-native)** path —
+  obstore/kvikio(+GDS) → GPU → nvCOMP → cupy → DLPack — for cold-streaming on GPU
+  boxes. The two are largely **mutually exclusive** within one pipeline (host
+  cache wants host-resident chunks; GPU decode wants GPU-resident chunks), so this
+  is a config choice by workload, not a competing implementation. The remaining
+  spike (folded into the M1 codec sweep): measure the CPU chunk-stage ceiling
+  (`n_cores × (decode + transform)`) vs NIC throughput — that ratio decides *when*
+  a workload must switch to Config B.
+- **GIL**: even with Rust IO, Python decode/assembly can choke — so the standing
+  rule is **chunk transforms must be vectorized numpy** (numcodecs C codecs and
+  big-array numpy ops release the GIL; a pure-Python transform would serialize and
+  kill the threaded overlap). Treat free-threaded 3.13t as *upside*, not a
+  dependency; still must win on stock CPython via async + coalescing.
+- **Cross-variable derived fields** — reads already co-schedule per-variable
+  chunkings (`build_read_plan` keys each variable by its own chunk size); the open
+  part is a *cached* derived variable (e.g. windspeed), which needs sample-axis
+  aligned inputs (deferred — see the limitations in docs/architecture.md).
 - **Determinism + resumption** across epochs and DDP ranks (canonical-node style;
   `state_dict` à la torchdata `StatefulDataLoader`).
 - **DDP**: shard *chunks* across ranks.
@@ -148,7 +172,71 @@ sample/chunk) is already **~2.8× faster** than naive sync via async fan-out, wi
 bounded memory. The fat-chunk regime is overhead-bound locally (no latency to
 hide) — its win is expected to appear on S3.
 
-Next: **Phase 1** — run the same harness on a CPU EC2 instance against an S3
-bucket (us-east-1, c7i/m7i, Spot); add the decode-codec sweep. Then **Phase 2**:
-GPU path (kvikio/cupy/nvCOMP, dlpack→torch). The GPU path remains the only
-stubbed area.
+Prefetch is currently **demand-driven** — concurrent *within* a batch, but the
+loop goes idle during the compute step (no inter-batch overlap yet). The
+producer/consumer pipeline that fixes this is specified in
+[docs/architecture.md](docs/architecture.md) (milestone M1.5).
+
+Built so far: planner, chunk-aligned splits, async obstore reads, shuffle-block
+buffer, coalesced gather, torch surface. **Not yet built:** inter-batch prefetch
+overlap (M1.5), the transform stages (M-T), the chunk cache (M-C), and the
+GPU/device path (M2); JAX/TF surfaces (M3). Next is **Phase 1** — run the harness
+on a CPU EC2 instance against S3 (us-east-1, c7i/m7i, Spot) with the decode-codec
+sweep.
+
+## Roadmap / milestones
+
+Perf track (the core thesis):
+- **M0 — local proof** ✅ real obstore IO, naive baseline, ~2.8× on GRIB regime.
+- **M1 — CPU EC2 / S3** run the harness against real S3 (us-east-1, c7i/m7i,
+  Spot); decode-codec sweep to measure the CPU chunk-stage ceiling vs NIC (the
+  one remaining decompression spike — see Open questions).
+- **M1.5 — prefetch pipeline** producer/consumer with a bounded queue so IO +
+  decode + assembly overlap the compute step (today the loop is demand-driven:
+  intra-batch concurrency, no inter-batch overlap). Gates any *GPU-fed*
+  benchmark — see [docs/architecture.md](docs/architecture.md).
+- **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
+  with bounded host memory.
+
+Engine track (make it real for models — see [docs/architecture.md](docs/architecture.md)):
+- **M-T — transforms (three stages).** `chunk_transform` (per-chunk, amortized,
+  cacheable) + `batch_transform` (per-batch, cross-variable / per-sample-random)
+  now; `device_transform` defined, implemented with the framework adapters (M3).
+  Ship `StandardScaler` + `fit_standard_scaler` (fit with our own infra, one
+  streaming pass) and `Regrid` (precomputed weights). Scope limits documented:
+  chunk transforms are single-variable/single-chunk; cross-variable (e.g.
+  windspeed) is batch-stage and uncached; cross-chunk is not v1.
+- **M-C — chunk cache.** Cache the *prepped* (decoded + chunk-transformed) array
+  keyed `(array, chunk_index, pipeline_fingerprint)`; one interception in
+  `_fetch_and_decode`. RAM LRU first, optional NVMe/zarr spill. Generalizes the
+  epoch buffer into the dedup→buffer→cache continuum. Unlocks multi-epoch /
+  fat-chunk / scoring / HPO reuse. (Deferred: cached cross-variable *derived
+  variables*.)
+
+Reach track (broaden + make a splash):
+- **M3 — framework surfaces.** The core `Batch` is numpy; frameworks are thin
+  DLPack adapters, never core deps. Add **JAX first** (no native loader; the
+  weather/climate frontier — GraphCast, NeuralGCM — is JAX/torch, not TF), then
+  a **TF** surface via `tf.data.from_generator` + `prefetch(AUTOTUNE)`
+  opportunistically. Same async engine, multiple framework fronts.
+- **M4 — NVIDIA Earth2Studio target** (grounded in `data/arco.py`, `run.py`,
+  `data/utils.py`). Their pipeline is `DataSource → xr.DataArray → fetch_data →
+  prep_data_array → (torch.Tensor, coords) → model.create_iterator`. xarray is
+  load-bearing down to `prep_data_array`. Two integrations, only one is ours
+  (details in [docs/architecture.md](docs/architecture.md)):
+    - **Inside their inference loop = obstore, not insitubatch.** ARCO is already
+      zarr-v3-async; only the store backend differs (`FsspecStore(gcsfs/MSC)` vs
+      `ObjectStore(obstore gs://)`). A cold-cache backend-swap benchmark is a
+      clean **obstore** win (ARCO is `...chunk-1.zarr-v3` = our GRIB regime).
+      insitubatch building `xr.DataArray` would just reimplement their
+      lexicon/coords/regrid — not worth it.
+    - **Around their models = the insitubatch play.** For training / fine-tuning
+      / big batched hindcast & scoring, feed `prognostic.create_iterator(x,
+      coords)` tensor batches straight from insitubatch (zarr → DLPack → torch),
+      bypassing DataSource/fetch_data/xarray. `coords` is a light OrderedDict,
+      not the xarray machinery. This is the "closer to the GPU" headline.
+  Honesty bar: NVIDIA prefers **MSC** (fsspec-based; obstore can still beat it
+  cold) and caches via `AsyncCachingFileSystem`, so target MSC *cold-cache* on an
+  IO-bound workload (scoring/hindcast/large or lagged ensembles, NOT a single-IC
+  ensemble, which is rollout-bound). GFS/GRIB: later, our degenerate sweet spot
+  via virtual-zarr.
