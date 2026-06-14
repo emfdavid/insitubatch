@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterator, Sequence
 import numpy as np
 
 from .buffer import BufferConfig, ShuffleBlockBuffer
+from .cache import ChunkCache
 from .io import AsyncChunkReader, IOConfig
 from .plan import build_read_plan
 from .shuffle import block_shuffled_order
@@ -60,6 +61,7 @@ class InSituDataset(IterableDataset):
         seed: int = 0,
         to_tensor: bool = True,
         prefetch_depth: int = 2,
+        cache_chunks: int = 0,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: object,
@@ -75,6 +77,8 @@ class InSituDataset(IterableDataset):
         self.seed = seed
         self.to_tensor = to_tensor and _HAS_TORCH
         self.prefetch_depth = max(int(prefetch_depth), 1)
+        # Owned here so prepped chunks persist across epochs (cross-epoch reuse).
+        self.cache = ChunkCache(cache_chunks) if cache_chunks > 0 else None
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
@@ -140,6 +144,7 @@ class InSituDataset(IterableDataset):
             self.geometries,
             self.io_config,
             chunk_transforms=self.chunk_transforms,
+            cache=self.cache,
             **self.store_kwargs,
         ) as reader:
             producer = threading.Thread(

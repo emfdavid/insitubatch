@@ -70,8 +70,8 @@ flowchart TB
 ```
 
 *Target pipeline.* Built today: planner, bounded fan-out, obstore reads, decode,
-chunk/batch transforms (M-T), buffer, gather, prefetch overlap (M1.5), torch
-surface. Planned: the chunk cache (M-C), `Regrid` + `device_transform` (M2/M3).
+chunk/batch transforms (M-T), chunk cache (M-C), buffer, gather, prefetch overlap
+(M1.5), torch surface. Planned: `Regrid` + `device_transform` (M2/M3).
 
 Properties: parallelism in the loop (not processes); each chunk read once and
 amortized across every sample that touches it; residency bounded by
@@ -252,14 +252,42 @@ storing post-chunk-transform arrays:
 | chunk cache | across epochs & runs | RAM LRU → optional NVMe/zarr spill |
 
 The current buffer is the epoch-scoped special case; the cache generalizes it with
-an eviction policy and a disk tier. Note this caches the *prepped* representation —
-strictly stronger than MSC's raw-byte NVMe cache for an ML pipeline.
+an LRU eviction policy. v1 is **RAM, cross-epoch** (`cache_chunks`, default off);
+the NVMe spill tier + content fingerprint (cross-*run*) are deferred. Note this
+caches the *prepped* representation — strictly stronger than MSC's raw-byte NVMe
+cache for an ML pipeline.
 
 **Heavy-reuse tasks unlocked:** multi-epoch training (epoch 0 warms it); the
 fat-chunk regime (one chunk → many batches); scoring/verification (reference
 chunks reused across metrics, lead times, models); HPO/sweeps (disk tier amortizes
 prepped chunks across *runs*); datasets that fit in RAM/NVMe (effectively
 in-memory at GPU-fed speed after the first pass).
+
+### Future: persistent (NVMe) tier
+
+v1 is RAM-only and cross-epoch. A persistent tier would extend reuse across
+*runs* (HPO sweeps, restarts, multi-job) and feed the GDS path. Design notes:
+
+- **The key needs a fingerprint.** RAM keys on `(array, chunk_index)` because one
+  cache instance == one fixed pipeline. A cross-run key must add a fingerprint of
+  (a) source identity (store URL + array + chunk version/etag) and (b) the
+  chunk-transform pipeline (stats + transform list), so changed data *or*
+  transforms invalidate. Fingerprinting arbitrary callables is the hard part —
+  require transforms to expose a stable `version` / config hash (e.g. hash the
+  `StandardScaler` stats).
+- **Two levels are worth considering.** A *raw-decoded* disk tier keyed by source
+  identity only (decode = the expensive cloud + decompress step) beneath the
+  *prepped* RAM tier. Transform experimentation then reuses decoded chunks without
+  a fingerprint, recomputing only the cheap transforms.
+- **On-disk format.** Prepped arrays on local NVMe, `mmap` on read (near
+  zero-copy; aligns with kvikio/GDS NVMe→GPU in M2). Packed store (lmdb/zarr) vs
+  many small files trades write-amplification for simplicity.
+- **Two-tier eviction.** RAM LRU (chunk count) backed by NVMe (byte budget); a RAM
+  miss checks disk → `mmap`-load → promote.
+- **Concurrency.** Cross-process reuse needs atomic writes / immutable files +
+  light locking; readers `mmap` immutable entries.
+- **GDS synergy.** A persistent NVMe tier of prepped chunks is the natural feed
+  for the Phase-2 kvikio/GDS NVMe→GPU path — ties M-C's disk tier to M2.
 
 ## Earth2Studio integration
 

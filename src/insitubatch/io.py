@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import numpy as np
 import zarr.api.asynchronous as za
 
+from .cache import ChunkCache
 from .plan import ReadPlan
 from .store import store_from_url
 from .types import ArrayGeometry, ChunkRead, DecodedChunk
@@ -59,6 +60,7 @@ class AsyncChunkReader:
         config: IOConfig | None = None,
         *,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
+        cache: ChunkCache | None = None,
         **store_kwargs: object,
     ) -> None:
         self._url = store_url
@@ -66,6 +68,7 @@ class AsyncChunkReader:
         self._geometries = geometries
         self._config = config or IOConfig()
         self._chunk_transforms = tuple(chunk_transforms)
+        self._cache = cache
         self._arrays: dict[str, za.AsyncArray] = {}  # opened lazily on the loop
         self._loop = asyncio.new_event_loop()
         self._sem: asyncio.Semaphore | None = None  # created on the loop bootstrap
@@ -168,6 +171,11 @@ class AsyncChunkReader:
         (numcodecs C codecs release the GIL) -- the bounded-fan-out structure
         here already isolates that change to this method.
         """
+        if self._cache is not None:
+            hit = self._cache.get(read.array, read.chunk_index)
+            if hit is not None:  # prepped chunk: skips fetch + decode + transforms
+                return hit
+
         geom = self._geometries[read.array]
         arr = self._arrays[read.array]
         samples = geom.samples_in_chunk(read.chunk_index)
@@ -176,4 +184,7 @@ class AsyncChunkReader:
         chunk = DecodedChunk(read=read, data=np.asarray(block), sample_offset=samples.start)
         for transform in self._chunk_transforms:  # vectorized numpy -> GIL released
             chunk = transform(chunk)
+
+        if self._cache is not None:
+            self._cache.put(read.array, read.chunk_index, chunk)
         return chunk

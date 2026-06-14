@@ -11,6 +11,7 @@ See DESIGN.md for the full rationale.
 from __future__ import annotations
 
 from .buffer import BufferConfig, ShuffleBlockBuffer
+from .cache import ChunkCache
 from .io import AsyncChunkReader, IOConfig
 from .plan import ReadPlan, build_read_plan, dedup_ratio
 from .shuffle import block_shuffled_order, chunk_permutation, shuffle_quality
@@ -32,6 +33,7 @@ __all__ = [
     "Batch",
     "BatchTransform",
     "BufferConfig",
+    "ChunkCache",
     "ChunkRead",
     "ChunkTransform",
     "DecodedChunk",

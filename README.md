@@ -26,13 +26,14 @@ shuffle-block buffer assembles batches; torch runs `num_workers=0`.
 🚧 **Pre-alpha — Phase 0 complete (local).** Real obstore-backed zarr v3 async
 reads work end-to-end against a local `file://` store; chunk-aligned splits,
 approximate (shuffle-block) shuffle, a bounded buffer, chunk/batch **transforms**
-(incl. a fitted `StandardScaler`), and **prefetch** (a background producer that
-runs ahead of the consumer) are implemented and tested (23 tests). Early signal:
-the GRIB-per-timestep regime is ~2.8× over a naive sync baseline locally.
+(incl. a fitted `StandardScaler`), **prefetch** (a background producer that runs
+ahead of the consumer), and a **chunk cache** (cross-epoch reuse of prepped
+chunks) are implemented and tested (27 tests). Early signal: the GRIB-per-timestep
+regime is ~2.8× over a naive sync baseline locally.
 
-Not yet built: the **chunk cache**, `Regrid` + the **GPU/device** transform stage.
-Torch is the only framework surface so far (JAX/TF planned). See the roadmap and
-scope limits in [DESIGN.md](DESIGN.md) and [docs/architecture.md](docs/architecture.md).
+Not yet built: `Regrid` + the **GPU/device** transform stage. Torch is the only
+framework surface so far (JAX/TF planned). See the roadmap and scope limits in
+[DESIGN.md](DESIGN.md) and [docs/architecture.md](docs/architecture.md).
 
 ## Install (dev)
 

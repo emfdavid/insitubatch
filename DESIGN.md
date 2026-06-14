@@ -127,7 +127,7 @@ chunk/batch size" goal.
 | `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
 | `source.py` | `InSituDataset` (IterableDataset), optional torch handoff |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
-| *chunk cache* *(planned, M-C)* | prepped-chunk cache keyed `(array, chunk_index, fingerprint)`; RAM → NVMe |
+| `cache.py` | `ChunkCache` — bounded LRU of prepped chunks keyed `(array, chunk_index)`; RAM (NVMe spill + fingerprint: follow-up) |
 
 ## Open questions / spikes
 
@@ -179,8 +179,8 @@ a later refinement. See [docs/architecture.md](docs/architecture.md).
 
 Built so far: planner, chunk-aligned splits, async obstore reads, shuffle-block
 buffer, coalesced gather, torch surface, **chunk/batch transforms +
-`StandardScaler`/`fit_standard_scaler` (M-T)**, **prefetch (M1.5)**. **Not yet
-built:** the chunk cache (M-C), `Regrid` + the GPU/device transform stage (M2),
+`StandardScaler`/`fit_standard_scaler` (M-T)**, **prefetch (M1.5)**, **chunk cache
+(M-C)**. **Not yet built:** `Regrid` + the GPU/device transform stage (M2),
 JAX/TF surfaces (M3). Next is **Phase 1** — run the harness on a CPU EC2 instance
 against S3 (us-east-1, c7i/m7i, Spot) with the decode-codec sweep.
 
@@ -206,12 +206,13 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   Scope limits hold: chunk transforms are single-variable/single-chunk;
   cross-variable (e.g. windspeed) is batch-stage and uncached; cross-chunk is not
   v1.
-- **M-C — chunk cache.** Cache the *prepped* (decoded + chunk-transformed) array
-  keyed `(array, chunk_index, pipeline_fingerprint)`; one interception in
-  `_fetch_and_decode`. RAM LRU first, optional NVMe/zarr spill. Generalizes the
-  epoch buffer into the dedup→buffer→cache continuum. Unlocks multi-epoch /
-  fat-chunk / scoring / HPO reuse. (Deferred: cached cross-variable *derived
-  variables*.)
+- **M-C — chunk cache.** ✅ `ChunkCache` (bounded LRU of *prepped* chunks) owned
+  by `InSituDataset`, intercepted in `_fetch_and_decode`; persists across epochs
+  (`cache_chunks` knob, default off). A hit skips fetch + decode + chunk
+  transforms. Generalizes the epoch buffer into the dedup→buffer→cache continuum;
+  unlocks multi-epoch / fat-chunk / scoring / HPO reuse. Tests assert each chunk
+  is decoded+transformed once across epochs. Deferred: NVMe spill tier + content
+  fingerprint (cross-*run*), and cached cross-variable derived variables.
 
 Reach track (broaden + make a splash):
 - **M3 — framework surfaces.** The core `Batch` is numpy; frameworks are thin
