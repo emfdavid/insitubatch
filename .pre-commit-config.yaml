@@ -1,0 +1,25 @@
+# Local hooks run through uv so tool versions match pyproject / uv.lock exactly
+# (no separate rev pinning to drift). Requires `uv` on PATH (see ~/.zshenv).
+#   uv run pre-commit install        # enable
+#   uv run pre-commit run --all-files # run manually
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: mypy
+        name: mypy (src)
+        entry: uv run mypy src
+        language: system
+        pass_filenames: false
+        always_run: true

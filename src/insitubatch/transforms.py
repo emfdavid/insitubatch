@@ -66,7 +66,7 @@ class StandardScaler:
     def save(self, path: str | Path) -> None:
         flat = {f"{k}.mean": v for k, v in self.mean.items()}
         flat.update({f"{k}.std": v for k, v in self.std.items()})
-        np.savez(path, **flat)
+        np.savez(path, **flat)  # type: ignore[arg-type]  # np stub collides **kwds w/ allow_pickle
 
     @classmethod
     def load(cls, path: str | Path) -> StandardScaler:

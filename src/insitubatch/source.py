@@ -33,11 +33,11 @@ try:  # optional torch surface
 
     _HAS_TORCH = True
 except ImportError:  # pragma: no cover - exercised on torch-less installs
-    IterableDataset = object  # type: ignore[assignment,misc]
+    IterableDataset = object
     _HAS_TORCH = False
 
 
-class InSituDataset(IterableDataset):  # type: ignore[misc]
+class InSituDataset(IterableDataset):
     """An IterableDataset that streams shuffled batches from a Zarr archive.
 
     One epoch = permute the split's chunks -> walk shuffle-blocks -> for each
@@ -106,9 +106,7 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
             for start in range(0, len(order), bs):
                 rows = order[start : start + bs]
                 needed = {(v, int(c)) for v in self.variables for c in np.unique(rows[:, 0])}
-                missing_samples = [
-                    int(c) * spc for (v, c) in needed if (v, c) not in buf._chunks
-                ]
+                missing_samples = [int(c) * spc for (v, c) in needed if (v, c) not in buf._chunks]
                 if missing_samples:
                     plan = build_read_plan(sorted(set(missing_samples)), self.geometries)
                     for decoded in reader.read_plan(plan):

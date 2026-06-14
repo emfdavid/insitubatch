@@ -84,8 +84,15 @@ def test_chunk_transform_normalizes_batches(tmp_path) -> None:
     sc = fit_standard_scaler(url, manifest, geoms)
     m, s = np.squeeze(sc.mean["t2m"]), np.squeeze(sc.std["t2m"])
 
-    ds = InSituDataset(url, manifest, split=SplitName.TRAIN, batch_size=10,
-                       block_chunks=4, to_tensor=False, chunk_transforms=[sc])
+    ds = InSituDataset(
+        url,
+        manifest,
+        split=SplitName.TRAIN,
+        batch_size=10,
+        block_chunks=4,
+        to_tensor=False,
+        chunk_transforms=[sc],
+    )
     ds.set_epoch(0)
     for batch in ds:
         idx = batch.sample_indices
@@ -113,8 +120,15 @@ def test_cross_variable_windspeed_is_a_batch_transform(tmp_path) -> None:
         batch.arrays["wspd"] = np.sqrt(batch.arrays["u10"] ** 2 + batch.arrays["v10"] ** 2)
         return batch
 
-    ds = InSituDataset(url, manifest, split=SplitName.TRAIN, batch_size=8,
-                       block_chunks=4, to_tensor=False, batch_transforms=[windspeed])
+    ds = InSituDataset(
+        url,
+        manifest,
+        split=SplitName.TRAIN,
+        batch_size=8,
+        block_chunks=4,
+        to_tensor=False,
+        batch_transforms=[windspeed],
+    )
     ds.set_epoch(0)
     for batch in ds:
         idx = batch.sample_indices

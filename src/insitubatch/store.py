@@ -15,6 +15,7 @@ off the hot path -- but not here.)
 from __future__ import annotations
 
 import os
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -25,9 +26,7 @@ import zarr.storage
 from .types import ArrayGeometry
 
 
-def store_from_url(
-    url: str, *, read_only: bool = True, **kwargs: object
-) -> zarr.storage.ObjectStore:
+def store_from_url(url: str, *, read_only: bool = True, **kwargs: Any) -> zarr.storage.ObjectStore:
     """Return a zarr ObjectStore for ``url`` (any obstore-supported scheme).
 
     ``file:///abs/path.zarr`` for local; ``s3://bucket/path.zarr`` for cloud.
@@ -53,7 +52,7 @@ def ensure_local_dir(url: str) -> str:
 def open_geometries(
     url: str,
     variables: list[str] | None = None,
-    **kwargs: object,
+    **kwargs: Any,
 ) -> dict[str, ArrayGeometry]:
     """Introspect a zarr group at ``url`` into ``{name: ArrayGeometry}``.
 
@@ -66,6 +65,7 @@ def open_geometries(
     out: dict[str, ArrayGeometry] = {}
     for name in names:
         arr = group[name]
+        assert isinstance(arr, zarr.Array)  # arrays only, not subgroups
         out[name] = ArrayGeometry(
             name=name,
             shape=tuple(arr.shape),

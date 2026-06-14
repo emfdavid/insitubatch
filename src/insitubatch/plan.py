@@ -59,7 +59,7 @@ class ReadPlan:
 
 
 def build_read_plan(
-    sample_indices: Sequence[int],
+    sample_indices: Sequence[int] | np.ndarray,
     geometries: dict[str, ArrayGeometry],
 ) -> ReadPlan:
     """Build a deduplicated read plan for ``sample_indices`` across all variables.

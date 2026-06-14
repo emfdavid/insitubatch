@@ -133,10 +133,11 @@ class AsyncChunkReader:
 
     async def _drive(self, plan: ReadPlan, out_q: queue.Queue) -> None:
         assert self._sem is not None  # guaranteed by _ready.wait() in __init__
+        sem = self._sem  # local binding so the closure sees a non-Optional type
         await self._ensure_arrays()
 
         async def one(read: ChunkRead) -> None:
-            async with self._sem:  # bound in-flight chunks -> bounded memory
+            async with sem:  # bound in-flight chunks -> bounded memory
                 decoded = await self._fetch_and_decode(read)
             out_q.put(decoded)  # stdlib queue: thread-safe, non-blocking
 

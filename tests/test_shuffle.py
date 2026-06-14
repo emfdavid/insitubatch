@@ -28,10 +28,6 @@ def test_order_covers_every_sample_exactly_once() -> None:
 def test_bigger_blocks_improve_shuffle_quality() -> None:
     ids = np.arange(64)
     spc = 16
-    q_small = shuffle_quality(
-        block_shuffled_order(ids, spc, block_chunks=1, seed=0, epoch=0), spc
-    )
-    q_large = shuffle_quality(
-        block_shuffled_order(ids, spc, block_chunks=32, seed=0, epoch=0), spc
-    )
+    q_small = shuffle_quality(block_shuffled_order(ids, spc, block_chunks=1, seed=0, epoch=0), spc)
+    q_large = shuffle_quality(block_shuffled_order(ids, spc, block_chunks=32, seed=0, epoch=0), spc)
     assert q_large > q_small  # wider block -> closer to global mixing

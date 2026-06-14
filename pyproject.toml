@@ -48,6 +48,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
     "mypy>=1.11",
+    "pre-commit>=3.7",
 ]
 
 [build-system]
