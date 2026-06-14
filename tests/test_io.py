@@ -8,6 +8,7 @@ InSituDataset returns (a) the correct values at the right sample indices and
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import zarr
 
 from insitubatch import (
@@ -73,3 +74,16 @@ def test_geometry_introspection_matches_metadata(tmp_path) -> None:
     assert geom.shape == (50, 3, 3)
     assert geom.sample_chunk_size == 5
     assert geom.n_chunks == 10
+
+
+def test_open_geometries_rejects_subgroup(tmp_path) -> None:
+    # A name resolving to a subgroup (not an array) is bad input: must raise a
+    # clear TypeError that survives `python -O`, not a bare/strippable assert.
+    url = f"file://{tmp_path}/d.zarr"
+    ensure_local_dir(url)
+    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group.create_array("t2m", shape=(4, 2), chunks=(2, 2), dtype="f4")
+    group.create_group("nested")
+
+    with pytest.raises(TypeError, match="not an array"):
+        open_geometries(url, variables=["nested"])

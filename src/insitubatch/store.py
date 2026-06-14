@@ -64,8 +64,12 @@ def open_geometries(
     names = variables if variables is not None else [k for k, _ in group.arrays()]
     out: dict[str, ArrayGeometry] = {}
     for name in names:
-        arr = group[name]
-        assert isinstance(arr, zarr.Array)  # arrays only, not subgroups
+        arr = group[name]  # raises KeyError if the name is absent
+        if not isinstance(arr, zarr.Array):
+            raise TypeError(
+                f"{name!r} in {url} is a {type(arr).__name__}, not an array; "
+                "open_geometries handles arrays (variables), not subgroups."
+            )
         out[name] = ArrayGeometry(
             name=name,
             shape=tuple(arr.shape),
