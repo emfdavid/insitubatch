@@ -11,3 +11,6 @@ wheels/
 
 # JetBrains IDE
 .idea/
+
+# Benchmark output
+bench/results/

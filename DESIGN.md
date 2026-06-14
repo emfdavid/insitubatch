@@ -117,7 +117,8 @@ chunk/batch size" goal.
 | `types.py` | `ArrayGeometry`, `ChunkRead`, `DecodedChunk`, `Batch` |
 | `plan.py` | `ReadPlan`, `build_read_plan` (samples → deduped reads) |
 | `split.py` | chunk-aligned `SplitManifest`, `split_by_chunk` |
-| `io.py` | `AsyncChunkReader` — one event loop, bounded fan-out *(IO wiring stubbed)* |
+| `store.py` | `store_from_url` shim (local↔S3 via obstore) + geometry introspection |
+| `io.py` | `AsyncChunkReader` — one event loop, bounded fan-out, real zarr-async reads |
 | `shuffle.py` | chunk permutation + shuffle-block order + quality metric |
 | `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
 | `source.py` | `InSituDataset` (IterableDataset), optional torch handoff |
@@ -136,8 +137,18 @@ chunk/batch size" goal.
 
 ## Status
 
-Pre-alpha **skeleton**. Control flow and abstractions are in place and import
-cleanly; the live store wiring in `io.py::_fetch_and_decode` and the GPU path are
-stubbed at marked TODOs. First milestone: replace the stub with a real
-obstore-backed zarr async read and benchmark throughput vs a classic
-`DataLoader` baseline on a sample archive.
+**Phase 0 complete (local).** Real obstore-backed zarr v3 async reads are wired
+end-to-end via `store_from_url` (one URL → local `file://` now, `s3://` later).
+`bench/make_dataset.py` generates either regime; `bench/bench_throughput.py`
+compares against a naive synchronous baseline and logs JSONL. 14 tests pass
+(values + split coverage verified against source).
+
+Early signal on **local disk**: the degenerate GRIB-per-timestep regime (1
+sample/chunk) is already **~2.8× faster** than naive sync via async fan-out, with
+bounded memory. The fat-chunk regime is overhead-bound locally (no latency to
+hide) — its win is expected to appear on S3.
+
+Next: **Phase 1** — run the same harness on a CPU EC2 instance against an S3
+bucket (us-east-1, c7i/m7i, Spot); add the decode-codec sweep. Then **Phase 2**:
+GPU path (kvikio/cupy/nvCOMP, dlpack→torch). The GPU path remains the only
+stubbed area.

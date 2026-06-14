@@ -15,6 +15,7 @@ from .io import AsyncChunkReader, IOConfig
 from .plan import ReadPlan, build_read_plan, dedup_ratio
 from .shuffle import block_shuffled_order, chunk_permutation, shuffle_quality
 from .split import SplitManifest, split_by_chunk
+from .store import ensure_local_dir, open_geometries, store_from_url
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk, SplitName
 
 __version__ = "0.1.0"
@@ -35,6 +36,9 @@ __all__ = [
     "build_read_plan",
     "chunk_permutation",
     "dedup_ratio",
+    "ensure_local_dir",
+    "open_geometries",
     "shuffle_quality",
     "split_by_chunk",
+    "store_from_url",
 ]

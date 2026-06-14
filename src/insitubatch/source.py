@@ -25,6 +25,7 @@ from .io import AsyncChunkReader, IOConfig
 from .plan import build_read_plan
 from .shuffle import block_shuffled_order
 from .split import SplitManifest
+from .store import open_geometries
 from .types import ArrayGeometry, Batch, SplitName
 
 try:  # optional torch surface
@@ -45,9 +46,9 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
 
     def __init__(
         self,
-        store: object,
-        geometries: dict[str, ArrayGeometry],
+        store_url: str,
         manifest: SplitManifest,
+        geometries: dict[str, ArrayGeometry] | None = None,
         split: SplitName = SplitName.TRAIN,
         *,
         batch_size: int = 32,
@@ -55,12 +56,14 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
         max_inflight: int = 16,
         seed: int = 0,
         to_tensor: bool = True,
+        **store_kwargs: object,
     ) -> None:
-        self.store = store
-        self.geometries = geometries
+        self.store_url = store_url
+        self.store_kwargs = store_kwargs
+        self.geometries = geometries if geometries is not None else open_geometries(store_url)
         self.manifest = manifest
         self.split = split
-        self.variables = list(geometries)
+        self.variables = list(self.geometries)
         self.io_config = IOConfig(max_inflight=max_inflight)
         self.buffer_config = BufferConfig(block_chunks=block_chunks, batch_size=batch_size)
         self.seed = seed
@@ -84,7 +87,9 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
             epoch=self._epoch,
         )
 
-        with AsyncChunkReader(self.store, self.geometries, self.io_config) as reader:
+        with AsyncChunkReader(
+            self.store_url, self.geometries, self.io_config, **self.store_kwargs
+        ) as reader:
             buf = ShuffleBlockBuffer(self.buffer_config, seed=self.seed)
             bs = self.buffer_config.batch_size
 
@@ -101,7 +106,7 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
                     for decoded in reader.read_plan(plan):
                         buf.add(decoded)
 
-                batch = buf.gather_batch(rows, self.variables)
+                batch = buf.gather_batch(rows, self.variables, spc)
                 yield self._maybe_tensor(batch)
                 buf.evict_drained(needed)
 

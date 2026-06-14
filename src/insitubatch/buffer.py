@@ -49,28 +49,36 @@ class ShuffleBlockBuffer:
         self,
         rows: np.ndarray,
         variables: list[str],
+        sample_chunk_size: int,
     ) -> Batch:
         """Assemble one batch from ``rows`` of ``[chunk_id, within]`` draws.
 
         ``rows`` are pre-shuffled draw coordinates (see shuffle.block_shuffled_order).
-        For each variable we issue ONE vectorized gather into the resident chunk
-        arrays. Samples that don't cross chunk boundaries (the v1 contract) make
-        this a clean per-chunk slice + concatenate.
+        Draws are grouped by chunk so each resident array is touched once (one
+        coalesced fancy-index per chunk); ``data`` and ``sample_indices`` are
+        emitted in the *same* grouped order so row ``i`` of every variable and
+        ``sample_indices[i]`` refer to the same sample. Intra-batch order is thus
+        grouped-by-chunk -- irrelevant for training, and the cross-batch shuffle
+        is preserved.
+
+        ``sample_chunk_size`` is the array's true chunk length (from geometry),
+        used to recover global sample indices -- NOT inferred from a resident
+        chunk, which may be a short final chunk.
         """
-        out: dict[str, np.ndarray] = {}
         chunk_ids = rows[:, 0]
         within = rows[:, 1]
-        sample_indices = chunk_ids * self._sample_chunk_size(variables[0]) + within
+        uniq = np.unique(chunk_ids)
 
-        for var in variables:
-            pieces = []
-            # Group draws by chunk so each resident array is touched once.
-            for cid in np.unique(chunk_ids):
-                mask = chunk_ids == cid
-                chunk = self._chunks[(var, int(cid))]
-                pieces.append(chunk.data[within[mask]])
-            out[var] = np.concatenate(pieces, axis=0)
-        return Batch(arrays=out, sample_indices=sample_indices)
+        out: dict[str, list[np.ndarray]] = {v: [] for v in variables}
+        idx_pieces: list[np.ndarray] = []
+        for cid in uniq:
+            w = within[chunk_ids == cid]
+            idx_pieces.append(cid * sample_chunk_size + w)
+            for var in variables:
+                out[var].append(self._chunks[(var, int(cid))].data[w])
+
+        arrays = {var: np.concatenate(pieces, axis=0) for var, pieces in out.items()}
+        return Batch(arrays=arrays, sample_indices=np.concatenate(idx_pieces))
 
     def evict_drained(self, still_needed: set[tuple[str, int]]) -> int:
         """Drop chunks no longer referenced by any pending draw. Returns count."""
@@ -78,10 +86,3 @@ class ShuffleBlockBuffer:
         for k in drop:
             del self._chunks[k]
         return len(drop)
-
-    def _sample_chunk_size(self, var: str) -> int:
-        # All resident chunks of a var share chunking; read it off any one.
-        for (v, _), chunk in self._chunks.items():
-            if v == var:
-                return chunk.data.shape[0]
-        raise KeyError(f"no resident chunk for variable {var!r}")

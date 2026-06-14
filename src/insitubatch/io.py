@@ -28,8 +28,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
+import zarr.api.asynchronous as za
 
 from .plan import ReadPlan
+from .store import store_from_url
 from .types import ArrayGeometry, ChunkRead, DecodedChunk
 
 
@@ -52,25 +54,30 @@ class AsyncChunkReader:
 
     def __init__(
         self,
-        store: object,  # zarr AsyncArray / obstore store; typed loosely until wired
+        store_url: str,
         geometries: dict[str, ArrayGeometry],
         config: IOConfig | None = None,
+        **store_kwargs: object,
     ) -> None:
-        self._store = store
+        self._url = store_url
+        self._store_kwargs = store_kwargs
         self._geometries = geometries
         self._config = config or IOConfig()
+        self._arrays: dict[str, za.AsyncArray] = {}  # opened lazily on the loop
         self._loop = asyncio.new_event_loop()
         self._sem: asyncio.Semaphore | None = None  # created on the loop bootstrap
+        self._open_lock: asyncio.Lock | None = None
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="insitu-io")
         self._thread.start()
-        self._ready.wait()  # don't return until the loop + semaphore exist
+        self._ready.wait()  # don't return until the loop + primitives exist
 
     # -- loop lifecycle -----------------------------------------------------
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
         self._sem = asyncio.Semaphore(self._config.max_inflight)
+        self._open_lock = asyncio.Lock()
         self._loop.call_soon(self._ready.set)
         self._loop.run_forever()
 
@@ -123,6 +130,7 @@ class AsyncChunkReader:
 
     async def _drive(self, plan: ReadPlan, out_q: queue.Queue) -> None:
         assert self._sem is not None  # guaranteed by _ready.wait() in __init__
+        await self._ensure_arrays()
 
         async def one(read: ChunkRead) -> None:
             async with self._sem:  # bound in-flight chunks -> bounded memory
@@ -131,21 +139,34 @@ class AsyncChunkReader:
 
         await asyncio.gather(*(one(r) for r in plan.reads))
 
+    async def _ensure_arrays(self) -> None:
+        """Open one AsyncArray per variable, once, sharing the store."""
+        if self._arrays:
+            return
+        assert self._open_lock is not None
+        async with self._open_lock:
+            if self._arrays:  # double-checked: another coroutine may have won
+                return
+            store = store_from_url(self._url, **self._store_kwargs)  # type: ignore[arg-type]
+            for name in self._geometries:
+                self._arrays[name] = await za.open_array(store=store, path=name, mode="r")
+
     async def _fetch_and_decode(self, read: ChunkRead) -> DecodedChunk:
-        """Fetch one chunk's bytes and decode to ndarray.
+        """Fetch + decode one chunk via the zarr v3 async codec pipeline.
 
-        TODO(io): wire to the real store. With zarr v3 async this is roughly::
+        The selection is exactly one chunk along the sample axis, full on the
+        inner dims (the v1 sample-geometry contract). zarr fans the underlying
+        byte-range reads out through obstore and runs the decode pipeline; for
+        single-chunk inner dims this touches exactly one stored chunk.
 
-            arr = self._store[read.array]              # AsyncArray
-            block = await arr.getitem((slice(c0, c1), ...))
-
-        or, for the obstore-direct path, issue ``get_ranges_async`` for the
-        chunk's byte range(s) and hand the compressed buffer to a decode running
-        in a thread (numcodecs releases the GIL) via
-        ``loop.run_in_executor(decode_pool, decode, buf)``.
+        TODO(perf): decode currently runs inside zarr's pipeline on the loop. If
+        it shows up as a GIL bottleneck, move it to a thread pool
+        (numcodecs C codecs release the GIL) -- the bounded-fan-out structure
+        here already isolates that change to this method.
         """
         geom = self._geometries[read.array]
+        arr = self._arrays[read.array]
         samples = geom.samples_in_chunk(read.chunk_index)
-        # Placeholder payload so the pipeline is exercisable end-to-end in tests.
-        data = np.zeros((len(samples), *geom.inner_shape), dtype=geom.dtype)
-        return DecodedChunk(read=read, data=data, sample_offset=samples.start)
+        selection = (slice(samples.start, samples.stop), *(slice(None) for _ in geom.inner_shape))
+        block = await arr.getitem(selection)
+        return DecodedChunk(read=read, data=np.asarray(block), sample_offset=samples.start)
