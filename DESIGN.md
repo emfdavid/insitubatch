@@ -172,18 +172,17 @@ sample/chunk) is already **~2.8× faster** than naive sync via async fan-out, wi
 bounded memory. The fat-chunk regime is overhead-bound locally (no latency to
 hide) — its win is expected to appear on S3.
 
-Prefetch is currently **demand-driven** — concurrent *within* a batch, but the
-loop goes idle during the compute step (no inter-batch overlap yet). The
-producer/consumer pipeline that fixes this is specified in
-[docs/architecture.md](docs/architecture.md) (milestone M1.5).
+Prefetch (M1.5) is implemented: a background producer assembles batches ahead of
+the consumer through a bounded queue (`prefetch_depth`), overlapping IO + decode +
+assembly with the compute step. Batch-granularity; chunk-granularity look-ahead is
+a later refinement. See [docs/architecture.md](docs/architecture.md).
 
 Built so far: planner, chunk-aligned splits, async obstore reads, shuffle-block
 buffer, coalesced gather, torch surface, **chunk/batch transforms +
-`StandardScaler`/`fit_standard_scaler` (M-T)**. **Not yet built:** inter-batch
-prefetch overlap (M1.5), the chunk cache (M-C), `Regrid` + the GPU/device
-transform stage (M2), JAX/TF surfaces (M3). Next is **Phase 1** — run the harness
-on a CPU EC2 instance against S3 (us-east-1, c7i/m7i, Spot) with the decode-codec
-sweep.
+`StandardScaler`/`fit_standard_scaler` (M-T)**, **prefetch (M1.5)**. **Not yet
+built:** the chunk cache (M-C), `Regrid` + the GPU/device transform stage (M2),
+JAX/TF surfaces (M3). Next is **Phase 1** — run the harness on a CPU EC2 instance
+against S3 (us-east-1, c7i/m7i, Spot) with the decode-codec sweep.
 
 ## Roadmap / milestones
 
@@ -192,10 +191,10 @@ Perf track (the core thesis):
 - **M1 — CPU EC2 / S3** run the harness against real S3 (us-east-1, c7i/m7i,
   Spot); decode-codec sweep to measure the CPU chunk-stage ceiling vs NIC (the
   one remaining decompression spike — see Open questions).
-- **M1.5 — prefetch pipeline** producer/consumer with a bounded queue so IO +
-  decode + assembly overlap the compute step (today the loop is demand-driven:
-  intra-batch concurrency, no inter-batch overlap). Gates any *GPU-fed*
-  benchmark — see [docs/architecture.md](docs/architecture.md).
+- **M1.5 — prefetch** ✅ background producer + bounded queue (`prefetch_depth`)
+  overlap IO/decode/assembly with the consumer step; backpressure + early-exit
+  cleanup; tests assert the producer runs ahead. Batch-granularity (chunk-level
+  look-ahead is a later refinement).
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 

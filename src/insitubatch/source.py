@@ -16,6 +16,9 @@ framework-agnostic and importable on a box without torch installed.
 
 from __future__ import annotations
 
+import contextlib
+import queue
+import threading
 from collections.abc import Callable, Iterator, Sequence
 
 import numpy as np
@@ -56,6 +59,7 @@ class InSituDataset(IterableDataset):
         max_inflight: int = 16,
         seed: int = 0,
         to_tensor: bool = True,
+        prefetch_depth: int = 2,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: object,
@@ -70,6 +74,7 @@ class InSituDataset(IterableDataset):
         self.buffer_config = BufferConfig(block_chunks=block_chunks, batch_size=batch_size)
         self.seed = seed
         self.to_tensor = to_tensor and _HAS_TORCH
+        self.prefetch_depth = max(int(prefetch_depth), 1)
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
@@ -78,11 +83,23 @@ class InSituDataset(IterableDataset):
         """Call from the training loop so each epoch reshuffles deterministically."""
         self._epoch = epoch
 
+    _SENTINEL = object()
+
     def __iter__(self) -> Iterator[Batch | dict]:
+        """Drain assembled batches from a background producer (prefetch).
+
+        A producer thread walks the draw order, assembles batches (async fan-out
+        + gather + batch transforms) and pushes them onto a bounded queue; this
+        consumer pops them. The queue (depth ``prefetch_depth``) provides the
+        backpressure and the inter-batch overlap: while the caller works on batch
+        N, the producer is already building N+1..N+depth.
+
+        Prefetch granularity is per-batch in v1; chunk-granularity look-ahead
+        (reads for N+2 starting before N+1 is assembled) is a later refinement.
+        """
         geom = self.geometries[self.variables[0]]
         chunk_ids = np.asarray(self.manifest.chunks[self.split.value], dtype=np.int64)
         spc = geom.sample_chunk_size
-
         order = block_shuffled_order(
             chunk_ids,
             spc,
@@ -91,6 +108,33 @@ class InSituDataset(IterableDataset):
             epoch=self._epoch,
         )
 
+        out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
+        stop = threading.Event()
+
+        def produce(reader: AsyncChunkReader) -> None:
+            buf = ShuffleBlockBuffer(self.buffer_config, seed=self.seed)
+            bs = self.buffer_config.batch_size
+            try:
+                for start in range(0, len(order), bs):
+                    if stop.is_set():
+                        break
+                    rows = order[start : start + bs]
+                    needed = {(v, int(c)) for v in self.variables for c in np.unique(rows[:, 0])}
+                    missing = [int(c) * spc for (v, c) in needed if (v, c) not in buf._chunks]
+                    if missing:
+                        plan = build_read_plan(sorted(set(missing)), self.geometries)
+                        for decoded in reader.read_plan(plan):
+                            buf.add(decoded)
+                    batch = buf.gather_batch(rows, self.variables, spc)
+                    for transform in self.batch_transforms:
+                        batch = transform(batch)
+                    out_q.put(batch)  # blocks when full -> backpressure
+                    buf.evict_drained(needed)
+            except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
+                out_q.put(exc)
+            finally:
+                out_q.put(self._SENTINEL)
+
         with AsyncChunkReader(
             self.store_url,
             self.geometries,
@@ -98,25 +142,26 @@ class InSituDataset(IterableDataset):
             chunk_transforms=self.chunk_transforms,
             **self.store_kwargs,
         ) as reader:
-            buf = ShuffleBlockBuffer(self.buffer_config, seed=self.seed)
-            bs = self.buffer_config.batch_size
-
-            # Walk the emitted draw order in batch-sized windows. For each window
-            # we ensure its chunks are resident (async fan-out), then gather.
-            for start in range(0, len(order), bs):
-                rows = order[start : start + bs]
-                needed = {(v, int(c)) for v in self.variables for c in np.unique(rows[:, 0])}
-                missing_samples = [int(c) * spc for (v, c) in needed if (v, c) not in buf._chunks]
-                if missing_samples:
-                    plan = build_read_plan(sorted(set(missing_samples)), self.geometries)
-                    for decoded in reader.read_plan(plan):
-                        buf.add(decoded)
-
-                batch = buf.gather_batch(rows, self.variables, spc)
-                for transform in self.batch_transforms:
-                    batch = transform(batch)
-                yield self._maybe_tensor(batch)
-                buf.evict_drained(needed)
+            producer = threading.Thread(
+                target=produce, args=(reader,), name="insitu-prefetch", daemon=True
+            )
+            producer.start()
+            try:
+                while True:
+                    item = out_q.get()
+                    if item is self._SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield self._maybe_tensor(item)
+            finally:
+                # Signal stop, then drain so a producer parked on a full queue can
+                # proceed and exit before the reader (context manager) is closed.
+                stop.set()
+                while producer.is_alive():
+                    with contextlib.suppress(queue.Empty):
+                        out_q.get(timeout=0.05)
+                producer.join(timeout=10)
 
     def _maybe_tensor(self, batch: Batch) -> Batch | dict:
         if not self.to_tensor:

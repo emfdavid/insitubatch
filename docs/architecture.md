@@ -70,9 +70,8 @@ flowchart TB
 ```
 
 *Target pipeline.* Built today: planner, bounded fan-out, obstore reads, decode,
-chunk/batch transforms (M-T), buffer, gather, torch surface. Planned: the chunk
-cache (M-C), prefetch overlap (M1.5), `Regrid` + `device_transform` (M2/M3) — so
-today the loop is demand-driven (see Prefetch, below).
+chunk/batch transforms (M-T), buffer, gather, prefetch overlap (M1.5), torch
+surface. Planned: the chunk cache (M-C), `Regrid` + `device_transform` (M2/M3).
 
 Properties: parallelism in the loop (not processes); each chunk read once and
 amortized across every sample that touches it; residency bounded by
@@ -82,32 +81,28 @@ length.
 
 ## Prefetch
 
-### Current state (demand-driven)
+`source.InSituDataset.__iter__` runs a **background producer thread** that
+assembles batches ahead of the consumer:
 
-`source.InSituDataset.__iter__` today:
+- ✅ **Intra-batch concurrency** — a batch's missing chunks are fetched
+  concurrently via the async loop (`read_plan` fan-out under `max_inflight`). This
+  is what won the ~2.8× on the GRIB regime locally.
+- ✅ **Inter-batch overlap (M1.5)** — the producer assembles batches
+  N+1..N+`depth` while the caller works on batch N; the consumer just drains a
+  bounded queue. (A pre-M1.5 demand-driven loop left the event loop idle during
+  the compute step.)
 
-- ✅ **Intra-batch concurrency** — when a batch is requested, all its missing
-  chunks are fetched concurrently via the async loop (`read_plan` fan-out under
-  `max_inflight`). This is what won the ~2.8× on the GRIB regime locally.
-- ❌ **No inter-batch overlap** — it fully drains the current batch's reads
-  *before* `yield`, so the event loop sits **idle during the training/compute
-  step**. Batch N+1 is not fetched while the GPU works on batch N.
-
-Fine for read-only throughput benchmarks (no consumer to overlap), but it leaves
-the loop idle exactly when it should be working in an end-to-end loop.
-
-### Target design (producer/consumer pipeline)
+### Design (producer/consumer pipeline)
 
 ```mermaid
 flowchart LR
-    subgraph PRODUCER["producer coroutine (event loop)"]
-        WALK["walk draw order<br/>ahead of consumer"] --> ENSURE["ensure next d batches'<br/>chunks resident-or-in-flight"]
-        ENSURE --> ASM["assemble batch when<br/>its chunks land"]
+    subgraph PRODUCER["producer thread"]
+        WALK["walk draw order"] --> ASM["assemble batch<br/>(async read + gather + transforms)"]
     end
     ASM --> Q["bounded queue · maxsize d"]
     Q --> CONS["consumer __iter__<br/>pops finished batches"]
     CONS --> STEP[("train / infer step")]
-    Q -.->|"full ⇒ producer pauses<br/>(backpressure)"| ENSURE
+    Q -.->|"full ⇒ producer blocks<br/>(backpressure)"| ASM
 ```
 
 - **Producer** walks the draw order ahead of the consumer, keeping "every chunk
@@ -117,13 +112,15 @@ flowchart LR
   overlaps with IO+decode+assembly of the next `d` batches.
 - **Backpressure / memory bound** — queue depth `d` + buffer `block_chunks` cap
   residency; a full queue pauses scheduling.
-- **Look-ahead is at chunk granularity, not batch** — reads for batch N+2 can
-  start before N+1 is assembled, maximizing overlap.
-- **Knobs:** `prefetch_depth d`, `max_inflight`, `block_chunks`.
+- **Granularity (v1: per batch)** — the producer assembles whole batches ahead.
+  Chunk-granularity look-ahead (reads for N+2 starting before N+1 is assembled) is
+  a later refinement.
+- **Lifecycle** — early consumer exit sets a stop flag and drains the queue so a
+  producer parked on a full `put` can exit before the reader is closed.
+- **Knobs:** `prefetch_depth` (queue depth `d`), `max_inflight`, `block_chunks`.
 
-Same shape as `torchdata.nodes.Prefetcher`, but async-native and chunk-cache
-aware. This is the piece that turns a throughput win into a *GPU-fed* win — it
-should land before any GPU benchmark.
+Same shape as `torchdata.nodes.Prefetcher`, but async-native. This is what turns a
+throughput win into a *GPU-fed* win.
 
 ## Transforms — three stages, placed by cost
 
