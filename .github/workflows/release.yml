@@ -1,0 +1,63 @@
+name: release
+
+# Build and publish to PyPI on a version tag (e.g. v0.1.0), or manually.
+# Uses PyPI Trusted Publishing (OIDC) -- no API tokens or secrets to manage.
+#
+# ONE-TIME SETUP (before the first run):
+#   1. Push this repo to GitHub as emfdavid/insitubatch.
+#   2. On PyPI: Account -> Publishing -> "Add a pending publisher":
+#        PyPI Project Name: insitubatch
+#        Owner:             emfdavid
+#        Repository name:   insitubatch
+#        Workflow name:     release.yml
+#        Environment name:  pypi
+#      (A "pending" publisher creates the project on first publish, claiming the name.)
+#   3. (Optional) Create a GitHub Environment named "pypi" for a manual approval gate.
+# Then:  git tag v0.1.0 && git push origin v0.1.0
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run ruff check src tests bench
+      - run: uv run pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/insitubatch
+    permissions:
+      id-token: write # required for trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
