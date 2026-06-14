@@ -18,7 +18,7 @@ from .split import SplitManifest, split_by_chunk
 from .store import ensure_local_dir, open_geometries, store_from_url
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk, SplitName
 
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 
 __all__ = [
     "ArrayGeometry",
