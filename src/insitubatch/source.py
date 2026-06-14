@@ -16,7 +16,7 @@ framework-agnostic and importable on a box without torch installed.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 
 import numpy as np
 
@@ -26,7 +26,7 @@ from .plan import build_read_plan
 from .shuffle import block_shuffled_order
 from .split import SplitManifest
 from .store import open_geometries
-from .types import ArrayGeometry, Batch, SplitName
+from .types import ArrayGeometry, Batch, DecodedChunk, SplitName
 
 try:  # optional torch surface
     from torch.utils.data import IterableDataset
@@ -56,6 +56,8 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
         max_inflight: int = 16,
         seed: int = 0,
         to_tensor: bool = True,
+        chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
+        batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: object,
     ) -> None:
         self.store_url = store_url
@@ -68,6 +70,8 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
         self.buffer_config = BufferConfig(block_chunks=block_chunks, batch_size=batch_size)
         self.seed = seed
         self.to_tensor = to_tensor and _HAS_TORCH
+        self.chunk_transforms = tuple(chunk_transforms)
+        self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -88,7 +92,11 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
         )
 
         with AsyncChunkReader(
-            self.store_url, self.geometries, self.io_config, **self.store_kwargs
+            self.store_url,
+            self.geometries,
+            self.io_config,
+            chunk_transforms=self.chunk_transforms,
+            **self.store_kwargs,
         ) as reader:
             buf = ShuffleBlockBuffer(self.buffer_config, seed=self.seed)
             bs = self.buffer_config.batch_size
@@ -107,6 +115,8 @@ class InSituDataset(IterableDataset):  # type: ignore[misc]
                         buf.add(decoded)
 
                 batch = buf.gather_batch(rows, self.variables, spc)
+                for transform in self.batch_transforms:
+                    batch = transform(batch)
                 yield self._maybe_tensor(batch)
                 buf.evict_drained(needed)
 

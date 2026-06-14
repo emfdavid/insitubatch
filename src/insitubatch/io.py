@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -57,12 +57,15 @@ class AsyncChunkReader:
         store_url: str,
         geometries: dict[str, ArrayGeometry],
         config: IOConfig | None = None,
+        *,
+        chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         **store_kwargs: object,
     ) -> None:
         self._url = store_url
         self._store_kwargs = store_kwargs
         self._geometries = geometries
         self._config = config or IOConfig()
+        self._chunk_transforms = tuple(chunk_transforms)
         self._arrays: dict[str, za.AsyncArray] = {}  # opened lazily on the loop
         self._loop = asyncio.new_event_loop()
         self._sem: asyncio.Semaphore | None = None  # created on the loop bootstrap
@@ -169,4 +172,7 @@ class AsyncChunkReader:
         samples = geom.samples_in_chunk(read.chunk_index)
         selection = (slice(samples.start, samples.stop), *(slice(None) for _ in geom.inner_shape))
         block = await arr.getitem(selection)
-        return DecodedChunk(read=read, data=np.asarray(block), sample_offset=samples.start)
+        chunk = DecodedChunk(read=read, data=np.asarray(block), sample_offset=samples.start)
+        for transform in self._chunk_transforms:  # vectorized numpy -> GIL released
+            chunk = transform(chunk)
+        return chunk

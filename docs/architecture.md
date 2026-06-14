@@ -70,9 +70,9 @@ flowchart TB
 ```
 
 *Target pipeline.* Built today: planner, bounded fan-out, obstore reads, decode,
-buffer, gather, torch surface. Planned: chunk/batch transforms (M-T), the chunk
-cache (M-C), prefetch overlap (M1.5), `device_transform` (M2/M3) — so today the
-loop is demand-driven (see Prefetch, below).
+chunk/batch transforms (M-T), buffer, gather, torch surface. Planned: the chunk
+cache (M-C), prefetch overlap (M1.5), `Regrid` + `device_transform` (M2/M3) — so
+today the loop is demand-driven (see Prefetch, below).
 
 Properties: parallelism in the loop (not processes); each chunk read once and
 amortized across every sample that touches it; residency bounded by

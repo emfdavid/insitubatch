@@ -126,7 +126,7 @@ chunk/batch size" goal.
 | `shuffle.py` | chunk permutation + shuffle-block order + quality metric |
 | `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
 | `source.py` | `InSituDataset` (IterableDataset), optional torch handoff |
-| `transforms.py` *(planned, M-T)* | chunk/batch transform stages, `StandardScaler`, `Regrid`, `fit_standard_scaler` |
+| `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
 | *chunk cache* *(planned, M-C)* | prepped-chunk cache keyed `(array, chunk_index, fingerprint)`; RAM → NVMe |
 
 ## Open questions / spikes
@@ -178,9 +178,10 @@ producer/consumer pipeline that fixes this is specified in
 [docs/architecture.md](docs/architecture.md) (milestone M1.5).
 
 Built so far: planner, chunk-aligned splits, async obstore reads, shuffle-block
-buffer, coalesced gather, torch surface. **Not yet built:** inter-batch prefetch
-overlap (M1.5), the transform stages (M-T), the chunk cache (M-C), and the
-GPU/device path (M2); JAX/TF surfaces (M3). Next is **Phase 1** — run the harness
+buffer, coalesced gather, torch surface, **chunk/batch transforms +
+`StandardScaler`/`fit_standard_scaler` (M-T)**. **Not yet built:** inter-batch
+prefetch overlap (M1.5), the chunk cache (M-C), `Regrid` + the GPU/device
+transform stage (M2), JAX/TF surfaces (M3). Next is **Phase 1** — run the harness
 on a CPU EC2 instance against S3 (us-east-1, c7i/m7i, Spot) with the decode-codec
 sweep.
 
@@ -199,13 +200,13 @@ Perf track (the core thesis):
   with bounded host memory.
 
 Engine track (make it real for models — see [docs/architecture.md](docs/architecture.md)):
-- **M-T — transforms (three stages).** `chunk_transform` (per-chunk, amortized,
-  cacheable) + `batch_transform` (per-batch, cross-variable / per-sample-random)
-  now; `device_transform` defined, implemented with the framework adapters (M3).
-  Ship `StandardScaler` + `fit_standard_scaler` (fit with our own infra, one
-  streaming pass) and `Regrid` (precomputed weights). Scope limits documented:
-  chunk transforms are single-variable/single-chunk; cross-variable (e.g.
-  windspeed) is batch-stage and uncached; cross-chunk is not v1.
+- **M-T — transforms.** ✅ `chunk_transform` + `batch_transform` hooks wired,
+  `StandardScaler` + `fit_standard_scaler` (one streaming pass with our own
+  reader), 6 tests incl. cross-variable windspeed at the batch stage. Pending:
+  `Regrid` (precomputed weights) and `device_transform` (with the M3 adapters).
+  Scope limits hold: chunk transforms are single-variable/single-chunk;
+  cross-variable (e.g. windspeed) is batch-stage and uncached; cross-chunk is not
+  v1.
 - **M-C — chunk cache.** Cache the *prepped* (decoded + chunk-transformed) array
   keyed `(array, chunk_index, pipeline_fingerprint)`; one interception in
   `_fetch_and_decode`. RAM LRU first, optional NVMe/zarr spill. Generalizes the

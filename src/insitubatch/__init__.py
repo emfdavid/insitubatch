@@ -16,6 +16,12 @@ from .plan import ReadPlan, build_read_plan, dedup_ratio
 from .shuffle import block_shuffled_order, chunk_permutation, shuffle_quality
 from .split import SplitManifest, split_by_chunk
 from .store import ensure_local_dir, open_geometries, store_from_url
+from .transforms import (
+    BatchTransform,
+    ChunkTransform,
+    StandardScaler,
+    fit_standard_scaler,
+)
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk, SplitName
 
 __version__ = "0.0.1"
@@ -24,19 +30,23 @@ __all__ = [
     "ArrayGeometry",
     "AsyncChunkReader",
     "Batch",
+    "BatchTransform",
     "BufferConfig",
     "ChunkRead",
+    "ChunkTransform",
     "DecodedChunk",
     "IOConfig",
     "ReadPlan",
     "ShuffleBlockBuffer",
     "SplitManifest",
     "SplitName",
+    "StandardScaler",
     "block_shuffled_order",
     "build_read_plan",
     "chunk_permutation",
     "dedup_ratio",
     "ensure_local_dir",
+    "fit_standard_scaler",
     "open_geometries",
     "shuffle_quality",
     "split_by_chunk",
