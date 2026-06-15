@@ -37,9 +37,11 @@ class ShuffleBlockBuffer:
     _chunks: dict[tuple[str, int], DecodedChunk] = field(default_factory=dict)
     # Pending draws: rows of (array, chunk_index, within) flattened per variable.
     _pending: deque[int] = field(default_factory=deque)
+    max_resident: int = 0  # peak chunks held at once (observability / memory bound)
 
     def add(self, chunk: DecodedChunk) -> None:
         self._chunks[(chunk.read.array, chunk.read.chunk_index)] = chunk
+        self.max_resident = max(self.max_resident, len(self._chunks))
 
     def ready(self) -> bool:
         """Enough buffered to safely emit a well-mixed batch."""

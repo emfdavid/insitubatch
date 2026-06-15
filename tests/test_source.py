@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import collections
+
 import numpy as np
 import pytest
 import zarr
@@ -64,3 +66,60 @@ def test_shuffle_true_covers_but_reorders(write_zarr) -> None:
     idx = np.concatenate([b.sample_indices for b in ds])
     assert sorted(idx.tolist()) == list(range(40))  # full coverage
     assert idx.tolist() != list(range(40))  # but not in order
+
+
+def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
+    # block_chunks >> batch_size + shuffle scatters each chunk's samples across
+    # non-consecutive batches. With the cache off, last-use eviction must still
+    # decode each chunk exactly once per epoch (naive per-batch eviction re-reads).
+    url, _ = write_zarr(n=80, spc=4)  # 20 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+
+    decoded: collections.Counter[int] = collections.Counter()
+
+    def count(chunk):
+        decoded[chunk.read.chunk_index] += 1
+        return chunk
+
+    ds = InSituDataset(
+        url,
+        manifest,
+        split=SplitName.TRAIN,
+        batch_size=1,
+        block_chunks=20,
+        cache_chunks=0,
+        shuffle=True,
+        seed=0,
+        to_tensor=False,
+        chunk_transforms=[count],
+    )
+    ds.set_epoch(0)
+    for _ in ds:
+        pass
+
+    assert set(decoded) == set(manifest.chunks[SplitName.TRAIN.value])
+    assert all(v == 1 for v in decoded.values()), dict(decoded)  # decoded once, no re-reads
+
+
+def test_buffer_residency_is_bounded_by_block(write_zarr) -> None:
+    # Last-use eviction holds at most one shuffle block (+ a straddling-window
+    # margin), independent of epoch length -- NOT the whole split.
+    url, _ = write_zarr(n=160, spc=4)  # 40 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    block_chunks, batch_size = 8, 4
+    ds = InSituDataset(
+        url,
+        manifest,
+        batch_size=batch_size,
+        block_chunks=block_chunks,
+        cache_chunks=0,
+        shuffle=True,
+        seed=0,
+        to_tensor=False,
+    )
+    ds.set_epoch(0)
+    for _ in ds:
+        pass
+    assert 1 <= ds.buffer_peak <= block_chunks + batch_size  # ~one block, not all 40

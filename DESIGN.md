@@ -127,7 +127,7 @@ chunk/batch size" goal.
 | `io.py` | `AsyncChunkReader` — one event loop, bounded fan-out, real zarr-async reads |
 | `shuffle.py` | chunk permutation + shuffle-block / sequential order + quality metric |
 | `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
-| `source.py` | `InSituDataset` (IterableDataset), optional torch handoff |
+| `source.py` | `InSituDataset` (IterableDataset) — prefetch producer, last-use eviction, optional torch handoff |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
 | `cache.py` | `ChunkCache` — bounded LRU of prepped chunks keyed `(array, chunk_index)`; RAM (NVMe spill + fingerprint: follow-up) |
 

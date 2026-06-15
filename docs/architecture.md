@@ -251,6 +251,11 @@ storing post-chunk-transform arrays:
 | shuffle-block buffer | within an epoch | RAM (bounded) |
 | chunk cache | across epochs & runs | RAM LRU → optional NVMe/zarr spill |
 
+The within-epoch buffer evicts by **last use** — a chunk is dropped only once no
+later batch in the epoch needs it — so each chunk is read and decoded **once per
+epoch even with the cache off** (a naive per-batch eviction would re-read chunks
+whose samples are scattered across a shuffle block).
+
 The current buffer is the epoch-scoped special case; the cache generalizes it with
 an LRU eviction policy. v1 is **RAM, cross-epoch** (`cache_chunks`, default off);
 the NVMe spill tier + content fingerprint (cross-*run*) are deferred. Note this

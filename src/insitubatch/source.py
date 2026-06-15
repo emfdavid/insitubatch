@@ -104,6 +104,7 @@ class InSituDataset(IterableDataset):
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
+        self.buffer_peak = 0  # peak resident chunks in the last epoch (observability)
 
     def set_epoch(self, epoch: int) -> None:
         """Call from the training loop so each epoch reshuffles deterministically."""
@@ -141,12 +142,22 @@ class InSituDataset(IterableDataset):
 
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
         stop = threading.Event()
+        buf = ShuffleBlockBuffer(self.buffer_config, seed=self.seed)
 
         def produce(reader: AsyncChunkReader) -> None:
-            buf = ShuffleBlockBuffer(self.buffer_config, seed=self.seed)
             bs = self.buffer_config.batch_size
+            # Last window index at which each chunk id is drawn, so a chunk is
+            # evicted only once no later batch needs it -> each chunk is read and
+            # decoded once per epoch (not re-read per batch). Vectorized: O(chunks)
+            # of Python, the scatter-max runs in C.
+            if len(order):
+                windows = np.arange(len(order)) // bs
+                last_use = np.zeros(int(order[:, 0].max()) + 1, dtype=np.int64)
+                np.maximum.at(last_use, order[:, 0], windows)
+            else:
+                last_use = np.zeros(0, dtype=np.int64)
             try:
-                for start in range(0, len(order), bs):
+                for w, start in enumerate(range(0, len(order), bs)):
                     if stop.is_set():
                         break
                     rows = order[start : start + bs]
@@ -160,7 +171,9 @@ class InSituDataset(IterableDataset):
                     for transform in self.batch_transforms:
                         batch = transform(batch)
                     out_q.put(batch)  # blocks when full -> backpressure
-                    buf.evict_drained(needed)
+                    # Evict only chunks not needed in any later batch.
+                    keep = {key for key in buf._chunks if last_use[key[1]] > w}
+                    buf.evict_drained(keep)
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
                 out_q.put(exc)
             finally:
@@ -194,6 +207,7 @@ class InSituDataset(IterableDataset):
                     with contextlib.suppress(queue.Empty):
                         out_q.get(timeout=0.05)
                 producer.join(timeout=10)
+                self.buffer_peak = buf.max_resident  # peak residency this epoch
 
     def _maybe_tensor(self, batch: Batch) -> Batch | dict:
         if not self.to_tensor:
