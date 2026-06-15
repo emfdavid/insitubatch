@@ -249,18 +249,20 @@ storing post-chunk-transform arrays:
 |---|---|---|
 | read-plan dedup | within a request | — |
 | shuffle-block buffer | within an epoch | RAM (bounded) |
-| chunk cache | across epochs & runs | RAM LRU → optional NVMe/zarr spill |
+| chunk cache | across epochs (+ runs via DiskCache) | `MemoryCache` (heap) or `DiskCache` (mmap NVMe), byte-LRU |
 
 The within-epoch buffer evicts by **last use** — a chunk is dropped only once no
 later batch in the epoch needs it — so each chunk is read and decoded **once per
 epoch even with the cache off** (a naive per-batch eviction would re-read chunks
 whose samples are scattered across a shuffle block).
 
-The current buffer is the epoch-scoped special case; the cache generalizes it with
-an LRU eviction policy. v1 is **RAM, cross-epoch** (`cache_chunks`, default off);
-the NVMe spill tier + content fingerprint (cross-*run*) are deferred. Note this
-caches the *prepped* representation — strictly stronger than MSC's raw-byte NVMe
-cache for an ML pipeline.
+The within-epoch buffer is the epoch-scoped special case; the cache generalizes it
+with a byte-bounded LRU. It is **pluggable** (`ChunkCache` protocol):
+`MemoryCache` (heap — fastest hit, but spends the RAM we bound) or `DiskCache`
+(mmap'd `.npy` on local NVMe — the RAM footprint becomes reclaimable kernel page
+cache, the cache is bounded on disk by bytes, and the working set stays bounded).
+Caching the *prepped* representation is strictly stronger than MSC's raw-byte NVMe
+cache for an ML pipeline. Default is no cache — pass an instance to enable.
 
 **Heavy-reuse tasks unlocked:** multi-epoch training (epoch 0 warms it); the
 fat-chunk regime (one chunk → many batches); scoring/verification (reference
@@ -268,10 +270,11 @@ chunks reused across metrics, lead times, models); HPO/sweeps (disk tier amortiz
 prepped chunks across *runs*); datasets that fit in RAM/NVMe (effectively
 in-memory at GPU-fed speed after the first pass).
 
-### Future: persistent (NVMe) tier
+### Persistent (NVMe) tier — `DiskCache`
 
-v1 is RAM-only and cross-epoch. A persistent tier would extend reuse across
-*runs* (HPO sweeps, restarts, multi-job) and feed the GDS path. Design notes:
+**Built (v1):** one mmap'd `.npy` per prepped chunk on local NVMe, byte-bounded
+LRU (evict = `unlink`), in-process index → multi-epoch reuse with a reclaimable
+RAM footprint. **Remaining** for full cross-*run* reuse + the GDS path:
 
 - **The key needs a fingerprint.** RAM keys on `(array, chunk_index)` because one
   cache instance == one fixed pipeline. A cross-run key must add a fingerprint of
@@ -284,9 +287,12 @@ v1 is RAM-only and cross-epoch. A persistent tier would extend reuse across
   identity only (decode = the expensive cloud + decompress step) beneath the
   *prepped* RAM tier. Transform experimentation then reuses decoded chunks without
   a fingerprint, recomputing only the cheap transforms.
-- **On-disk format.** Prepped arrays on local NVMe, `mmap` on read (near
-  zero-copy; aligns with kvikio/GDS NVMe→GPU in M2). Packed store (lmdb/zarr) vs
-  many small files trades write-amplification for simplicity.
+- **Cross-run index (done within a run; future across runs).** The index is
+  in-process today; a dir scan on init (parse `(array, chunk)` + size) would
+  recover entries written by earlier runs.
+- **On-disk format (done):** one mmap'd `.npy` per chunk; near zero-copy read,
+  aligns with kvikio/GDS NVMe→GPU in M2. A packed store (lmdb/zarr) would cut
+  per-file overhead later.
 - **Two-tier eviction.** RAM LRU (chunk count) backed by NVMe (byte budget); a RAM
   miss checks disk → `mmap`-load → promote.
 - **Concurrency.** Cross-process reuse needs atomic writes / immutable files +

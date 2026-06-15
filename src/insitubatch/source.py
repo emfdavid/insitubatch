@@ -71,7 +71,7 @@ class InSituDataset(IterableDataset):
         to_tensor: bool = True,
         shuffle: bool = True,
         prefetch_depth: int = 2,
-        cache_chunks: int = 0,
+        cache: ChunkCache | None = None,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: Any,
@@ -101,8 +101,9 @@ class InSituDataset(IterableDataset):
         self.to_tensor = to_tensor and _HAS_TORCH
         self.shuffle = shuffle
         self.prefetch_depth = max(int(prefetch_depth), 1)
-        # Owned here so prepped chunks persist across epochs (cross-epoch reuse).
-        self.cache = ChunkCache(cache_chunks) if cache_chunks > 0 else None
+        # A caller-owned cache (MemoryCache / DiskCache) persists across epochs and
+        # runs; None disables caching. See insitubatch.cache.
+        self.cache = cache
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0

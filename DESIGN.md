@@ -129,7 +129,7 @@ chunk/batch size" goal.
 | `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
 | `source.py` | `InSituDataset` (IterableDataset) — prefetch producer, last-use eviction, optional torch handoff |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
-| `cache.py` | `ChunkCache` — bounded LRU of prepped chunks keyed `(array, chunk_index)`; RAM (NVMe spill + fingerprint: follow-up) |
+| `cache.py` | `ChunkCache` protocol + `MemoryCache` (heap) / `DiskCache` (mmap NVMe), byte-LRU of prepped chunks keyed `(array, chunk_index)` |
 
 ## Open questions / spikes
 
@@ -208,13 +208,15 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   Scope limits hold: chunk transforms are single-variable/single-chunk;
   cross-variable (e.g. windspeed) is batch-stage and uncached; cross-chunk is not
   v1.
-- **M-C — chunk cache.** ✅ `ChunkCache` (bounded LRU of *prepped* chunks) owned
-  by `InSituDataset`, intercepted in `_fetch_and_decode`; persists across epochs
-  (`cache_chunks` knob, default off). A hit skips fetch + decode + chunk
-  transforms. Generalizes the epoch buffer into the dedup→buffer→cache continuum;
-  unlocks multi-epoch / fat-chunk / scoring / HPO reuse. Tests assert each chunk
-  is decoded+transformed once across epochs. Deferred: NVMe spill tier + content
-  fingerprint (cross-*run*), and cached cross-variable derived variables.
+- **M-C — chunk cache.** ✅ Pluggable byte-bounded LRU of *prepped* chunks
+  (`ChunkCache` protocol): **`MemoryCache`** (heap) and **`DiskCache`** (mmap'd
+  `.npy` on local NVMe — RAM footprint becomes reclaimable page cache, working set
+  stays bounded). Caller-owned, passed via `cache=`; intercepted in
+  `_fetch_and_decode`; a hit skips fetch + decode + transforms. Generalizes the
+  epoch buffer into the dedup→buffer→cache continuum; unlocks multi-epoch /
+  fat-chunk / scoring / HPO reuse. Tests assert decode-once across epochs for both
+  backends. Deferred: cross-*run* index rebuild + content fingerprint, an L1/L2
+  (RAM+NVMe) tier, and cached cross-variable derived variables.
 
 Reach track (broaden + make a splash):
 - **M3 — framework surfaces.** The core `Batch` is numpy; frameworks are thin

@@ -28,12 +28,13 @@ Baselines (`bench/baselines.py`, to build):
   - It only fits on a **small reference dataset**, not the 200 GB grid — so it is
     measured separately at the same chunk/compute config and drawn as a ceiling.
   - insitubatch's **warm cache (E3)** should *approach* B3 when the data fits in
-    `cache_chunks` — an internal consistency check (warm cache ≈ in-memory).
+    the cache budget — an internal consistency check (warm cache ≈ in-memory).
 
 insitubatch ablation (one optimization at a time, to show marginal value):
-- **E1** async fan-out only — `prefetch_depth=1`, `cache_chunks=0`
+- **E1** async fan-out only — `prefetch_depth=1`, `cache=None`
 - **E2** + prefetch overlap — `prefetch_depth=k`
-- **E3** + chunk cache — report epoch-2 (warm)
+- **E3** + chunk cache — report epoch-2 (warm); ablate `cache=` none / `MemoryCache`
+  (heap) / `DiskCache` (mmap NVMe)
 
 (`naive_sync`, the existing no-torch sequential reader, stays as a sanity floor.)
 
@@ -66,8 +67,10 @@ self-describing.
   insitubatch stays GPU-fed via prefetch while baselines stall once IO-bound; all
   curves asymptote to the ceiling as compute dominates.
 - **G4 — epoch-over-epoch with cache**: epoch-1 cold vs epoch-2 warm. Cache value.
-- **G5 — peak memory vs `batch_size` / `block_chunks`**: insitubatch flat
-  (bounded by block) vs B1 growing with `workers × prefetch_factor`.
+- **G5 — peak memory vs `batch_size` / `block_chunks`**: insitubatch's **anonymous
+  working set** flat (bounded by block + prefetch) vs B1 growing with
+  `workers × prefetch_factor`; report `DiskCache` separately as reclaimable
+  file-backed page cache (byte-capped on NVMe), not heap.
 - **G6 — time-to-first-batch**: worker-fork startup vs insitubatch.
 
 ## Training vs inference
@@ -114,7 +117,8 @@ that the baselines serialize per worker.
   validate the whole grid on small data. Proves the harness and gives correct
   *shapes* for G2/G5/G6. (Absolute async wins won't show locally — expected.)
 - **1b (EC2 / S3):** run the grid on the box (see [ops_aws.md](ops_aws.md)) → the
-  real numbers; G1/G3/G4 come alive on S3.
+  real numbers; G1/G3/G4 come alive on S3. `DiskCache` runs use a local-NVMe
+  instance (`c6id`/`i4i`/`c7gd`), cache dir on the instance store.
 - **M2 (GPU):** real compute step + GPU-native path; GPU-utilization graphs.
 
 ## Build order
