@@ -65,6 +65,38 @@ def make_dataset(
     )
 
 
+def make_family(
+    url_prefix: str,
+    chunk_sizes: tuple[int, ...],
+    *,
+    n_samples: int,
+    inner: tuple[int, ...],
+    variables: tuple[str, ...] = ("t2m",),
+    compress: bool = True,
+    seed: int = 0,
+) -> dict[int, str]:
+    """Write the same logical dataset at several sample-chunk sizes.
+
+    Produces ``{url_prefix}_c{spc}.zarr`` per ``spc``. Random values differ across
+    chunkings (chunk-by-chunk fill), but byte count, dtype, inner shape, and codec
+    match — so throughput is comparable along the chunk-size axis.
+    """
+    paths: dict[int, str] = {}
+    for spc in chunk_sizes:
+        url = f"{url_prefix}_c{spc}.zarr"
+        make_dataset(
+            url,
+            n_samples=n_samples,
+            inner=inner,
+            sample_chunk=spc,
+            variables=list(variables),
+            compress=compress,
+            seed=seed,
+        )
+        paths[spc] = url
+    return paths
+
+
 def _inner(s: str) -> tuple[int, ...]:
     return tuple(int(x) for x in s.split(","))
 

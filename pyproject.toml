@@ -65,6 +65,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]  # make the dev-only `bench` package importable in tests
 
 [tool.mypy]
 python_version = "3.12"
