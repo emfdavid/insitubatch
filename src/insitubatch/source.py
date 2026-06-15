@@ -20,7 +20,7 @@ import contextlib
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -74,11 +74,13 @@ class InSituDataset(IterableDataset):
         cache_chunks: int = 0,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
-        **store_kwargs: object,
+        **store_kwargs: Any,
     ) -> None:
         self.store_url = store_url
         self.store_kwargs = store_kwargs
-        self.geometries = geometries if geometries is not None else open_geometries(store_url)
+        self.geometries = (
+            geometries if geometries is not None else open_geometries(store_url, **store_kwargs)
+        )
         self.manifest = manifest
         self.split = split
         self.variables = list(self.geometries)
