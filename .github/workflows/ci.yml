@@ -1,0 +1,26 @@
+name: ci
+
+# Lint, type-check, and test on every push to main and every PR. Installs the
+# torch extra so the torch-handoff tests run here (they skip locally when torch
+# is absent).
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --extra torch
+      - run: uv run ruff check src tests bench
+      - run: uv run ruff format --check src tests bench
+      - run: uv run mypy src
+      - run: uv run pytest -q
