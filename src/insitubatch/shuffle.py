@@ -29,19 +29,32 @@ def chunk_permutation(chunk_ids: np.ndarray, *, seed: int, epoch: int) -> np.nda
     return rng.permutation(chunk_ids)
 
 
+def _chunk_rows(chunk_id: int, samples_per_chunk: int, n_samples: int) -> np.ndarray:
+    """``[chunk_id, within]`` rows for one chunk, honouring a short final chunk.
+
+    The last chunk on the sample axis holds ``n_samples - chunk_id*spc`` samples,
+    which is < ``spc`` when ``n_samples`` is not a multiple of ``spc``. Emitting
+    ``within`` only up to the real length avoids out-of-range sample indices.
+    """
+    clen = min(samples_per_chunk, n_samples - chunk_id * samples_per_chunk)
+    return np.stack([np.full(clen, chunk_id), np.arange(clen)], axis=1)
+
+
 def block_shuffled_order(
     chunk_ids: np.ndarray,
     samples_per_chunk: int,
+    n_samples: int,
     *,
     block_chunks: int,
     seed: int,
     epoch: int,
 ) -> np.ndarray:
-    """Produce a globally-ordered list of (chunk_id, within) draws.
+    """Produce a shuffle-block-ordered list of ``[chunk_id, within]`` draws.
 
-    Emulates the shuffle-block draw order the live buffer will realise, useful
-    for the quality harness and for deterministic single-process iteration.
-    Returns an array of shape ``(n_samples, 2)`` of ``[chunk_id, within]`` rows.
+    Chunks are permuted per epoch; within each window of ``block_chunks`` chunks
+    all samples are shuffled together. ``n_samples`` is the global sample-axis
+    length, used to size a short final chunk correctly. Returns an array of shape
+    ``(N, 2)`` where ``N`` is the number of samples covered by ``chunk_ids``.
     """
     perm = chunk_permutation(chunk_ids, seed=seed, epoch=epoch)
     rng = np.random.default_rng((seed, epoch, 7919))
@@ -49,13 +62,27 @@ def block_shuffled_order(
     rows: list[np.ndarray] = []
     for start in range(0, len(perm), block_chunks):
         block = perm[start : start + block_chunks]
-        # Materialise every (chunk, within) pair in this block, then shuffle.
-        cc = np.repeat(block, samples_per_chunk)
-        ww = np.tile(np.arange(samples_per_chunk), len(block))
-        pairs = np.stack([cc, ww], axis=1)
+        pairs = np.concatenate(
+            [_chunk_rows(int(cid), samples_per_chunk, n_samples) for cid in block], axis=0
+        )
         rng.shuffle(pairs)  # in-place, along axis 0
         rows.append(pairs)
     return np.concatenate(rows, axis=0)
+
+
+def sequential_order(
+    chunk_ids: np.ndarray,
+    samples_per_chunk: int,
+    n_samples: int,
+) -> np.ndarray:
+    """In-order ``[chunk_id, within]`` draws (no permutation, no shuffle).
+
+    Used when ``shuffle=False`` (eval / inference / reconstruction): chunks in the
+    given order, samples in order within each. Honours a short final chunk.
+    """
+    return np.concatenate(
+        [_chunk_rows(int(cid), samples_per_chunk, n_samples) for cid in chunk_ids], axis=0
+    )
 
 
 def shuffle_quality(order: np.ndarray, samples_per_chunk: int) -> float:

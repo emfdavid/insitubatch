@@ -14,7 +14,12 @@ from .buffer import BufferConfig, ShuffleBlockBuffer
 from .cache import ChunkCache
 from .io import AsyncChunkReader, IOConfig
 from .plan import ReadPlan, build_read_plan, dedup_ratio
-from .shuffle import block_shuffled_order, chunk_permutation, shuffle_quality
+from .shuffle import (
+    block_shuffled_order,
+    chunk_permutation,
+    sequential_order,
+    shuffle_quality,
+)
 from .split import SplitManifest, split_by_chunk
 from .store import ensure_local_dir, open_geometries, store_from_url
 from .transforms import (
@@ -50,6 +55,7 @@ __all__ = [
     "ensure_local_dir",
     "fit_standard_scaler",
     "open_geometries",
+    "sequential_order",
     "shuffle_quality",
     "split_by_chunk",
     "store_from_url",

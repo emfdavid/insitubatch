@@ -392,9 +392,11 @@ pretending to be a general compute graph.
 - **Shuffle is approximate**, not global — chunk permutation + shuffle-block
   (`block_chunks` is the quality↔memory knob). Exact global shuffle is
   incompatible with chunk-aligned, low-copy reads.
-- **Variables are co-scheduled for reads** even at different chunkings, but a
-  *cross-variable chunk transform* would additionally require the inputs to be
-  sample-axis-aligned — another reason derived-at-chunk-stage is deferred.
+- **Variables must share the sample axis** (same length and chunk size) — an
+  enforced v1 invariant; `InSituDataset` raises `ValueError` otherwise. The draw
+  order and gather use one chunk size for all variables. (`build_read_plan` can
+  map per-variable chunkings, but the iteration layer does not yet; lifting this
+  is future work.)
 
 Rule of thumb: **per-variable, per-chunk, deterministic → chunk stage (cacheable).
 Cross-variable or per-sample-random → batch stage (not cached). Cross-chunk →

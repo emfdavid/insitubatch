@@ -20,6 +20,7 @@ import contextlib
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -27,18 +28,26 @@ from .buffer import BufferConfig, ShuffleBlockBuffer
 from .cache import ChunkCache
 from .io import AsyncChunkReader, IOConfig
 from .plan import build_read_plan
-from .shuffle import block_shuffled_order
+from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest
 from .store import open_geometries
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName
 
-try:  # optional torch surface
+# Optional torch surface. TYPE_CHECKING gives mypy a consistent view (the real
+# IterableDataset) regardless of whether torch is installed in the checking env;
+# the runtime branch handles torch-less installs.
+if TYPE_CHECKING:
     from torch.utils.data import IterableDataset
 
     _HAS_TORCH = True
-except ImportError:  # pragma: no cover - exercised on torch-less installs
-    IterableDataset = object
-    _HAS_TORCH = False
+else:
+    try:
+        from torch.utils.data import IterableDataset
+
+        _HAS_TORCH = True
+    except ImportError:  # pragma: no cover - torch-less installs
+        IterableDataset = object
+        _HAS_TORCH = False
 
 
 class InSituDataset(IterableDataset):
@@ -60,6 +69,7 @@ class InSituDataset(IterableDataset):
         max_inflight: int = 16,
         seed: int = 0,
         to_tensor: bool = True,
+        shuffle: bool = True,
         prefetch_depth: int = 2,
         cache_chunks: int = 0,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
@@ -72,10 +82,22 @@ class InSituDataset(IterableDataset):
         self.manifest = manifest
         self.split = split
         self.variables = list(self.geometries)
+
+        # v1 invariant: variables must share the sample axis (length + chunk size).
+        # The draw order and gather use a single chunk size for all variables.
+        spcs = {g.sample_chunk_size for g in self.geometries.values()}
+        lengths = {g.n_samples for g in self.geometries.values()}
+        if len(spcs) > 1 or len(lengths) > 1:
+            raise ValueError(
+                "All variables must share the same sample-axis length and chunk "
+                f"size (v1 invariant); got sample_chunk_size={sorted(spcs)}, "
+                f"n_samples={sorted(lengths)}."
+            )
         self.io_config = IOConfig(max_inflight=max_inflight)
         self.buffer_config = BufferConfig(block_chunks=block_chunks, batch_size=batch_size)
         self.seed = seed
         self.to_tensor = to_tensor and _HAS_TORCH
+        self.shuffle = shuffle
         self.prefetch_depth = max(int(prefetch_depth), 1)
         # Owned here so prepped chunks persist across epochs (cross-epoch reuse).
         self.cache = ChunkCache(cache_chunks) if cache_chunks > 0 else None
@@ -104,12 +126,17 @@ class InSituDataset(IterableDataset):
         geom = self.geometries[self.variables[0]]
         chunk_ids = np.asarray(self.manifest.chunks[self.split.value], dtype=np.int64)
         spc = geom.sample_chunk_size
-        order = block_shuffled_order(
-            chunk_ids,
-            spc,
-            block_chunks=self.buffer_config.block_chunks,
-            seed=self.seed,
-            epoch=self._epoch,
+        order = (
+            block_shuffled_order(
+                chunk_ids,
+                spc,
+                geom.n_samples,
+                block_chunks=self.buffer_config.block_chunks,
+                seed=self.seed,
+                epoch=self._epoch,
+            )
+            if self.shuffle
+            else sequential_order(chunk_ids, spc, geom.n_samples)
         )
 
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)

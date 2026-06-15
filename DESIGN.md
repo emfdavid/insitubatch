@@ -103,7 +103,9 @@ Streaming's `py1e`/`py1br`:
 
 `block_chunks ≳ 10×` samples-per-chunk ≈ global quality; `block_chunks` is the
 single **quality ↔ memory** knob. `shuffle_quality()` scores a draw order so the
-knob can be tuned empirically.
+knob can be tuned empirically. `shuffle=False` (eval / inference / reconstruction)
+swaps in `sequential_order` — chunks and samples in order, no permutation. Both
+order functions size a short final chunk correctly (no out-of-range draws).
 
 ## Memory model
 
@@ -123,7 +125,7 @@ chunk/batch size" goal.
 | `split.py` | chunk-aligned `SplitManifest`, `split_by_chunk` |
 | `store.py` | `store_from_url` shim (local↔S3 via obstore) + geometry introspection |
 | `io.py` | `AsyncChunkReader` — one event loop, bounded fan-out, real zarr-async reads |
-| `shuffle.py` | chunk permutation + shuffle-block order + quality metric |
+| `shuffle.py` | chunk permutation + shuffle-block / sequential order + quality metric |
 | `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
 | `source.py` | `InSituDataset` (IterableDataset), optional torch handoff |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
