@@ -15,3 +15,6 @@ wheels/
 # Benchmark output
 bench/results/
 bench/figures/
+
+# macOS
+.DS_Store
