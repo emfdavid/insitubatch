@@ -1,0 +1,205 @@
+"""An insitubatch data loader paralleling the Earthmover ``dataloader-demo``.
+
+Mirrors https://github.com/earth-mover/dataloader-demo: load an ERA5-style zarr
+from the cloud, feed a simulated training loop, and report per-batch wait time.
+What differs:
+
+- **Storage is obstore.** Pass any zarr ``--url`` (e.g. an S3 ERA5 store); reads
+  go through ``store_from_url`` (so ``--request-payer`` works for Requester-Pays).
+- **Parallelism is in the event loop, not workers.** There is no ``num_workers``
+  knob — insitubatch fans out IO on its async loop and prefetches; that's the
+  point of the comparison.
+- **A spatial subregion is extracted with a ``batch_transform``** (random crop per
+  sample), to echo the demo's patches.
+
+**v1 limitation vs the demo:** the demo samples 48x48 patches over *3 timesteps*.
+insitubatch v1 samples one timestep per sample (the outer axis); a multi-timestep
+window crosses chunk boundaries and is not supported yet. So each sample here is a
+single-timestep field cropped to a spatial subregion.
+
+    uv run python -m examples.wb2_dataloader \
+        --url s3://bucket/era5.zarr --var 2m_temperature --subregion 48,48 \
+        --batch-size 32 --train-step-ms 10 --request-payer
+    uv run python -m examples.wb2_dataloader            # tiny synthetic data, no network
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import tempfile
+import time
+from collections.abc import Callable
+
+import numpy as np
+import zarr
+
+from insitubatch import (
+    DiskCache,
+    MemoryCache,
+    SplitName,
+    ensure_local_dir,
+    open_geometries,
+    split_by_chunk,
+    store_from_url,
+)
+from insitubatch.source import InSituDataset
+from insitubatch.types import Batch
+
+
+def _synthetic(
+    tmp: str, *, n: int = 64, lat: int = 32, lon: int = 64, spc: int = 8
+) -> tuple[str, str]:
+    url = f"file://{tmp}/era5.zarr"
+    ensure_local_dir(url)
+    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    arr = group.create_array(
+        "t2m",
+        shape=(n, lat, lon),
+        chunks=(spc, lat, lon),
+        dtype="f4",
+        dimension_names=("time", "lat", "lon"),
+    )
+    arr[:] = np.random.default_rng(0).standard_normal((n, lat, lon)).astype("f4")
+    return url, "t2m"
+
+
+def _subregion_crop(var: str, subregion: tuple[int, int], seed: int) -> Callable[[Batch], Batch]:
+    """A batch_transform: crop a random (h, w) spatial subregion per sample."""
+    h, w = subregion
+    rng = np.random.default_rng(seed)
+
+    def crop(batch: Batch) -> Batch:
+        a = batch.arrays[var]  # (batch, ..., LAT, LON)
+        lat, lon = a.shape[-2], a.shape[-1]
+        out = np.empty(a.shape[:-2] + (h, w), dtype=a.dtype)
+        for b in range(a.shape[0]):
+            i = int(rng.integers(0, lat - h + 1))
+            j = int(rng.integers(0, lon - w + 1))
+            out[b] = a[b, ..., i : i + h, j : j + w]
+        batch.arrays[var] = out
+        return batch
+
+    return crop
+
+
+def run_demo(
+    *,
+    url: str | None = None,
+    var: str = "t2m",
+    subregion: tuple[int, int] = (16, 16),
+    batch_size: int = 16,
+    block_chunks: int = 8,
+    prefetch_depth: int = 2,
+    cache: str = "none",
+    train_step_ms: float = 0.0,
+    num_epochs: int = 1,
+    shuffle: bool = True,
+    seed: int = 0,
+    request_payer: bool = False,
+    verbose: bool = True,
+) -> dict:
+    store_kwargs = {"request_payer": True} if request_payer else {}
+    tmp = None
+    if url is None:
+        tmp = tempfile.mkdtemp(prefix="wb2-demo-")
+        url, var = _synthetic(tmp)
+
+    geom = open_geometries(url, variables=[var], **store_kwargs)[var]
+    manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
+    if cache == "memory":
+        cache_obj = MemoryCache(8 << 30)
+    elif cache == "disk":
+        cache_obj = DiskCache(tempfile.mkdtemp(prefix="wb2-cache-"), 8 << 30)
+    else:
+        cache_obj = None
+
+    ds = InSituDataset(
+        url,
+        manifest,
+        geometries={var: geom},
+        split=SplitName.TRAIN,
+        batch_size=batch_size,
+        block_chunks=block_chunks,
+        prefetch_depth=prefetch_depth,
+        cache=cache_obj,
+        shuffle=shuffle,
+        seed=seed,
+        to_tensor=False,
+        batch_transforms=[_subregion_crop(var, subregion, seed)],
+        **store_kwargs,
+    )
+
+    waits: list[float] = []
+    total = 0
+    sample_shape: tuple[int, ...] = ()
+    t_start = time.perf_counter()
+    for epoch in range(num_epochs):
+        ds.set_epoch(epoch)
+        t_prev = time.perf_counter()
+        for i, batch in enumerate(ds):
+            now = time.perf_counter()
+            waits.append(now - t_prev)
+            a = batch.arrays[var]
+            total += a.shape[0]
+            sample_shape = tuple(a.shape[1:])
+            if verbose:
+                print(
+                    f"epoch {epoch} batch {i}: {tuple(a.shape)}  wait {1e3 * (now - t_prev):.1f} ms"
+                )
+            time.sleep(train_step_ms / 1000.0)  # simulated train step
+            t_prev = time.perf_counter()
+    dt = time.perf_counter() - t_start
+
+    summary = {
+        "samples": total,
+        "sample_shape": sample_shape,
+        "seconds": dt,
+        "samples_per_s": total / dt if dt else 0.0,
+        "mean_wait_ms": 1e3 * float(np.mean(waits)) if waits else 0.0,
+        "cache": cache,
+        "train_step_ms": train_step_ms,
+    }
+    if verbose:
+        print(f"\nsummary: {summary}")
+    if tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return summary
+
+
+def _subregion(s: str) -> tuple[int, int]:
+    h, w = (int(x) for x in s.split(","))
+    return (h, w)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--url", default=None, help="zarr URL (e.g. s3://...); default = synthetic")
+    p.add_argument("--var", default="t2m")
+    p.add_argument("--subregion", type=_subregion, default=(16, 16), help="crop H,W e.g. 48,48")
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--block-chunks", type=int, default=8)
+    p.add_argument("--prefetch-depth", type=int, default=2)
+    p.add_argument("--cache", choices=["none", "memory", "disk"], default="none")
+    p.add_argument("--train-step-ms", type=float, default=0.0)
+    p.add_argument("--num-epochs", type=int, default=1)
+    p.add_argument("--no-shuffle", action="store_true")
+    p.add_argument("--request-payer", action="store_true")
+    a = p.parse_args()
+    run_demo(
+        url=a.url,
+        var=a.var,
+        subregion=a.subregion,
+        batch_size=a.batch_size,
+        block_chunks=a.block_chunks,
+        prefetch_depth=a.prefetch_depth,
+        cache=a.cache,
+        train_step_ms=a.train_step_ms,
+        num_epochs=a.num_epochs,
+        shuffle=not a.no_shuffle,
+        request_payer=a.request_payer,
+    )
+
+
+if __name__ == "__main__":
+    main()

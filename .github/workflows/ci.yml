@@ -20,7 +20,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --extra torch --extra bench
-      - run: uv run ruff check src tests bench
-      - run: uv run ruff format --check src tests bench
+      - run: uv run ruff check src tests bench examples
+      - run: uv run ruff format --check src tests bench examples
       - run: uv run mypy src
       - run: uv run pytest -q
