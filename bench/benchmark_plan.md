@@ -14,12 +14,22 @@ baselines below are load-bearing.
 Baselines (`bench/baselines.py`, to build):
 - **B0 — naive `IterableDataset`, `num_workers=0`.** Synchronous per-chunk zarr
   reads, single thread. The floor / "default base case".
-- **B1 — map-style `Dataset` + `DataLoader(num_workers=N, prefetch_factor=k)`.**
-  How practitioners actually do it. **Must be tuned** (sweep `N`/`k`, report the
-  best) or the comparison is a strawman.
-- **B2 — xbatcher + `DataLoader`** (the Earthmover/domain-standard stack).
-  **Required before claiming a win** — it is the loader the community will
-  compare us to.
+- **B1 — map-style `Dataset` + `DataLoader(num_workers=N, prefetch_factor=k)`**
+  (bench engine `workers`). The DIY pattern: `__getitem__` returns one sample, so
+  the containing chunk is decoded once **per sample** with no shared cache. This is
+  *not* the Earthmover stack. **Must be tuned** (sweep `N`/`k`, report best) or it's
+  a strawman.
+- **B2 — xbatcher + `DataLoader`** (bench engine `xbatcher`; the **Earthmover** /
+  domain-standard stack). **Required before claiming a win.** Match *their* tuning,
+  not our defaults: the post used `num_workers=32`, `prefetch_factor=3` (formula
+  `workers = prefetch × load_time/train_time`) + a dask threaded scheduler for
+  cross-variable concurrency — so **sweep `num_workers`/`prefetch_factor`** and
+  report the best, or we beat a crippled baseline. Our B2 feeds xbatcher the
+  **obstore** store (storage held constant vs insitu → a *stronger*, conservative
+  baseline than their gcsfs path); confirm the per-sample `input_dims` matches a
+  realistic config. Note their headline **~15× is internal** (tuned vs untuned
+  xbatcher), *not* xbatcher-vs-another-loader — so "beating Earthmover" means
+  insitu vs a **well-tuned** B2.
 - **B3 — fully in-memory (the ceiling).** Whole dataset preloaded into RAM (host
   array; GPU-resident in M2), then iterate with the same compute step — zero IO.
   This is the **compute-bound ceiling**: no out-of-core loader can beat having all
