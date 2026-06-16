@@ -2,10 +2,11 @@
 
     uv run python -m bench.plot --in bench/results/suite.jsonl --out bench/figures
 
-Builds whichever of the planned graphs (benchmark_plan.md, G1-G6) the data
-supports — a graph whose axis doesn't vary in the data is skipped. Repeats are
-aggregated with the median. HTML is dependency-free; for static PNG/SVG add
-kaleido and `fig.write_image(...)` later.
+Builds whichever of the planned graphs (benchmark_plan.md, G1-G7) the data
+supports — a graph whose axis doesn't vary is skipped. Repeats are aggregated by
+median; the DataLoader engines are compared at their **best** num_workers (so the
+baselines are tuned, not strawmanned). HTML is dependency-free; for static
+PNG/SVG add kaleido and `fig.write_image(...)` later.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ import plotly.express as px
 def load(jsonl_path: str | Path) -> pd.DataFrame:
     df = pd.read_json(jsonl_path, lines=True)
     if not df.empty:
-        # legend label: engine, annotated with the cache backend for insitu
         df["engine_label"] = df.apply(
             lambda r: (
                 f"{r.engine}+{r.cache}" if r.engine == "insitu" and r.cache != "none" else r.engine
@@ -35,16 +35,22 @@ def _median(df: pd.DataFrame, value: str, keys: list[str]) -> pd.DataFrame:
     return df.groupby(keys, as_index=False)[value].median()
 
 
+def _best(df: pd.DataFrame, value: str, keys: list[str]) -> pd.DataFrame:
+    """Median over repeats, then the BEST num_workers per group (tuned baseline)."""
+    m = _median(df, value, [*keys, "num_workers"])
+    return m.groupby([k for k in keys if k in m.columns], as_index=False)[value].max()
+
+
 def build_figures(df: pd.DataFrame) -> dict[str, object]:
     figs: dict[str, object] = {}
     if df.empty:
         return figs
-    last_epoch = int(df["epoch"].max())
-    warm = df[df["epoch"] == last_epoch]
+    warm = df[df["epoch"] == int(df["epoch"].max())]
+    base = warm[warm["compute_ms"] == warm["compute_ms"].min()]  # pure-IO slice
 
-    # G1 — throughput vs sample-chunk size (lines per engine; B3 'memory' = ceiling)
+    # G1 — throughput vs sample-chunk size (best workers per engine; memory = ceiling)
     if df["sample_chunk"].nunique() > 1:
-        d = _median(warm, "samples_per_s", ["engine_label", "sample_chunk", "storage"])
+        d = _best(base, "samples_per_s", ["engine_label", "sample_chunk", "storage"])
         figs["g1_throughput_vs_chunk"] = px.line(
             d,
             x="sample_chunk",
@@ -56,19 +62,19 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
             title="G1 Throughput vs sample-chunk size (memory = in-memory ceiling)",
         )
 
-    # G2 — ablation bars per chunk size
-    d = _median(warm, "samples_per_s", ["engine_label", "sample_chunk"])
+    # G2 — ablation bars (best workers per engine)
+    d = _best(base, "samples_per_s", ["engine_label", "sample_chunk"])
     figs["g2_ablation"] = px.bar(
         d,
         x="engine_label",
         y="samples_per_s",
         facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
-        title="G2 Ablation — throughput by engine",
+        title="G2 Ablation - throughput by engine (best num_workers)",
     )
 
-    # G3 — throughput vs compute_ms (the prefetch-overlap graph)
+    # G3 — throughput vs compute_ms (prefetch overlap; best workers per engine)
     if df["compute_ms"].nunique() > 1:
-        d = _median(warm, "samples_per_s", ["engine_label", "compute_ms"])
+        d = _best(warm, "samples_per_s", ["engine_label", "compute_ms"])
         figs["g3_throughput_vs_compute"] = px.line(
             d,
             x="compute_ms",
@@ -79,7 +85,7 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
         )
 
     # G4 — cache cold vs warm across epochs (insitu only)
-    insitu = df[df["engine"] == "insitu"]
+    insitu = df[(df["engine"] == "insitu") & (df["compute_ms"] == df["compute_ms"].min())]
     if not insitu.empty and insitu["epoch"].nunique() > 1:
         d = _median(insitu, "samples_per_s", ["cache", "epoch", "sample_chunk"])
         figs["g4_cache_epochs"] = px.line(
@@ -93,7 +99,7 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
         )
 
     # G5 — peak RSS by engine
-    d = _median(warm, "peak_rss_mb", ["engine_label", "sample_chunk"])
+    d = _best(base, "peak_rss_mb", ["engine_label", "sample_chunk"])
     figs["g5_peak_memory"] = px.bar(
         d,
         x="engine_label",
@@ -103,7 +109,7 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
     )
 
     # G6 — time-to-first-batch by engine
-    d = _median(warm, "ttfb_ms", ["engine_label", "sample_chunk"])
+    d = _best(base, "ttfb_ms", ["engine_label", "sample_chunk"])
     figs["g6_ttfb"] = px.bar(
         d,
         x="engine_label",
@@ -111,6 +117,20 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
         facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
         title="G6 Time-to-first-batch (ms)",
     )
+
+    # G7 — DataLoader tuning curve: throughput vs num_workers (workers/xbatcher)
+    dl = base[base["engine"].isin(["workers", "xbatcher"])]
+    if not dl.empty and dl["num_workers"].nunique() > 1:
+        d = _median(dl, "samples_per_s", ["engine_label", "num_workers", "sample_chunk"])
+        figs["g7_worker_tuning"] = px.line(
+            d,
+            x="num_workers",
+            y="samples_per_s",
+            color="engine_label",
+            markers=True,
+            facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
+            title="G7 Baseline tuning - throughput vs num_workers",
+        )
     return figs
 
 

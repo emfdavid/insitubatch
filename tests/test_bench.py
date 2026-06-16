@@ -21,7 +21,7 @@ def test_suite_smoke(tmp_path) -> None:
         inner=(4, 4),
         batch_size=8,
         block_chunks=4,
-        num_workers=0,  # single-process DataLoader -> fast + deterministic in CI
+        worker_sweep=(0,),  # single-process DataLoader -> fast + deterministic in CI
         epochs=1,
         verbose=False,
     )
@@ -53,6 +53,26 @@ def test_xbatcher_engine(tmp_path) -> None:
     rows = run(cfg)
     assert rows and rows[0].samples_per_s > 0
     assert rows[0].n_samples > 0
+
+
+def test_run_suite_compute_sweep(tmp_path) -> None:
+    out = tmp_path / "s.jsonl"
+    res = run_suite(
+        out=out,
+        data_dir=tmp_path / "d",
+        chunk_sizes=(4,),
+        engines=("insitu",),
+        caches=("none",),
+        n_samples=48,
+        inner=(4, 4),
+        batch_size=8,
+        block_chunks=4,
+        worker_sweep=(0,),
+        compute_ms_sweep=(0.0, 2.0),
+        epochs=1,
+        verbose=False,
+    )
+    assert {r.compute_ms for r in res} == {0.0, 2.0}  # the compute sweep produced both
 
 
 def test_workers_engine_spawns(tmp_path) -> None:
