@@ -5,6 +5,7 @@ Engines (see benchmark_plan.md):
   naive   — B0: sequential per-chunk zarr reads, no torch, no concurrency (floor)
   memory  — B3: whole split preloaded into RAM, then iterate (compute-bound ceiling)
   workers — B1: map-style Dataset + torch DataLoader(num_workers) (the realistic baseline)
+  xbatcher— B2: xbatcher.BatchGenerator + torch DataLoader (the domain-standard stack)
 
 Each engine returns one Result per epoch. A per-batch ``compute_ms`` step
 (``time.sleep``, which releases the GIL like a CUDA kernel launch) simulates the
@@ -112,6 +113,7 @@ def run(
         "naive": _run_naive,
         "memory": _run_memory,
         "workers": _run_workers,
+        "xbatcher": _run_xbatcher,
     }
     return engines[cfg.engine](cfg, geom, manifest, cache_dir, store_kwargs)
 
@@ -206,6 +208,32 @@ def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
             num_workers=cfg.num_workers,
             shuffle=cfg.shuffle,
             persistent_workers=False,
+            prefetch_factor=(2 if cfg.num_workers else None),
+        )
+        sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)
+        del loader
+        out.append(_result(cfg, geom, epoch, sec, n, ttfb))
+    return out
+
+
+def _run_xbatcher(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
+    import xarray as xr  # optional bench dependency
+    import xbatcher
+    from torch.utils.data import DataLoader
+    from xbatcher.loaders.torch import MapDataset
+
+    da = xr.open_zarr(store_from_url(cfg.url, **store_kwargs), consolidated=False)[cfg.var]
+    da = da.isel({da.dims[0]: manifest.sample_indices(SplitName.TRAIN, geom)})
+    # one timestep per sample (full inner dims); the DataLoader collates batch_size.
+    input_dims = {da.dims[0]: 1, **{d: int(da.sizes[d]) for d in da.dims[1:]}}
+
+    out = []
+    for epoch in range(cfg.epochs):
+        loader = DataLoader(
+            MapDataset(xbatcher.BatchGenerator(da, input_dims=input_dims)),
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            shuffle=cfg.shuffle,
             prefetch_factor=(2 if cfg.num_workers else None),
         )
         sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)

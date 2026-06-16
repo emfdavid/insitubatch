@@ -45,6 +45,9 @@ def make_dataset(
     chunks = (sample_chunk, *inner)
     compressors = "auto" if compress else None
 
+    # Named dims so xarray (and thus the xbatcher baseline) can open the store;
+    # our own engine reads by index and ignores names.
+    dim_names = ("time", *(f"dim{i}" for i in range(len(inner))))
     for var in variables:
         arr = group.create_array(
             var,
@@ -52,6 +55,7 @@ def make_dataset(
             chunks=chunks,
             dtype="f4",
             compressors=compressors,
+            dimension_names=dim_names,
         )
         for start in range(0, n_samples, sample_chunk):
             stop = min(start + sample_chunk, n_samples)

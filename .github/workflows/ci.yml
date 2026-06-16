@@ -19,7 +19,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
-      - run: uv sync --extra torch
+      - run: uv sync --extra torch --extra bench
       - run: uv run ruff check src tests bench
       - run: uv run ruff format --check src tests bench
       - run: uv run mypy src

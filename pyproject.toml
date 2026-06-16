@@ -41,6 +41,11 @@ gpu = [
 virtual = [
     "virtualizarr>=1.2",
 ]
+# Benchmark suite extras: the xbatcher baseline (B2) and plotting.
+bench = [
+    "xbatcher>=0.3",
+    "matplotlib>=3.8",
+]
 
 [dependency-groups]
 dev = [

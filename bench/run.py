@@ -29,7 +29,7 @@ def run_suite(
     url_prefix: str | None = None,
     storage: str = "file",
     chunk_sizes: Sequence[int] = (1, 8),
-    engines: Sequence[str] = ("naive", "workers", "insitu", "memory"),
+    engines: Sequence[str] = ("naive", "workers", "xbatcher", "insitu", "memory"),
     caches: Sequence[str] = ("none", "memory", "disk"),
     n_samples: int = 128,
     inner: tuple[int, ...] = (16, 16),
@@ -104,7 +104,7 @@ def main() -> None:
     p.add_argument("--url-prefix", default=None, help="pre-generated data: <prefix>_c<spc>.zarr")
     p.add_argument("--storage", default="file", choices=["file", "s3"])
     p.add_argument("--full", action="store_true", help="chunk-size spectrum + larger grid")
-    p.add_argument("--engines", default=None, help="comma list: naive,workers,insitu,memory")
+    p.add_argument("--engines", default=None, help="comma list of engines to run")
     p.add_argument("--chunk-sizes", default=None, help="comma list, e.g. 1,2,4,8,16,32")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--compute-ms", type=float, default=0.0)
