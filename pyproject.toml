@@ -42,9 +42,10 @@ virtual = [
     "virtualizarr>=1.2",
 ]
 # Benchmark suite extras: the xbatcher baseline (B2) and plotting.
+# (pandas comes in transitively via xarray.)
 bench = [
     "xbatcher>=0.3",
-    "matplotlib>=3.8",
+    "plotly>=5.20",
 ]
 
 [dependency-groups]

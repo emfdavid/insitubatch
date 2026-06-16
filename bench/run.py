@@ -111,6 +111,8 @@ def main() -> None:
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--request-payer", action="store_true")
+    p.add_argument("--plot", action="store_true", help="render Plotly graphs after the run")
+    p.add_argument("--fig-dir", default="bench/figures")
     a = p.parse_args()
 
     kw: dict = dict(
@@ -131,6 +133,12 @@ def main() -> None:
     if a.chunk_sizes:
         kw["chunk_sizes"] = tuple(int(x) for x in a.chunk_sizes.split(","))
     run_suite(**kw)
+
+    if a.plot:
+        from .plot import build_figures, load, write_figures
+
+        paths = write_figures(build_figures(load(a.out)), a.fig_dir)
+        print(f"wrote {len(paths)} figures -> {a.fig_dir}")
 
 
 if __name__ == "__main__":

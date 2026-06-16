@@ -1,0 +1,140 @@
+"""Plot the benchmark JSONL into interactive Plotly graphs (one HTML each).
+
+    uv run python -m bench.plot --in bench/results/suite.jsonl --out bench/figures
+
+Builds whichever of the planned graphs (benchmark_plan.md, G1-G6) the data
+supports — a graph whose axis doesn't vary in the data is skipped. Repeats are
+aggregated with the median. HTML is dependency-free; for static PNG/SVG add
+kaleido and `fig.write_image(...)` later.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+
+
+def load(jsonl_path: str | Path) -> pd.DataFrame:
+    df = pd.read_json(jsonl_path, lines=True)
+    if not df.empty:
+        # legend label: engine, annotated with the cache backend for insitu
+        df["engine_label"] = df.apply(
+            lambda r: (
+                f"{r.engine}+{r.cache}" if r.engine == "insitu" and r.cache != "none" else r.engine
+            ),
+            axis=1,
+        )
+    return df
+
+
+def _median(df: pd.DataFrame, value: str, keys: list[str]) -> pd.DataFrame:
+    keys = [k for k in keys if k in df.columns]
+    return df.groupby(keys, as_index=False)[value].median()
+
+
+def build_figures(df: pd.DataFrame) -> dict[str, object]:
+    figs: dict[str, object] = {}
+    if df.empty:
+        return figs
+    last_epoch = int(df["epoch"].max())
+    warm = df[df["epoch"] == last_epoch]
+
+    # G1 — throughput vs sample-chunk size (lines per engine; B3 'memory' = ceiling)
+    if df["sample_chunk"].nunique() > 1:
+        d = _median(warm, "samples_per_s", ["engine_label", "sample_chunk", "storage"])
+        figs["g1_throughput_vs_chunk"] = px.line(
+            d,
+            x="sample_chunk",
+            y="samples_per_s",
+            color="engine_label",
+            facet_col="storage" if d["storage"].nunique() > 1 else None,
+            log_x=True,
+            markers=True,
+            title="G1 Throughput vs sample-chunk size (memory = in-memory ceiling)",
+        )
+
+    # G2 — ablation bars per chunk size
+    d = _median(warm, "samples_per_s", ["engine_label", "sample_chunk"])
+    figs["g2_ablation"] = px.bar(
+        d,
+        x="engine_label",
+        y="samples_per_s",
+        facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
+        title="G2 Ablation — throughput by engine",
+    )
+
+    # G3 — throughput vs compute_ms (the prefetch-overlap graph)
+    if df["compute_ms"].nunique() > 1:
+        d = _median(warm, "samples_per_s", ["engine_label", "compute_ms"])
+        figs["g3_throughput_vs_compute"] = px.line(
+            d,
+            x="compute_ms",
+            y="samples_per_s",
+            color="engine_label",
+            markers=True,
+            title="G3 Throughput vs per-batch compute (prefetch overlap)",
+        )
+
+    # G4 — cache cold vs warm across epochs (insitu only)
+    insitu = df[df["engine"] == "insitu"]
+    if not insitu.empty and insitu["epoch"].nunique() > 1:
+        d = _median(insitu, "samples_per_s", ["cache", "epoch", "sample_chunk"])
+        figs["g4_cache_epochs"] = px.line(
+            d,
+            x="epoch",
+            y="samples_per_s",
+            color="cache",
+            markers=True,
+            facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
+            title="G4 Cache: cold (epoch 0) vs warm (epoch 1+)",
+        )
+
+    # G5 — peak RSS by engine
+    d = _median(warm, "peak_rss_mb", ["engine_label", "sample_chunk"])
+    figs["g5_peak_memory"] = px.bar(
+        d,
+        x="engine_label",
+        y="peak_rss_mb",
+        facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
+        title="G5 Peak RSS by engine (MB)",
+    )
+
+    # G6 — time-to-first-batch by engine
+    d = _median(warm, "ttfb_ms", ["engine_label", "sample_chunk"])
+    figs["g6_ttfb"] = px.bar(
+        d,
+        x="engine_label",
+        y="ttfb_ms",
+        facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
+        title="G6 Time-to-first-batch (ms)",
+    )
+    return figs
+
+
+def write_figures(figs: dict[str, object], outdir: str | Path) -> list[Path]:
+    out = Path(outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, fig in figs.items():
+        p = out / f"{name}.html"
+        fig.write_html(p)  # type: ignore[attr-defined]
+        paths.append(p)
+    return paths
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--in", dest="infile", default="bench/results/suite.jsonl")
+    p.add_argument("--out", dest="outdir", default="bench/figures")
+    a = p.parse_args()
+    paths = write_figures(build_figures(load(a.infile)), a.outdir)
+    print(f"wrote {len(paths)} figures -> {a.outdir}")
+    for p_ in paths:
+        print(f"  {p_}")
+
+
+if __name__ == "__main__":
+    main()

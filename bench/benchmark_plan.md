@@ -109,7 +109,8 @@ that the baselines serialize per worker.
    JSONL; extend `Result`; `--repeats` (3–5) for medians + spread.
 4. `compute_ms` knob — simulate the step (CPU: GIL-releasing op; GPU later: real
    matmul) so prefetch overlap is observable.
-5. `bench/plot.py` — JSONL → G1–G6 (matplotlib, a `bench` extra). 
+5. `bench/plot.py` — JSONL → G1–G6 as interactive **Plotly** HTML (a `bench`
+   extra; pandas comes via xarray). `--plot` on the runner renders after a run.
 6. Fix rough edges: per-dataset `--url` runs (not both regime configs on one URL);
    exclude a warmup batch.
 
