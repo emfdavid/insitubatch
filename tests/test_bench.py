@@ -22,6 +22,7 @@ def test_suite_smoke(tmp_path) -> None:
         batch_size=8,
         block_chunks=4,
         worker_sweep=(0,),  # single-process DataLoader -> fast + deterministic in CI
+        cache_dir=tmp_path / "cache",  # exercise the explicit DiskCache scratch dir
         epochs=1,
         verbose=False,
     )

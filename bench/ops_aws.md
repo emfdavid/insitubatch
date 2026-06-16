@@ -25,7 +25,7 @@ export AWS_REGION=us-east-1
 export ACCT=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET="insitubatch-bench-${ACCT}"      # bucket names are global; suffix keeps it unique
 export KEY_NAME=emfdavid_ed25519
-export INSTANCE_TYPE=c7i.4xlarge               # 16 vCPU / 32 GiB; scale up for more NIC
+export INSTANCE_TYPE=c6id.8xlarge              # 32 vCPU / 64 GiB + ~1.9 TB local NVMe (DiskCache)
 ```
 
 ## 1. Import your SSH key (from ssh-agent)
@@ -82,7 +82,10 @@ aws iam add-role-to-instance-profile \
 
 ## 4. Security group (SSH from your IP only) + default VPC lookups
 ```bash
-MYIP=$(curl -s https://checkip.amazonaws.com)
+export MYIP=$(curl -s https://checkip.amazonaws.com)
+# If the next line prints "None", your account has no default VPC in this region.
+# Create one (recreates default subnets + IGW + route table), then re-run it:
+#   aws ec2 create-default-vpc --region "$AWS_REGION"
 export VPC=$(aws ec2 describe-vpcs --region "$AWS_REGION" \
   --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
 export SG=$(aws ec2 create-security-group --region "$AWS_REGION" \
@@ -125,23 +128,32 @@ IP=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
 echo "ssh ec2-user@$IP"
 ```
 
-## 7. On the box — install, generate ~200 GB, bench
+## 7. On the box — mount NVMe, install, generate, bench
 ```bash
 ssh ec2-user@$IP
 export AWS_REGION=us-east-1            # obstore/object_store needs the region
 export BUCKET=insitubatch-bench-<ACCT> # same value as above
 
+# --- mount the instance-store NVMe (ephemeral scratch for the DiskCache) ---
+lsblk                                  # find the instance store (usually /dev/nvme1n1; root = nvme0n1)
+sudo mkfs -t xfs /dev/nvme1n1
+sudo mkdir -p /mnt/nvme && sudo mount /dev/nvme1n1 /mnt/nvme && sudo chown "$USER" /mnt/nvme
+
+# --- install ---
 curl -LsSf https://astral.sh/uv/install.sh | sh && source "$HOME/.bashrc"
 git clone https://github.com/emfdavid/insitubatch && cd insitubatch
-uv sync --extra torch
+uv sync --extra torch --extra bench
 
-# Generate (owner creds via instance profile -> no request_payer needed).
-# Sizing: (n, 721, 1440) f4 ~= 4.15 MB/sample. n=24000 ~= 100 GB per dataset.
-uv run python bench/make_dataset.py --url "s3://$BUCKET/era5_fat.zarr"  --regime fat  --n-samples 24000 --inner 721,1440
-uv run python bench/make_dataset.py --url "s3://$BUCKET/era5_grib.zarr" --regime grib --n-samples 24000 --inner 721,1440
+# --- generate the chunk-size family (owner creds -> no request_payer needed) ---
+# (n, 721, 1440) f4 ~= 4.15 MB/sample; n=6000 ~= 25 GB per chunking, ~150 GB total.
+for spc in 1 2 4 8 16 32; do
+  uv run python bench/make_dataset.py --url "s3://$BUCKET/era5_c${spc}.zarr" \
+    --sample-chunk "$spc" --n-samples 6000 --inner 721,1440
+done
 
-uv run python bench/bench_throughput.py --url "s3://$BUCKET/era5_fat.zarr"
-uv run python bench/bench_throughput.py --url "s3://$BUCKET/era5_grib.zarr"
+# --- run the suite + render Plotly graphs (DiskCache on the NVMe) ---
+uv run python -m bench --full --url-prefix "s3://$BUCKET/era5" \
+  --cache-dir /mnt/nvme/cache --plot
 ```
 
 ## External reproducers (a different AWS account)
@@ -169,14 +181,14 @@ aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$IID"
 ```
 
 ## Cost (us-east-1, approximate)
-- `c7i.4xlarge`: Spot ~$0.30/hr, On-Demand ~$0.71/hr. **Terminate when done.**
-- S3 storage: ~$0.023/GB-mo → 200 GB ≈ **$4.6/mo** (owner pays storage only).
+- `c6id.8xlarge`: Spot ~$0.5-0.7/hr, On-Demand ~$1.6/hr. **Terminate when done.**
+  (Instance-store NVMe is included and ephemeral — wiped on stop/terminate.)
+- S3 storage: ~$0.023/GB-mo → ~150 GB ≈ **$3.5/mo** (owner pays storage only).
 - Requester Pays: reproducers pay their own GET + egress; owner pays $0 for reads.
 - Optional: an AWS Budgets alarm to cap surprises.
 
-## Known rough edges (Phase-1 code work, not ops)
-- `bench_throughput.py --url` currently runs both regime *configs* against the one
-  URL you pass; for clean cloud numbers it wants a small refinement to take its
-  config from the dataset and emit per-dataset rows.
-- The bench has no compute step, so prefetch overlap won't show as throughput;
-  add a simulated step (or a real model) to surface the GPU-fed win.
+## Notes
+- The suite reads each `era5_c<spc>.zarr` once per config; the chunk-size sweep
+  (`--full`) and `num_workers`/`compute_ms` sweeps come from `python -m bench`.
+- The DiskCache lives on `/mnt/nvme` (instance store) — fast and ephemeral; the
+  dataset stays in S3.

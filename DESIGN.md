@@ -165,9 +165,9 @@ chunk/batch size" goal.
 
 **Phase 0 complete (local).** Real obstore-backed zarr v3 async reads are wired
 end-to-end via `store_from_url` (one URL → local `file://` now, `s3://` later).
-`bench/make_dataset.py` generates either regime; `bench/bench_throughput.py`
-compares against a naive synchronous baseline and logs JSONL. 14 tests pass
-(values + split coverage verified against source).
+`bench/make_dataset.py` generates datasets; the one-command `bench` suite
+(`uv run python -m bench`) compares insitubatch against the baselines (naive,
+workers, xbatcher, memory/ceiling) and logs JSONL + Plotly graphs.
 
 Early signal on **local disk**: the degenerate GRIB-per-timestep regime (1
 sample/chunk) is already **~2.8× faster** than naive sync via async fan-out, with

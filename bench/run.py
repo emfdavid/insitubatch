@@ -42,6 +42,7 @@ def run_suite(
     epochs: int = 2,
     worker_sweep: Sequence[int] = (0,),
     compute_ms_sweep: Sequence[float] = (0.0,),
+    cache_dir: str | Path | None = None,
     repeats: int = 1,
     request_payer: bool = False,
     verbose: bool = True,
@@ -55,7 +56,10 @@ def run_suite(
             f"file://{ddir}/era5", tuple(chunk_sizes), n_samples=n_samples, inner=inner
         )
 
-    scratch = Path(tempfile.mkdtemp(prefix="insitubatch-bench-cache-"))
+    scratch = (
+        Path(cache_dir) if cache_dir else Path(tempfile.mkdtemp(prefix="insitubatch-bench-cache-"))
+    )
+    scratch.mkdir(parents=True, exist_ok=True)
     results: list[Result] = []
     if verbose:
         print(
@@ -121,6 +125,7 @@ def main() -> None:
     p.add_argument("--num-workers", default="0", help="DataLoader worker counts to sweep (comma)")
     p.add_argument("--compute-ms", default="0", help="per-batch compute ms to sweep (comma)")
     p.add_argument("--repeats", type=int, default=1)
+    p.add_argument("--cache-dir", default=None, help="DiskCache scratch dir (point at NVMe)")
     p.add_argument("--request-payer", action="store_true")
     p.add_argument("--plot", action="store_true", help="render Plotly graphs after the run")
     p.add_argument("--fig-dir", default="bench/figures")
@@ -133,6 +138,7 @@ def main() -> None:
         storage=a.storage,
         epochs=a.epochs,
         repeats=a.repeats,
+        cache_dir=a.cache_dir,
         request_payer=a.request_payer,
         worker_sweep=tuple(int(x) for x in a.num_workers.split(",")),
         compute_ms_sweep=tuple(float(x) for x in a.compute_ms.split(",")),
