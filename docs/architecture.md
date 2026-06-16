@@ -2,7 +2,8 @@
 
 This doc contrasts the classic worker-based data loader with insitubatch's
 async-driven engine, then specifies the prefetch pipeline and the Earth2Studio
-integration surfaces. For the why behind the project see [DESIGN.md](../DESIGN.md).
+integration surfaces. For the why behind the project see
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md).
 
 ## The inversion in one line
 

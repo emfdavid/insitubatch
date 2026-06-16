@@ -47,6 +47,11 @@ bench = [
     "xbatcher>=0.3",
     "plotly>=5.20",
 ]
+# Docs site (MkDocs-Material + API from docstrings), published to GitHub Pages.
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.26",
+]
 
 [dependency-groups]
 dev = [

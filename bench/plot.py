@@ -134,13 +134,16 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
     return figs
 
 
-def write_figures(figs: dict[str, object], outdir: str | Path) -> list[Path]:
+def write_figures(figs: dict[str, object], outdir: str | Path, *, cdn: bool = False) -> list[Path]:
+    # cdn=True loads plotly.js from a CDN instead of inlining ~3.5 MB per file,
+    # so the figures are small enough to commit and embed (the docs site iframes them).
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
+    plotlyjs = "cdn" if cdn else True
     paths = []
     for name, fig in figs.items():
         p = out / f"{name}.html"
-        fig.write_html(p)  # type: ignore[attr-defined]
+        fig.write_html(p, include_plotlyjs=plotlyjs)  # type: ignore[attr-defined]
         paths.append(p)
     return paths
 
@@ -149,8 +152,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--in", dest="infile", default="bench/results/suite.jsonl")
     p.add_argument("--out", dest="outdir", default="bench/figures")
+    p.add_argument(
+        "--cdn", action="store_true", help="load plotly.js from CDN (small files for the docs site)"
+    )
     a = p.parse_args()
-    paths = write_figures(build_figures(load(a.infile)), a.outdir)
+    paths = write_figures(build_figures(load(a.infile)), a.outdir, cdn=a.cdn)
     print(f"wrote {len(paths)} figures -> {a.outdir}")
     for p_ in paths:
         print(f"  {p_}")

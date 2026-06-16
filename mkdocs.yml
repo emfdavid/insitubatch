@@ -1,0 +1,67 @@
+site_name: insitubatch
+site_description: Train in place on n-dimensional cloud tensors.
+site_url: https://emfdavid.github.io/insitubatch/
+repo_url: https://github.com/emfdavid/insitubatch
+repo_name: emfdavid/insitubatch
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Benchmarks: benchmarks.md
+  - API reference: api.md
+  - Design rationale: https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md
+  - Benchmark plan: https://github.com/emfdavid/insitubatch/blob/main/bench/benchmark_plan.md
+  - AWS ops runbook: https://github.com/emfdavid/insitubatch/blob/main/bench/ops_aws.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_root_heading: true
+            show_source: false
+            docstring_style: google
+            members_order: source
+            separate_signature: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format

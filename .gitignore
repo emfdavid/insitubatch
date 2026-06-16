@@ -16,5 +16,8 @@ wheels/
 bench/results/
 bench/figures/
 
+# MkDocs build output (docs/figures/ is committed for the published site)
+site/
+
 # macOS
 .DS_Store
