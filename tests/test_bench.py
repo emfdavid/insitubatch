@@ -53,3 +53,22 @@ def test_xbatcher_engine(tmp_path) -> None:
     rows = run(cfg)
     assert rows and rows[0].samples_per_s > 0
     assert rows[0].n_samples > 0
+
+
+def test_workers_engine_spawns(tmp_path) -> None:
+    # Guards the spawn-pickling regression: the worker dataset must be a top-level,
+    # picklable class (num_workers>0 forks/spawns a worker process).
+    pytest.importorskip("torch")
+    url = f"file://{tmp_path}/w.zarr"
+    make_dataset(url, n_samples=32, inner=(3, 3), sample_chunk=8, variables=["t2m"])
+    cfg = Cfg(
+        engine="workers",
+        url=url,
+        storage="file",
+        sample_chunk=8,
+        batch_size=8,
+        num_workers=1,
+        epochs=1,
+    )
+    rows = run(cfg)
+    assert rows and rows[0].n_samples > 0

@@ -182,28 +182,36 @@ def _run_memory(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     return out
 
 
+class _SampleReader:
+    """Picklable map-style dataset for the B1 baseline: one sample per index,
+    opening its own zarr handle per worker. Must be top-level (not a closure) so
+    it pickles to DataLoader worker processes under the `spawn` start method."""
+
+    def __init__(self, url: str, var: str, idx, store_kwargs: dict) -> None:
+        self.url = url
+        self.var = var
+        self.idx = idx
+        self.store_kwargs = store_kwargs
+        self._arr = None  # opened lazily, once per worker
+
+    def __len__(self) -> int:
+        return len(self.idx)
+
+    def __getitem__(self, i: int):
+        if self._arr is None:
+            grp = zarr.open_group(store=store_from_url(self.url, **self.store_kwargs), mode="r")
+            self._arr = grp[self.var]
+        return np.asarray(self._arr[int(self.idx[i])])
+
+
 def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
-    from torch.utils.data import DataLoader, Dataset  # optional baseline dependency
+    from torch.utils.data import DataLoader  # optional baseline dependency
 
     idx = manifest.sample_indices(SplitName.TRAIN, geom)
-    url, var, sk = cfg.url, cfg.var, store_kwargs
-
-    class _MapDataset(Dataset):
-        def __init__(self) -> None:
-            self._arr = None
-
-        def __len__(self) -> int:
-            return len(idx)
-
-        def __getitem__(self, i: int):
-            if self._arr is None:  # open once per worker process
-                self._arr = zarr.open_group(store=store_from_url(url, **sk), mode="r")[var]
-            return np.asarray(self._arr[int(idx[i])])
-
     out = []
     for epoch in range(cfg.epochs):
         loader = DataLoader(
-            _MapDataset(),
+            _SampleReader(cfg.url, cfg.var, idx, store_kwargs),
             batch_size=cfg.batch_size,
             num_workers=cfg.num_workers,
             shuffle=cfg.shuffle,
