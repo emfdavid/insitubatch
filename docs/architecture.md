@@ -40,9 +40,26 @@ Frictions against cloud ndim zarr:
   range reads from inside a worker.
 - **dask thread pool nested in each worker** — procs × threads oversubscription,
   slow fork startup, fat memory.
+- **The fork-safety tax** — a modern object store (obstore) runs a Rust **tokio**
+  runtime. `fork` (the Linux default for workers) copies only the calling thread
+  and leaves that runtime's threads dead with their locks held, so the *first read*
+  in a forked worker **deadlocks**. Every escape is a cost the process model
+  imposes: `spawn` (relaunch the interpreter per worker), `forkserver` (keep a
+  pristine pre-fork server around), or a fork-tolerant-but-slower stack (s3fs
+  rebuilds its event loop on a PID change). We hit this benchmarking our own
+  baseline — the `workers` engine hung under fork until we pinned it to
+  `forkserver`/`spawn`.
 - Note: the worker model *does* prefetch (via `prefetch_factor` — workers run
   ahead into the IPC result queue). Prefetch is not the differentiator; **how**
   we prefetch is.
+
+> **Why this is the argument for the single loop.** Every friction above — no
+> shared cache, sync IO that can't drive obstore, thread oversubscription, the
+> fork-safety tax — follows from putting parallelism in OS *processes*.
+> insitubatch drives one in-process event loop (`num_workers=0`): there is no
+> fork, so there is no fork-safety tax, no per-worker runtime to relaunch, and the
+> chunk cache and the obstore runtime are simply shared. The deadlock we hit
+> benchmarking the baseline is a symptom of the very thing we replace.
 
 ## insitubatch async-driven pipeline
 

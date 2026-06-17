@@ -14,6 +14,8 @@ train/infer step so prefetch overlap is observable; GPU uses a real step in M2.
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -204,27 +206,45 @@ class _SampleReader:
         return np.asarray(self._arr[int(self.idx[i])])
 
 
+def _worker_mp_context(num_workers: int) -> str | None:
+    """Start method for DataLoader worker processes.
+
+    obstore's Rust tokio runtime is not fork-safe (fork copies only the calling
+    thread, leaving the runtime's threads dead with their locks held), so a forked
+    worker deadlocks on first read. forkserver forks each worker from a pristine
+    server that never touched the runtime, and is cheaper than spawn — so prefer it
+    on Linux; fall back to spawn elsewhere (macOS, where forkserver is unreliable).
+    None when there are no workers (torch rejects a context without them).
+    """
+    if not num_workers:
+        return None
+    if sys.platform != "darwin" and "forkserver" in mp.get_all_start_methods():
+        return "forkserver"
+    return "spawn"
+
+
 def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     from torch.utils.data import DataLoader  # optional baseline dependency
 
     idx = manifest.sample_indices(SplitName.TRAIN, geom)
+    # Build the loader once and re-iterate per epoch so persistent_workers keeps the
+    # pool warm: the worker model's startup is then paid once (epoch-0 TTFB), not every
+    # epoch. That's the tuned baseline (benchmark_plan.md: no strawman). shuffle still
+    # reshuffles each iteration. persistent_workers requires num_workers>0.
+    loader = DataLoader(
+        _SampleReader(cfg.url, cfg.var, idx, store_kwargs),
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        shuffle=cfg.shuffle,
+        persistent_workers=bool(cfg.num_workers),
+        prefetch_factor=(2 if cfg.num_workers else None),
+        multiprocessing_context=_worker_mp_context(cfg.num_workers),
+    )
     out = []
     for epoch in range(cfg.epochs):
-        loader = DataLoader(
-            _SampleReader(cfg.url, cfg.var, idx, store_kwargs),
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
-            shuffle=cfg.shuffle,
-            persistent_workers=False,
-            prefetch_factor=(2 if cfg.num_workers else None),
-            # Force spawn: the worker reads via obstore, whose Rust tokio runtime is
-            # not fork-safe, so fork (Linux default) deadlocks; spawn gives a fresh
-            # process. None for num_workers=0 (torch rejects a context without workers).
-            multiprocessing_context=("spawn" if cfg.num_workers else None),
-        )
         sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)
-        del loader
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
+    del loader
     return out
 
 
@@ -239,17 +259,19 @@ def _run_xbatcher(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     # one timestep per sample (full inner dims); the DataLoader collates batch_size.
     input_dims = {da.dims[0]: 1, **{d: int(da.sizes[d]) for d in da.dims[1:]}}
 
+    # Built once + re-iterated so persistent_workers keeps the pool warm (see _run_workers).
+    loader = DataLoader(
+        MapDataset(xbatcher.BatchGenerator(da, input_dims=input_dims)),
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        shuffle=cfg.shuffle,
+        persistent_workers=bool(cfg.num_workers),
+        prefetch_factor=(2 if cfg.num_workers else None),
+        multiprocessing_context=_worker_mp_context(cfg.num_workers),
+    )
     out = []
     for epoch in range(cfg.epochs):
-        loader = DataLoader(
-            MapDataset(xbatcher.BatchGenerator(da, input_dims=input_dims)),
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
-            shuffle=cfg.shuffle,
-            prefetch_factor=(2 if cfg.num_workers else None),
-            multiprocessing_context=("spawn" if cfg.num_workers else None),  # see _run_workers
-        )
         sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)
-        del loader
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
+    del loader
     return out

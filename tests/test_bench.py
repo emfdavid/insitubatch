@@ -77,8 +77,9 @@ def test_run_suite_compute_sweep(tmp_path) -> None:
 
 
 def test_workers_engine_spawns(tmp_path) -> None:
-    # Guards the spawn-pickling regression: the worker dataset must be a top-level,
-    # picklable class (num_workers>0 forks/spawns a worker process).
+    # Guards the worker-pickling regression: the worker dataset must be a top-level,
+    # picklable class (num_workers>0 starts a worker via forkserver/spawn, which
+    # re-imports + unpickles it).
     pytest.importorskip("torch")
     url = f"file://{tmp_path}/w.zarr"
     make_dataset(url, n_samples=32, inner=(3, 3), sample_chunk=8, variables=["t2m"])
