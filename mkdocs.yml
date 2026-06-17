@@ -32,6 +32,7 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - Benchmarks: benchmarks.md
+  - WeatherBench2 walkthrough: walkthrough.md
   - API reference: api.md
   - Design rationale: https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md
   - Benchmark plan: https://github.com/emfdavid/insitubatch/blob/main/bench/benchmark_plan.md
