@@ -31,12 +31,20 @@ def make_dataset(
     variables: list[str],
     compress: bool = True,
     seed: int = 0,
+    write_batch_mb: int = 1024,
+    write_concurrency: int = 32,
 ) -> None:
     """Write a ``(n_samples, *inner)`` array per variable, chunked along axis 0.
 
     Inner dims are single-chunk (the v1 contract), so one sample-axis chunk maps
-    to exactly one stored chunk. Data is written chunk-by-chunk to keep the
-    writer's memory bounded regardless of total size.
+    to exactly one stored chunk.
+
+    Speed: data is written a *slab* of many chunks at a time rather than
+    chunk-by-chunk. A multi-chunk ``arr[start:stop] = ...`` lets zarr fan the
+    chunk writes out concurrently on its async loop (so cloud PUTs overlap instead
+    of being one serial round-trip each); ``write_batch_mb`` bounds the slab — and
+    thus the writer's RAM — and ``write_concurrency`` raises zarr's in-flight write
+    limit (default 10). Values are generated as float32 directly (no float64 copy).
     """
     ensure_local_dir(url)
     store = store_from_url(url, read_only=False)
@@ -45,21 +53,27 @@ def make_dataset(
     chunks = (sample_chunk, *inner)
     compressors = "auto" if compress else None
 
+    # Slab size = a whole number of sample-axis chunks fitting in write_batch_mb.
+    bytes_per_row = int(np.prod(inner)) * 4
+    rows_per_batch = max(1, (write_batch_mb * 1_000_000) // bytes_per_row // sample_chunk)
+    slab_rows = rows_per_batch * sample_chunk
+
     # Named dims so xarray (and thus the xbatcher baseline) can open the store;
     # our own engine reads by index and ignores names.
     dim_names = ("time", *(f"dim{i}" for i in range(len(inner))))
-    for var in variables:
-        arr = group.create_array(
-            var,
-            shape=(n_samples, *inner),
-            chunks=chunks,
-            dtype="f4",
-            compressors=compressors,
-            dimension_names=dim_names,
-        )
-        for start in range(0, n_samples, sample_chunk):
-            stop = min(start + sample_chunk, n_samples)
-            arr[start:stop] = rng.standard_normal((stop - start, *inner)).astype("f4")
+    with zarr.config.set({"async.concurrency": write_concurrency}):
+        for var in variables:
+            arr = group.create_array(
+                var,
+                shape=(n_samples, *inner),
+                chunks=chunks,
+                dtype="f4",
+                compressors=compressors,
+                dimension_names=dim_names,
+            )
+            for start in range(0, n_samples, slab_rows):
+                stop = min(start + slab_rows, n_samples)
+                arr[start:stop] = rng.standard_normal((stop - start, *inner), dtype=np.float32)
 
     nbytes = n_samples * int(np.prod(inner)) * 4 * len(variables)
     print(
@@ -78,12 +92,14 @@ def make_family(
     variables: tuple[str, ...] = ("t2m",),
     compress: bool = True,
     seed: int = 0,
+    write_batch_mb: int = 1024,
+    write_concurrency: int = 32,
 ) -> dict[int, str]:
     """Write the same logical dataset at several sample-chunk sizes.
 
     Produces ``{url_prefix}_c{spc}.zarr`` per ``spc``. Random values differ across
-    chunkings (chunk-by-chunk fill), but byte count, dtype, inner shape, and codec
-    match — so throughput is comparable along the chunk-size axis.
+    chunkings (slab fill), but byte count, dtype, inner shape, and codec match — so
+    throughput is comparable along the chunk-size axis.
     """
     paths: dict[int, str] = {}
     for spc in chunk_sizes:
@@ -96,6 +112,8 @@ def make_family(
             variables=list(variables),
             compress=compress,
             seed=seed,
+            write_batch_mb=write_batch_mb,
+            write_concurrency=write_concurrency,
         )
         paths[spc] = url
     return paths
@@ -115,6 +133,10 @@ def main() -> None:
     p.add_argument("--variables", default="t2m", help="comma-separated names")
     p.add_argument("--uncompressed", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--write-batch-mb", type=int, default=1024, help="slab size (RAM bound) per write"
+    )
+    p.add_argument("--write-concurrency", type=int, default=32, help="zarr in-flight chunk writes")
     a = p.parse_args()
 
     sample_chunk = (
@@ -128,6 +150,8 @@ def main() -> None:
         variables=a.variables.split(","),
         compress=not a.uncompressed,
         seed=a.seed,
+        write_batch_mb=a.write_batch_mb,
+        write_concurrency=a.write_concurrency,
     )
 
 
