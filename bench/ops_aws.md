@@ -108,13 +108,20 @@ aws ec2 create-vpc-endpoint --region "$AWS_REGION" --vpc-id "$VPC" \
 AMI=$(aws ssm get-parameters --region "$AWS_REGION" \
   --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
   --query 'Parameters[0].Value' --output text)
-SUBNET=$(aws ec2 describe-subnets --region "$AWS_REGION" \
-  --filters Name=vpc-id,Values=$VPC Name=default-for-az,Values=true \
-  --query 'Subnets[0].SubnetId' --output text)
+# Don't pin an AZ. In a default VPC, leaving --subnet-id off lets EC2 launch into
+# the default subnet of whatever AZ has capacity — the fix for "InsufficientInstance-
+# Capacity" in one zone. Nothing here ties you to an AZ: default subnets auto-assign a
+# public IP, the SG is VPC-scoped, and the S3 gateway endpoint (step 5) is on the VPC
+# main route table, so it applies in every AZ. To force a zone instead, set SUBNET to
+# that AZ's default subnet, e.g.:
+#   SUBNET=$(aws ec2 describe-subnets --region "$AWS_REGION" \
+#     --filters Name=vpc-id,Values=$VPC Name=availability-zone,Values=us-east-1a \
+#     --query 'Subnets[0].SubnetId' --output text)
+SUBNET=""   # empty => EC2 picks an AZ with capacity
 
 IID=$(aws ec2 run-instances --region "$AWS_REGION" \
   --image-id "$AMI" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
-  --security-group-ids "$SG" --subnet-id "$SUBNET" --associate-public-ip-address \
+  --security-group-ids "$SG" ${SUBNET:+--subnet-id "$SUBNET"} \
   --iam-instance-profile Name=insitubatch-bench \
   --instance-market-options 'MarketType=spot' \
   --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=30,VolumeType=gp3}' \
@@ -130,9 +137,9 @@ echo "ssh ec2-user@$IP"
 
 ## 7. On the box — mount NVMe, install, generate, bench
 ```bash
-ssh ec2-user@$IP
+ssh -A ec2-user@$IP
 export AWS_REGION=us-east-1            # obstore/object_store needs the region
-export BUCKET=insitubatch-bench-<ACCT> # same value as above
+export BUCKET=insitubatch-bench-808047988126 # same value as above
 
 # --- mount the instance-store NVMe (ephemeral scratch for the DiskCache) ---
 lsblk                                  # find the instance store (usually /dev/nvme1n1; root = nvme0n1)
