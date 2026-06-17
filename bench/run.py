@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import tempfile
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -61,10 +62,20 @@ def run_suite(
     )
     scratch.mkdir(parents=True, exist_ok=True)
     results: list[Result] = []
+    # Total configs, so the progress line can show [i/total] + ETA on long S3 runs.
+    total = len(urls) * sum(
+        (len(caches) if e == "insitu" else 1)
+        * (len(worker_sweep) if e in _DATALOADER_ENGINES else 1)
+        * len(compute_ms_sweep)
+        * repeats
+        for e in engines
+    )
+    done = 0
+    t_start = time.perf_counter()
     if verbose:
         print(
             f"{'engine':8s} {'cache':6s} {'chunk':>5s} {'nw':>3s} {'cms':>5s} {'ep':>2s} "
-            f"{'samp/s':>10s} {'MB/s':>8s} {'ttfb_ms':>8s} {'rssMB':>7s}"
+            f"{'samp/s':>10s} {'MB/s':>8s} {'ttfb_ms':>8s} {'rssMB':>7s} {'anonMB':>7s}"
         )
 
     for spc, url in urls.items():
@@ -88,12 +99,15 @@ def run_suite(
                                 epochs=epochs,
                             )
                             cdir = scratch / f"{engine}_{spc}_{cache}_w{nw}_c{cms}_{rep}"
+                            done += 1
                             if verbose:
                                 # Progress line BEFORE the run (a config can take minutes on
                                 # S3) so the suite isn't silent between result rows.
+                                el = time.perf_counter() - t_start
                                 print(
-                                    f">> {engine:8s} c{spc:<2d} {cache:6s} "
-                                    f"nw{nw} cms{cms:.0f} ep{epochs} rep{rep} ...",
+                                    f">> [{done}/{total}] {engine:8s} c{spc:<2d} {cache:6s} "
+                                    f"nw{nw} cms{cms:.0f} ep{epochs} rep{rep}  "
+                                    f"(elapsed {el:.0f}s) ...",
                                     flush=True,
                                 )
                             try:
@@ -113,7 +127,8 @@ def run_suite(
                                         f"{r.engine:8s} {r.cache:6s} {r.sample_chunk:5d} "
                                         f"{r.num_workers:3d} {r.compute_ms:5.0f} {r.epoch:2d} "
                                         f"{r.samples_per_s:10.1f} {r.mb_per_s:8.1f} "
-                                        f"{r.ttfb_ms:8.1f} {r.peak_rss_mb:7.0f}"
+                                        f"{r.ttfb_ms:8.1f} {r.peak_rss_mb:7.0f} "
+                                        f"{r.rss_anon_mb:7.0f}"
                                     )
     if verbose:
         print(f"\nwrote {len(results)} rows -> {out}")

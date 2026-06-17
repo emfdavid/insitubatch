@@ -55,9 +55,13 @@ Cross-epoch reuse of prepped chunks (epoch 0 cold vs epoch 1+ warm), insitu only
 
 <iframe src="figures/g4_cache_epochs.html" width="100%" height="480" frameborder="0"></iframe>
 
-## G5 — Peak memory by engine
+## G5 — Resident memory by engine
 
-Peak RSS — worker processes each hold their own copy; insitu shares one cache.
+Resident **heap** (RssAnon) per engine — worker processes each hold their own copy;
+insitu shares one cache. The heap is the real memory bound: DiskCache's mmap'd
+`.npy` is file-backed and reclaimable, so it shows as bounded heap even when total
+RSS looks large (and `ru_maxrss` is a misleading monotonic high-water in the
+single-process suite).
 
 <iframe src="figures/g5_peak_memory.html" width="100%" height="480" frameborder="0"></iframe>
 

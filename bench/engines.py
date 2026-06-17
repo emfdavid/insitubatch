@@ -34,7 +34,7 @@ from insitubatch import (
 from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry
 
-from .result import Result, peak_rss_mb
+from .result import Result, peak_rss_mb, rss_breakdown_mb
 
 
 @dataclass
@@ -84,6 +84,7 @@ def _result(
     cfg: Cfg, geom: ArrayGeometry, epoch: int, seconds: float, n: int, ttfb: float
 ) -> Result:
     bps = _bytes_per_sample(geom)
+    anon, file = rss_breakdown_mb()
     return Result(
         engine=cfg.engine,
         cache=cfg.cache,
@@ -101,6 +102,8 @@ def _result(
         mb_per_s=(n * bps / 1e6 / seconds if seconds else 0.0),
         ttfb_ms=ttfb * 1e3,
         peak_rss_mb=peak_rss_mb(),
+        rss_anon_mb=anon,
+        rss_file_mb=file,
     )
 
 

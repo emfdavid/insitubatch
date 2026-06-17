@@ -98,14 +98,19 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
             title="G4 Cache: cold (epoch 0) vs warm (epoch 1+)",
         )
 
-    # G5 — peak RSS by engine
-    d = _best(base, "peak_rss_mb", ["engine_label", "sample_chunk"])
+    # G5 — resident heap by engine. Prefer per-row RssAnon (heap = true pressure):
+    # ru_maxrss is a monotonic process-wide high-water and overstates later configs,
+    # and it counts DiskCache's reclaimable mmap'd .npy as if it were heap.
+    has_anon = "rss_anon_mb" in df.columns and df["rss_anon_mb"].fillna(0).sum() > 0
+    mem_col = "rss_anon_mb" if has_anon else "peak_rss_mb"
+    label = "heap RssAnon" if has_anon else "peak RSS"
+    d = _best(base, mem_col, ["engine_label", "sample_chunk"])
     figs["g5_peak_memory"] = px.bar(
         d,
         x="engine_label",
-        y="peak_rss_mb",
+        y=mem_col,
         facet_col="sample_chunk" if d["sample_chunk"].nunique() > 1 else None,
-        title="G5 Peak RSS by engine (MB)",
+        title=f"G5 Resident memory by engine ({label}, MB)",
     )
 
     # G6 — time-to-first-batch by engine
