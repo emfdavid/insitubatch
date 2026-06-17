@@ -139,16 +139,18 @@ flowchart LR
     Q -.->|"full ⇒ producer blocks<br/>(backpressure)"| ASM
 ```
 
-- **Producer** walks the draw order ahead of the consumer, keeping "every chunk
-  needed for the next `d` batches is resident-or-in-flight," assembles batches as
-  chunks land, and pushes them to a bounded `queue.Queue(maxsize=d)`.
+- **Producer** walks the draw order one shuffle-block ahead: a read-ahead thread
+  fetches block N+1's chunks while the consumer drains block N, then assembles
+  batches as chunks land and pushes them to a bounded `queue.Queue(maxsize=d)`.
 - **Consumer** (`__iter__`) just pops finished batches → the train/infer step
   overlaps with IO+decode+assembly of the next `d` batches.
 - **Backpressure / memory bound** — queue depth `d` + buffer `block_chunks` cap
   residency; a full queue pauses scheduling.
-- **Granularity (v1: per batch)** — the producer assembles whole batches ahead.
-  Chunk-granularity look-ahead (reads for N+2 starting before N+1 is assembled) is
-  a later refinement.
+- **Granularity (v1.5: one block ahead)** — IO is prefetched a whole shuffle-block
+  ahead, so block-boundary reads overlap the current block's compute. (At zero
+  per-batch compute the loader is IO-throughput-bound, so the boundary is only
+  smoothed, not removed — the network ceiling, not a scheduling gap.) A decoupled
+  scheduler that keeps many chunk reads continuously in flight is V2 (DESIGN.md M1.6).
 - **Lifecycle** — early consumer exit sets a stop flag and drains the queue so a
   producer parked on a full `put` can exit before the reader is closed.
 - **Knobs:** `prefetch_depth` (queue depth `d`), `max_inflight`, `block_chunks`.
