@@ -88,6 +88,14 @@ def run_suite(
                                 epochs=epochs,
                             )
                             cdir = scratch / f"{engine}_{spc}_{cache}_w{nw}_c{cms}_{rep}"
+                            if verbose:
+                                # Progress line BEFORE the run (a config can take minutes on
+                                # S3) so the suite isn't silent between result rows.
+                                print(
+                                    f">> {engine:8s} c{spc:<2d} {cache:6s} "
+                                    f"nw{nw} cms{cms:.0f} ep{epochs} rep{rep} ...",
+                                    flush=True,
+                                )
                             try:
                                 rows = run(cfg, cache_dir=str(cdir), store_kwargs=store_kwargs)
                             except Exception as exc:  # noqa: BLE001 - skip a failing/missing engine
