@@ -15,16 +15,20 @@ Design rules (DESIGN.md, "the inversion"):
   * Decode releases the GIL (numcodecs C codecs do) so decode overlaps IO. The
     Python hot path stays O(reads); never decode per-sample in Python.
 
-Status: SKELETON. The async store wiring is stubbed at the marked TODOs so the
-module imports and the control flow is reviewable without a live store.
+Decode (the CPU step) runs on the loop's executor -- a bounded, reader-owned
+``ThreadPoolExecutor`` (``IOConfig.decode_threads``) -- because zarr v3 offloads
+codec decode via ``to_thread``. So IO concurrency lives on the loop while decode
+parallelizes across cores in one managed pool, without blocking the fan-out.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -41,8 +45,10 @@ class IOConfig:
     max_inflight: int = 16
     """Upper bound on chunks in flight. Memory ~= max_inflight * chunk_nbytes."""
 
-    decode_threads: int = 4
-    """Worker threads for GIL-releasing decode, overlapped with IO."""
+    decode_threads: int = 0
+    """Size of the loop's executor for GIL-releasing decode (zarr offloads codec
+    decode via ``to_thread``, so this is where decompression parallelizes across
+    cores). ``0`` = auto = ``min(32, cpu+4)`` (Python's default-executor sizing)."""
 
 
 class AsyncChunkReader:
@@ -73,6 +79,14 @@ class AsyncChunkReader:
         self._loop = asyncio.new_event_loop()
         self._sem: asyncio.Semaphore | None = None  # created on the loop bootstrap
         self._open_lock: asyncio.Lock | None = None
+        # One bounded, named decode pool, owned by this reader and shut down in
+        # close(). It backs the loop's run_in_executor / to_thread, which is where
+        # zarr's codec decode runs -- so decode parallelizes here without blocking
+        # the loop's IO fan-out.
+        workers = self._config.decode_threads or min(32, (os.cpu_count() or 4) + 4)
+        self._decode_pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="insitu-decode"
+        )
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="insitu-io")
         self._thread.start()
@@ -82,6 +96,7 @@ class AsyncChunkReader:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
+        self._loop.set_default_executor(self._decode_pool)  # decode -> our bounded pool
         self._sem = asyncio.Semaphore(self._config.max_inflight)
         self._open_lock = asyncio.Lock()
         self._loop.call_soon(self._ready.set)
@@ -90,6 +105,7 @@ class AsyncChunkReader:
     def close(self) -> None:
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
+        self._decode_pool.shutdown(wait=False, cancel_futures=True)
 
     def __enter__(self) -> AsyncChunkReader:
         return self
@@ -166,10 +182,9 @@ class AsyncChunkReader:
         byte-range reads out through obstore and runs the decode pipeline; for
         single-chunk inner dims this touches exactly one stored chunk.
 
-        TODO(perf): decode currently runs inside zarr's pipeline on the loop. If
-        it shows up as a GIL bottleneck, move it to a thread pool
-        (numcodecs C codecs release the GIL) -- the bounded-fan-out structure
-        here already isolates that change to this method.
+        Decode runs via zarr's codec pipeline, which offloads the GIL-releasing
+        decompression to the loop's executor (our bounded ``insitu-decode`` pool),
+        so it parallelizes across cores rather than serializing on the loop thread.
         """
         if self._cache is not None:
             hit = self._cache.get(read.array, read.chunk_index)

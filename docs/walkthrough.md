@@ -21,6 +21,14 @@ Run on the EC2 box from the [AWS ops runbook](https://github.com/emfdavid/insitu
 the network ceiling is lower than an in-region S3 store would give; treat the
 absolute throughput as a floor, and the *shape* of the comparison as the point.
 
+!!! warning "Compare MB/s, not samples/s, against full-resolution runs"
+    WeatherBench2 `128x64` is a **downsampled** ERA5: each field is `128·64·4` ≈
+    **32 KB**, about **130× smaller** than a full-resolution `721×1440` field
+    (~4.15 MB). So the `samples/s` here look fast mainly because the samples are
+    tiny — in **bytes/s** this run is ~96 MB/s, the same ~100 MB/s ceiling the
+    [benchmark suite](benchmarks.md) sees on full-resolution data. Don't read the
+    walkthrough's `samples/s` as comparable to the suite's; convert to MB/s.
+
 ## insitubatch
 
 ```bash
