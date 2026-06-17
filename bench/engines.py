@@ -217,6 +217,10 @@ def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
             shuffle=cfg.shuffle,
             persistent_workers=False,
             prefetch_factor=(2 if cfg.num_workers else None),
+            # Force spawn: the worker reads via obstore, whose Rust tokio runtime is
+            # not fork-safe, so fork (Linux default) deadlocks; spawn gives a fresh
+            # process. None for num_workers=0 (torch rejects a context without workers).
+            multiprocessing_context=("spawn" if cfg.num_workers else None),
         )
         sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)
         del loader
@@ -243,6 +247,7 @@ def _run_xbatcher(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
             num_workers=cfg.num_workers,
             shuffle=cfg.shuffle,
             prefetch_factor=(2 if cfg.num_workers else None),
+            multiprocessing_context=("spawn" if cfg.num_workers else None),  # see _run_workers
         )
         sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)
         del loader
