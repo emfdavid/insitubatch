@@ -26,9 +26,9 @@ real cost, and the worker start method is the lever:
 insitubatch pays none of this: one in-process event loop, no fork, nothing to
 relaunch. That contrast is the point.
 
-    uv run python -m examples.wb2_xbatcher --wb2 --compare        # the teaching table
-    uv run python -m examples.wb2_xbatcher --wb2 --num-workers 8  # one run, default regime
-    uv run python -m examples.wb2_xbatcher                        # tiny synthetic data, no network
+    uv run python -m examples.wb2_xbatcher --wb2 --compare --max-batches 100  # teaching table
+    uv run python -m examples.wb2_xbatcher --wb2 --max-batches 100  # one run, default regime
+    uv run python -m examples.wb2_xbatcher  # tiny synthetic data, no network
 """
 
 from __future__ import annotations

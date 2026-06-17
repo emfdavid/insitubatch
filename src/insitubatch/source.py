@@ -20,6 +20,7 @@ import contextlib
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -48,6 +49,30 @@ else:
     except ImportError:  # pragma: no cover - torch-less installs
         IterableDataset = object
         _HAS_TORCH = False
+
+
+def _partition_blocks(order: np.ndarray, block_chunks: int) -> list[tuple[int, int, np.ndarray]]:
+    """Split a draw ``order`` into shuffle-blocks: ``(row_start, row_stop, chunk_ids)``.
+
+    ``block_shuffled_order`` shuffles samples *within* a block of ``block_chunks``
+    chunks and concatenates blocks in chunk-permutation order, so every block is a
+    contiguous row range over disjoint chunks. We recover the blocks from the chunks'
+    first-appearance order (vectorized: O(chunks) of Python, not O(samples)), which
+    is robust to short final chunks where fixed-stride slicing would misalign.
+    """
+    if not len(order):
+        return []
+    cids = order[:, 0].astype(np.int64)
+    _, first_pos = np.unique(cids, return_index=True)
+    appearance = cids[np.sort(first_pos)]  # chunk ids in order of first appearance
+    block_of = np.full(int(cids.max()) + 1, -1, dtype=np.int64)
+    block_of[appearance] = np.arange(len(appearance)) // block_chunks
+    block_per_row = block_of[cids]
+    starts = [0, *(np.flatnonzero(np.diff(block_per_row) != 0) + 1).tolist(), len(order)]
+    return [
+        (starts[k], starts[k + 1], appearance[k * block_chunks : (k + 1) * block_chunks])
+        for k in range(len(starts) - 1)
+    ]
 
 
 class InSituDataset(IterableDataset):
@@ -124,8 +149,12 @@ class InSituDataset(IterableDataset):
         backpressure and the inter-batch overlap: while the caller works on batch
         N, the producer is already building N+1..N+depth.
 
-        Prefetch granularity is per-batch in v1; chunk-granularity look-ahead
-        (reads for N+2 starting before N+1 is assembled) is a later refinement.
+        The producer walks shuffle-blocks and reads one block ahead, so the
+        block-boundary IO overlaps the per-batch compute of the current block
+        instead of stalling. (At literally zero compute the loader is
+        IO-throughput-bound and the boundary is only smoothed, not removed.)
+        A decoupled fetch scheduler that keeps many reads continuously in flight
+        is V2 (see DESIGN.md).
         """
         geom = self.geometries[self.variables[0]]
         chunk_ids = np.asarray(self.manifest.chunks[self.split.value], dtype=np.int64)
@@ -149,34 +178,42 @@ class InSituDataset(IterableDataset):
 
         def produce(reader: AsyncChunkReader) -> None:
             bs = self.buffer_config.batch_size
-            # Last window index at which each chunk id is drawn, so a chunk is
-            # evicted only once no later batch needs it -> each chunk is read and
-            # decoded once per epoch (not re-read per batch). Vectorized: O(chunks)
-            # of Python, the scatter-max runs in C.
-            if len(order):
-                windows = np.arange(len(order)) // bs
-                last_use = np.zeros(int(order[:, 0].max()) + 1, dtype=np.int64)
-                np.maximum.at(last_use, order[:, 0], windows)
-            else:
-                last_use = np.zeros(0, dtype=np.int64)
+            blocks = _partition_blocks(order, self.buffer_config.block_chunks)
+
+            def read_block(chunk_ids: np.ndarray) -> list[DecodedChunk]:
+                # Fetch + decode a whole block's chunks (deduped). Runs on the read-ahead
+                # thread so it overlaps with the consumer draining the previous block.
+                plan = build_read_plan(sorted({int(c) * spc for c in chunk_ids}), self.geometries)
+                return list(reader.read_plan(plan))
+
             try:
-                for w, start in enumerate(range(0, len(order), bs)):
-                    if stop.is_set():
-                        break
-                    rows = order[start : start + bs]
-                    needed = {(v, int(c)) for v in self.variables for c in np.unique(rows[:, 0])}
-                    missing = [int(c) * spc for (v, c) in needed if (v, c) not in buf._chunks]
-                    if missing:
-                        plan = build_read_plan(sorted(set(missing)), self.geometries)
-                        for decoded in reader.read_plan(plan):
+                # One-block read-ahead: while we emit block b, the chunks for block b+1
+                # are already being fetched, so the block-boundary IO is hidden instead
+                # of stalling the consumer. Blocks use disjoint chunks, so the buffer
+                # holds one block plus the in-flight block's decoded list (still
+                # O(block_chunks)). Per-batch chunk-granularity look-ahead is V2 (the
+                # decoupled fetch scheduler).
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="insitu-readahead") as ex:
+                    inflight: Future[list[DecodedChunk]] | None = (
+                        ex.submit(read_block, blocks[0][2]) if blocks else None
+                    )
+                    for b, (rstart, rstop, _chunk_ids) in enumerate(blocks):
+                        assert inflight is not None
+                        for decoded in inflight.result():
                             buf.add(decoded)
-                    batch = buf.gather_batch(rows, self.variables, spc)
-                    for transform in self.batch_transforms:
-                        batch = transform(batch)
-                    out_q.put(batch)  # blocks when full -> backpressure
-                    # Evict only chunks not needed in any later batch.
-                    keep = {key for key in buf._chunks if last_use[key[1]] > w}
-                    buf.evict_drained(keep)
+                        inflight = (
+                            ex.submit(read_block, blocks[b + 1][2]) if b + 1 < len(blocks) else None
+                        )
+                        for start in range(rstart, rstop, bs):
+                            if stop.is_set():
+                                return
+                            rows = order[start : min(start + bs, rstop)]
+                            batch = buf.gather_batch(rows, self.variables, spc)
+                            for transform in self.batch_transforms:
+                                batch = transform(batch)
+                            out_q.put(batch)  # blocks when full -> backpressure
+                        # Block b is fully drained and shares no chunk with later blocks.
+                        buf.evict_drained(set())
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
                 out_q.put(exc)
             finally:

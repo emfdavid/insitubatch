@@ -17,7 +17,7 @@ insitubatch v1 samples one timestep per sample (the outer axis); a multi-timeste
 window crosses chunk boundaries and is not supported yet. So each sample here is a
 single-timestep field cropped to a spatial subregion.
 
-    uv run python -m examples.wb2_dataloader --wb2 --subregion 48,32   # public WeatherBench2 GCS
+    uv run python -m examples.wb2_dataloader --wb2 --max-batches 100   # public WeatherBench2 GCS
     uv run python -m examples.wb2_dataloader \
         --url s3://bucket/era5.zarr --var 2m_temperature --subregion 48,48 \
         --batch-size 32 --train-step-ms 10 --request-payer

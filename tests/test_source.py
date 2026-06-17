@@ -15,7 +15,34 @@ from insitubatch import (
     split_by_chunk,
     store_from_url,
 )
-from insitubatch.source import InSituDataset
+from insitubatch.shuffle import block_shuffled_order
+from insitubatch.source import InSituDataset, _partition_blocks
+
+
+def test_partition_blocks_covers_disjoint_contiguous_blocks() -> None:
+    # 10 chunks x 4 samples, block_chunks=3 -> blocks of 3,3,3,1 chunks.
+    chunk_ids = np.arange(10, dtype=np.int64)
+    order = block_shuffled_order(chunk_ids, 4, 40, block_chunks=3, seed=0, epoch=0)
+    blocks = _partition_blocks(order, block_chunks=3)
+
+    assert [len(b[2]) for b in blocks] == [3, 3, 3, 1]  # chunk counts per block
+    # Row ranges tile the whole order contiguously, and chunk sets are disjoint.
+    assert blocks[0][0] == 0 and blocks[-1][1] == len(order)
+    seen: set[int] = set()
+    prev_stop = 0
+    for rstart, rstop, chunks in blocks:
+        assert rstart == prev_stop
+        prev_stop = rstop
+        ids = {int(c) for c in chunks}
+        assert seen.isdisjoint(ids)
+        # every row in this block draws only from this block's chunks
+        assert set(int(c) for c in order[rstart:rstop, 0]) == ids
+        seen |= ids
+    assert seen == set(range(10))
+
+
+def test_partition_blocks_empty() -> None:
+    assert _partition_blocks(np.empty((0, 2), dtype=np.int64), block_chunks=4) == []
 
 
 def test_unequal_chunking_raises(tmp_path) -> None:

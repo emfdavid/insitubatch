@@ -195,8 +195,20 @@ Perf track (the core thesis):
   one remaining decompression spike — see Open questions).
 - **M1.5 — prefetch** ✅ background producer + bounded queue (`prefetch_depth`)
   overlap IO/decode/assembly with the consumer step; backpressure + early-exit
-  cleanup; tests assert the producer runs ahead. Batch-granularity (chunk-level
-  look-ahead is a later refinement).
+  cleanup; tests assert the producer runs ahead. The producer walks shuffle-blocks
+  and reads **one block ahead** (a read-ahead thread fetches block N+1 while the
+  consumer drains block N), so block-boundary IO overlaps the per-batch compute
+  instead of stalling. Validated on WeatherBench2/GCS: at a realistic train step
+  the per-block sawtooth disappears (boundary waits 0.1 ms); at *zero* compute the
+  loader is IO-throughput-bound and the stall is only smoothed, not removed — that
+  is the network ceiling, not a scheduling bug.
+- **M1.6 — decoupled fetch scheduler (V2).** Replace block read-ahead with a
+  continuous fetch pump that keeps `max_inflight` chunk reads in flight along the
+  draw order, independent of batch emission; `gather_batch` only ever waits on
+  already-in-flight/buffered chunks. This raises *sustained* read concurrency
+  (more parallel range requests = higher effective bandwidth, not just hidden
+  latency) and removes the dependence on per-batch compute for overlap. Supersedes
+  the one-block look-ahead in `source.py`.
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 
