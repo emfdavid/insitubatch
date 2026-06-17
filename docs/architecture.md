@@ -61,6 +61,22 @@ Frictions against cloud ndim zarr:
 > chunk cache and the obstore runtime are simply shared. The deadlock we hit
 > benchmarking the baseline is a symptom of the very thing we replace.
 
+### Startup latency — the inference angle
+
+Training amortizes worker spin-up over many epochs, so the start-method tax above
+mostly disappears. **Inference does not**: you typically make a single pass from a
+cold loader, and a long-lived server holding a `DataLoader` open (pinned workers,
+held file handles) is rare. There, time-to-first-batch is dominated by process
+startup. The worker model's best case is `forkserver` with
+`set_forkserver_preload([...])` — heavy imports paid once in the server, forked
+workers skip them. insitubatch's first batch is just the first read: no processes
+to start. The two runnable examples make this concrete and measurable:
+[`examples/wb2_dataloader.py`](https://github.com/emfdavid/insitubatch/blob/main/examples/wb2_dataloader.py)
+(insitubatch) and
+[`examples/wb2_xbatcher.py`](https://github.com/emfdavid/insitubatch/blob/main/examples/wb2_xbatcher.py)
+(`--compare` prints TTFB across `spawn` / `forkserver` / `forkserver-preload`),
+both on the public WeatherBench2 ERA5.
+
 ## insitubatch async-driven pipeline
 
 ```mermaid

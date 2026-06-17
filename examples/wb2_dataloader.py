@@ -17,10 +17,14 @@ insitubatch v1 samples one timestep per sample (the outer axis); a multi-timeste
 window crosses chunk boundaries and is not supported yet. So each sample here is a
 single-timestep field cropped to a spatial subregion.
 
+    uv run python -m examples.wb2_dataloader --wb2 --subregion 48,32   # public WeatherBench2 GCS
     uv run python -m examples.wb2_dataloader \
         --url s3://bucket/era5.zarr --var 2m_temperature --subregion 48,48 \
         --batch-size 32 --train-step-ms 10 --request-payer
     uv run python -m examples.wb2_dataloader            # tiny synthetic data, no network
+
+Compare the worker-process stack (and how to cut its startup) in
+``examples/wb2_xbatcher.py``.
 """
 
 from __future__ import annotations
@@ -45,6 +49,12 @@ from insitubatch import (
 )
 from insitubatch.source import InSituDataset
 from insitubatch.types import Batch
+
+# The public WeatherBench2 ERA5 used by the Earthmover demo (zarr v2, consolidated).
+WB2_URL = (
+    "gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr"
+)
+WB2_VAR = "2m_temperature"
 
 
 def _synthetic(
@@ -94,16 +104,22 @@ def run_demo(
     cache: str = "none",
     train_step_ms: float = 0.0,
     num_epochs: int = 1,
+    max_batches: int = 0,
     shuffle: bool = True,
     seed: int = 0,
     request_payer: bool = False,
     verbose: bool = True,
 ) -> dict:
-    store_kwargs = {"request_payer": True} if request_payer else {}
     tmp = None
     if url is None:
         tmp = tempfile.mkdtemp(prefix="wb2-demo-")
         url, var = _synthetic(tmp)
+
+    store_kwargs: dict = {}
+    if url.startswith("gs://"):
+        store_kwargs["skip_signature"] = True  # public bucket, anonymous read
+    if request_payer:
+        store_kwargs["request_payer"] = True
 
     geom = open_geometries(url, variables=[var], **store_kwargs)[var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
@@ -149,11 +165,14 @@ def run_demo(
                 )
             time.sleep(train_step_ms / 1000.0)  # simulated train step
             t_prev = time.perf_counter()
+            if max_batches and i + 1 >= max_batches:
+                break
     dt = time.perf_counter() - t_start
 
     summary = {
         "samples": total,
         "sample_shape": sample_shape,
+        "ttfb_ms": 1e3 * waits[0] if waits else 0.0,  # cold-start time-to-first-batch
         "seconds": dt,
         "samples_per_s": total / dt if dt else 0.0,
         "mean_wait_ms": 1e3 * float(np.mean(waits)) if waits else 0.0,
@@ -173,8 +192,15 @@ def _subregion(s: str) -> tuple[int, int]:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--url", default=None, help="zarr URL (e.g. s3://...); default = synthetic")
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument(
+        "--url", default=None, help="zarr URL (gs://, s3://, file://); default = synthetic"
+    )
+    p.add_argument(
+        "--wb2", action="store_true", help="use the public WeatherBench2 ERA5 (sets --url/--var)"
+    )
     p.add_argument("--var", default="t2m")
     p.add_argument("--subregion", type=_subregion, default=(16, 16), help="crop H,W e.g. 48,48")
     p.add_argument("--batch-size", type=int, default=16)
@@ -183,12 +209,14 @@ def main() -> None:
     p.add_argument("--cache", choices=["none", "memory", "disk"], default="none")
     p.add_argument("--train-step-ms", type=float, default=0.0)
     p.add_argument("--num-epochs", type=int, default=1)
+    p.add_argument("--max-batches", type=int, default=0, help="cap batches per epoch (0 = all)")
     p.add_argument("--no-shuffle", action="store_true")
     p.add_argument("--request-payer", action="store_true")
     a = p.parse_args()
+    url, var = (WB2_URL, WB2_VAR) if a.wb2 else (a.url, a.var)
     run_demo(
-        url=a.url,
-        var=a.var,
+        url=url,
+        var=var,
         subregion=a.subregion,
         batch_size=a.batch_size,
         block_chunks=a.block_chunks,
@@ -196,6 +224,7 @@ def main() -> None:
         cache=a.cache,
         train_step_ms=a.train_step_ms,
         num_epochs=a.num_epochs,
+        max_batches=a.max_batches,
         shuffle=not a.no_shuffle,
         request_payer=a.request_payer,
     )

@@ -46,6 +46,7 @@ virtual = [
 bench = [
     "xbatcher>=0.3",
     "plotly>=5.20",
+    "gcsfs>=2024.6",  # xr.open_zarr(gs://...) for the WeatherBench2 example baseline
 ]
 # Docs site (MkDocs-Material + API from docstrings), published to GitHub Pages.
 docs = [
