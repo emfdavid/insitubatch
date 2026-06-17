@@ -19,9 +19,12 @@ real cost, and the worker start method is the lever:
   tokio runtime; safe). Cheaper than spawn.
 - ``forkserver-preload`` — same, but the server imports the heavy modules **once**
   (``set_forkserver_preload``); forked workers skip the re-import. Lowest safe TTFB.
-- ``fork`` — fastest startup, but copies only the calling thread: it deadlocks the
-  moment the worker reads through a non-fork-safe runtime (obstore's tokio). Shown
-  in ``--compare`` on Linux for contrast; do not use it with obstore.
+- ``fork`` — fastest startup, but unsafe with async cloud stores and so **excluded
+  from ``--compare``**. fork copies only the calling thread, so a store opened in
+  the parent (here ``gcsfs``/aiohttp; equally obstore/tokio) is inherited bound to
+  the parent's now-dead event loop — the first worker read raises ``got Future
+  attached to a different loop`` (obstore deadlocks instead). ``--mp fork`` still
+  lets you reproduce the failure on purpose.
 
 insitubatch pays none of this: one in-process event loop, no fork, nothing to
 relaunch. That contrast is the point.
@@ -55,7 +58,7 @@ WB2_VAR = "2m_temperature"
 # tokio runtime that fork can't inherit.
 PRELOAD = ["torch", "xarray", "zarr", "numcodecs", "xbatcher", "numpy", "pandas"]
 
-# The regimes --compare runs. fork is Linux-only and unsafe with obstore (see above).
+# The regimes --compare runs. fork is excluded: unsafe with async cloud stores (see above).
 COMPARE_MODES = ["spawn", "forkserver", "forkserver-preload"]
 
 
@@ -249,13 +252,12 @@ def main() -> None:
     )
 
     if a.compare:
-        modes = COMPARE_MODES + (["fork"] if sys.platform != "darwin" else [])
         rows = []
-        for mode in modes:
+        for mode in COMPARE_MODES:  # fork excluded: unsafe with async cloud stores (see --mp fork)
             print(f"\n=== {mode} ===")
             try:
                 rows.append(run_xbatcher_demo(mp_mode=mode, verbose=False, **common))
-            except Exception as e:  # fork+obstore would hang, not raise; other modes may error
+            except Exception as e:  # noqa: BLE001 - report and keep comparing other regimes
                 print(f"  {mode} failed: {type(e).__name__}: {e}")
         _print_table(rows)
     else:

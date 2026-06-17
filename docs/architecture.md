@@ -45,10 +45,12 @@ Frictions against cloud ndim zarr:
   and leaves that runtime's threads dead with their locks held, so the *first read*
   in a forked worker **deadlocks**. Every escape is a cost the process model
   imposes: `spawn` (relaunch the interpreter per worker), `forkserver` (keep a
-  pristine pre-fork server around), or a fork-tolerant-but-slower stack (s3fs
-  rebuilds its event loop on a PID change). We hit this benchmarking our own
-  baseline — the `workers` engine hung under fork until we pinned it to
-  `forkserver`/`spawn`.
+  pristine pre-fork server around), or a stack that rebuilds its loop on a PID
+  change (s3fs/gcsfs) — and even that only if the store is *reopened in the worker*,
+  never inherited across the fork. An obstore handle opened pre-fork deadlocks; a
+  gcsfs one raises `Future attached to a different loop`. We hit both: the obstore
+  `workers` baseline hung under fork, and the gcsfs xbatcher example raised — so
+  fork is off the table for async cloud stores.
 - Note: the worker model *does* prefetch (via `prefetch_factor` — workers run
   ahead into the IPC result queue). Prefetch is not the differentiator; **how**
   we prefetch is.
