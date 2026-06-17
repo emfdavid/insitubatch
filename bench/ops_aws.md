@@ -132,14 +132,13 @@ echo "instance: $IID"
 aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$IID"
 IP=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-echo "ssh ec2-user@$IP"
+echo "ssh -A ec2-user@$IP"
 ```
 
 ## 7. On the box — mount NVMe, install, generate, bench
 ```bash
-ssh -A ec2-user@$IP
 export AWS_REGION=us-east-1            # obstore/object_store needs the region
-export BUCKET=insitubatch-bench-808047988126 # same value as above
+export BUCKET=insitubatch-bench-808047988126
 
 # --- mount the instance-store NVMe (ephemeral scratch for the DiskCache) ---
 lsblk                                  # find the instance store (usually /dev/nvme1n1; root = nvme0n1)
@@ -148,7 +147,8 @@ sudo mkdir -p /mnt/nvme && sudo mount /dev/nvme1n1 /mnt/nvme && sudo chown "$USE
 
 # --- install ---
 curl -LsSf https://astral.sh/uv/install.sh | sh && source "$HOME/.bashrc"
-git clone https://github.com/emfdavid/insitubatch && cd insitubatch
+sudo yum install git
+git clone git@github.com:emfdavid/insitubatch.git && cd insitubatch
 uv sync --extra torch --extra bench
 
 # --- generate the chunk-size family (owner creds -> no request_payer needed) ---
