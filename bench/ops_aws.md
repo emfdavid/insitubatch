@@ -160,7 +160,15 @@ done
 
 # --- run the suite + render Plotly graphs (DiskCache on the NVMe) ---
 uv run python -m bench --full --url-prefix "s3://$BUCKET/era5" \
-  --cache-dir /mnt/nvme/cache --plot
+  --cache-dir /mnt/nvme/cache
+```
+
+## 8 back to local
+```bash
+scp ec2-user@$IP:insitubatch/bench/results/suite.jsonl /tmp/suite.jsonl
+
+# in the repo
+uv run python -m bench.plot --in /tmp/suite.jsonl --out docs/figures --cdn
 ```
 
 ## External reproducers (a different AWS account)
@@ -176,6 +184,9 @@ ds = InSituDataset(url, manifest, request_payer=True)      # store kwargs pass t
 
 ## Teardown
 ```bash
+
+aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$IID"
+
 aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$IID"
 # keep the bucket for reproducers; to remove later:
 #   aws s3 rb "s3://$BUCKET" --force
