@@ -24,9 +24,12 @@ import argparse
 import atexit
 import math
 import shutil
+import statistics
 import tempfile
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import numpy as np
 import obstore
@@ -46,9 +49,16 @@ def _store_kwargs(url: str, anon: bool, request_payer: bool) -> dict:
     return kw
 
 
+def _stats(fn: Callable[[], float], repeats: int) -> tuple[float, float, float]:
+    """Run ``fn`` ``repeats`` times; return (median, min, max) MB/s. Cloud reads of a
+    small (cold) sample are noisy, so a single number lies -- report the spread."""
+    xs = sorted(fn() for _ in range(repeats))
+    return statistics.median(xs), xs[0], xs[-1]
+
+
 def _insitu_mb_s(
     url, var, kw, decode_threads, max_chunks, block_chunks=8, max_inflight=16
-) -> tuple[float, float]:
+) -> float:
     geom = open_geometries(url, variables=[var], **kw)[var]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
@@ -73,7 +83,7 @@ def _insitu_mb_s(
         if n >= limit:
             break
     dt = time.perf_counter() - t
-    return n / dt, n * bps / 1e6 / dt
+    return n * bps / 1e6 / dt
 
 
 def _raw_get_mb_s(url, var, kw, concurrency, max_chunks) -> float:
@@ -100,6 +110,7 @@ def main() -> None:
     p.add_argument("--url", default=None, help="zarr URL; default = synthetic file://")
     p.add_argument("--var", default="t2m")
     p.add_argument("--max-chunks", type=int, default=64, help="chunks to probe (bounds the cost)")
+    p.add_argument("--repeats", type=int, default=3, help="runs per point; report median (min-max)")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
     a = p.parse_args()
@@ -114,21 +125,29 @@ def main() -> None:
     kw = _store_kwargs(a.url, a.anon, a.request_payer)
     print(f"probe {a.url}  var={a.var}  first {a.max_chunks} chunks\n")
 
-    print("1) insitu throughput vs decode_threads (cold each):")
+    def show(label: str, fn: Callable[[], float]) -> None:
+        med, lo, hi = _stats(fn, a.repeats)
+        print(f"   {label}: {med:8.1f} MB/s  ({lo:.0f}-{hi:.0f})")
+
+    print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}):")
     for dt in (1, 2, 4, 8, 0):
-        sps, mbs = _insitu_mb_s(a.url, a.var, kw, dt, a.max_chunks)
-        print(f"   decode_threads={dt or 'auto':>4}: {sps:8.1f} samp/s  {mbs:8.1f} MB/s")
-
-    print("\n1b) insitu vs read concurrency (block_chunks=max_inflight, decode auto):")
-    for bc in (8, 16, 32):
-        sps, mbs = _insitu_mb_s(a.url, a.var, kw, 0, a.max_chunks, block_chunks=bc, max_inflight=bc)
-        print(f"   block_chunks={bc:>2}: {sps:8.1f} samp/s  {mbs:8.1f} MB/s")
-
-    print("\n2) raw obstore concurrent GET (no decode):")
-    for c in (1, 4, 8, 16, 32):
-        print(
-            f"   concurrency={c:>2}: {_raw_get_mb_s(a.url, a.var, kw, c, a.max_chunks):8.1f} MB/s"
+        show(
+            f"decode_threads={dt or 'auto':>4}",
+            partial(_insitu_mb_s, a.url, a.var, kw, dt, a.max_chunks),
         )
+
+    print("\n1b) insitu MB/s vs read concurrency (block_chunks=max_inflight, decode auto):")
+    for bc in (8, 16, 32):
+        show(
+            f"block_chunks={bc:>2}",
+            partial(
+                _insitu_mb_s, a.url, a.var, kw, 0, a.max_chunks, block_chunks=bc, max_inflight=bc
+            ),
+        )
+
+    print("\n2) raw obstore concurrent GET MB/s (no decode):")
+    for c in (1, 4, 8, 16, 32):
+        show(f"concurrency={c:>2}", partial(_raw_get_mb_s, a.url, a.var, kw, c, a.max_chunks))
 
     if tmp:
         none_url = f"file://{tmp}/era5_none.zarr"
@@ -142,8 +161,7 @@ def main() -> None:
         )
         print("\n3) codec cost (synthetic, auto vs uncompressed, auto decode_threads):")
         for label, u in (("compressed", a.url), ("uncompressed", none_url)):
-            sps, mbs = _insitu_mb_s(u, "t2m", {}, 0, a.max_chunks)
-            print(f"   {label:12}: {sps:8.1f} samp/s  {mbs:8.1f} MB/s")
+            show(f"{label:12}", partial(_insitu_mb_s, u, "t2m", {}, 0, a.max_chunks))
 
 
 if __name__ == "__main__":
