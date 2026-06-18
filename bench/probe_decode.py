@@ -21,7 +21,9 @@ network/endpoint (more/bigger parallel streams, in-region S3, the gateway endpoi
 from __future__ import annotations
 
 import argparse
+import atexit
 import math
+import shutil
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,7 +46,9 @@ def _store_kwargs(url: str, anon: bool, request_payer: bool) -> dict:
     return kw
 
 
-def _insitu_mb_s(url, var, kw, decode_threads, max_chunks) -> tuple[float, float]:
+def _insitu_mb_s(
+    url, var, kw, decode_threads, max_chunks, block_chunks=8, max_inflight=16
+) -> tuple[float, float]:
     geom = open_geometries(url, variables=[var], **kw)[var]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
@@ -53,8 +57,8 @@ def _insitu_mb_s(url, var, kw, decode_threads, max_chunks) -> tuple[float, float
         geometries={var: geom},
         split=SplitName.TRAIN,
         batch_size=16,
-        block_chunks=8,
-        max_inflight=16,
+        block_chunks=block_chunks,
+        max_inflight=max_inflight,
         to_tensor=False,
         shuffle=False,
         **kw,
@@ -103,6 +107,7 @@ def main() -> None:
     tmp = None
     if a.url is None:
         tmp = tempfile.mkdtemp(prefix="probe-")
+        atexit.register(shutil.rmtree, tmp, ignore_errors=True)  # don't leak GBs to /tmp
         a.url = f"file://{tmp}/era5.zarr"
         a.var = "t2m"
         make_dataset(a.url, n_samples=512, inner=(721, 1440), sample_chunk=8, variables=["t2m"])
@@ -113,6 +118,11 @@ def main() -> None:
     for dt in (1, 2, 4, 8, 0):
         sps, mbs = _insitu_mb_s(a.url, a.var, kw, dt, a.max_chunks)
         print(f"   decode_threads={dt or 'auto':>4}: {sps:8.1f} samp/s  {mbs:8.1f} MB/s")
+
+    print("\n1b) insitu vs read concurrency (block_chunks=max_inflight, decode auto):")
+    for bc in (8, 16, 32):
+        sps, mbs = _insitu_mb_s(a.url, a.var, kw, 0, a.max_chunks, block_chunks=bc, max_inflight=bc)
+        print(f"   block_chunks={bc:>2}: {sps:8.1f} samp/s  {mbs:8.1f} MB/s")
 
     print("\n2) raw obstore concurrent GET (no decode):")
     for c in (1, 4, 8, 16, 32):
