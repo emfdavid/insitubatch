@@ -111,6 +111,7 @@ def main() -> None:
     p.add_argument("--var", default="t2m")
     p.add_argument("--max-chunks", type=int, default=64, help="chunks to probe (bounds the cost)")
     p.add_argument("--repeats", type=int, default=3, help="runs per point; report median (min-max)")
+    p.add_argument("--block-chunks", default="8,16,32,64", help="comma list for the 1b sweep")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
     a = p.parse_args()
@@ -137,7 +138,7 @@ def main() -> None:
         )
 
     print("\n1b) insitu MB/s vs read concurrency (block_chunks=max_inflight, decode auto):")
-    for bc in (8, 16, 32):
+    for bc in (int(x) for x in a.block_chunks.split(",")):
         show(
             f"block_chunks={bc:>2}",
             partial(
