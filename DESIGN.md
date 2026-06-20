@@ -137,37 +137,83 @@ V2 flattens the unit of work to the **stored chunk** `(outer_id, inner_coord)` a
 runs a single budget over it:
 
 - **ReadPlan v2**: deduped stored-chunk reads in draw/priority order.
-- **One semaphore = `max_inflight`** over fetch+decode tasks, across inner *and*
-  outer — no nested caps, no double sawtooth; total concurrency is dialed directly.
-- **Scatter-assemble**: each decoded inner tile is copied into its outer chunk's
-  array; a per-outer-chunk completion counter marks it ready for gather; the tile
-  frees after the copy.
+- **One semaphore = `max_inflight`** — a slot held from fetch-start to
+  scatter-done, spanning all stages, across inner *and* outer. No nested caps, no
+  double sawtooth; total concurrency is dialed directly.
+- **Scatter-assemble**: each decoded tile is copied into its outer chunk's array
+  (pool threads write *disjoint* regions — no data lock, only an atomic completion
+  counter); the tile frees after the copy.
 - **Two explicit caps**: ≤ `block_chunks` (+read-ahead) outer chunks resident
   (shuffle window); ≤ `max_inflight` inner tiles in flight (pipeline).
+
+### The pipeline: three GIL-free stages
+
+All three steps release the GIL — **fetch** (obstore/tokio, Rust), **decode**
+(numcodecs C), **transform** (vectorized numpy) — so all three run *off* the loop,
+in the bounded pool; the loop only does async fetch + scheduling. Fuse
+decode→transform→scatter into **one** pool task per chunk (one GIL-release window,
+no inter-stage handoff). Transform granularity is the wrinkle, since fetch is at
+*tile* granularity but the v1 `chunk_transform` contract is *per outer chunk*:
+
+- **elementwise** transforms (e.g. `StandardScaler`) may fuse per tile — earliest
+  overlap, lowest peak.
+- **spatial** transforms (regrid, anything crossing tiles) run on the *assembled*
+  outer chunk — a completion-triggered pool task. (Default; opt into per-tile
+  fusion via a `chunk_transform` that declares itself elementwise.)
 
 Memory model (the user-facing invariant):
 
 ```
-peak ≈ block_chunks × (sample_chunk · ∏inner_shape · itemsize)   # residency / shuffle window
-     + max_inflight × (sample_chunk · ∏inner_chunk  · itemsize)   # fetch pipeline
-     + prefetch_depth × batch_bytes                               # assembled-batch queue
+in-flight ≈ max_inflight × (sample_chunk · ∏inner_chunk · itemsize)  + transform scratch
+resident  ≈ block_chunks × (sample_chunk · ∏inner_shape · itemsize)   # the ChunkPool
+queue     ≈ prefetch_depth × batch_bytes
 
 read_concurrency = max_inflight     (independent of block_chunks)
 shuffle_span     = block_chunks
 ```
 
 So `block_chunks` sets shuffle quality + residency; `max_inflight` sets network
-saturation — separately. The honest limit: in-flight memory is
-`max_inflight × stored_chunk` — cheap when data is inner-chunked (small tiles), but
-for *single-inner* data the stored chunk **is** the outer chunk, so concurrency and
-memory collapse back together (no scheduler escapes it; rechunk spatially or shrink
-`sample_chunk`). See [docs/tuning.md](docs/tuning.md) for the knobs.
+saturation — separately. (Transform output may differ in shape — regrid — so the
+pool slot is sized to the *output*; the input tile frees after.) The honest limit:
+in-flight memory is `max_inflight × stored_chunk` — cheap when data is inner-chunked
+(small tiles), but for *single-inner* data the stored chunk **is** the outer chunk,
+so concurrency and memory collapse back together (no scheduler escapes it; rechunk
+spatially or shrink `sample_chunk`). See [docs/tuning.md](docs/tuning.md).
+
+### The buffer is the cache (ChunkPool)
+
+Once V2 manages the slots itself, the assembly buffer **is** a pool of prepped
+(decoded + chunk-transformed) chunks — exactly what `ChunkCache` stores. So
+`ShuffleBlockBuffer`, `MemoryCache`, and `DiskCache` collapse into one **`ChunkPool`**
+parameterized by:
+
+- **backing** — heap (numpy) *or* mmap'd `.npy` on NVMe; the scatter writes straight
+  into the slot either way. mmap keeps **anon** (real pressure) low while pages stay
+  reclaimable (the anon/file split we measure).
+- **policy** — a byte budget + eviction. Epoch-last-use with `budget = block_chunks`
+  → today's read-once buffer; large budget + LRU → cross-epoch cache. *Same machinery* —
+  caching stops being an optional intercept and becomes "raise the budget, switch to
+  LRU, pick mmap backing."
+
+Caveats: (1) **mmap isn't free for read-once** — scattering into mmap is NVMe write
+traffic even when never reused, so default the pool to **heap** for streaming and
+use mmap only to spill a working set past RAM or for cross-epoch reuse. (2)
+**cross-*run* persistence is still extra** — intra-run/cross-epoch reuse is
+intrinsic (just don't evict), but surviving process exit needs a stable content key
++ index rebuild on reopen (the deferred cache item below).
 
 Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
 `chunk_key_encoding.encode_chunk_key`, bytes via `store.get`, decode via
 `codec_pipeline.decode([(buf, ArraySpec)])`, scatter into the outer array — matches
-`arr.getitem` exactly for single-inner and spatial layouts incl. partial edge
-chunks.
+`arr.getitem` exactly for single-inner and spatial layouts incl. partial edge chunks.
+
+### Phasing
+
+- **B1** — V2 scheduler + a **heap `ChunkPool`** subsuming `ShuffleBlockBuffer`
+  (cache off, read-once). Lands the throughput/memory decoupling first.
+- **B2** — add mmap backing + LRU; the pool subsumes `MemoryCache`/`DiskCache` and
+  the separate `ChunkCache` intercept retires. Keep the `ChunkCache` *protocol* as
+  the pool's backing-store interface so the migration is mechanical.
 
 Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurrency
 — v1 (concurrency = `block_chunks`) rises in both; V2 (`block_chunks` fixed small,
