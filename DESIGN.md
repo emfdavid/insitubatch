@@ -220,6 +220,43 @@ Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurre
 `max_inflight` swept) reaches the ~1 GB/s knee at flat, low memory. Plus the
 measured de-quantization (inner-grid sweep at a fixed budget: v1 sawtooth, V2 flat).
 
+### v1 baseline & acceptance (exp_c — S3, c6id.8xlarge)
+
+Fat data (`sample_chunk=200`, ~830 MB outer chunks), insitu MB/s, median of 5:
+
+| block_chunks (≈ resident) | single-inner | spatial (grid 15, read_conc 16) |
+|---|---:|---:|
+| 2 (~3.3 GB) | 76 | **930** |
+| 4 (~6.6 GB) | 120 | 871 |
+| 8 (~13 GB) | 178 | 724 (oversubscribed) |
+
+Spatial peaks at `bc=2` (~30 in-flight ≈ the network knee) and *falls* as `bc`
+rises — the nested caps overshoot. **V2 acceptance test:** match ~930 MB/s at
+`block_chunks ≤ 2` with a single `max_inflight ≈ 32` budget, and show throughput
+*flat* (not falling) + memory flat as `max_inflight` rises past the knee. Datasets
+persist in S3 (`era5_fat.zarr`, `era5_fatspatial.zarr` under the bench bucket);
+re-probe with:
+
+```
+uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fatspatial.zarr --var t2m \
+  --max-chunks 16 --repeats 5 --decode-threads 8 --block-chunks 2,4 --read-concurrency 16 --no-raw
+```
+
+### B1 task list
+
+1. **ReadPlan v2** — deduped stored-chunk reads `(outer, inner)` in draw order.
+2. **Scheduler** — one `asyncio.Semaphore(max_inflight)` over fetch+decode(+transform)
+   tasks; prioritize the next block's chunks; scatter into pre-allocated outer arrays
+   (disjoint writes, atomic completion counter). Decode/transform fused in the pool
+   (see the pipeline section); spike `bench/spike_v2_decode.py` has the validated path.
+3. **Heap `ChunkPool`** behind the `ChunkCache` protocol — allocate / scatter /
+   mark-ready / gather / evict; budget = `block_chunks` (read-once); subsumes
+   `ShuffleBlockBuffer`.
+4. **Wire into `source.py` behind a flag** (`scheduler="v1"|"v2"`) so the probe can
+   A/B the two on the same data.
+5. **Validate** — probe parity with v1 on moderate (exp_b) data; hit the exp_c
+   acceptance on fat-spatial. Then B2 (mmap backing + LRU; retire the cache intercept).
+
 ## Module map
 
 | Module | Role |
