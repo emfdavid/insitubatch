@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
+import zarr
 import zarr.api.asynchronous as za
 
 from .cache import ChunkCache
@@ -49,6 +50,13 @@ class IOConfig:
     """Size of the loop's executor for GIL-releasing decode (zarr offloads codec
     decode via ``to_thread``, so this is where decompression parallelizes across
     cores). ``0`` = auto = ``min(32, cpu+4)`` (Python's default-executor sizing)."""
+
+    read_concurrency: int = 0
+    """zarr ``async.concurrency``: the inner fan-out per ``getitem`` (how many of a
+    chunk's *inner* stored chunks are fetched at once). Set >= the inner grid count
+    so a spatially-chunked field doesn't take an extra partial wave (15 inner chunks
+    at concurrency 10 = 2 waves ~= half rate). ``0`` = zarr default (10). This and
+    ``max_inflight`` are two nested caps; one flat budget is the V2 fetch scheduler."""
 
 
 class AsyncChunkReader:
@@ -87,6 +95,8 @@ class AsyncChunkReader:
         self._decode_pool = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="insitu-decode"
         )
+        if self._config.read_concurrency:  # inner fan-out per getitem (zarr default 10)
+            zarr.config.set({"async.concurrency": self._config.read_concurrency})
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="insitu-io")
         self._thread.start()

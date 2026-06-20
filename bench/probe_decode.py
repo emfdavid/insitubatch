@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import itertools
 import math
 import shutil
 import statistics
@@ -33,9 +34,11 @@ from functools import partial
 
 import numpy as np
 import obstore
+import zarr
 
 from insitubatch import SplitName, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
+from insitubatch.store import store_from_url
 
 from .make_dataset import make_dataset
 
@@ -57,7 +60,7 @@ def _stats(fn: Callable[[], float], repeats: int) -> tuple[float, float, float]:
 
 
 def _insitu_mb_s(
-    url, var, kw, decode_threads, max_chunks, block_chunks=8, max_inflight=16
+    url, var, kw, decode_threads, max_chunks, block_chunks=8, max_inflight=16, read_concurrency=0
 ) -> float:
     geom = open_geometries(url, variables=[var], **kw)[var]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
@@ -74,6 +77,7 @@ def _insitu_mb_s(
         **kw,
     )
     ds.io_config.decode_threads = decode_threads  # read by the reader at iteration time
+    ds.io_config.read_concurrency = read_concurrency  # inner fan-out per getitem (0 = zarr default)
     bps = int(np.prod(geom.inner_shape)) * 4
     limit = max_chunks * geom.sample_chunk_size
     n = 0
@@ -87,12 +91,24 @@ def _insitu_mb_s(
 
 
 def _raw_get_mb_s(url, var, kw, concurrency, max_chunks) -> float:
-    """Fetch raw (still-encoded) chunk objects via obstore — no decode."""
-    geom = open_geometries(url, variables=[var], **kw)[var]
+    """Fetch raw (still-encoded) chunk objects via obstore — no decode.
+
+    Enumerates the *real* stored-chunk grid (outer x inner) from the array's
+    chunks, so it's correct for spatially-chunked arrays (not just single inner
+    chunk). max_chunks bounds the number of OUTER chunks; every inner chunk under
+    them is fetched.
+    """
+    arr = zarr.open_array(store=store_from_url(url, **kw), path=var, mode="r")  # sync; for chunks
     obs = obstore.store.from_url(url, **kw)
-    nchunks = min(max_chunks, math.ceil(geom.n_samples / geom.sample_chunk_size))
-    zeros = "/".join("0" for _ in geom.inner_shape)
-    keys = [f"{var}/c/{i}/{zeros}" for i in range(nchunks)]
+    n_outer = min(max_chunks, math.ceil(arr.shape[0] / arr.chunks[0]))
+    inner_ranges = [
+        range(math.ceil(s / c)) for s, c in zip(arr.shape[1:], arr.chunks[1:], strict=True)
+    ]
+    keys = [
+        f"{var}/c/{oi}/" + "/".join(map(str, inner))
+        for oi in range(n_outer)
+        for inner in itertools.product(*inner_ranges)
+    ]
 
     def fetch(key: str) -> int:
         return len(bytes(obstore.get(obs, key).bytes()))
@@ -113,6 +129,12 @@ def main() -> None:
     p.add_argument("--repeats", type=int, default=3, help="runs per point; report median (min-max)")
     p.add_argument("--decode-threads", default="1,2,4,8,0", help="sec 1 sweep (0=auto)")
     p.add_argument("--block-chunks", default="8,16,32,64", help="sec 1b sweep")
+    p.add_argument(
+        "--read-concurrency",
+        type=int,
+        default=0,
+        help="inner fan-out per getitem (0=zarr default 10)",
+    )
     p.add_argument("--concurrency", default="1,4,8,16,32", help="sec 2 raw-GET sweep")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
@@ -132,19 +154,28 @@ def main() -> None:
         med, lo, hi = _stats(fn, a.repeats)
         print(f"   {label}: {med:8.1f} MB/s  ({lo:.0f}-{hi:.0f})")
 
-    print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}):")
+    rc = a.read_concurrency
+    print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, read_conc={rc or 'def'}):")
     for dt in (int(x) for x in a.decode_threads.split(",")):
         show(
             f"decode_threads={dt or 'auto':>4}",
-            partial(_insitu_mb_s, a.url, a.var, kw, dt, a.max_chunks),
+            partial(_insitu_mb_s, a.url, a.var, kw, dt, a.max_chunks, read_concurrency=rc),
         )
 
-    print("\n1b) insitu MB/s vs read concurrency (block_chunks=max_inflight, decode auto):")
+    print(f"\n1b) insitu MB/s vs read concurrency bc=mi (decode auto, read_conc={rc or 'def'}):")
     for bc in (int(x) for x in a.block_chunks.split(",")):
         show(
             f"block_chunks={bc:>2}",
             partial(
-                _insitu_mb_s, a.url, a.var, kw, 0, a.max_chunks, block_chunks=bc, max_inflight=bc
+                _insitu_mb_s,
+                a.url,
+                a.var,
+                kw,
+                0,
+                a.max_chunks,
+                block_chunks=bc,
+                max_inflight=bc,
+                read_concurrency=rc,
             ),
         )
 
