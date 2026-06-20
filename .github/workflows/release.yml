@@ -27,19 +27,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
-      - run: uv sync
-      - run: uv run ruff check src tests bench
+      - run: uv sync --extra torch --extra bench
+      - run: uv run ruff check src tests bench examples
+      - run: uv run ruff format --check src tests bench examples
+      - run: uv run mypy src
       - run: uv run pytest -q
 
   build:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0
       - run: uv build
       - uses: actions/upload-artifact@v4

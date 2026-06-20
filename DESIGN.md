@@ -267,28 +267,28 @@ measured de-quantization (inner-grid sweep at a fixed budget: v1 sawtooth, V2 fl
 
 ## Status
 
-**Phase 0 complete (local).** Real obstore-backed zarr v3 async reads are wired
-end-to-end via `store_from_url` (one URL → local `file://` now, `s3://` later).
-`bench/make_dataset.py` generates datasets; the one-command `bench` suite
-(`uv run python -m bench`) compares insitubatch against the baselines (naive,
-workers, xbatcher, memory/ceiling) and logs JSONL + Plotly graphs.
+**Phase 1 (real S3) validated.** Run on a `c6id.8xlarge` against in-region S3
+(ERA5-shaped `721×1440` fields, `sample_chunk=8`, warm), insitubatch delivers
+**~8× the throughput** of a tuned `xbatcher`/worker `DataLoader` baseline (swept to
+32 workers) and **~10× lower** time-to-first-batch — the map-style baseline
+re-decodes a whole chunk per sample (the ~8× ≈ `sample_chunk`); insitubatch reads
+each chunk once. It saturates ~85% of the raw-GET ceiling at `block_chunks=32`. See
+[the benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/).
 
-Early signal on **local disk**: the degenerate GRIB-per-timestep regime (1
-sample/chunk) is already **~2.8× faster** than naive sync via async fan-out, with
-bounded memory. The fat-chunk regime is overhead-bound locally (no latency to
-hide) — its win is expected to appear on S3.
+The diagnosis that got there: the throughput wall was **read concurrency** (pinned
+at a fixed `max_inflight`), not decode or bandwidth. Fixes shipped — concurrency
+follows `block_chunks`, a bounded decode pool, S3 warm-up before timing,
+inner-chunk support, and one-block read-ahead so block-boundary IO overlaps compute
+(M1.5). The probe (`bench/probe_decode.py`) separates network vs decode on any
+store.
 
-Prefetch (M1.5) is implemented: a background producer assembles batches ahead of
-the consumer through a bounded queue (`prefetch_depth`), overlapping IO + decode +
-assembly with the compute step. Batch-granularity; chunk-granularity look-ahead is
-a later refinement. See [docs/architecture.md](docs/architecture.md).
-
-Built so far: planner, chunk-aligned splits, async obstore reads, shuffle-block
-buffer, coalesced gather, torch surface, **chunk/batch transforms +
-`StandardScaler`/`fit_standard_scaler` (M-T)**, **prefetch (M1.5)**, **chunk cache
-(M-C)**. **Not yet built:** `Regrid` + the GPU/device transform stage (M2),
-JAX/TF surfaces (M3). Next is **Phase 1** — run the harness on a CPU EC2 instance
-against S3 (us-east-1, c7i/m7i, Spot) with the decode-codec sweep.
+Built so far: planner, chunk-aligned splits, async obstore reads + bounded decode
+pool, shuffle-block buffer + one-block read-ahead, coalesced gather, torch surface,
+**chunk/batch transforms + `StandardScaler` (M-T)**, **prefetch (M1.5)**, **chunk
+cache (M-C)**, runnable examples + a published docs site. **Designed & de-risked:**
+the **V2 decoupled fetch scheduler** (M1.6 — one budget over inner+outer chunks,
+buffer-as-cache; spike validated). **Not yet built:** V2 itself, `Regrid` + the
+GPU/device stage (M2), JAX/TF surfaces (M3).
 
 ## Roadmap / milestones
 

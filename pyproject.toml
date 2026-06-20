@@ -1,6 +1,6 @@
 [project]
 name = "insitubatch"
-version = "0.0.1"
+version = "0.0.2"
 description = "Train in place on n-dimensional cloud tensors: the data-loader orchestration layer on top of solved async IO (obstore / zarr v3 / icechunk)."
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,13 @@ dependencies = [
     "xarray>=2024.9",
     "obstore>=0.3",
 ]
+
+[project.urls]
+Documentation = "https://emfdavid.github.io/insitubatch/"
+Homepage = "https://emfdavid.github.io/insitubatch/"
+Repository = "https://github.com/emfdavid/insitubatch"
+Changelog = "https://github.com/emfdavid/insitubatch/blob/main/CHANGELOG.md"
+Issues = "https://github.com/emfdavid/insitubatch/issues"
 
 [project.optional-dependencies]
 # Torch handoff surface (IterableDataset / torchdata.nodes). Kept optional so the

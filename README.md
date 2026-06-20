@@ -1,5 +1,10 @@
 # insitubatch
 
+[![PyPI](https://img.shields.io/pypi/v/insitubatch.svg)](https://pypi.org/project/insitubatch/)
+[![CI](https://github.com/emfdavid/insitubatch/actions/workflows/ci.yml/badge.svg)](https://github.com/emfdavid/insitubatch/actions/workflows/ci.yml)
+[![docs](https://github.com/emfdavid/insitubatch/actions/workflows/docs.yml/badge.svg)](https://emfdavid.github.io/insitubatch/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 **Train in place on n-dimensional cloud tensors.**
 
 `insitubatch` is the data-loader orchestration layer that sits on top of
@@ -23,19 +28,35 @@ shuffle-block buffer assembles batches; torch runs `num_workers=0`.
 
 ## Status
 
-🚧 **Pre-alpha — Phase 0 complete (local).** Real obstore-backed zarr v3 async
-reads work end-to-end against a local `file://` store; chunk-aligned splits,
-approximate (shuffle-block) shuffle, a bounded buffer, chunk/batch **transforms**
-(incl. a fitted `StandardScaler`), **prefetch** (a background producer that runs
-ahead of the consumer), and a **chunk cache** (cross-epoch reuse of prepped
-chunks) are implemented and tested (27 tests). Early signal: the GRIB-per-timestep
-regime is ~2.8× over a naive sync baseline locally.
+🚧 **Pre-alpha, but validated on real cloud IO.** On an in-region S3 run
+(`c6id.8xlarge`, ERA5-shaped `721×1440` fields, `sample_chunk=8`), insitubatch
+delivers **~8× the throughput** of a *tuned* `xbatcher`/worker `DataLoader`
+baseline (swept to 32 workers) and reaches its first batch **~10× sooner** — the
+map-style baseline re-decodes a whole chunk per sample; insitubatch reads each
+chunk once. Full numbers + methodology:
+[the benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/).
 
-Not yet built: `Regrid` + the **GPU/device** transform stage. Torch is the only
-framework surface so far (JAX/TF planned). See the roadmap and scope limits in
-[DESIGN.md](DESIGN.md) and [docs/architecture.md](docs/architecture.md).
+Built: planner + chunk-aligned splits, async obstore reads with bounded fan-out, a
+shuffle-block buffer with one-block read-ahead, chunk/batch **transforms** (incl. a
+fitted `StandardScaler`), **prefetch**, a pluggable **chunk cache** (heap or
+mmap-on-NVMe, byte-LRU), the torch surface, and runnable [examples](examples/). Not
+yet built: `Regrid` + the **GPU/device** transform stage; JAX/TF surfaces. The
+**V2 decoupled fetch scheduler** (one concurrency budget over inner+outer chunks,
+buffer-as-cache) is designed and de-risked — see the roadmap in
+[DESIGN.md](DESIGN.md).
 
-## Install (dev)
+📖 **Docs:** <https://emfdavid.github.io/insitubatch/>
+(see [Tuning](https://emfdavid.github.io/insitubatch/tuning/) for the
+chunks↔concurrency↔memory model).
+
+## Install
+
+```bash
+pip install insitubatch              # core engine
+pip install "insitubatch[torch]"     # + the torch IterableDataset surface
+```
+
+For development:
 
 ```bash
 uv sync                  # core engine + dev tools

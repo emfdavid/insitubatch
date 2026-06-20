@@ -20,12 +20,15 @@ reproduce the benchmark paying only their own egress.
   and billed.
 
 ## Variables
+
+* c6id.8xlarge: 32 vCPU / 64 GiB + ~1.9 TB local NVMe (DiskCache)
+* bucket names are global; suffix keeps it unique
 ```bash
 export AWS_REGION=us-east-1
 export ACCT=$(aws sts get-caller-identity --query Account --output text)
-export BUCKET="insitubatch-bench-${ACCT}"      # bucket names are global; suffix keeps it unique
+export BUCKET="insitubatch-bench-${ACCT}"
 export KEY_NAME=emfdavid_ed25519
-export INSTANCE_TYPE=c6id.8xlarge              # 32 vCPU / 64 GiB + ~1.9 TB local NVMe (DiskCache)
+export INSTANCE_TYPE=c6id.8xlarge      
 ```
 
 ## 1. Import your SSH key (from ssh-agent)
@@ -163,6 +166,14 @@ uv run python -m bench --full --url-prefix "s3://$BUCKET/era5" \
   --cache-dir /mnt/nvme/cache
 ```
 
+
+### Get results:
+```bash
+scp ec2-user@$IP:/home/ec2-user/insitubatch/bench/results/suite.jsonl bench/results/exp_a.jsonl
+
+
+```
+
 ## 8 back to local
 ```bash
 scp ec2-user@$IP:insitubatch/bench/results/suite.jsonl /tmp/suite.jsonl
@@ -186,6 +197,7 @@ ds = InSituDataset(url, manifest, request_payer=True)      # store kwargs pass t
 ```bash
 
 aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$IID"
+aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$IID"
 
 aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$IID"
 # keep the bucket for reproducers; to remove later:
