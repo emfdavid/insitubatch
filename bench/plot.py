@@ -36,8 +36,10 @@ def _median(df: pd.DataFrame, value: str, keys: list[str]) -> pd.DataFrame:
 
 
 def _best(df: pd.DataFrame, value: str, keys: list[str]) -> pd.DataFrame:
-    """Median over repeats, then the BEST num_workers per group (tuned baseline)."""
-    m = _median(df, value, [*keys, "num_workers"])
+    """Median over repeats, then the BEST tuning per group: max over the tuning axes
+    (num_workers for the DataLoader baselines, block_chunks for insitu). Each engine
+    is thus reported at its tuned optimum -- no strawman, no under-tuned insitu."""
+    m = _median(df, value, [*keys, "num_workers", "block_chunks"])
     return m.groupby([k for k in keys if k in m.columns], as_index=False)[value].max()
 
 
