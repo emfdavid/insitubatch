@@ -31,6 +31,7 @@ theme:
 nav:
   - Home: index.md
   - Architecture: architecture.md
+  - Tuning: tuning.md
   - Benchmarks: benchmarks.md
   - WeatherBench2 walkthrough: walkthrough.md
   - API reference: api.md

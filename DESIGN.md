@@ -118,12 +118,61 @@ order functions size a short final chunk correctly (no out-of-range draws).
 
 ## Memory model
 
-Peak residency ≈ `max(max_inflight, block_chunks) × chunk_nbytes` — **independent
-of batch size and epoch length**. Prefetch (M1.5) adds a bounded queue
-(`prefetch_depth` batches) and the chunk cache (M-C) adds an explicit, bounded
-budget (RAM, optionally spilled to NVMe). Every term is a tunable cap; none scale
-with batch size or epoch length. That directly answers the "low overhead vs
-chunk/batch size" goal.
+v1 peak residency ≈ `block_chunks × outer_chunk_nbytes` (the shuffle/assembly
+window) + the prefetch queue (`prefetch_depth` batches) + the chunk-cache budget
+(M-C, RAM optionally spilled to NVMe). Because read concurrency follows
+`block_chunks` (a block fetches its chunks), v1 **couples three things into one
+knob**: read concurrency, residency, and shuffle span. Every term is still a
+tunable cap that never scales with batch size or epoch length — but the coupling is
+what V2 breaks.
+
+## V2 — decoupled fetch scheduler (M1.6)
+
+v1 fetches one *outer* chunk per `arr.getitem` (zarr stitches the inner grid),
+under two nested caps: `max_inflight` (outer) and zarr's `async.concurrency`
+(inner). That double-quantizes — a 15-tile field at inner-cap 10 takes 2 waves ≈
+half rate — and pins read concurrency to `block_chunks`.
+
+V2 flattens the unit of work to the **stored chunk** `(outer_id, inner_coord)` and
+runs a single budget over it:
+
+- **ReadPlan v2**: deduped stored-chunk reads in draw/priority order.
+- **One semaphore = `max_inflight`** over fetch+decode tasks, across inner *and*
+  outer — no nested caps, no double sawtooth; total concurrency is dialed directly.
+- **Scatter-assemble**: each decoded inner tile is copied into its outer chunk's
+  array; a per-outer-chunk completion counter marks it ready for gather; the tile
+  frees after the copy.
+- **Two explicit caps**: ≤ `block_chunks` (+read-ahead) outer chunks resident
+  (shuffle window); ≤ `max_inflight` inner tiles in flight (pipeline).
+
+Memory model (the user-facing invariant):
+
+```
+peak ≈ block_chunks × (sample_chunk · ∏inner_shape · itemsize)   # residency / shuffle window
+     + max_inflight × (sample_chunk · ∏inner_chunk  · itemsize)   # fetch pipeline
+     + prefetch_depth × batch_bytes                               # assembled-batch queue
+
+read_concurrency = max_inflight     (independent of block_chunks)
+shuffle_span     = block_chunks
+```
+
+So `block_chunks` sets shuffle quality + residency; `max_inflight` sets network
+saturation — separately. The honest limit: in-flight memory is
+`max_inflight × stored_chunk` — cheap when data is inner-chunked (small tiles), but
+for *single-inner* data the stored chunk **is** the outer chunk, so concurrency and
+memory collapse back together (no scheduler escapes it; rechunk spatially or shrink
+`sample_chunk`). See [docs/tuning.md](docs/tuning.md) for the knobs.
+
+Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
+`chunk_key_encoding.encode_chunk_key`, bytes via `store.get`, decode via
+`codec_pipeline.decode([(buf, ArraySpec)])`, scatter into the outer array — matches
+`arr.getitem` exactly for single-inner and spatial layouts incl. partial edge
+chunks.
+
+Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurrency
+— v1 (concurrency = `block_chunks`) rises in both; V2 (`block_chunks` fixed small,
+`max_inflight` swept) reaches the ~1 GB/s knee at flat, low memory. Plus the
+measured de-quantization (inner-grid sweep at a fixed budget: v1 sawtooth, V2 flat).
 
 ## Module map
 
@@ -211,13 +260,12 @@ Perf track (the core thesis):
   the per-block sawtooth disappears (boundary waits 0.1 ms); at *zero* compute the
   loader is IO-throughput-bound and the stall is only smoothed, not removed — that
   is the network ceiling, not a scheduling bug.
-- **M1.6 — decoupled fetch scheduler (V2).** Replace block read-ahead with a
-  continuous fetch pump that keeps `max_inflight` chunk reads in flight along the
-  draw order, independent of batch emission; `gather_batch` only ever waits on
-  already-in-flight/buffered chunks. This raises *sustained* read concurrency
-  (more parallel range requests = higher effective bandwidth, not just hidden
-  latency) and removes the dependence on per-batch compute for overlap. Supersedes
-  the one-block look-ahead in `source.py`.
+- **M1.6 — decoupled fetch scheduler (V2).** Flatten to stored-chunk granularity
+  with one `max_inflight` budget over inner+outer reads (full design above):
+  decouples read concurrency from residency/shuffle and kills the nested-cap
+  sawtooth. The risky zarr-internals path (fetch encoded bytes → `codec_pipeline`
+  decode → scatter) is **validated** in `bench/spike_v2_decode.py`. Supersedes the
+  one-block look-ahead in `source.py`.
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 
