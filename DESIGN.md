@@ -74,8 +74,17 @@ shared-cache + intra-chunk shuffle win       async fan-out is the whole game
   coalesced copy per chunk and preserves partial zero-copy.
 - **must support now:** the degenerate end — **one slice per chunk**
   (GRIB-per-timestep). Same scheduler, fan-out ratio just slides to 1:1.
-- **later (opt-in):** windows spanning *n* chunks, trading zero-copy for
-  flexibility.
+- **inner (spatial) chunking is supported** — and is how you get concurrency in
+  the *fat* outer-chunk regime. The reader fetches each outer chunk with a
+  full-inner `getitem`, so if the inner dims are chunked (the ARCO/ERA5 norm) zarr
+  fans the read across the spatial grid; with few outer chunks, the grid is what
+  keeps reads parallel. So "inner dims single-chunk" is a simplification, not a
+  requirement. (Concurrency then has two dials: our `block_chunks`/`max_inflight`
+  on the outer axis, and zarr's `async.concurrency` on the inner grid per read.)
+- **later (opt-in):** windows spanning *n* outer chunks, and pushing a spatial
+  *sub-selection* into the read (read only the inner chunks covering a crop, rather
+  than reading the full field and cropping in a `batch_transform`) — both trade
+  zero-copy for flexibility.
 
 GRIB / NetCDF are consumed via a **virtual-zarr** view (virtualizarr / kerchunk /
 icechunk) so the engine only ever speaks zarr-async — we never parse GRIB.

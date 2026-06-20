@@ -31,13 +31,17 @@ def make_dataset(
     variables: list[str],
     compress: bool = True,
     seed: int = 0,
+    inner_chunks: tuple[int, ...] | None = None,
     write_batch_mb: int = 1024,
     write_concurrency: int = 32,
 ) -> None:
     """Write a ``(n_samples, *inner)`` array per variable, chunked along axis 0.
 
-    Inner dims are single-chunk (the v1 contract), so one sample-axis chunk maps
-    to exactly one stored chunk.
+    ``inner_chunks`` chunks the inner (spatial) dims too: one sample-axis chunk then
+    maps to a *grid* of stored chunks, so a single sample's field fans out into many
+    concurrent reads. That restores read concurrency in the fat-sample regime (few
+    sample-axis chunks) — how ARCO/ERA5 is typically chunked. Default: single inner
+    chunk (the v1 simplification).
 
     Speed: data is written a *slab* of many chunks at a time rather than
     chunk-by-chunk. A multi-chunk ``arr[start:stop] = ...`` lets zarr fan the
@@ -46,11 +50,14 @@ def make_dataset(
     thus the writer's RAM — and ``write_concurrency`` raises zarr's in-flight write
     limit (default 10). Values are generated as float32 directly (no float64 copy).
     """
+    inner_chunks = inner_chunks or inner
+    if len(inner_chunks) != len(inner):
+        raise ValueError(f"inner_chunks {inner_chunks} must match inner dims {inner}")
     ensure_local_dir(url)
     store = store_from_url(url, read_only=False)
     group = zarr.open_group(store=store, mode="w")
     rng = np.random.default_rng(seed)
-    chunks = (sample_chunk, *inner)
+    chunks = (sample_chunk, *inner_chunks)
     compressors = "auto" if compress else None
 
     # Slab size = a whole number of sample-axis chunks fitting in write_batch_mb.
@@ -129,6 +136,9 @@ def main() -> None:
     p.add_argument("--regime", choices=["fat", "grib"], default="fat")
     p.add_argument("--n-samples", type=int, default=512)
     p.add_argument("--inner", type=_inner, default=(64, 64), help="comma-separated, e.g. 721,1440")
+    p.add_argument(
+        "--inner-chunks", type=_inner, default=None, help="chunk inner dims too, e.g. 256,256"
+    )
     p.add_argument("--sample-chunk", type=int, default=None, help="override regime default")
     p.add_argument("--variables", default="t2m", help="comma-separated names")
     p.add_argument("--uncompressed", action="store_true")
@@ -150,6 +160,7 @@ def main() -> None:
         variables=a.variables.split(","),
         compress=not a.uncompressed,
         seed=a.seed,
+        inner_chunks=a.inner_chunks,
         write_batch_mb=a.write_batch_mb,
         write_concurrency=a.write_concurrency,
     )
