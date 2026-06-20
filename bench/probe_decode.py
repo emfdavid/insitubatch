@@ -136,6 +136,7 @@ def main() -> None:
         help="inner fan-out per getitem (0=zarr default 10)",
     )
     p.add_argument("--concurrency", default="1,4,8,16,32", help="sec 2 raw-GET sweep")
+    p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
     a = p.parse_args()
@@ -179,9 +180,10 @@ def main() -> None:
             ),
         )
 
-    print("\n2) raw obstore concurrent GET MB/s (no decode):")
-    for c in (int(x) for x in a.concurrency.split(",")):
-        show(f"concurrency={c:>2}", partial(_raw_get_mb_s, a.url, a.var, kw, c, a.max_chunks))
+    if not a.no_raw:
+        print("\n2) raw obstore concurrent GET MB/s (no decode):")
+        for c in (int(x) for x in a.concurrency.split(",")):
+            show(f"concurrency={c:>2}", partial(_raw_get_mb_s, a.url, a.var, kw, c, a.max_chunks))
 
     if tmp:
         none_url = f"file://{tmp}/era5_none.zarr"
