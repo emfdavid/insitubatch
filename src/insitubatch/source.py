@@ -91,7 +91,7 @@ class InSituDataset(IterableDataset):
         *,
         batch_size: int = 32,
         block_chunks: int = 16,
-        max_inflight: int = 16,
+        max_inflight: int | None = None,
         seed: int = 0,
         to_tensor: bool = True,
         shuffle: bool = True,
@@ -120,7 +120,11 @@ class InSituDataset(IterableDataset):
                 f"size (v1 invariant); got sample_chunk_size={sorted(spcs)}, "
                 f"n_samples={sorted(lengths)}."
             )
-        self.io_config = IOConfig(max_inflight=max_inflight)
+        # Read concurrency follows the block size unless overridden: a block fetches
+        # its block_chunks chunks, so max_inflight defaults to block_chunks (raising
+        # block_chunks alone then actually raises concurrency). Decoupling read
+        # concurrency from the shuffle-block size is the V2 fetch scheduler.
+        self.io_config = IOConfig(max_inflight=max_inflight or block_chunks)
         self.buffer_config = BufferConfig(block_chunks=block_chunks, batch_size=batch_size)
         self.seed = seed
         self.to_tensor = to_tensor and _HAS_TORCH

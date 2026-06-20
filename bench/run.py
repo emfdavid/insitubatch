@@ -39,12 +39,13 @@ def run_suite(
     n_samples: int = 128,
     inner: tuple[int, ...] = (16, 16),
     batch_size: int = 16,
-    block_chunks: int = 8,
+    block_chunks_sweep: Sequence[int] = (16,),
     epochs: int = 2,
     worker_sweep: Sequence[int] = (0,),
     compute_ms_sweep: Sequence[float] = (0.0,),
     cache_dir: str | Path | None = None,
     repeats: int = 1,
+    max_batches: int = 0,
     request_payer: bool = False,
     verbose: bool = True,
 ) -> list[Result]:
@@ -65,6 +66,7 @@ def run_suite(
     # Total configs, so the progress line can show [i/total] + ETA on long S3 runs.
     total = len(urls) * sum(
         (len(caches) if e == "insitu" else 1)
+        * (len(block_chunks_sweep) if e == "insitu" else 1)
         * (len(worker_sweep) if e in _DATALOADER_ENGINES else 1)
         * len(compute_ms_sweep)
         * repeats
@@ -74,62 +76,68 @@ def run_suite(
     t_start = time.perf_counter()
     if verbose:
         print(
-            f"{'engine':8s} {'cache':6s} {'chunk':>5s} {'nw':>3s} {'cms':>5s} {'ep':>2s} "
-            f"{'samp/s':>10s} {'MB/s':>8s} {'ttfb_ms':>8s} {'rssMB':>7s} {'anonMB':>7s}"
+            f"{'engine':8s} {'cache':6s} {'chunk':>5s} {'bc':>3s} {'nw':>3s} {'cms':>5s} "
+            f"{'ep':>2s} {'samp/s':>10s} {'MB/s':>8s} {'ttfb_ms':>8s} {'rssMB':>7s} {'anonMB':>7s}"
         )
 
+    # block_chunks (= read concurrency) is an insitu-only axis; other engines ignore it.
     for spc, url in urls.items():
         for engine in engines:
             engine_caches = caches if engine == "insitu" else ("none",)
             nw_values = tuple(worker_sweep) if engine in _DATALOADER_ENGINES else (0,)
+            bc_values = (
+                tuple(block_chunks_sweep) if engine == "insitu" else (block_chunks_sweep[0],)
+            )
             for cache in engine_caches:
-                for nw in nw_values:
-                    for cms in compute_ms_sweep:
-                        for rep in range(repeats):
-                            cfg = Cfg(
-                                engine=engine,
-                                url=url,
-                                storage=storage,
-                                sample_chunk=spc,
-                                batch_size=batch_size,
-                                block_chunks=block_chunks,
-                                num_workers=nw,
-                                cache=cache,
-                                compute_ms=cms,
-                                epochs=epochs,
-                            )
-                            cdir = scratch / f"{engine}_{spc}_{cache}_w{nw}_c{cms}_{rep}"
-                            done += 1
-                            if verbose:
-                                # Progress line BEFORE the run (a config can take minutes on
-                                # S3) so the suite isn't silent between result rows.
-                                el = time.perf_counter() - t_start
-                                print(
-                                    f">> [{done}/{total}] {engine:8s} c{spc:<2d} {cache:6s} "
-                                    f"nw{nw} cms{cms:.0f} ep{epochs} rep{rep}  "
-                                    f"(elapsed {el:.0f}s) ...",
-                                    flush=True,
+                for bc in bc_values:
+                    for nw in nw_values:
+                        for cms in compute_ms_sweep:
+                            for rep in range(repeats):
+                                cfg = Cfg(
+                                    engine=engine,
+                                    url=url,
+                                    storage=storage,
+                                    sample_chunk=spc,
+                                    batch_size=batch_size,
+                                    block_chunks=bc,
+                                    num_workers=nw,
+                                    cache=cache,
+                                    compute_ms=cms,
+                                    epochs=epochs,
+                                    max_batches=max_batches,
                                 )
-                            try:
-                                rows = run(cfg, cache_dir=str(cdir), store_kwargs=store_kwargs)
-                            except Exception as exc:  # noqa: BLE001 - skip a failing/missing engine
+                                cdir = scratch / f"{engine}_{spc}_{cache}_bc{bc}_w{nw}_c{cms}_{rep}"
+                                done += 1
                                 if verbose:
+                                    # Progress line BEFORE the run so the suite isn't silent.
+                                    el = time.perf_counter() - t_start
                                     print(
-                                        f"  skip {engine}/{cache}/c{spc}/w{nw}: "
-                                        f"{type(exc).__name__}: {exc}"
+                                        f">> [{done}/{total}] {engine:8s} c{spc:<2d} bc{bc:<3d} "
+                                        f"{cache:6s} nw{nw} cms{cms:.0f} ep{epochs} rep{rep}  "
+                                        f"(elapsed {el:.0f}s) ...",
+                                        flush=True,
                                     )
-                                continue
-                            for r in rows:
-                                append_jsonl(out, r)
-                                results.append(r)
-                                if verbose:
-                                    print(
-                                        f"{r.engine:8s} {r.cache:6s} {r.sample_chunk:5d} "
-                                        f"{r.num_workers:3d} {r.compute_ms:5.0f} {r.epoch:2d} "
-                                        f"{r.samples_per_s:10.1f} {r.mb_per_s:8.1f} "
-                                        f"{r.ttfb_ms:8.1f} {r.peak_rss_mb:7.0f} "
-                                        f"{r.rss_anon_mb:7.0f}"
-                                    )
+                                try:
+                                    rows = run(cfg, cache_dir=str(cdir), store_kwargs=store_kwargs)
+                                except Exception as exc:  # noqa: BLE001 - skip a failing engine
+                                    if verbose:
+                                        print(
+                                            f"  skip {engine}/{cache}/c{spc}/bc{bc}/w{nw}: "
+                                            f"{type(exc).__name__}: {exc}"
+                                        )
+                                    continue
+                                for r in rows:
+                                    append_jsonl(out, r)
+                                    results.append(r)
+                                    if verbose:
+                                        print(
+                                            f"{r.engine:8s} {r.cache:6s} {r.sample_chunk:5d} "
+                                            f"{r.block_chunks:3d} {r.num_workers:3d} "
+                                            f"{r.compute_ms:5.0f} {r.epoch:2d} "
+                                            f"{r.samples_per_s:10.1f} {r.mb_per_s:8.1f} "
+                                            f"{r.ttfb_ms:8.1f} {r.peak_rss_mb:7.0f} "
+                                            f"{r.rss_anon_mb:7.0f}"
+                                        )
     if verbose:
         print(f"\nwrote {len(results)} rows -> {out}")
     return results
@@ -144,10 +152,14 @@ def main() -> None:
     p.add_argument("--full", action="store_true", help="chunk-size spectrum + sweeps")
     p.add_argument("--engines", default=None, help="comma list of engines to run")
     p.add_argument("--chunk-sizes", default=None, help="comma list, e.g. 1,2,4,8,16,32")
+    p.add_argument("--block-chunks", default=None, help="insitu read-concurrency sweep (comma)")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--num-workers", default="0", help="DataLoader worker counts to sweep (comma)")
     p.add_argument("--compute-ms", default="0", help="per-batch compute ms to sweep (comma)")
     p.add_argument("--repeats", type=int, default=1)
+    p.add_argument(
+        "--max-batches", type=int, default=0, help="cap batches/epoch (0=full) for fast runs"
+    )
     p.add_argument("--cache-dir", default=None, help="DiskCache scratch dir (point at NVMe)")
     p.add_argument("--request-payer", action="store_true")
     p.add_argument("--plot", action="store_true", help="render Plotly graphs after the run")
@@ -163,6 +175,7 @@ def main() -> None:
         repeats=a.repeats,
         cache_dir=a.cache_dir,
         request_payer=a.request_payer,
+        max_batches=a.max_batches,
         worker_sweep=tuple(int(x) for x in a.num_workers.split(",")),
         compute_ms_sweep=tuple(float(x) for x in a.compute_ms.split(",")),
     )
@@ -172,6 +185,7 @@ def main() -> None:
             n_samples=512,
             inner=(64, 64),
             batch_size=32,
+            block_chunks_sweep=(8, 32),
             worker_sweep=(2, 4, 8),
             compute_ms_sweep=(0.0, 10.0),
         )
@@ -179,6 +193,8 @@ def main() -> None:
         kw["engines"] = tuple(a.engines.split(","))
     if a.chunk_sizes:
         kw["chunk_sizes"] = tuple(int(x) for x in a.chunk_sizes.split(","))
+    if a.block_chunks:
+        kw["block_chunks_sweep"] = tuple(int(x) for x in a.block_chunks.split(","))
     run_suite(**kw)
 
     if a.plot:

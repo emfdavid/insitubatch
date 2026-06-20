@@ -21,7 +21,7 @@ def test_plot_smoke(tmp_path) -> None:
         n_samples=48,
         inner=(4, 4),
         batch_size=8,
-        block_chunks=4,
+        block_chunks_sweep=(4,),
         worker_sweep=(0,),
         compute_ms_sweep=(0.0, 2.0),  # compute axis varies (G3)
         epochs=2,  # cache cold/warm (G4)

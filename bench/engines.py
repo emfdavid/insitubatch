@@ -46,12 +46,13 @@ class Cfg:
     var: str = "t2m"
     batch_size: int = 32
     block_chunks: int = 16
-    max_inflight: int = 16
+    max_inflight: int | None = None  # None -> follows block_chunks (read concurrency)
     prefetch_depth: int = 2
     num_workers: int = 4
     cache: str = "none"  # none | memory | disk
     compute_ms: float = 0.0
     epochs: int = 1
+    max_batches: int = 0  # cap batches/epoch (0 = full) -> bounded, predictable run time
     shuffle: bool = True
     seed: int = 0
 
@@ -65,18 +66,24 @@ def _bytes_per_sample(geom: ArrayGeometry) -> int:
     return int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
 
 
-def _drive(batches: Iterator, count: object, compute_ms: float) -> tuple[float, int, float]:
-    """Iterate batches, timing total seconds, sample count, time-to-first-batch."""
+def _drive(
+    batches: Iterator, count: object, compute_ms: float, max_batches: int = 0
+) -> tuple[float, int, float]:
+    """Iterate batches, timing total seconds, sample count, time-to-first-batch.
+
+    ``max_batches`` caps the work per epoch (0 = full) so a config's run time is
+    bounded and predictable -- the lever for sub-hour exploratory suite runs.
+    """
     t0 = time.perf_counter()
     ttfb = 0.0
     n = 0
-    first = True
-    for batch in batches:
-        if first:
+    for i, batch in enumerate(batches):
+        if i == 0:
             ttfb = time.perf_counter() - t0
-            first = False
         n += count(batch)  # type: ignore[operator]
         _compute(compute_ms)
+        if max_batches and i + 1 >= max_batches:
+            break
     return time.perf_counter() - t0, n, ttfb
 
 
@@ -147,7 +154,9 @@ def _run_insitu(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     out = []
     for epoch in range(cfg.epochs):
         ds.set_epoch(epoch)
-        sec, n, ttfb = _drive(iter(ds), lambda b: b.arrays[cfg.var].shape[0], cfg.compute_ms)
+        sec, n, ttfb = _drive(
+            iter(ds), lambda b: b.arrays[cfg.var].shape[0], cfg.compute_ms, cfg.max_batches
+        )
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
     return out
 
@@ -163,7 +172,7 @@ def _run_naive(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
 
     out = []
     for epoch in range(cfg.epochs):
-        sec, n, ttfb = _drive(batches(), lambda a: a.shape[0], cfg.compute_ms)
+        sec, n, ttfb = _drive(batches(), lambda a: a.shape[0], cfg.compute_ms, cfg.max_batches)
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
     return out
 
@@ -182,7 +191,7 @@ def _run_memory(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
             for i in range(0, len(idx), cfg.batch_size):
                 yield full[idx[i : i + cfg.batch_size]]
 
-        sec, n, ttfb = _drive(batches(), lambda a: a.shape[0], cfg.compute_ms)
+        sec, n, ttfb = _drive(batches(), lambda a: a.shape[0], cfg.compute_ms, cfg.max_batches)
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
     return out
 
@@ -245,7 +254,7 @@ def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     )
     out = []
     for epoch in range(cfg.epochs):
-        sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)
+        sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms, cfg.max_batches)
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
     del loader
     return out
@@ -274,7 +283,7 @@ def _run_xbatcher(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     )
     out = []
     for epoch in range(cfg.epochs):
-        sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms)
+        sec, n, ttfb = _drive(iter(loader), lambda t: t.shape[0], cfg.compute_ms, cfg.max_batches)
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
     del loader
     return out
