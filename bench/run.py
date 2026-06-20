@@ -46,6 +46,7 @@ def run_suite(
     cache_dir: str | Path | None = None,
     repeats: int = 1,
     max_batches: int = 0,
+    warmup_batches: int = 32,
     request_payer: bool = False,
     verbose: bool = True,
 ) -> list[Result]:
@@ -62,6 +63,30 @@ def run_suite(
         Path(cache_dir) if cache_dir else Path(tempfile.mkdtemp(prefix="insitubatch-bench-cache-"))
     )
     scratch.mkdir(parents=True, exist_ok=True)
+
+    # Warm S3/obstore before timing: a cold prefix is rate-limited and the HTTP/TLS
+    # pool is empty, so the first config otherwise eats ~30 s of ramp-up and reads
+    # at ~1 stream (see exp_a). One throwaway burst at the max concurrency fixes it.
+    if warmup_batches and urls:
+        spc0 = next(iter(urls))
+        warm = Cfg(
+            engine="insitu",
+            url=urls[spc0],
+            storage=storage,
+            sample_chunk=spc0,
+            batch_size=batch_size,
+            block_chunks=max(block_chunks_sweep),
+            max_batches=warmup_batches,
+            epochs=1,
+        )
+        if verbose:
+            print(f"warmup: {warmup_batches} batches @ bc{max(block_chunks_sweep)} ...", flush=True)
+        try:
+            run(warm, cache_dir=str(scratch / "warmup"), store_kwargs=store_kwargs)
+        except Exception as exc:  # noqa: BLE001 - warmup is best-effort
+            if verbose:
+                print(f"  warmup failed: {type(exc).__name__}: {exc}")
+
     results: list[Result] = []
     # Total configs, so the progress line can show [i/total] + ETA on long S3 runs.
     total = len(urls) * sum(
@@ -151,6 +176,7 @@ def main() -> None:
     p.add_argument("--storage", default="file", choices=["file", "s3"])
     p.add_argument("--full", action="store_true", help="chunk-size spectrum + sweeps")
     p.add_argument("--engines", default=None, help="comma list of engines to run")
+    p.add_argument("--caches", default=None, help="insitu cache variants (comma: none,memory,disk)")
     p.add_argument("--chunk-sizes", default=None, help="comma list, e.g. 1,2,4,8,16,32")
     p.add_argument("--block-chunks", default=None, help="insitu read-concurrency sweep (comma)")
     p.add_argument("--epochs", type=int, default=2)
@@ -159,6 +185,9 @@ def main() -> None:
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument(
         "--max-batches", type=int, default=0, help="cap batches/epoch (0=full) for fast runs"
+    )
+    p.add_argument(
+        "--warmup-batches", type=int, default=32, help="throwaway read to warm S3 (0=off)"
     )
     p.add_argument("--cache-dir", default=None, help="DiskCache scratch dir (point at NVMe)")
     p.add_argument("--request-payer", action="store_true")
@@ -176,6 +205,7 @@ def main() -> None:
         cache_dir=a.cache_dir,
         request_payer=a.request_payer,
         max_batches=a.max_batches,
+        warmup_batches=a.warmup_batches,
         worker_sweep=tuple(int(x) for x in a.num_workers.split(",")),
         compute_ms_sweep=tuple(float(x) for x in a.compute_ms.split(",")),
     )
@@ -191,6 +221,8 @@ def main() -> None:
         )
     if a.engines:
         kw["engines"] = tuple(a.engines.split(","))
+    if a.caches:
+        kw["caches"] = tuple(a.caches.split(","))
     if a.chunk_sizes:
         kw["chunk_sizes"] = tuple(int(x) for x in a.chunk_sizes.split(","))
     if a.block_chunks:
