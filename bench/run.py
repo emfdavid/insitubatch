@@ -186,7 +186,7 @@ def main() -> None:
             inner=(64, 64),
             batch_size=32,
             block_chunks_sweep=(8, 32),
-            worker_sweep=(2, 4, 8),
+            worker_sweep=(8, 16, 32),  # ~1 stream/worker; tune up to vCPUs (no strawman)
             compute_ms_sweep=(0.0, 10.0),
         )
     if a.engines:
