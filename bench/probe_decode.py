@@ -111,7 +111,9 @@ def main() -> None:
     p.add_argument("--var", default="t2m")
     p.add_argument("--max-chunks", type=int, default=64, help="chunks to probe (bounds the cost)")
     p.add_argument("--repeats", type=int, default=3, help="runs per point; report median (min-max)")
-    p.add_argument("--block-chunks", default="8,16,32,64", help="comma list for the 1b sweep")
+    p.add_argument("--decode-threads", default="1,2,4,8,0", help="sec 1 sweep (0=auto)")
+    p.add_argument("--block-chunks", default="8,16,32,64", help="sec 1b sweep")
+    p.add_argument("--concurrency", default="1,4,8,16,32", help="sec 2 raw-GET sweep")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
     a = p.parse_args()
@@ -131,7 +133,7 @@ def main() -> None:
         print(f"   {label}: {med:8.1f} MB/s  ({lo:.0f}-{hi:.0f})")
 
     print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}):")
-    for dt in (1, 2, 4, 8, 0):
+    for dt in (int(x) for x in a.decode_threads.split(",")):
         show(
             f"decode_threads={dt or 'auto':>4}",
             partial(_insitu_mb_s, a.url, a.var, kw, dt, a.max_chunks),
@@ -147,7 +149,7 @@ def main() -> None:
         )
 
     print("\n2) raw obstore concurrent GET MB/s (no decode):")
-    for c in (1, 4, 8, 16, 32):
+    for c in (int(x) for x in a.concurrency.split(",")):
         show(f"concurrency={c:>2}", partial(_raw_get_mb_s, a.url, a.var, kw, c, a.max_chunks))
 
     if tmp:
