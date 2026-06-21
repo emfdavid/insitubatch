@@ -77,6 +77,7 @@ class ChunkPool:
         self._chunk_transforms = tuple(chunk_transforms)
         self._slots: dict[tuple[str, int], _Slot] = {}
         self._cv = threading.Condition(threading.Lock())
+        self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
 
     # -- residency observability (caller owns the policy) -------------------
@@ -151,6 +152,18 @@ class ChunkPool:
                 slot.ready = True
                 self._cv.notify_all()
 
+    def set_error(self, error: BaseException) -> None:
+        """Poison the whole pool (the fetch driver died) so every waiter re-raises.
+
+        Unlike :meth:`fail` (one chunk), this unblocks consumers waiting on chunks
+        that may never be allocated -- the driver failed before reaching them. The
+        first error wins (later failures are usually cascade noise).
+        """
+        with self._cv:
+            if self._error is None:
+                self._error = error
+            self._cv.notify_all()
+
     def _apply_transforms(self, array: str, chunk_index: int, data: np.ndarray) -> np.ndarray:
         if not self._chunk_transforms:
             return data
@@ -163,10 +176,20 @@ class ChunkPool:
     # -- consume: wait / gather / evict -------------------------------------
 
     def wait_ready(self, array: str, chunk_index: int) -> None:
-        """Block until the outer chunk is fully assembled (or raise its error)."""
+        """Block until the outer chunk is fully assembled (or raise its error).
+
+        Wakes on three conditions: the chunk is ready, the chunk failed
+        (:meth:`fail`), or the whole pool was poisoned (:meth:`set_error`) -- the
+        last covers a driver death before this chunk was even allocated, so a
+        consumer never waits forever on a chunk that will never arrive.
+        """
         key = (array, chunk_index)
         with self._cv:
-            self._cv.wait_for(lambda: key in self._slots and self._slots[key].ready)
+            self._cv.wait_for(
+                lambda: self._error is not None or (key in self._slots and self._slots[key].ready)
+            )
+            if self._error is not None:
+                raise self._error
             error = self._slots[key].error
         if error is not None:
             raise error
@@ -199,8 +222,10 @@ class ChunkPool:
     def evict(self, chunk_ids: set[int]) -> int:
         """Drop every variable's slot for the given drained outer chunks.
 
-        Frees the residency the chunk occupied and wakes the scheduler, which may
-        be parked waiting to admit the next block. Returns slots dropped.
+        Returns the number of distinct outer *positions* actually dropped (not
+        slots) -- that is what the scheduler releases back to the residency
+        budget, so admission stays in lock-step with one unit per outer chunk
+        regardless of how many variables share it.
         """
         with self._cv:
             drop = [k for k in self._slots if k[1] in chunk_ids]
@@ -208,4 +233,4 @@ class ChunkPool:
                 del self._slots[k]
             if drop:
                 self._cv.notify_all()
-            return len(drop)
+            return len({cid for _array, cid in drop})
