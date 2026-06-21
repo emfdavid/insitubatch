@@ -46,6 +46,17 @@ def test_async_reader_returns_correct_chunk(tmp_path) -> None:
         np.testing.assert_array_equal(by_chunk[c].data, src[c * 8 : c * 8 + 8])
 
 
+def test_reader_close_closes_the_loop(tmp_path) -> None:
+    """close() must close the loop, not leave it for GC -- an unclosed loop's
+    __del__ re-closes it during finalization and raises on the gone self-pipe fd
+    (a noisy unraisable first seen under free-threaded 3.13t)."""
+    url, _ = _write_known_zarr(tmp_path)
+    geom = open_geometries(url)["t2m"]
+    reader = AsyncChunkReader(url, {"t2m": geom})
+    reader.close()
+    assert reader._loop.is_closed()
+
+
 def test_insitu_dataset_values_and_coverage(tmp_path) -> None:
     url, src = _write_known_zarr(tmp_path)
     geom = open_geometries(url)["t2m"]
