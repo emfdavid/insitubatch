@@ -241,6 +241,17 @@ def fit_standard_scaler(url, manifest, geometries, split=SplitName.TRAIN,
     return StandardScaler(mean, std)
 ```
 
+**Alternative: fit at the *batch* stage with community tooling, warming the cache.**
+Standardization is elementwise, so per-chunk and per-batch are identical — which means
+you can also fit it *over the loader itself*: iterate once with no scaler (decoding +
+**caching** the raw chunks) while a `sklearn.preprocessing.StandardScaler.partial_fit`
+(or `dask_ml`) accumulates per-variable stats, then attach the fitted scaler as a
+`batch_transform`. The cache then holds **raw** chunks — normalization-agnostic and
+reusable across experiments — and the fit pass *is* the warm-up; training reads
+decode-once. It also composes cleanly with a preceding `chunk_transform` (a regrid),
+since the fit sees the chunk stage's output. Runnable:
+[`examples/fit_scaler.py`](https://github.com/emfdavid/insitubatch/blob/main/examples/fit_scaler.py).
+
 ### Regrid — precomputed weights, placement by regime
 
 ```python

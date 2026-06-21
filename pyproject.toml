@@ -56,6 +56,7 @@ bench = [
     "plotly>=5.20",
     "gcsfs>=2024.6",  # xr.open_zarr(gs://...) for the WeatherBench2 example baseline
     "py-spy>=0.4",  # sampling profiler; --native sees obstore (Rust) + numcodecs (C)
+    "scikit-learn>=1.4",  # examples/fit_scaler.py — partial_fit over the loader
 ]
 # Docs site (MkDocs-Material + API from docstrings), published to GitHub Pages.
 docs = [

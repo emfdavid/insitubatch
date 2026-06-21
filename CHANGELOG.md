@@ -38,6 +38,12 @@ no oversubscription collapse.
   date range of a long archive. Chunk-aligned (snaps outward to chunk bounds; whole
   chunks only). Docs show defining the window with the xarray API (`xds.sel(time=...)`)
   and translating it — xarray stays off the hot path.
+- **Scaler-over-the-loader example** (`examples/fit_scaler.py`): fit a
+  `sklearn.StandardScaler` with `partial_fit` while iterating once — the pass decodes +
+  **caches** the raw chunks (the fit *is* the warm-up), then the fitted scaler attaches
+  as a `batch_transform`. The cache stays raw/reusable; training reads decode-once
+  (~20× warm vs cold even on `file://`). The familiar, cache-friendly alternative to
+  the chunk-stage `fit_standard_scaler`.
 - **`AsyncChunkReader` kept** as the streaming-chunk primitive (used by
   `fit_standard_scaler`); only the v1 *training* path was removed.
 - **`__version__`** now derives from package metadata (pyproject is the single

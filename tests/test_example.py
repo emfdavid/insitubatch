@@ -38,3 +38,14 @@ def test_wb2_xbatcher_example_spawns(tmp_path) -> None:
     assert summary["samples"] > 0
     assert summary["sample_shape"] == (8, 8)
     assert summary["ttfb_ms"] > 0.0
+
+
+def test_fit_scaler_example_partial_fit(tmp_path) -> None:
+    pytest.importorskip("sklearn")  # bench extra
+    from examples.fit_scaler import run_demo
+
+    summary = run_demo(url=None, cache_dir=str(tmp_path / "cache"), verbose=False)
+    assert summary["samples"] > 0
+    assert summary["stat_max_err"] < 1e-3  # partial_fit over the loader == true global stats
+    assert abs(summary["scaled_mean"]) < 1e-2  # batch-stage scaling -> standardized output
+    assert abs(summary["scaled_std"] - 1.0) < 0.05
