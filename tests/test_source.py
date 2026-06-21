@@ -190,3 +190,15 @@ def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
 
     assert set(transformed) == set(manifest.chunks[SplitName.TRAIN.value])
     assert all(v == 1 for v in transformed.values()), dict(transformed)  # once, not twice
+
+
+def test_sample_range_subsets_what_the_dataset_reads(write_zarr) -> None:
+    # sample_range restricts the manifest to the covering chunks; the dataset then
+    # yields exactly those samples (chunk-aligned).
+    url, _ = write_zarr(n=80, spc=8)  # 10 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0), sample_range=(16, 40))
+    ds = InSituDataset(url, manifest, shuffle=False, to_tensor=False, batch_size=8)
+    ds.set_epoch(0)
+    idx = np.concatenate([b.sample_indices for b in ds])
+    assert set(idx.tolist()) == set(range(16, 40))  # chunks 2,3,4 -> samples 16..39

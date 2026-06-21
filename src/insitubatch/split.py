@@ -56,6 +56,7 @@ def split_by_chunk(
     fractions: tuple[float, float, float] = (0.8, 0.1, 0.1),
     seed: int = 0,
     contiguous: bool = True,
+    sample_range: tuple[int, int] | None = None,
 ) -> SplitManifest:
     """Partition a variable's sample-axis chunks into train/val/test.
 
@@ -69,23 +70,43 @@ def split_by_chunk(
         still risks leakage through autocorrelation across chunk boundaries. If
         False, chunks are shuffled before partitioning (acceptable when samples
         are exchangeable, e.g. independent scenes).
+    sample_range:
+        Optional half-open ``(start, stop)`` window of sample (outer-axis) indices
+        to restrict the split to *before* partitioning -- e.g. train on one date
+        range of a long archive. **The selection is chunk-aligned and contiguous:**
+        every chunk that *overlaps* ``[start, stop)`` is kept whole, so a window
+        starting or ending mid-chunk pulls in that partial edge chunk (splits are
+        chunk-granular -- you subset whole chunks, never individual samples). Use it
+        for a single contiguous window; it is **not** a tool for scattered/boolean
+        selections (those would drag in straddling chunks and silently add samples).
     """
     if abs(sum(fractions) - 1.0) > 1e-6:
         raise ValueError(f"fractions must sum to 1.0, got {fractions} -> {sum(fractions)}")
 
-    n = geom.n_chunks
-    order = np.arange(n)
-    if not contiguous:
-        order = np.random.default_rng(seed).permutation(n)
+    if sample_range is None:
+        order = np.arange(geom.n_chunks)
+    else:
+        start, stop = sample_range
+        if not 0 <= start < stop <= geom.n_samples:
+            raise ValueError(
+                f"sample_range must satisfy 0 <= start < stop <= {geom.n_samples}, "
+                f"got {sample_range}"
+            )
+        spc = geom.sample_chunk_size
+        order = np.arange(start // spc, -(-stop // spc))  # chunks overlapping [start, stop)
 
-    n_train = int(round(fractions[0] * n))
-    n_val = int(round(fractions[1] * n))
+    if not contiguous:
+        order = np.random.default_rng(seed).permutation(order)
+
+    n_sel = len(order)
+    n_train = int(round(fractions[0] * n_sel))
+    n_val = int(round(fractions[1] * n_sel))
     train = sorted(order[:n_train].tolist())
     val = sorted(order[n_train : n_train + n_val].tolist())
     test = sorted(order[n_train + n_val :].tolist())
 
     return SplitManifest(
-        n_chunks=n,
+        n_chunks=geom.n_chunks,  # the array's chunk count; the splits may be a subset
         sample_chunk_size=geom.sample_chunk_size,
         n_samples=geom.n_samples,
         chunks={

@@ -288,6 +288,40 @@ NaN-containing *samples* is deliberately not automatic (it would break the fixed
 vectorized gather); exclude known-bad chunks at the split/manifest level instead
 (`ds.bad_chunks` gives you the list to quarantine).
 
+## Subsetting the sample (time) axis — define it with xarray
+
+The `SplitManifest` records *which sample-axis chunks* belong to each split, so to
+train on a window of a long archive you just restrict the manifest. `split_by_chunk`
+takes a `sample_range=(start, stop)` of sample indices and keeps the chunks overlapping
+it before partitioning. And because you probably think in *time*, not indices, you can
+define the window with the **xarray API you already know** and translate it — xarray is
+used only for this off-hot-path planning step; the engine itself never touches xarray:
+
+```python
+import xarray as xr
+from insitubatch import open_geometries, split_by_chunk, store_from_url
+from insitubatch.source import InSituDataset
+
+xds = xr.open_zarr(store_from_url(url))
+sel = xds.sel(time=slice("2020-01-01", "2021-01-01"))      # define it in xarray
+times = xds.indexes["time"]
+i0 = times.get_loc(sel.time.values[0])
+i1 = times.get_loc(sel.time.values[-1]) + 1                # half-open
+
+geom = open_geometries(url)[var]
+manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1), sample_range=(i0, i1))
+ds = InSituDataset(url, manifest, ...)                     # pure zarr/numpy from here
+```
+
+**Limitation — chunk-aligned and contiguous.** The selection snaps *outward* to chunk
+boundaries: a window that starts or ends mid-chunk pulls in that whole partial edge
+chunk, because splits are chunk-granular (you subset whole chunks, never individual
+samples). For day/hour chunks against a multi-month window that's effectively exact.
+It is **only** for a single contiguous window — scattered/boolean selections (e.g.
+"summers only") don't map cleanly, since straddling chunks would silently re-add the
+samples you meant to drop. Subsetting the *inner* (spatial) axes is a separate, later
+feature.
+
 ## The caching continuum
 
 **The cache boundary IS the chunk-transform boundary.** Every chunk is keyed

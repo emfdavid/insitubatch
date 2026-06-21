@@ -33,6 +33,11 @@ no oversubscription collapse.
   NaN with a `chunk_transform`. The corrupt reads are listed in `ds.bad_chunks` (the
   `(array, chunk_index, inner_coord)` tiles) for logging/quarantine. A failure
   *during scatter* still poisons (a genuine bug, not a bad chunk).
+- **Sample-axis subsetting:** `split_by_chunk(..., sample_range=(start, stop))`
+  restricts a split to a contiguous window of the sample (time) axis — train on a
+  date range of a long archive. Chunk-aligned (snaps outward to chunk bounds; whole
+  chunks only). Docs show defining the window with the xarray API (`xds.sel(time=...)`)
+  and translating it — xarray stays off the hot path.
 - **`AsyncChunkReader` kept** as the streaming-chunk primitive (used by
   `fit_standard_scaler`); only the v1 *training* path was removed.
 - **`__version__`** now derives from package metadata (pyproject is the single
