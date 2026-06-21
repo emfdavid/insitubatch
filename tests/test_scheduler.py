@@ -81,6 +81,22 @@ def test_scheduler_inflight_saturates_to_budget(tiled_store):
         assert sched.inflight_peak == cfg.max_inflight
 
 
+def test_scheduler_close_closes_the_loop(tiled_store):
+    """close() must close the loop, not leave it for GC.
+
+    An unclosed event loop is re-closed by ``BaseEventLoop.__del__`` during garbage
+    collection, which raises ``ValueError: Invalid file descriptor: -1`` on the
+    already-gone self-pipe socket -- a noisy unraisable first seen under
+    free-threaded 3.13t (where finalizer timing exposes the latent leak).
+    """
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    sched = Scheduler(url, geoms)
+    sched.start(range(geoms["single_inner"].n_chunks))
+    sched.close()
+    assert sched._loop.is_closed()
+
+
 def test_scheduler_poisons_pool_on_driver_failure(tiled_store):
     """A variable absent from the store fails array-open; the pool poison unblocks waiters."""
     url, _ = tiled_store

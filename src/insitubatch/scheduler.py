@@ -149,6 +149,8 @@ class Scheduler:
             fut.result(timeout=5)  # resolves while the loop is still running
         self._loop.call_soon_threadsafe(self._loop.stop)  # ...then stop it
         self._thread.join(timeout=5)
+        if not self._thread.is_alive():  # loop has exited run_forever -> safe to close
+            self._loop.close()  # release the self-pipe now; don't leave it for __del__
         self._decode_pool.shutdown(wait=False, cancel_futures=True)
 
     async def _shutdown(self) -> None:

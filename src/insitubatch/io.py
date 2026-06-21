@@ -115,6 +115,8 @@ class AsyncChunkReader:
     def close(self) -> None:
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
+        if not self._thread.is_alive():  # loop has exited run_forever -> safe to close
+            self._loop.close()  # release the self-pipe now; don't leave it for __del__
         self._decode_pool.shutdown(wait=False, cancel_futures=True)
 
     def __enter__(self) -> AsyncChunkReader:
