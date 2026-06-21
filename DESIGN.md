@@ -321,6 +321,15 @@ from the 1052 peak is benign oversubscription, not a sawtooth; the sweet spot is
   big-array numpy ops release the GIL; a pure-Python transform would serialize and
   kill the threaded overlap). Treat free-threaded 3.13t as *upside*, not a
   dependency; still must win on stock CPython via async + coalescing.
+  - **Validated on 3.13t (B1):** the engine runs correctly GIL-free — the pool's
+    disjoint lock-free scatter + lock-published readiness hold under true parallel
+    execution (`test_pool_concurrent_scatter_is_race_free`, the `test-freethreaded`
+    CI job). **Caveat (the FT upside is gated upstream, not by us):** `numcodecs`
+    has not yet declared itself GIL-safe, so importing the codec stack *re-enables*
+    the GIL on 3.13t. We override with `PYTHON_GIL=0` (its codecs already release
+    the GIL, so this is safe in practice), but the real free-threaded *benefit*
+    waits on numcodecs shipping `Py_MOD_GIL_NOT_USED`. Our code is ready; the
+    dependency is the long pole.
 - **Cross-variable derived fields** — reads already co-schedule per-variable
   chunkings (`build_read_plan` keys each variable by its own chunk size); the open
   part is a *cached* derived variable (e.g. windspeed), which needs sample-axis

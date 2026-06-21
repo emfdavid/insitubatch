@@ -24,7 +24,7 @@ from zarr.core.buffer import default_buffer_prototype
 from insitubatch import ensure_local_dir, open_geometries, store_from_url
 from insitubatch.plan import build_stored_chunk_reads
 from insitubatch.pool import ChunkPool
-from insitubatch.types import StoredChunkRead
+from insitubatch.types import ArrayGeometry, StoredChunkRead
 
 # shape with partial edge chunks on every axis; two layouts: single-inner + spatial
 SHAPE = (5, 9, 7)
@@ -111,6 +111,39 @@ def test_pool_scatter_reconstructs_array(tiled_store, var):
         expected = srcs[var][cid * spc : cid * spc + n0]
         assert np.array_equal(batch.arrays[var], expected)
         assert np.array_equal(batch.sample_indices, np.arange(cid * spc, cid * spc + n0))
+
+
+def test_pool_concurrent_scatter_is_race_free() -> None:
+    """Stress the lock-free disjoint writes: 64 tiles, 32 threads, repeated rounds.
+
+    Passes (serialized) under the GIL build; under ``PYTHON_GIL=0`` on free-threaded
+    3.13t it is a genuine data-race probe -- the FT CI job runs it GIL-free. A fine
+    8x8 inner grid means many threads write disjoint regions of one slot at once,
+    which is exactly the scatter concurrency the design relies on. No zarr/network:
+    tiles are exact-multiple slices of a reference array (edge clipping is covered
+    by the parity test), so this isolates the pool's threading.
+    """
+    geom = ArrayGeometry("v", (4, 64, 64), (4, 8, 8), np.dtype("f4"))  # 8x8 = 64 tiles
+    geoms = {"v": geom}
+    ref = np.random.default_rng(0).standard_normal((4, 64, 64)).astype("f4")
+    coords = list(geom.inner_coords())
+
+    for _round in range(8):  # repeated alloc -> concurrent scatter -> gather -> evict
+        pool = ChunkPool(geoms)
+        pool.allocate("v", 0)
+
+        def scatter(ic, pool=pool, geom=geom, ref=ref) -> None:  # default-bind per round
+            dst, _src = geom.tile_placement(0, ic)
+            pool.scatter("v", 0, ic, ref[dst].copy())  # full chunk-shaped tile
+
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            list(ex.map(scatter, coords))
+
+        pool.wait_ready("v", 0)
+        rows = np.array([[0, w] for w in range(4)], dtype=np.int64)
+        got = pool.gather(rows, ["v"], geom.sample_chunk_size).arrays["v"]
+        assert np.array_equal(got, ref)
+        pool.evict({0})
 
 
 def test_pool_wait_ready_raises_on_failure(tiled_store):

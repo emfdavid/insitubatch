@@ -1,8 +1,8 @@
 name: ci
 
-# Lint, type-check, and test on every push to main and every PR. Installs the
-# torch extra so the torch-handoff tests run here (they skip locally when torch
-# is absent).
+# Lint, type-check, and test on every push to main and every PR. Standard builds
+# run the full extras (torch handoff + bench); a separate free-threaded job runs
+# the core engine with the GIL disabled to guard the scatter/gather concurrency.
 on:
   push:
     branches: [main]
@@ -20,13 +20,43 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15  # a hang fails fast instead of burning the 6h default
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
-      - run: uv sync --extra torch --extra bench
-      - run: uv run ruff check src tests bench examples
-      - run: uv run ruff format --check src tests bench examples
-      - run: uv run mypy src
-      - run: uv run pytest -q
+      - run: uv sync --python ${{ matrix.python }} --extra torch --extra bench
+      # Lint + types are interpreter-independent: run once (on 3.12) to avoid 2x cost.
+      - if: matrix.python == '3.12'
+        run: |
+          uv run ruff check src tests bench examples
+          uv run ruff format --check src tests bench examples
+          uv run mypy src
+      - run: uv run --python ${{ matrix.python }} pytest -q
+
+  # Free-threaded 3.13t: the real test of the pool's lock-free disjoint scatter +
+  # lock-published readiness. torch/bench have no free-threaded wheels yet, so this
+  # job is core-deps-only (the torch tests skip via importorskip).
+  test-freethreaded:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # numcodecs has not declared itself GIL-safe, so importing the codec stack
+      # would otherwise re-enable the GIL on 3.13t. Force it off to genuinely
+      # exercise free-threaded execution (its codecs already release the GIL).
+      PYTHON_GIL: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --python 3.13t
+      # Fail loudly if the GIL is actually still on -- otherwise the run below is a
+      # no-op masquerading as a free-threading test.
+      - name: assert the GIL is disabled
+        run: uv run --python 3.13t python -c "import sys, zarr, numcodecs; assert not sys._is_gil_enabled(), 'GIL re-enabled'; print('GIL-free OK')"
+      - run: uv run --python 3.13t pytest -q
