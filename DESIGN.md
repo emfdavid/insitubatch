@@ -267,6 +267,18 @@ identical) instead of v1's collapse to 724 under oversubscription. The ~8% settl
 from the 1052 peak is benign oversubscription, not a sawtooth; the sweet spot is
 `max_inflight ≈ 32` (the ~30-in-flight network knee).
 
+**Confirmed post-B2 (the admission rewrite `resident_cap` → byte-budget pin/LRU did
+not regress the thesis).** Re-running on the same box: throughput flat at the plateau
+across the sweep — `981 / 981 / 988` MB/s at `mi = 32 / 64 / 128` — with `resident = 4`
+at *every* `max_inflight`. The plateau sits a touch below the original 1052, inside
+the cold-S3 run-to-run spread (the small sample is noisy by design); the shape — rise
+to the knee, flat after, residency pinned — is intact.
+
+**Cache (B2), on S3:** with `cache_budget_bytes` large enough to hold the probed
+window (mmap on NVMe), epoch 0 cold `930` MB/s → epoch 1 **cached `2314` MB/s
+(2.5×)** — the cached epoch is served from the pool with no GET and no decode. The
+multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
+
 ### B1 task list
 
 1. ✅ **`build_stored_chunk_reads`** — deduped stored-chunk reads `(outer, inner)` in
