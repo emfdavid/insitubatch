@@ -24,8 +24,6 @@ import numpy as np
 import zarr
 
 from insitubatch import (
-    DiskCache,
-    MemoryCache,
     SplitName,
     open_geometries,
     split_by_chunk,
@@ -131,11 +129,13 @@ def run(
 
 
 def _run_insitu(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
-    cache = None
-    if cfg.cache == "memory":
-        cache = MemoryCache(64 << 30)
-    elif cfg.cache == "disk":
-        cache = DiskCache(cache_dir or "/tmp/insitubatch-cache", 64 << 30)
+    if cfg.cache != "none":
+        # B1 ships read-once (the V2 throughput/memory decoupling). Cross-epoch
+        # reuse returns in B2 on the ChunkPool; fail loudly rather than silently
+        # mislabel a cache-off run as cached.
+        raise NotImplementedError(
+            f"insitu cache={cfg.cache!r} is B2 (ChunkPool LRU); B1 is read-once. Use cache=none."
+        )
     ds = InSituDataset(
         cfg.url,
         manifest,
@@ -145,7 +145,6 @@ def _run_insitu(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
         block_chunks=cfg.block_chunks,
         max_inflight=cfg.max_inflight,
         prefetch_depth=cfg.prefetch_depth,
-        cache=cache,
         shuffle=cfg.shuffle,
         seed=cfg.seed,
         to_tensor=False,

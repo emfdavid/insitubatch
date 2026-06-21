@@ -90,7 +90,7 @@ def run_suite(
     results: list[Result] = []
     # Total configs, so the progress line can show [i/total] + ETA on long S3 runs.
     total = len(urls) * sum(
-        (len(caches) if e == "insitu" else 1)
+        1  # cache axis is B2; B1 insitu is read-once (cache=none only)
         * (len(block_chunks_sweep) if e == "insitu" else 1)
         * (len(worker_sweep) if e in _DATALOADER_ENGINES else 1)
         * len(compute_ms_sweep)
@@ -105,10 +105,11 @@ def run_suite(
             f"{'ep':>2s} {'samp/s':>10s} {'MB/s':>8s} {'ttfb_ms':>8s} {'rssMB':>7s} {'anonMB':>7s}"
         )
 
-    # block_chunks (= read concurrency) is an insitu-only axis; other engines ignore it.
+    # block_chunks (shuffle window / residency) is an insitu-only axis; read concurrency
+    # is now max_inflight. Cache is B2 (ChunkPool LRU), so B1 runs cache=none only.
     for spc, url in urls.items():
         for engine in engines:
-            engine_caches = caches if engine == "insitu" else ("none",)
+            engine_caches = ("none",)
             nw_values = tuple(worker_sweep) if engine in _DATALOADER_ENGINES else (0,)
             bc_values = (
                 tuple(block_chunks_sweep) if engine == "insitu" else (block_chunks_sweep[0],)

@@ -16,13 +16,13 @@ def test_suite_smoke(tmp_path) -> None:
         data_dir=tmp_path / "data",
         chunk_sizes=(1, 4),
         engines=("naive", "workers", "xbatcher", "insitu", "memory"),
-        caches=("none", "memory", "disk"),
+        caches=("none",),  # B1 is read-once; insitu cache returns in B2 on the ChunkPool
         n_samples=64,
         inner=(4, 4),
         batch_size=8,
         block_chunks_sweep=(4,),
         worker_sweep=(0,),  # single-process DataLoader -> fast + deterministic in CI
-        cache_dir=tmp_path / "cache",  # exercise the explicit DiskCache scratch dir
+        cache_dir=tmp_path / "cache",
         epochs=1,
         verbose=False,
     )
@@ -35,7 +35,7 @@ def test_suite_smoke(tmp_path) -> None:
     assert all(r.samples_per_s > 0 for r in results)
     assert all(r.n_samples > 0 for r in results)
     insitu_caches = {r.cache for r in results if r.engine == "insitu"}
-    assert {"none", "memory", "disk"} <= insitu_caches
+    assert insitu_caches == {"none"}  # B1 read-once: only the cache-off path runs
 
 
 def test_xbatcher_engine(tmp_path) -> None:

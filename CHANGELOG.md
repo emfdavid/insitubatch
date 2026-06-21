@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+The V2 decoupled fetch scheduler (M1.6, B1) is now the training engine; the v1
+shuffle-block path is retired.
+
+- **`Scheduler` + `ChunkPool` replace the v1 reader+buffer** on the training path.
+  Reads are flattened to *stored chunks* (`(outer, inner)` tiles) under one
+  `max_inflight` budget — no nested inner/outer concurrency caps. Decoded tiles
+  scatter into pre-allocated outer-chunk slots (disjoint, lock-free copies);
+  residency is decoupled at `resident_cap = 2*block_chunks`. **Read concurrency
+  (`max_inflight`) and shuffle span / residency (`block_chunks`) are now
+  independent dials.**
+- **Free-threading-ready:** pool readiness is published through a lock (not the
+  GIL), so the disjoint-scatter design is correct on 3.13t as well as the GIL build.
+- **`AsyncChunkReader` kept** as the streaming-chunk primitive (used by
+  `fit_standard_scaler`); only the v1 *training* path was removed.
+- **`__version__`** now derives from package metadata (pyproject is the single
+  source of truth).
+- **Breaking (pre-1.0):** `buffer.py` (`ShuffleBlockBuffer`, `BufferConfig`)
+  removed; `InSituDataset(cache=...)` removed — B1 is read-once. Cross-epoch reuse
+  returns in B2 as a `ChunkPool` policy (same `ChunkCache` protocol);
+  `MemoryCache`/`DiskCache` remain. Observability attr `buffer_peak` →
+  `resident_peak`. New exports: `Scheduler`, `SchedulerConfig`, `ChunkPool`,
+  `StoredChunkRead`, `build_stored_chunk_reads`.
+
 ## 0.0.2
 
 First results on real cloud IO, and the tuning model behind them.
