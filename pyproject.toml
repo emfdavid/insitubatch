@@ -48,12 +48,14 @@ gpu = [
 virtual = [
     "virtualizarr>=1.2",
 ]
-# Benchmark suite extras: the xbatcher baseline (B2) and plotting.
-# (pandas comes in transitively via xarray.)
+# Benchmark suite extras: the xbatcher baseline (B2), plotting, and the py-spy
+# sampling profiler (probe_decode --profile). (pandas comes in transitively via
+# xarray.)
 bench = [
     "xbatcher>=0.3",
     "plotly>=5.20",
     "gcsfs>=2024.6",  # xr.open_zarr(gs://...) for the WeatherBench2 example baseline
+    "py-spy>=0.4",  # sampling profiler; --native sees obstore (Rust) + numcodecs (C)
 ]
 # Docs site (MkDocs-Material + API from docstrings), published to GitHub Pages.
 docs = [
