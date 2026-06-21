@@ -1,6 +1,6 @@
 """Fit a scaler over the loader with scikit-learn ``partial_fit`` — warming the cache.
 
-The recommended normalization pattern (vs the chunk-stage `fit_standard_scaler`):
+The recommended normalization pattern (vs caching the *scaled* chunk at the chunk stage):
 
   1. **Fit pass** — iterate the loader ONCE with *no scaler*. Each chunk is decoded
      and **cached** (raw); meanwhile a sklearn `StandardScaler.partial_fit` accumulates

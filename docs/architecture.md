@@ -219,27 +219,11 @@ class StandardScaler:
         return chunk
 ```
 
-Fit it **with our own infra** — one streaming, bounded-memory pass over the
-training split, reusing the read plan + async reader (no separate Dask job):
-
-```python
-def fit_standard_scaler(url, manifest, geometries, split=SplitName.TRAIN,
-                        keep_axes=("level",)) -> StandardScaler:
-    """Per-variable sum / sumsq / count, reducing over the sample axis (+ spatial),
-    keeping `keep_axes`. (Production: use Welford / a shifted mean for stability.)"""
-    sums, sqs, counts = {}, {}, {}
-    for var, geom in geometries.items():
-        plan = build_read_plan(manifest.sample_indices(split, geom), {var: geom})
-        with AsyncChunkReader(url, {var: geom}) as reader:
-            for chunk in reader.read_plan(plan):
-                x = chunk.data.astype("f8"); axes = _reduce_axes(geom, keep_axes)
-                sums[var]   = sums.get(var, 0)   + x.sum(axes, keepdims=True)
-                sqs[var]    = sqs.get(var, 0)    + (x * x).sum(axes, keepdims=True)
-                counts[var] = counts.get(var, 0) + _n_reduced(x, axes)
-    mean = {v: sums[v] / counts[v] for v in sums}
-    std  = {v: np.sqrt(np.maximum(sqs[v] / counts[v] - mean[v] ** 2, 0)) for v in sums}
-    return StandardScaler(mean, std)
-```
+Pre-fit the stats however you like and pass them in. The recommended way is to fit
+*over the loader itself* with scikit-learn's incremental `StandardScaler.partial_fit`
+— covered next — which also warms the cache. `StandardScaler` above is then the
+*chunk*-stage applier, for when you want the normalization cached with the decoded
+chunk; the fit pass and the apply stage are independent.
 
 **Alternative: fit at the *batch* stage with community tooling, warming the cache.**
 Standardization is elementwise, so per-chunk and per-batch are identical — which means
@@ -488,17 +472,16 @@ pretending to be a general compute graph.
   supported. Windows spanning *n* chunks are a future opt-in that trades away
   zero-copy.
 - **Not a compute framework.** No general task graph, no cross-chunk reductions on
-  the hot path, no lazy dask-style evaluation. `fit_standard_scaler` is a
-  hand-rolled streaming reduction, not a generic groupby — by design (dask on the
-  hot path is the thing we route around).
+  the hot path, no lazy dask-style evaluation — by design (dask on the hot path is
+  the thing we route around). Reductions like fitting a scaler run *over the loader*
+  (e.g. sklearn `partial_fit`), not as a graph.
 - **Shuffle is approximate**, not global — chunk permutation + shuffle-block
   (`block_chunks` is the quality↔memory knob). Exact global shuffle is
   incompatible with chunk-aligned, low-copy reads.
 - **Variables must share the sample axis** (same length and chunk size) — an
-  enforced v1 invariant; `InSituDataset` raises `ValueError` otherwise. The draw
-  order and gather use one chunk size for all variables. (`build_read_plan` can
-  map per-variable chunkings, but the iteration layer does not yet; lifting this
-  is future work.)
+  enforced invariant; `InSituDataset` raises `ValueError` otherwise. The draw order
+  and gather use one chunk size for all variables; lifting this to per-variable
+  chunkings is future work.
 
 Rule of thumb: **per-variable, per-chunk, deterministic → chunk stage (cacheable).
 Cross-variable or per-sample-random → batch stage (not cached). Cross-chunk →

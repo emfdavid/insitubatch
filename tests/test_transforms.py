@@ -1,4 +1,4 @@
-"""Transforms: StandardScaler, fit-with-our-own-infra, and the two CPU stages."""
+"""Transforms: StandardScaler and the two CPU stages (chunk + batch)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from insitubatch import (
     SplitName,
     StandardScaler,
     ensure_local_dir,
-    fit_standard_scaler,
     open_geometries,
     split_by_chunk,
     store_from_url,
@@ -49,31 +48,6 @@ def test_standard_scaler_save_load(tmp_path) -> None:
     np.testing.assert_array_equal(back.std["t2m"], sc.std["t2m"])
 
 
-# -- fit_standard_scaler (with our own infra) -------------------------------
-
-
-def test_fit_recovers_scalar_stats(tmp_path) -> None:
-    url, src = _write(tmp_path)
-    geoms = open_geometries(url)
-    manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
-    sc = fit_standard_scaler(url, manifest, geoms)  # keep_axes=() -> scalar per var
-
-    x = src[manifest.sample_indices(SplitName.TRAIN, geoms["t2m"])].astype("f8")
-    np.testing.assert_allclose(np.squeeze(sc.mean["t2m"]), x.mean(), rtol=1e-4)
-    np.testing.assert_allclose(np.squeeze(sc.std["t2m"]), x.std(), rtol=1e-4)
-
-
-def test_fit_per_level_stats(tmp_path) -> None:
-    url, src = _write(tmp_path, inner=(5, 3, 4))  # (n, level, lat, lon)
-    geoms = open_geometries(url)
-    manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
-    sc = fit_standard_scaler(url, manifest, geoms, keep_axes=(0,))  # keep the level axis
-
-    assert sc.mean["t2m"].shape == (5, 1, 1)
-    x = src[manifest.sample_indices(SplitName.TRAIN, geoms["t2m"])].astype("f8")
-    np.testing.assert_allclose(np.squeeze(sc.mean["t2m"]), x.mean(axis=(0, 2, 3)), rtol=1e-4)
-
-
 # -- end-to-end through InSituDataset --------------------------------------
 
 
@@ -81,8 +55,11 @@ def test_chunk_transform_normalizes_batches(tmp_path) -> None:
     url, src = _write(tmp_path)
     geoms = open_geometries(url)
     manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
-    sc = fit_standard_scaler(url, manifest, geoms)
-    m, s = np.squeeze(sc.mean["t2m"]), np.squeeze(sc.std["t2m"])
+    # Pre-fit global stats over the train split (as a user would, or via the
+    # partial_fit-over-loader pattern), then apply at the chunk stage.
+    train = src[manifest.sample_indices(SplitName.TRAIN, geoms["t2m"])].astype("f8")
+    m, s = train.mean(), train.std()
+    sc = StandardScaler(mean={"t2m": np.float64(m)}, std={"t2m": np.float64(s)})
 
     ds = InSituDataset(
         url,

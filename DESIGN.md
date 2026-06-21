@@ -65,7 +65,8 @@ dedup collapses N samples → 1 read           no dedup; B samples = B reads
 shared-cache + intra-chunk shuffle win       async fan-out is the whole game
 ```
 
-`build_read_plan()` is vectorized: Python touches **O(reads)**, never O(samples).
+`build_stored_chunk_reads()` is vectorized: Python touches **O(reads)**, never
+O(samples).
 
 ## Sample geometry (v1 contract)
 
@@ -292,8 +293,8 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
 3. ✅ **Heap `ChunkPool`** — allocate / scatter / wait_ready / gather / evict / fail;
    residency window = `2*block_chunks`; subsumes `ShuffleBlockBuffer` (deleted).
 4. ✅ **Wire into `source.py`** — V2 *replaces* v1 (no flag; the recorded exp_b/exp_c
-   baselines are the A/B reference). `AsyncChunkReader` kept as the streaming-reader
-   primitive for `fit_standard_scaler`.
+   baselines are the A/B reference). The v1 streaming reader (`AsyncChunkReader`) and
+   read plan (`build_read_plan`) were later removed as dead.
 5. ✅ **Validate** — local parity green (`test_pool`, `test_scheduler`, `test_source`)
    and exp_c acceptance **passed** on fat-spatial S3 (1052 MB/s at `mi=32`, beats the
    930 v1 peak; residency flat at `2*block_chunks` across the sweep — see the result
@@ -304,16 +305,14 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
 | Module | Role |
 |---|---|
 | `types.py` | `ArrayGeometry`, `ChunkRead`, `DecodedChunk`, `Batch` |
-| `plan.py` | `ReadPlan`, `build_read_plan` (samples → deduped reads) |
-| `split.py` | chunk-aligned `SplitManifest`, `split_by_chunk` |
+| `split.py` | chunk-aligned `SplitManifest`, `split_by_chunk` (+ `sample_range` subsetting) |
 | `store.py` | `store_from_url` shim (local↔S3 via obstore) + geometry introspection |
-| `io.py` | `AsyncChunkReader` — one event loop, bounded fan-out, real zarr-async reads. The *streaming-chunk* primitive (used by `fit_standard_scaler`); the training path is the scheduler below |
 | `shuffle.py` | chunk permutation + shuffle-block / sequential order + quality metric |
-| `plan.py` | `build_read_plan` (outer-chunk + gather, for the reader) + `build_stored_chunk_reads` (tile reads, for the scheduler) |
+| `plan.py` | `build_stored_chunk_reads` — a draw order's chunks → deduped stored-chunk (tile) reads for the scheduler |
 | `scheduler.py` | `Scheduler` — one `max_inflight` budget over stored-chunk reads; fetch→decode→scatter; residency admission |
 | `pool.py` | `ChunkPool` — the assembly buffer *and* the cache: byte budget + pin/unpin + LRU, heap or mmap'd-`.npy` backing (try_admit/scatter/wait_ready/gather/unpin) |
 | `source.py` | `InSituDataset` (IterableDataset) — prefetch producer over the scheduler+pool, block-granular eviction, optional torch handoff |
-| `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
+| `transforms.py` | chunk/batch transform hooks, `StandardScaler` (chunk-stage applier; fit over the loader — see `examples/fit_scaler.py`) |
 
 ## Open questions / spikes
 
@@ -347,7 +346,7 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
     waits on numcodecs shipping `Py_MOD_GIL_NOT_USED`. Our code is ready; the
     dependency is the long pole.
 - **Cross-variable derived fields** — reads already co-schedule per-variable
-  chunkings (`build_read_plan` keys each variable by its own chunk size); the open
+  chunkings (the plan keys each variable by its own chunk size); the open
   part is a *cached* derived variable (e.g. windspeed), which needs sample-axis
   aligned inputs (deferred — see the limitations in docs/architecture.md).
 - **Determinism + resumption** across epochs and DDP ranks (canonical-node style;
@@ -414,9 +413,10 @@ Perf track (the core thesis):
 
 Engine track (make it real for models — see [docs/architecture.md](docs/architecture.md)):
 - **M-T — transforms.** ✅ `chunk_transform` + `batch_transform` hooks wired,
-  `StandardScaler` + `fit_standard_scaler` (one streaming pass with our own
-  reader), 6 tests incl. cross-variable windspeed at the batch stage. Pending:
-  `Regrid` (precomputed weights) and `device_transform` (with the M3 adapters).
+  `StandardScaler` (chunk-stage applier) + the recommended **fit-over-the-loader**
+  pattern (sklearn `partial_fit`, warms the cache — `examples/fit_scaler.py`), incl.
+  cross-variable windspeed at the batch stage. Pending: `Regrid` (precomputed
+  weights) and `device_transform` (with the M3 adapters).
   Scope limits hold: chunk transforms are single-variable/single-chunk;
   cross-variable (e.g. windspeed) is batch-stage and uncached; cross-chunk is not
   v1.

@@ -43,9 +43,7 @@ no oversubscription collapse.
   **caches** the raw chunks (the fit *is* the warm-up), then the fitted scaler attaches
   as a `batch_transform`. The cache stays raw/reusable; training reads decode-once
   (~20× warm vs cold even on `file://`). The familiar, cache-friendly alternative to
-  the chunk-stage `fit_standard_scaler`.
-- **`AsyncChunkReader` kept** as the streaming-chunk primitive (used by
-  `fit_standard_scaler`); only the v1 *training* path was removed.
+  the chunk-stage scaler.
 - **`__version__`** now derives from package metadata (pyproject is the single
   source of truth).
 - **Breaking (pre-1.0):** `buffer.py` (`ShuffleBlockBuffer`, `BufferConfig`)
@@ -55,8 +53,12 @@ no oversubscription collapse.
   residency). Observability attr `buffer_peak` → `resident_peak`. New exports:
   `Scheduler`, `SchedulerConfig`, `ChunkPool`, `StoredChunkRead`,
   `build_stored_chunk_reads`. `cache.py` (`ChunkCache`/`MemoryCache`/`DiskCache`)
-  removed — the pool subsumes it; `AsyncChunkReader`'s vestigial `cache=` param is
-  gone too.
+  removed — the pool subsumes it.
+- **Breaking (pre-1.0): the v1 streaming-reader stack is gone.** `fit_standard_scaler`
+  removed (fit over the loader with sklearn `partial_fit` instead — see above);
+  `io.py` (`AsyncChunkReader`, `IOConfig`) and the v1 read-plan (`build_read_plan`,
+  `ReadPlan`, `dedup_ratio`) removed — they were only used by that fitter and the v1
+  reader. `StandardScaler` stays as the chunk-stage applier (pass your own stats).
 
 ## 0.0.2
 

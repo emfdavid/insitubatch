@@ -12,8 +12,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .io import AsyncChunkReader, IOConfig
-from .plan import ReadPlan, build_read_plan, build_stored_chunk_reads, dedup_ratio
+from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import (
@@ -28,7 +27,6 @@ from .transforms import (
     BatchTransform,
     ChunkTransform,
     StandardScaler,
-    fit_standard_scaler,
 )
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk, SplitName, StoredChunkRead
 
@@ -42,15 +40,12 @@ except PackageNotFoundError:  # pragma: no cover - uninstalled source tree
 
 __all__ = [
     "ArrayGeometry",
-    "AsyncChunkReader",
     "Batch",
     "BatchTransform",
     "ChunkPool",
     "ChunkRead",
     "ChunkTransform",
     "DecodedChunk",
-    "IOConfig",
-    "ReadPlan",
     "Scheduler",
     "SchedulerConfig",
     "SplitManifest",
@@ -58,12 +53,9 @@ __all__ = [
     "StandardScaler",
     "StoredChunkRead",
     "block_shuffled_order",
-    "build_read_plan",
     "build_stored_chunk_reads",
     "chunk_permutation",
-    "dedup_ratio",
     "ensure_local_dir",
-    "fit_standard_scaler",
     "open_geometries",
     "sequential_order",
     "shuffle_quality",

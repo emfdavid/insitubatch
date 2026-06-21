@@ -12,7 +12,7 @@ import numpy as np
 
 from insitubatch import (
     SplitName,
-    fit_standard_scaler,
+    StandardScaler,
     open_geometries,
     split_by_chunk,
 )
@@ -24,8 +24,8 @@ def test_transforms_prefetch_reconstruct(write_zarr) -> None:
     src = srcs["t2m"]
     geoms = open_geometries(url)
     manifest = split_by_chunk(geoms["t2m"], fractions=(1.0, 0.0, 0.0))
-    scaler = fit_standard_scaler(url, manifest, geoms)
-    mean, std = np.squeeze(scaler.mean["t2m"]), np.squeeze(scaler.std["t2m"])
+    mean, std = src.astype("f8").mean(), src.astype("f8").std()  # global stats, pre-fit
+    scaler = StandardScaler(mean={"t2m": np.float64(mean)}, std={"t2m": np.float64(std)})
 
     ds = InSituDataset(
         url,

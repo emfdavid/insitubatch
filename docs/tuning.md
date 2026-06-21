@@ -57,11 +57,10 @@ concurrency gets expensive (see the fat-single-inner row below).
 | **fat, single inner** | huge outer chunk, single inner | pathological: the stored chunk *is* the outer chunk, so concurrency = memory. **Rechunk spatially**, or shrink `sample_chunk` |
 | **fat, spatial** | huge outer chunk, inner grid | the sweet spot: small stored chunks → high `max_inflight` is cheap; keep `block_chunks` small for low residency |
 
-## Decode and inner-fan-out knobs
+## Decode knob
 
-- `decode_threads` (`IOConfig`) — the loop's executor for codec decode. `0` = auto
-  (`min(32, cpu+4)`). On a busy box, ~8 often beats auto (oversubscription).
-- `read_concurrency` (`IOConfig`) — zarr's inner fan-out per `getitem` (v1 only).
-  Set it **≥ the inner-grid count** so a spatial field doesn't take an extra partial
-  wave (e.g. 15 inner tiles at the default cap of 10 = 2 waves ≈ half rate). V2
-  folds this into the single `max_inflight` budget.
+- `decode_threads` (`SchedulerConfig`) — the loop's executor for codec decode + the
+  scatter memcpy. `0` = auto (`min(32, cpu+4)`). On a busy box, ~8 often beats auto
+  (oversubscription). There is no separate inner-fan-out cap: the scheduler fetches
+  at stored-chunk granularity under the single `max_inflight` budget, so the inner
+  grid is dialed by `max_inflight` directly.

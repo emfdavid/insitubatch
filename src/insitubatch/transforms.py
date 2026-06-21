@@ -22,10 +22,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from .io import AsyncChunkReader
-from .plan import build_read_plan
-from .split import SplitManifest
-from .types import ArrayGeometry, Batch, DecodedChunk, SplitName
+from .types import Batch, DecodedChunk
 
 
 @runtime_checkable
@@ -49,8 +46,13 @@ class StandardScaler:
     ``mean``/``std`` are keyed by variable and shaped to broadcast over a chunk's
     ``(n_samples, *inner)`` array WITHOUT the sample axis: a surface variable uses
     shape ``(1, 1)``; per-level stats use ``(level, 1, 1)``. The same stats are
-    applied to every chunk of that variable -- never recomputed per chunk. Fit
-    once with :func:`fit_standard_scaler`.
+    applied to every chunk of that variable -- never recomputed per chunk.
+
+    Pre-fit the stats however you like and pass them in. The recommended path is to
+    fit over the loader with ``sklearn``'s incremental ``StandardScaler.partial_fit``
+    (which also warms the cache) and scale at the *batch* stage -- see
+    ``examples/fit_scaler.py``; this class is the *chunk*-stage applier for when you
+    want the normalization cached with the decoded chunk.
     """
 
     mean: dict[str, np.ndarray]
@@ -74,61 +76,3 @@ class StandardScaler:
         mean = {k[:-5]: d[k] for k in d.files if k.endswith(".mean")}
         std = {k[:-4]: d[k] for k in d.files if k.endswith(".std")}
         return cls(mean=mean, std=std)
-
-
-def _reduce_axes(chunk_ndim: int, keep_inner: tuple[int, ...]) -> tuple[int, ...]:
-    """Chunk axes to reduce over: the sample axis (0) + every inner axis not kept.
-
-    ``keep_inner`` indexes the *inner* dims (0-based within ``inner_shape``); the
-    corresponding chunk axis is ``1 + i``.
-    """
-    keep = {1 + i for i in keep_inner}
-    return tuple(ax for ax in range(chunk_ndim) if ax not in keep)
-
-
-def fit_standard_scaler(
-    url: str,
-    manifest: SplitManifest,
-    geometries: dict[str, ArrayGeometry],
-    *,
-    split: SplitName = SplitName.TRAIN,
-    keep_axes: tuple[int, ...] = (),
-    **store_kwargs: object,
-) -> StandardScaler:
-    """Fit a :class:`StandardScaler` over ``split`` -- with our own infra.
-
-    One streaming, bounded-memory pass per variable through the async reader:
-    accumulate sum / sumsq / count, reducing over the sample axis (+ spatial),
-    keeping the inner dims named in ``keep_axes`` (e.g. ``(0,)`` keeps a leading
-    level axis -> per-level stats). ``()`` gives one scalar mean/std per variable.
-
-    Note
-    ----
-    Uses float64 sum-of-squares for simplicity; for production prefer Welford or a
-    shifted mean to avoid catastrophic cancellation on large means.
-    """
-    sums: dict[str, np.ndarray] = {}
-    sqs: dict[str, np.ndarray] = {}
-    counts: dict[str, int] = {}
-
-    for var, geom in geometries.items():
-        idx = manifest.sample_indices(split, geom)
-        plan = build_read_plan(idx, {var: geom})
-        with AsyncChunkReader(url, {var: geom}, **store_kwargs) as reader:  # type: ignore[arg-type]
-            for chunk in reader.read_plan(plan):
-                x = chunk.data.astype(np.float64)
-                axes = _reduce_axes(x.ndim, keep_axes)
-                sums[var] = sums.get(var, 0.0) + x.sum(axis=axes, keepdims=True)
-                sqs[var] = sqs.get(var, 0.0) + (x * x).sum(axis=axes, keepdims=True)
-                counts[var] = counts.get(var, 0) + int(np.prod([x.shape[a] for a in axes]))
-
-    mean: dict[str, np.ndarray] = {}
-    std: dict[str, np.ndarray] = {}
-    for var in geometries:
-        n = counts[var]
-        m = sums[var] / n
-        var_ = np.maximum(sqs[var] / n - m * m, 0.0)
-        # Drop the sample axis (size 1) -> stats broadcast over (n_samples, *inner).
-        mean[var] = np.squeeze(m, axis=0)
-        std[var] = np.squeeze(np.sqrt(var_), axis=0)
-    return StandardScaler(mean=mean, std=std)
