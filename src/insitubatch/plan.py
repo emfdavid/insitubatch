@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .types import ArrayGeometry, ChunkRead
+from .types import ArrayGeometry, ChunkRead, StoredChunkRead
 
 
 @dataclass(slots=True)
@@ -99,6 +99,42 @@ def build_read_plan(
             gathers[name].append(Gather(read_index=ri, within=int(w)))
 
     return ReadPlan(reads=reads, gathers=gathers, sample_indices=idx)
+
+
+def build_stored_chunk_reads(
+    chunk_ids: Sequence[int] | np.ndarray,
+    geometries: dict[str, ArrayGeometry],
+) -> list[StoredChunkRead]:
+    """Expand outer chunk ids into deduped stored-chunk reads, in priority order.
+
+    Where :func:`build_read_plan` plans *outer-chunk* reads plus a sample gather
+    map (for the streaming reader), this plans *stored-chunk* (tile) reads with no
+    gather map: the scheduler scatters tiles into per-outer-chunk slots in a
+    :class:`~insitubatch.pool.ChunkPool`, and batches are gathered straight from
+    those assembled slots by ``(chunk_id, within)`` draw rows -- the same
+    coordinates the shuffle order already produces. So the result is just *what to
+    fetch, in what order*; the scheduler keeps ``max_inflight`` tiles in flight
+    across the list.
+
+    ``chunk_ids`` are outer (sample-axis) chunk indices in *draw/priority* order
+    (e.g. the next shuffle-block's chunks first), so the soonest-needed tiles go
+    first. Each outer chunk expands to its inner grid; every variable contributes
+    its own grid (variables may chunk the inner dims differently). Order is
+    ``chunk -> variable -> inner`` so a whole outer chunk's tiles are scheduled
+    together (it can be assembled and drained promptly). Dedup is
+    belt-and-suspenders -- a draw order visits each outer chunk once -- but makes
+    the function safe to call with repeated ids.
+    """
+    reads: list[StoredChunkRead] = []
+    seen: set[StoredChunkRead] = set()
+    for cid in chunk_ids:
+        for name, geom in geometries.items():
+            for inner in geom.inner_coords():
+                read = StoredChunkRead(array=name, chunk_index=int(cid), inner_coord=inner)
+                if read not in seen:
+                    seen.add(read)
+                    reads.append(read)
+    return reads
 
 
 def dedup_ratio(plan: ReadPlan) -> float:
