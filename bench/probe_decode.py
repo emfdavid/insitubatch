@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import itertools
 import math
 import shutil
@@ -44,6 +45,7 @@ from insitubatch import SplitName, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.store import store_from_url
 
+from ._profile import record_pyspy
 from .make_dataset import make_dataset
 
 
@@ -144,6 +146,15 @@ def main() -> None:
     )
     p.add_argument("--max-inflight", default="8,16,32,64", help="sec 1b sweep (the V2 dial)")
     p.add_argument("--concurrency", default="1,4,8,16,32", help="sec 2 raw-GET sweep")
+    p.add_argument(
+        "--profile",
+        nargs="?",
+        const="probe-profile.svg",
+        default=None,
+        help="record a py-spy --native flamegraph of the sec 1b sweep to PATH "
+        "(default probe-profile.svg; .json => speedscope). Needs ptrace_scope=0 "
+        "or sudo; see bench/_profile.py.",
+    )
     p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
@@ -175,25 +186,27 @@ def main() -> None:
 
     print(f"\n1b) insitu MB/s + peak residency vs max_inflight (block_chunks={bc}, decode auto):")
     print("    V2 wants throughput flat (not falling) past the knee, residency pinned.")
-    for mi in (int(x) for x in a.max_inflight.split(",")):
-        xs = sorted(
-            _insitu(
-                a.url,
-                a.var,
-                kw,
-                decode_threads=0,
-                max_chunks=a.max_chunks,
-                block_chunks=bc,
-                max_inflight=mi,
+    profile = record_pyspy(a.profile) if a.profile else contextlib.nullcontext()
+    with profile:  # profile scope = the V2 acceptance sweep (insitu only, no raw-GET)
+        for mi in (int(x) for x in a.max_inflight.split(",")):
+            xs = sorted(
+                _insitu(
+                    a.url,
+                    a.var,
+                    kw,
+                    decode_threads=0,
+                    max_chunks=a.max_chunks,
+                    block_chunks=bc,
+                    max_inflight=mi,
+                )
+                for _ in range(a.repeats)
             )
-            for _ in range(a.repeats)
-        )
-        med = statistics.median(x[0] for x in xs)
-        resident = xs[0][1]  # deterministic across repeats
-        print(
-            f"   max_inflight={mi:>4}: {med:8.1f} MB/s  ({xs[0][0]:.0f}-{xs[-1][0]:.0f})"
-            f"  resident={resident} chunks"
-        )
+            med = statistics.median(x[0] for x in xs)
+            resident = xs[0][1]  # deterministic across repeats
+            print(
+                f"   max_inflight={mi:>4}: {med:8.1f} MB/s  ({xs[0][0]:.0f}-{xs[-1][0]:.0f})"
+                f"  resident={resident} chunks"
+            )
 
     if not a.no_raw:
         print("\n2) raw obstore concurrent GET MB/s (no decode):")
