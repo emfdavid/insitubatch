@@ -146,6 +146,58 @@ def test_pool_concurrent_scatter_is_race_free() -> None:
         pool.evict({0})
 
 
+@pytest.mark.parametrize("var", list(LAYOUTS))
+def test_pool_mmap_backing_parity_and_cleanup(tiled_store, tmp_path, var):
+    """mmap-backed slots reconstruct == arr[:], live as files on disk, and the
+    files are freed on evict (read-once)."""
+    url, srcs = tiled_store
+    geoms = open_geometries(url, variables=[var])
+    geom = geoms[var]
+    tiles = asyncio.run(_decode_tiles(url, var))
+    backing = tmp_path / "slots"
+
+    pool = ChunkPool(geoms, backing_dir=backing)
+    for cid in range(geom.n_chunks):
+        pool.allocate(var, cid)
+        for inner in geom.inner_coords():
+            pool.scatter(var, cid, inner, tiles[(cid, *inner)])
+
+    assert list(backing.glob("*.npy")), "slots should live as .npy files on disk"
+    spc = geom.sample_chunk_size
+    for cid in range(geom.n_chunks):
+        pool.wait_ready(var, cid)
+        n0 = len(geom.samples_in_chunk(cid))
+        rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
+        got = pool.gather(rows, [var], spc).arrays[var]
+        assert np.array_equal(got, srcs[var][cid * spc : cid * spc + n0])
+
+    pool.evict(set(range(geom.n_chunks)))
+    assert not list(backing.glob("*.npy")), "evict must unlink the slot files"
+
+
+def test_pool_mmap_backing_with_transform(tiled_store, tmp_path):
+    """A shape-preserving chunk_transform's output is written back into the memmap."""
+    url, srcs = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+
+    def scale(chunk):  # new array, same shape
+        chunk.data = chunk.data * 2.0
+        return chunk
+
+    pool = ChunkPool(geoms, backing_dir=tmp_path / "s", chunk_transforms=[scale])
+    pool.allocate("single_inner", 0)
+    for inner in geom.inner_coords():
+        pool.scatter("single_inner", 0, inner, tiles[(0, *inner)])
+    pool.wait_ready("single_inner", 0)
+
+    spc = geom.sample_chunk_size
+    rows = np.array([[0, w] for w in range(spc)], dtype=np.int64)
+    got = pool.gather(rows, ["single_inner"], spc).arrays["single_inner"]
+    np.testing.assert_allclose(got, srcs["single_inner"][:spc] * 2.0)
+
+
 def test_pool_wait_ready_raises_on_failure(tiled_store):
     """A poisoned tile surfaces on the waiting consumer (fail-fast), not a hang."""
     url, _ = tiled_store
