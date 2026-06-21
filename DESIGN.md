@@ -247,6 +247,21 @@ rises to the network knee and stays *flat* (not falling, as v1's nested caps did
 when oversubscribed) while `resident` stays pinned at `2*block_chunks` independent
 of `max_inflight`.
 
+**V2 result (✅ passed, c6id.8xlarge, fat-spatial, median of 5):**
+
+| `max_inflight` | 8 | 16 | **32** | 64 | 128 |
+|---|---:|---:|---:|---:|---:|
+| MB/s | 388 | 788 | **1052** | 970 | 970 |
+| `resident` (chunks) | 4 | 4 | 4 | 4 | 4 |
+
+V2 **beats** the v1 spatial peak (1052 vs 930) at the *same* low memory (`bc=2`,
+`resident=4 ≈ 3.3 GB`), and — the thesis — residency is **flat at `2*block_chunks`
+for every `max_inflight`**, so concurrency is now dialed independently of memory.
+Past the knee (`mi≈32`) throughput settles to a **stable 970 plateau** (64 and 128
+identical) instead of v1's collapse to 724 under oversubscription. The ~8% settle
+from the 1052 peak is benign oversubscription, not a sawtooth; the sweet spot is
+`max_inflight ≈ 32` (the ~30-in-flight network knee).
+
 ### B1 task list
 
 1. ✅ **`build_stored_chunk_reads`** — deduped stored-chunk reads `(outer, inner)` in
@@ -262,9 +277,10 @@ of `max_inflight`.
 4. ✅ **Wire into `source.py`** — V2 *replaces* v1 (no flag; the recorded exp_b/exp_c
    baselines are the A/B reference). `AsyncChunkReader` kept as the streaming-reader
    primitive for `fit_standard_scaler`.
-5. ⏳ **Validate** — local parity green (`test_pool`, `test_scheduler`, `test_source`).
-   Pending: exp_c acceptance on fat-spatial S3 (`probe_decode` rewired, sec 1b sweeps
-   `max_inflight`). Then B2 (mmap backing + LRU; the pool subsumes the cache).
+5. ✅ **Validate** — local parity green (`test_pool`, `test_scheduler`, `test_source`)
+   and exp_c acceptance **passed** on fat-spatial S3 (1052 MB/s at `mi=32`, beats the
+   930 v1 peak; residency flat at `2*block_chunks` across the sweep — see the result
+   table above). Next: B2 (mmap backing + LRU; the pool subsumes the cache).
 
 ## Module map
 
@@ -335,8 +351,9 @@ pool, coalesced gather, torch surface, **chunk/batch transforms + `StandardScale
 (M-T)**, **prefetch (M1.5)**, runnable examples + a published docs site, and the
 **V2 decoupled fetch scheduler (M1.6, B1)** — `Scheduler` + `ChunkPool` are now the
 training engine (one `max_inflight` budget over stored chunks, residency decoupled
-at `2*block_chunks`); the v1 shuffle-block buffer is retired. **Validated locally;
-acceptance pending** the exp_c fat-spatial S3 run. **Not yet built:** B2 (mmap/LRU
+at `2*block_chunks`); the v1 shuffle-block buffer is retired. **Acceptance passed**
+on fat-spatial S3: 1052 MB/s at `max_inflight=32` (beats the 930 v1 peak) with
+residency flat across the concurrency sweep. **Not yet built:** B2 (mmap/LRU
 pool backing — the cache then rides the pool, M-C reintroduced there), `Regrid` +
 the GPU/device stage (M2), JAX/TF surfaces (M3).
 
@@ -356,7 +373,7 @@ Perf track (the core thesis):
   the per-block sawtooth disappears (boundary waits 0.1 ms); at *zero* compute the
   loader is IO-throughput-bound and the stall is only smoothed, not removed — that
   is the network ceiling, not a scheduling bug.
-- **M1.6 — decoupled fetch scheduler (V2). 🔬 B1 implemented; acceptance pending.**
+- **M1.6 — decoupled fetch scheduler (V2). ✅ B1 (acceptance passed: 1052 MB/s, residency flat).**
   Flatten to stored-chunk granularity with one `max_inflight` budget over
   inner+outer reads (full design above): decouples read concurrency from
   residency/shuffle and kills the nested-cap sawtooth. `Scheduler` + `ChunkPool`
@@ -364,7 +381,8 @@ Perf track (the core thesis):
   zarr-internals path (fetch encoded bytes → `codec_pipeline` decode → scatter,
   first proven in `bench/spike_v2_decode.py`) is the live engine, covered by
   `test_pool`/`test_scheduler` parity + bound tests. Supersedes the one-block
-  look-ahead in `source.py`. Remaining: exp_c fat-spatial S3 acceptance, then B2.
+  look-ahead in `source.py`. exp_c fat-spatial acceptance passed (see the result
+  table). Remaining: B2 (mmap/LRU pool backing).
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 

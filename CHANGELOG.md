@@ -3,7 +3,11 @@
 ## Unreleased
 
 The V2 decoupled fetch scheduler (M1.6, B1) is now the training engine; the v1
-shuffle-block path is retired.
+shuffle-block path is retired. **Acceptance passed** on S3 (c6id.8xlarge,
+fat-spatial): **1052 MB/s at `max_inflight=32`**, beating the 930 MB/s v1 peak at
+the same `block_chunks=2` memory, with residency **flat at 4 chunks across the
+whole `max_inflight` sweep** (8→128) — concurrency dialed independently of memory,
+no oversubscription collapse.
 
 - **`Scheduler` + `ChunkPool` replace the v1 reader+buffer** on the training path.
   Reads are flattened to *stored chunks* (`(outer, inner)` tiles) under one
