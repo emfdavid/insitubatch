@@ -128,9 +128,11 @@ def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
     assert all(v == 1 for v in decoded.values()), dict(decoded)  # decoded once, no re-reads
 
 
-def test_buffer_residency_is_bounded_by_block(write_zarr) -> None:
-    # Last-use eviction holds at most one shuffle block (+ a straddling-window
-    # margin), independent of epoch length -- NOT the whole split.
+def test_residency_is_bounded_by_block(write_zarr) -> None:
+    # Block-granular eviction holds the current block plus one read-ahead block
+    # (resident_cap = 2*block_chunks), independent of epoch length -- NOT the whole
+    # split. The lower bound is one block: a batch may draw across a whole block,
+    # so the block must be co-resident to gather.
     url, _ = write_zarr(n=160, spc=4)  # 40 chunks
     geom = open_geometries(url)["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
@@ -147,4 +149,4 @@ def test_buffer_residency_is_bounded_by_block(write_zarr) -> None:
     ds.set_epoch(0)
     for _ in ds:
         pass
-    assert 1 <= ds.buffer_peak <= block_chunks + batch_size  # ~one block, not all 40
+    assert block_chunks <= ds.resident_peak <= 2 * block_chunks  # ~two blocks, not all 40

@@ -36,6 +36,7 @@ instead of hanging.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import threading
 from collections.abc import Callable, Sequence
@@ -136,9 +137,28 @@ class Scheduler:
         self._loop.run_forever()
 
     def close(self) -> None:
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        """Cancel any in-flight driver, then stop the loop and decode pool.
+
+        Graceful: a consumer may close mid-epoch (early ``break``) while ``_drive``
+        is still streaming. We cancel outstanding tasks and let them unwind *before*
+        stopping the loop, so no coroutine is orphaned (which would surface as
+        ``GeneratorExit`` / "never awaited" warnings on GC).
+        """
+        with contextlib.suppress(Exception):  # loop may already be down
+            fut = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+            fut.result(timeout=5)  # resolves while the loop is still running
+        self._loop.call_soon_threadsafe(self._loop.stop)  # ...then stop it
         self._thread.join(timeout=5)
         self._decode_pool.shutdown(wait=False, cancel_futures=True)
+
+    async def _shutdown(self) -> None:
+        # Cancel + drain in-flight tasks, but do NOT stop the loop here: stopping
+        # inside the awaited coroutine would race the delivery of this future's
+        # result back to close(), which then blocks until its timeout.
+        tasks = [t for t in asyncio.all_tasks(self._loop) if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def __enter__(self) -> Scheduler:
         return self

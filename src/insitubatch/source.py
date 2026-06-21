@@ -1,14 +1,21 @@
 """Torch handoff surface.
 
 Ties the pieces together and exposes them to PyTorch *without* using the classic
-DataLoader worker model. Parallelism lives in :class:`AsyncChunkReader`'s event
-loop, so the recommended configuration is::
+DataLoader worker model. Parallelism lives in :class:`Scheduler`'s event loop, so
+the recommended configuration is::
 
     loader = DataLoader(InSituDataset(...), batch_size=None, num_workers=0)
 
 ``batch_size=None`` because the dataset already yields assembled batches;
 ``num_workers=0`` because forking workers would re-introduce exactly the
 redundant-read / nested-parallelism problems we set out to avoid.
+
+The engine is the decoupled fetch scheduler (DESIGN.md, M1.6): one event loop
+streams stored-chunk reads under a single ``max_inflight`` budget and scatters
+decoded tiles into a :class:`ChunkPool`; this producer walks the shuffle order,
+waits on each block's assembled chunks, gathers coalesced batches, and evicts the
+block to free residency. Read concurrency (``max_inflight``) and shuffle span /
+residency (``block_chunks``) are independent dials.
 
 torch (and torchdata.nodes) are optional imports so the core engine stays
 framework-agnostic and importable on a box without torch installed.
@@ -20,19 +27,20 @@ import contextlib
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .buffer import BufferConfig, ShuffleBlockBuffer
-from .cache import ChunkCache
-from .io import AsyncChunkReader, IOConfig
-from .plan import build_read_plan
+from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest
 from .store import open_geometries
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName
+
+# Default for the single concurrency dial when the caller does not pin it. Unlike
+# v1 (where read concurrency followed block_chunks), max_inflight is independent
+# of the shuffle window -- it is sized to saturate the network, not the buffer.
+DEFAULT_MAX_INFLIGHT = 32
 
 # Optional torch surface. TYPE_CHECKING gives mypy a consistent view (the real
 # IterableDataset) regardless of whether torch is installed in the checking env;
@@ -79,7 +87,8 @@ class InSituDataset(IterableDataset):
     """An IterableDataset that streams shuffled batches from a Zarr archive.
 
     One epoch = permute the split's chunks -> walk shuffle-blocks -> for each
-    block, async-fetch its chunks, fill the buffer, emit coalesced batches.
+    block, stream-fetch its stored chunks into the pool, gather coalesced batches,
+    evict the block.
     """
 
     def __init__(
@@ -96,7 +105,6 @@ class InSituDataset(IterableDataset):
         to_tensor: bool = True,
         shuffle: bool = True,
         prefetch_depth: int = 2,
-        cache: ChunkCache | None = None,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: Any,
@@ -120,23 +128,29 @@ class InSituDataset(IterableDataset):
                 f"size (v1 invariant); got sample_chunk_size={sorted(spcs)}, "
                 f"n_samples={sorted(lengths)}."
             )
-        # Read concurrency follows the block size unless overridden: a block fetches
-        # its block_chunks chunks, so max_inflight defaults to block_chunks (raising
-        # block_chunks alone then actually raises concurrency). Decoupling read
-        # concurrency from the shuffle-block size is the V2 fetch scheduler.
-        self.io_config = IOConfig(max_inflight=max_inflight or block_chunks)
-        self.buffer_config = BufferConfig(block_chunks=block_chunks, batch_size=batch_size)
+
+        self.batch_size = batch_size
+        self.block_chunks = block_chunks
         self.seed = seed
         self.to_tensor = to_tensor and _HAS_TORCH
         self.shuffle = shuffle
         self.prefetch_depth = max(int(prefetch_depth), 1)
-        # A caller-owned cache (MemoryCache / DiskCache) persists across epochs and
-        # runs; None disables caching. See insitubatch.cache.
-        self.cache = cache
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
-        self.buffer_peak = 0  # peak resident chunks in the last epoch (observability)
+        self.resident_peak = 0  # peak resident outer chunks last epoch (observability)
+
+        # One concurrency dial (max_inflight, network) decoupled from the shuffle
+        # window (block_chunks). resident_cap = 2*block_chunks holds the current
+        # block plus one read-ahead block, so block-boundary IO overlaps compute
+        # (matching the v1 baseline residency in DESIGN's exp_c table). The invariant
+        # resident_cap >= block_chunks is required: a batch may draw across a whole
+        # block, so the block must be co-resident to gather. Exposed so the probe can
+        # tune decode_threads at iteration time.
+        self.scheduler_config = SchedulerConfig(
+            max_inflight=max_inflight or DEFAULT_MAX_INFLIGHT,
+            resident_cap=2 * block_chunks,
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Call from the training loop so each epoch reshuffles deterministically."""
@@ -144,95 +158,76 @@ class InSituDataset(IterableDataset):
 
     _SENTINEL = object()
 
-    def __iter__(self) -> Iterator[Batch | dict]:
-        """Drain assembled batches from a background producer (prefetch).
-
-        A producer thread walks the draw order, assembles batches (async fan-out
-        + gather + batch transforms) and pushes them onto a bounded queue; this
-        consumer pops them. The queue (depth ``prefetch_depth``) provides the
-        backpressure and the inter-batch overlap: while the caller works on batch
-        N, the producer is already building N+1..N+depth.
-
-        The producer walks shuffle-blocks and reads one block ahead, so the
-        block-boundary IO overlaps the per-batch compute of the current block
-        instead of stalling. (At literally zero compute the loader is
-        IO-throughput-bound and the boundary is only smoothed, not removed.)
-        A decoupled fetch scheduler that keeps many reads continuously in flight
-        is V2 (see DESIGN.md).
-        """
+    def _draw_order(self) -> np.ndarray:
         geom = self.geometries[self.variables[0]]
         chunk_ids = np.asarray(self.manifest.chunks[self.split.value], dtype=np.int64)
         spc = geom.sample_chunk_size
-        order = (
-            block_shuffled_order(
+        if self.shuffle:
+            return block_shuffled_order(
                 chunk_ids,
                 spc,
                 geom.n_samples,
-                block_chunks=self.buffer_config.block_chunks,
+                block_chunks=self.block_chunks,
                 seed=self.seed,
                 epoch=self._epoch,
             )
-            if self.shuffle
-            else sequential_order(chunk_ids, spc, geom.n_samples)
-        )
+        return sequential_order(chunk_ids, spc, geom.n_samples)
+
+    def __iter__(self) -> Iterator[Batch | dict]:
+        """Drain assembled batches from a background producer (prefetch).
+
+        A producer thread starts the scheduler over the epoch's chunks (in draw
+        order), then for each shuffle-block waits the block assembled, gathers its
+        batches, and evicts it; this consumer pops from a bounded queue (depth
+        ``prefetch_depth``) that provides backpressure and inter-batch overlap.
+
+        The scheduler keeps ``max_inflight`` tiles continuously in flight and (via
+        ``resident_cap``) fetches one block ahead, so block-boundary IO overlaps
+        the current block's per-batch compute instead of stalling.
+        """
+        geom = self.geometries[self.variables[0]]
+        spc = geom.sample_chunk_size
+        order = self._draw_order()
+        blocks = _partition_blocks(order, self.block_chunks)
+        ordered_chunks = [int(c) for _rstart, _rstop, cids in blocks for c in cids]
 
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
         stop = threading.Event()
-        buf = ShuffleBlockBuffer(self.buffer_config, seed=self.seed)
 
-        def produce(reader: AsyncChunkReader) -> None:
-            bs = self.buffer_config.batch_size
-            blocks = _partition_blocks(order, self.buffer_config.block_chunks)
-
-            def read_block(chunk_ids: np.ndarray) -> list[DecodedChunk]:
-                # Fetch + decode a whole block's chunks (deduped). Runs on the read-ahead
-                # thread so it overlaps with the consumer draining the previous block.
-                plan = build_read_plan(sorted({int(c) * spc for c in chunk_ids}), self.geometries)
-                return list(reader.read_plan(plan))
-
+        def produce(sched: Scheduler) -> None:
+            bs = self.batch_size
             try:
-                # One-block read-ahead: while we emit block b, the chunks for block b+1
-                # are already being fetched, so the block-boundary IO is hidden instead
-                # of stalling the consumer. Blocks use disjoint chunks, so the buffer
-                # holds one block plus the in-flight block's decoded list (still
-                # O(block_chunks)). Per-batch chunk-granularity look-ahead is V2 (the
-                # decoupled fetch scheduler).
-                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="insitu-readahead") as ex:
-                    inflight: Future[list[DecodedChunk]] | None = (
-                        ex.submit(read_block, blocks[0][2]) if blocks else None
-                    )
-                    for b, (rstart, rstop, _chunk_ids) in enumerate(blocks):
-                        assert inflight is not None
-                        for decoded in inflight.result():
-                            buf.add(decoded)
-                        inflight = (
-                            ex.submit(read_block, blocks[b + 1][2]) if b + 1 < len(blocks) else None
-                        )
-                        for start in range(rstart, rstop, bs):
-                            if stop.is_set():
-                                return
-                            rows = order[start : min(start + bs, rstop)]
-                            batch = buf.gather_batch(rows, self.variables, spc)
-                            for transform in self.batch_transforms:
-                                batch = transform(batch)
-                            out_q.put(batch)  # blocks when full -> backpressure
-                        # Block b is fully drained and shares no chunk with later blocks.
-                        buf.evict_drained(set())
+                sched.start(ordered_chunks)
+                for rstart, rstop, block_cids in blocks:
+                    block = [int(c) for c in block_cids]
+                    # A block's batches draw across all its chunks, so wait the whole
+                    # block assembled before gathering (each wait is cheap once ready).
+                    for cid in block:
+                        for var in self.variables:
+                            sched.pool.wait_ready(var, cid)
+                    for start in range(rstart, rstop, bs):
+                        if stop.is_set():
+                            return
+                        rows = order[start : min(start + bs, rstop)]
+                        batch = sched.pool.gather(rows, self.variables, spc)
+                        for transform in self.batch_transforms:
+                            batch = transform(batch)
+                        out_q.put(batch)  # blocks when full -> backpressure
+                    sched.evict(set(block))  # frees residency for the next read-ahead
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
                 out_q.put(exc)
             finally:
                 out_q.put(self._SENTINEL)
 
-        with AsyncChunkReader(
+        with Scheduler(
             self.store_url,
             self.geometries,
-            self.io_config,
+            self.scheduler_config,
             chunk_transforms=self.chunk_transforms,
-            cache=self.cache,
             **self.store_kwargs,
-        ) as reader:
+        ) as sched:
             producer = threading.Thread(
-                target=produce, args=(reader,), name="insitu-prefetch", daemon=True
+                target=produce, args=(sched,), name="insitu-prefetch", daemon=True
             )
             producer.start()
             try:
@@ -245,13 +240,13 @@ class InSituDataset(IterableDataset):
                     yield self._maybe_tensor(item)
             finally:
                 # Signal stop, then drain so a producer parked on a full queue can
-                # proceed and exit before the reader (context manager) is closed.
+                # proceed and exit before the scheduler (context manager) is closed.
                 stop.set()
                 while producer.is_alive():
                     with contextlib.suppress(queue.Empty):
                         out_q.get(timeout=0.05)
                 producer.join(timeout=10)
-                self.buffer_peak = buf.max_resident  # peak residency this epoch
+                self.resident_peak = sched.pool.max_resident  # peak residency this epoch
 
     def _maybe_tensor(self, batch: Batch) -> Batch | dict:
         if not self.to_tensor:
