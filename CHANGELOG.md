@@ -37,8 +37,9 @@ no oversubscription collapse.
   a caller-owned `pool`; `SchedulerConfig.resident_cap` removed (the budget governs
   residency). Observability attr `buffer_peak` → `resident_peak`. New exports:
   `Scheduler`, `SchedulerConfig`, `ChunkPool`, `StoredChunkRead`,
-  `build_stored_chunk_reads`. The standalone `MemoryCache`/`DiskCache` are now
-  unused by the engine (the pool subsumes them) — retirement is a follow-up.
+  `build_stored_chunk_reads`. `cache.py` (`ChunkCache`/`MemoryCache`/`DiskCache`)
+  removed — the pool subsumes it; `AsyncChunkReader`'s vestigial `cache=` param is
+  gone too.
 
 ## 0.0.2
 

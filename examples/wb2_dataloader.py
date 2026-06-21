@@ -39,8 +39,6 @@ import numpy as np
 import zarr
 
 from insitubatch import (
-    DiskCache,
-    MemoryCache,
     SplitName,
     ensure_local_dir,
     open_geometries,
@@ -123,12 +121,11 @@ def run_demo(
 
     geom = open_geometries(url, variables=[var], **store_kwargs)[var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
-    if cache == "memory":
-        cache_obj = MemoryCache(8 << 30)
-    elif cache == "disk":
-        cache_obj = DiskCache(tempfile.mkdtemp(prefix="wb2-cache-"), 8 << 30)
-    else:
-        cache_obj = None
+    # Caching is the pool's policy: a large budget retains decoded chunks across
+    # epochs (decode-once); cache_dir spills the slots to NVMe (mmap) vs heap.
+    # "none" leaves the default read-once budget.
+    cache_dir = tempfile.mkdtemp(prefix="wb2-cache-") if cache == "disk" else None
+    cache_budget_bytes = (8 << 30) if cache in ("memory", "disk") else None
 
     ds = InSituDataset(
         url,
@@ -138,7 +135,8 @@ def run_demo(
         batch_size=batch_size,
         block_chunks=block_chunks,
         prefetch_depth=prefetch_depth,
-        cache=cache_obj,
+        cache_dir=cache_dir,
+        cache_budget_bytes=cache_budget_bytes,
         shuffle=shuffle,
         seed=seed,
         to_tensor=False,

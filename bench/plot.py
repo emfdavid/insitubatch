@@ -102,7 +102,7 @@ def build_figures(df: pd.DataFrame) -> dict[str, object]:
 
     # G5 — resident heap by engine. Prefer per-row RssAnon (heap = true pressure):
     # ru_maxrss is a monotonic process-wide high-water and overstates later configs,
-    # and it counts DiskCache's reclaimable mmap'd .npy as if it were heap.
+    # and it counts the cache's reclaimable mmap'd .npy as if it were heap.
     has_anon = "rss_anon_mb" in df.columns and df["rss_anon_mb"].fillna(0).sum() > 0
     mem_col = "rss_anon_mb" if has_anon else "peak_rss_mb"
     label = "heap RssAnon" if has_anon else "peak RSS"

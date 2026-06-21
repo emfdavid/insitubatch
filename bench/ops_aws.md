@@ -21,7 +21,7 @@ reproduce the benchmark paying only their own egress.
 
 ## Variables
 
-* c6id.8xlarge: 32 vCPU / 64 GiB + ~1.9 TB local NVMe (DiskCache)
+* c6id.8xlarge: 32 vCPU / 64 GiB + ~1.9 TB local NVMe (mmap cache spill)
 * bucket names are global; suffix keeps it unique
 ```bash
 export AWS_REGION=us-east-1
@@ -143,7 +143,7 @@ echo "ssh -A ec2-user@$IP"
 export AWS_REGION=us-east-1            # obstore/object_store needs the region
 export BUCKET=insitubatch-bench-808047988126
 
-# --- mount the instance-store NVMe (ephemeral scratch for the DiskCache) ---
+# --- mount the instance-store NVMe (ephemeral scratch for the mmap cache) ---
 lsblk                                  # find the instance store (usually /dev/nvme1n1; root = nvme0n1)
 sudo mkfs -t xfs /dev/nvme1n1
 sudo mkdir -p /mnt/nvme && sudo mount /dev/nvme1n1 /mnt/nvme && sudo chown "$USER" /mnt/nvme
@@ -162,7 +162,7 @@ for spc in 1 2 4 8 16 32; do
     --sample-chunk "$spc" --n-samples 6000 --inner 721,1440
 done
 
-# --- run the suite + render Plotly graphs (DiskCache on the NVMe) ---
+# --- run the suite + render Plotly graphs (mmap cache on the NVMe) ---
 uv run python -m bench --full --url-prefix "s3://$BUCKET/era5" \
   --cache-dir /mnt/nvme/cache
 ```
@@ -201,11 +201,12 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t \
 #        runs for real here) ---
 PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t pytest -q
 
-# --- 2) rerun the V2 probe acceptance GIL-free (owner creds -> no request_payer) ---
+# --- 2) rerun the probe acceptance GIL-free (owner creds -> no request_payer);
+#        --cache-dir adds the cross-epoch cache section (cold vs cached epoch) ---
 PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t \
   python -m bench.probe_decode --url "s3://$BUCKET/era5_fatspatial.zarr" --var t2m \
   --max-chunks 16 --repeats 5 --decode-threads 8 --block-chunks 2 \
-  --max-inflight 8,16,32,64,128 --no-raw
+  --max-inflight 8,16,32,64,128 --no-raw --cache-dir /mnt/nvme/ft-cache
 ```
 
 What to look for: section 1 (`decode_threads` sweep) is where GIL-off could move the
@@ -223,6 +224,29 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t \
   --max-chunks 16 --repeats 3 --block-chunks 2 --max-inflight 32 --no-raw \
   --profile /mnt/nvme/ft-probe.svg
 ```
+
+## 7c. Perf re-confirmation — the merge gate (GIL build)
+
+Two numbers to confirm on the **standard** env (section 7, plain `uv run` — no
+`PYTHON_GIL`), both owner-creds (no `request_payer`):
+
+```bash
+# (1) The decoupling, post-B2: throughput rises to the knee (~mi=32) then flat,
+#     resident PINNED at 4 across the whole sweep. Confirms the 1052 headline held
+#     through the B2 admission rewrite (resident_cap -> byte-budget pin/LRU).
+uv run python -m bench.probe_decode --url "s3://$BUCKET/era5_fatspatial.zarr" --var t2m \
+  --max-chunks 16 --repeats 5 --decode-threads 8 --block-chunks 2 \
+  --max-inflight 8,16,32,64,128 --no-raw
+
+# (2) The cache win (section 1c): epoch 0 cold vs epoch 1 served from the NVMe cache.
+#     On S3 the cached epoch should be a large multiple of cold (no GET, no decode).
+uv run python -m bench.probe_decode --url "s3://$BUCKET/era5_fatspatial.zarr" --var t2m \
+  --max-chunks 16 --repeats 1 --block-chunks 2 --max-inflight 32 --no-raw \
+  --cache-dir /mnt/nvme/probe-cache
+```
+
+Pass criteria: (1) `mi=32` ≈ the v1 peak (~930–1050), throughput flat past the knee,
+`resident=4` at every `max_inflight`; (2) epoch-1 (cached) ≫ epoch-0 (cold).
 
 ## 8 back to local
 ```bash
@@ -270,5 +294,5 @@ aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$IID"
 ## Notes
 - The suite reads each `era5_c<spc>.zarr` once per config; the chunk-size sweep
   (`--full`) and `num_workers`/`compute_ms` sweeps come from `python -m bench`.
-- The DiskCache lives on `/mnt/nvme` (instance store) — fast and ephemeral; the
+- The mmap cache spills to `/mnt/nvme` (instance store) — fast and ephemeral; the
   dataset stays in S3.
