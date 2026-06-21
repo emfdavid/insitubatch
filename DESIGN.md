@@ -239,23 +239,32 @@ re-probe with:
 
 ```
 uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fatspatial.zarr --var t2m \
-  --max-chunks 16 --repeats 5 --decode-threads 8 --block-chunks 2,4 --read-concurrency 16 --no-raw
+  --max-chunks 16 --repeats 5 --decode-threads 8 --block-chunks 2 --max-inflight 8,16,32,64 --no-raw
 ```
+
+Section 1b sweeps `max_inflight` at fixed `block_chunks=2`: V2 passes if throughput
+rises to the network knee and stays *flat* (not falling, as v1's nested caps did
+when oversubscribed) while `resident` stays pinned at `2*block_chunks` independent
+of `max_inflight`.
 
 ### B1 task list
 
-1. **ReadPlan v2** — deduped stored-chunk reads `(outer, inner)` in draw order.
-2. **Scheduler** — one `asyncio.Semaphore(max_inflight)` over fetch+decode(+transform)
-   tasks; prioritize the next block's chunks; scatter into pre-allocated outer arrays
-   (disjoint writes, atomic completion counter). Decode/transform fused in the pool
-   (see the pipeline section); spike `bench/spike_v2_decode.py` has the validated path.
-3. **Heap `ChunkPool`** behind the `ChunkCache` protocol — allocate / scatter /
-   mark-ready / gather / evict; budget = `block_chunks` (read-once); subsumes
-   `ShuffleBlockBuffer`.
-4. **Wire into `source.py` behind a flag** (`scheduler="v1"|"v2"`) so the probe can
-   A/B the two on the same data.
-5. **Validate** — probe parity with v1 on moderate (exp_b) data; hit the exp_c
-   acceptance on fat-spatial. Then B2 (mmap backing + LRU; retire the cache intercept).
+1. ✅ **`build_stored_chunk_reads`** — deduped stored-chunk reads `(outer, inner)` in
+   draw/priority order (`plan.py`).
+2. ✅ **`Scheduler`** — one `asyncio.Semaphore(max_inflight)` over fetch+decode+scatter
+   tasks; chunk-major priority; scatter into pre-allocated outer arrays (disjoint
+   writes, lock-published completion counter). Residency admission is a second
+   semaphore over outer positions. Spike `bench/spike_v2_decode.py` validated the
+   fetch+decode path. (Per-tile transform fusion deferred; transforms run on the
+   assembled chunk — see the pipeline section.)
+3. ✅ **Heap `ChunkPool`** — allocate / scatter / wait_ready / gather / evict / fail;
+   residency window = `2*block_chunks`; subsumes `ShuffleBlockBuffer` (deleted).
+4. ✅ **Wire into `source.py`** — V2 *replaces* v1 (no flag; the recorded exp_b/exp_c
+   baselines are the A/B reference). `AsyncChunkReader` kept as the streaming-reader
+   primitive for `fit_standard_scaler`.
+5. ⏳ **Validate** — local parity green (`test_pool`, `test_scheduler`, `test_source`).
+   Pending: exp_c acceptance on fat-spatial S3 (`probe_decode` rewired, sec 1b sweeps
+   `max_inflight`). Then B2 (mmap backing + LRU; the pool subsumes the cache).
 
 ## Module map
 
@@ -265,12 +274,14 @@ uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fatspatial.zarr --va
 | `plan.py` | `ReadPlan`, `build_read_plan` (samples → deduped reads) |
 | `split.py` | chunk-aligned `SplitManifest`, `split_by_chunk` |
 | `store.py` | `store_from_url` shim (local↔S3 via obstore) + geometry introspection |
-| `io.py` | `AsyncChunkReader` — one event loop, bounded fan-out, real zarr-async reads |
+| `io.py` | `AsyncChunkReader` — one event loop, bounded fan-out, real zarr-async reads. The *streaming-chunk* primitive (used by `fit_standard_scaler`); the training path is the scheduler below |
 | `shuffle.py` | chunk permutation + shuffle-block / sequential order + quality metric |
-| `buffer.py` | `ShuffleBlockBuffer` — residency + coalesced batch gather |
-| `source.py` | `InSituDataset` (IterableDataset) — prefetch producer, last-use eviction, optional torch handoff |
+| `plan.py` | `build_read_plan` (outer-chunk + gather, for the reader) + `build_stored_chunk_reads` (tile reads, for the scheduler) |
+| `scheduler.py` | `Scheduler` — one `max_inflight` budget over stored-chunk reads; fetch→decode→scatter; residency admission |
+| `pool.py` | `ChunkPool` — assembly slots (allocate/scatter/wait_ready/gather/evict); residency window; B2 cache backing |
+| `source.py` | `InSituDataset` (IterableDataset) — prefetch producer over the scheduler+pool, block-granular eviction, optional torch handoff |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
-| `cache.py` | `ChunkCache` protocol + `MemoryCache` (heap) / `DiskCache` (mmap NVMe), byte-LRU of prepped chunks keyed `(array, chunk_index)` |
+| `cache.py` | `ChunkCache` protocol + `MemoryCache` (heap) / `DiskCache` (mmap NVMe), byte-LRU of prepped chunks. Standalone in B1; the pool's backing in B2 |
 
 ## Open questions / spikes
 
@@ -320,12 +331,14 @@ inner-chunk support, and one-block read-ahead so block-boundary IO overlaps comp
 store.
 
 Built so far: planner, chunk-aligned splits, async obstore reads + bounded decode
-pool, shuffle-block buffer + one-block read-ahead, coalesced gather, torch surface,
-**chunk/batch transforms + `StandardScaler` (M-T)**, **prefetch (M1.5)**, **chunk
-cache (M-C)**, runnable examples + a published docs site. **Designed & de-risked:**
-the **V2 decoupled fetch scheduler** (M1.6 — one budget over inner+outer chunks,
-buffer-as-cache; spike validated). **Not yet built:** V2 itself, `Regrid` + the
-GPU/device stage (M2), JAX/TF surfaces (M3).
+pool, coalesced gather, torch surface, **chunk/batch transforms + `StandardScaler`
+(M-T)**, **prefetch (M1.5)**, runnable examples + a published docs site, and the
+**V2 decoupled fetch scheduler (M1.6, B1)** — `Scheduler` + `ChunkPool` are now the
+training engine (one `max_inflight` budget over stored chunks, residency decoupled
+at `2*block_chunks`); the v1 shuffle-block buffer is retired. **Validated locally;
+acceptance pending** the exp_c fat-spatial S3 run. **Not yet built:** B2 (mmap/LRU
+pool backing — the cache then rides the pool, M-C reintroduced there), `Regrid` +
+the GPU/device stage (M2), JAX/TF surfaces (M3).
 
 ## Roadmap / milestones
 
@@ -343,12 +356,15 @@ Perf track (the core thesis):
   the per-block sawtooth disappears (boundary waits 0.1 ms); at *zero* compute the
   loader is IO-throughput-bound and the stall is only smoothed, not removed — that
   is the network ceiling, not a scheduling bug.
-- **M1.6 — decoupled fetch scheduler (V2).** Flatten to stored-chunk granularity
-  with one `max_inflight` budget over inner+outer reads (full design above):
-  decouples read concurrency from residency/shuffle and kills the nested-cap
-  sawtooth. The risky zarr-internals path (fetch encoded bytes → `codec_pipeline`
-  decode → scatter) is **validated** in `bench/spike_v2_decode.py`. Supersedes the
-  one-block look-ahead in `source.py`.
+- **M1.6 — decoupled fetch scheduler (V2). 🔬 B1 implemented; acceptance pending.**
+  Flatten to stored-chunk granularity with one `max_inflight` budget over
+  inner+outer reads (full design above): decouples read concurrency from
+  residency/shuffle and kills the nested-cap sawtooth. `Scheduler` + `ChunkPool`
+  replace `AsyncChunkReader`/`ShuffleBlockBuffer` on the training path; the
+  zarr-internals path (fetch encoded bytes → `codec_pipeline` decode → scatter,
+  first proven in `bench/spike_v2_decode.py`) is the live engine, covered by
+  `test_pool`/`test_scheduler` parity + bound tests. Supersedes the one-block
+  look-ahead in `source.py`. Remaining: exp_c fat-spatial S3 acceptance, then B2.
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 
@@ -360,15 +376,15 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   Scope limits hold: chunk transforms are single-variable/single-chunk;
   cross-variable (e.g. windspeed) is batch-stage and uncached; cross-chunk is not
   v1.
-- **M-C — chunk cache.** ✅ Pluggable byte-bounded LRU of *prepped* chunks
-  (`ChunkCache` protocol): **`MemoryCache`** (heap) and **`DiskCache`** (mmap'd
-  `.npy` on local NVMe — RAM footprint becomes reclaimable page cache, working set
-  stays bounded). Caller-owned, passed via `cache=`; intercepted in
-  `_fetch_and_decode`; a hit skips fetch + decode + transforms. Generalizes the
-  epoch buffer into the dedup→buffer→cache continuum; unlocks multi-epoch /
-  fat-chunk / scoring / HPO reuse. Tests assert decode-once across epochs for both
-  backends. Deferred: cross-*run* index rebuild + content fingerprint, an L1/L2
-  (RAM+NVMe) tier, and cached cross-variable derived variables.
+- **M-C — chunk cache.** 🔬 Byte-bounded LRU of *prepped* chunks (`ChunkCache`
+  protocol): **`MemoryCache`** (heap) and **`DiskCache`** (mmap'd `.npy` on local
+  NVMe — RAM footprint becomes reclaimable page cache, working set stays bounded).
+  The v1 `cache=`/`_fetch_and_decode` *intercept* was retired in V2 B1 (read-once);
+  the classes + unit tests stand. **B2 reintroduces caching as the `ChunkPool`
+  policy** (raise the byte budget, switch to LRU, opt into mmap backing) behind the
+  same `ChunkCache` protocol — caching stops being a separate intercept and becomes
+  "don't evict." Deferred: cross-*run* index rebuild + content fingerprint, an
+  L1/L2 (RAM+NVMe) tier, and cached cross-variable derived variables.
 
 Reach track (broaden + make a splash):
 - **M3 — framework surfaces.** The core `Batch` is numpy; frameworks are thin

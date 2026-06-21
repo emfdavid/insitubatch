@@ -1,21 +1,25 @@
-"""Probe: is the read pipeline network-bound or decode-bound?
+"""Probe: is the read pipeline network-bound or decode-bound, and does V2 decouple?
 
     uv run python -m bench.probe_decode                              # synthetic file://
     uv run python -m bench.probe_decode --url s3://bucket/era5_c8.zarr --var t2m
     uv run python -m bench.probe_decode --url gs://.../era5.zarr --var 2m_temperature --anon
 
-Three measurements over the first ``--max-chunks`` chunks (so it's quick on a 25 GB
-store):
+Measurements over the first ``--max-chunks`` chunks (quick on a 25 GB store):
 
   1. insitu throughput vs ``decode_threads`` (1,2,4,8,auto) — where decode parallelism
      saturates; flat past N cores => decode isn't the limit.
+  1b. **The V2 decoupling headline**: insitu throughput + peak residency vs
+     ``max_inflight``, with ``block_chunks`` fixed small. V2 dials network
+     concurrency with ``max_inflight`` alone; throughput should rise to the network
+     knee and then stay *flat* (not fall, as v1's nested caps did when oversubscribed)
+     while residency stays pinned at ``2*block_chunks`` — independent of concurrency.
   2. raw obstore concurrent GET MB/s vs concurrency (1,4,8,16,32) — pure fetch, no
      decode.
   3. (synthetic only) insitu compressed vs uncompressed — the codec's share.
 
-Diagnosis: if raw GET (2) far exceeds insitu (1), we're decode/loop-limited and the
-decode pool / max_inflight is the lever; if raw GET also caps near insitu, it's the
-network/endpoint (more/bigger parallel streams, in-region S3, the gateway endpoint).
+Diagnosis: if raw GET (2) far exceeds insitu (1/1b), we're decode/loop-limited and
+``max_inflight`` / the decode pool is the lever; if raw GET also caps near insitu,
+it's the network/endpoint (more/bigger parallel streams, in-region S3, the gateway).
 """
 
 from __future__ import annotations
@@ -53,15 +57,20 @@ def _store_kwargs(url: str, anon: bool, request_payer: bool) -> dict:
 
 
 def _stats(fn: Callable[[], float], repeats: int) -> tuple[float, float, float]:
-    """Run ``fn`` ``repeats`` times; return (median, min, max) MB/s. Cloud reads of a
+    """Run ``fn`` ``repeats`` times; return (median, min, max). Cloud reads of a
     small (cold) sample are noisy, so a single number lies -- report the spread."""
     xs = sorted(fn() for _ in range(repeats))
     return statistics.median(xs), xs[0], xs[-1]
 
 
-def _insitu_mb_s(
-    url, var, kw, decode_threads, max_chunks, block_chunks=8, max_inflight=16, read_concurrency=0
-) -> float:
+def _insitu(
+    url, var, kw, *, decode_threads, max_chunks, block_chunks=2, max_inflight=32
+) -> tuple[float, int]:
+    """One insitu pass over the first ``max_chunks`` chunks; (MB/s, peak resident chunks).
+
+    ``block_chunks`` sets the shuffle window / residency; ``max_inflight`` is the
+    single network-concurrency dial (V2 -- no nested ``read_concurrency`` cap).
+    """
     geom = open_geometries(url, variables=[var], **kw)[var]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
@@ -76,8 +85,7 @@ def _insitu_mb_s(
         shuffle=False,
         **kw,
     )
-    ds.io_config.decode_threads = decode_threads  # read by the reader at iteration time
-    ds.io_config.read_concurrency = read_concurrency  # inner fan-out per getitem (0 = zarr default)
+    ds.scheduler_config.decode_threads = decode_threads  # read by the scheduler at iteration time
     bps = int(np.prod(geom.inner_shape)) * 4
     limit = max_chunks * geom.sample_chunk_size
     n = 0
@@ -87,7 +95,7 @@ def _insitu_mb_s(
         if n >= limit:
             break
     dt = time.perf_counter() - t
-    return n * bps / 1e6 / dt
+    return n * bps / 1e6 / dt, ds.resident_peak
 
 
 def _raw_get_mb_s(url, var, kw, concurrency, max_chunks) -> float:
@@ -128,13 +136,13 @@ def main() -> None:
     p.add_argument("--max-chunks", type=int, default=64, help="chunks to probe (bounds the cost)")
     p.add_argument("--repeats", type=int, default=3, help="runs per point; report median (min-max)")
     p.add_argument("--decode-threads", default="1,2,4,8,0", help="sec 1 sweep (0=auto)")
-    p.add_argument("--block-chunks", default="8,16,32,64", help="sec 1b sweep")
     p.add_argument(
-        "--read-concurrency",
+        "--block-chunks",
         type=int,
-        default=0,
-        help="inner fan-out per getitem (0=zarr default 10)",
+        default=2,
+        help="fixed shuffle window / residency for the max_inflight sweep (sec 1b)",
     )
+    p.add_argument("--max-inflight", default="8,16,32,64", help="sec 1b sweep (the V2 dial)")
     p.add_argument("--concurrency", default="1,4,8,16,32", help="sec 2 raw-GET sweep")
     p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
@@ -155,29 +163,36 @@ def main() -> None:
         med, lo, hi = _stats(fn, a.repeats)
         print(f"   {label}: {med:8.1f} MB/s  ({lo:.0f}-{hi:.0f})")
 
-    rc = a.read_concurrency
-    print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, read_conc={rc or 'def'}):")
+    bc = a.block_chunks
+    print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, block_chunks={bc}):")
     for dt in (int(x) for x in a.decode_threads.split(",")):
         show(
             f"decode_threads={dt or 'auto':>4}",
-            partial(_insitu_mb_s, a.url, a.var, kw, dt, a.max_chunks, read_concurrency=rc),
+            lambda dt=dt: _insitu(
+                a.url, a.var, kw, decode_threads=dt, max_chunks=a.max_chunks, block_chunks=bc
+            )[0],
         )
 
-    print(f"\n1b) insitu MB/s vs read concurrency bc=mi (decode auto, read_conc={rc or 'def'}):")
-    for bc in (int(x) for x in a.block_chunks.split(",")):
-        show(
-            f"block_chunks={bc:>2}",
-            partial(
-                _insitu_mb_s,
+    print(f"\n1b) insitu MB/s + peak residency vs max_inflight (block_chunks={bc}, decode auto):")
+    print("    V2 wants throughput flat (not falling) past the knee, residency pinned.")
+    for mi in (int(x) for x in a.max_inflight.split(",")):
+        xs = sorted(
+            _insitu(
                 a.url,
                 a.var,
                 kw,
-                0,
-                a.max_chunks,
+                decode_threads=0,
+                max_chunks=a.max_chunks,
                 block_chunks=bc,
-                max_inflight=bc,
-                read_concurrency=rc,
-            ),
+                max_inflight=mi,
+            )
+            for _ in range(a.repeats)
+        )
+        med = statistics.median(x[0] for x in xs)
+        resident = xs[0][1]  # deterministic across repeats
+        print(
+            f"   max_inflight={mi:>4}: {med:8.1f} MB/s  ({xs[0][0]:.0f}-{xs[-1][0]:.0f})"
+            f"  resident={resident} chunks"
         )
 
     if not a.no_raw:
@@ -195,9 +210,12 @@ def main() -> None:
             variables=["t2m"],
             compress=False,
         )
-        print("\n3) codec cost (synthetic, auto vs uncompressed, auto decode_threads):")
+        print("\n3) codec cost (synthetic, compressed vs uncompressed, auto decode_threads):")
         for label, u in (("compressed", a.url), ("uncompressed", none_url)):
-            show(f"{label:12}", partial(_insitu_mb_s, u, "t2m", {}, 0, a.max_chunks))
+            show(
+                f"{label:12}",
+                lambda u=u: _insitu(u, "t2m", {}, decode_threads=0, max_chunks=a.max_chunks)[0],
+            )
 
 
 if __name__ == "__main__":
