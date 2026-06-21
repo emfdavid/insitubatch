@@ -90,7 +90,7 @@ def run_suite(
     results: list[Result] = []
     # Total configs, so the progress line can show [i/total] + ETA on long S3 runs.
     total = len(urls) * sum(
-        1  # cache axis is B2; B1 insitu is read-once (cache=none only)
+        1  # cache is a pool budget, not a suite axis -> insitu runs cache=none here
         * (len(block_chunks_sweep) if e == "insitu" else 1)
         * (len(worker_sweep) if e in _DATALOADER_ENGINES else 1)
         * len(compute_ms_sweep)
@@ -106,7 +106,7 @@ def run_suite(
         )
 
     # block_chunks (shuffle window / residency) is an insitu-only axis; read concurrency
-    # is now max_inflight. Cache is B2 (ChunkPool LRU), so B1 runs cache=none only.
+    # is max_inflight. Caching is the pool's byte budget, not a suite axis -> cache=none.
     for spc, url in urls.items():
         for engine in engines:
             engine_caches = ("none",)
@@ -190,7 +190,7 @@ def main() -> None:
     p.add_argument(
         "--warmup-batches", type=int, default=32, help="throwaway read to warm S3 (0=off)"
     )
-    p.add_argument("--cache-dir", default=None, help="DiskCache scratch dir (point at NVMe)")
+    p.add_argument("--cache-dir", default=None, help="mmap cache scratch dir (point at NVMe)")
     p.add_argument("--request-payer", action="store_true")
     p.add_argument("--plot", action="store_true", help="render Plotly graphs after the run")
     p.add_argument("--fig-dir", default="bench/figures")

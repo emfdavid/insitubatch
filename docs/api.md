@@ -19,20 +19,20 @@ package, plus `InSituDataset` (the torch source) from `insitubatch.source`.
         - Batch
         - ChunkRead
         - DecodedChunk
+        - StoredChunkRead
         - build_read_plan
+        - build_stored_chunk_reads
         - dedup_ratio
         - ReadPlan
         - block_shuffled_order
         - sequential_order
         - chunk_permutation
         - shuffle_quality
-        - ShuffleBlockBuffer
-        - BufferConfig
+        - Scheduler
+        - SchedulerConfig
+        - ChunkPool
         - AsyncChunkReader
         - IOConfig
-        - ChunkCache
-        - MemoryCache
-        - DiskCache
         - StandardScaler
         - fit_standard_scaler
         - ChunkTransform

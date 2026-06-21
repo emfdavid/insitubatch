@@ -41,7 +41,7 @@ import numpy as np
 import obstore
 import zarr
 
-from insitubatch import SplitName, open_geometries, split_by_chunk
+from insitubatch import SplitManifest, SplitName, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.store import store_from_url
 
@@ -100,6 +100,53 @@ def _insitu(
     return n * bps / 1e6 / dt, ds.resident_peak
 
 
+def _insitu_cache(url, var, kw, *, max_chunks, block_chunks, cache_dir) -> tuple[float, float]:
+    """Two epochs over the first ``max_chunks`` chunks with a budget that holds them
+    all; returns (cold MB/s, warm MB/s). The manifest is restricted to exactly those
+    chunks so read-ahead can't LRU-evict the early ones before epoch 1 -- which is
+    then served entirely from the cache (no S3, no decode). ``cache_dir`` spills the
+    slots to NVMe (mmap); pass it to keep heap bounded on fat data.
+    """
+    geom = open_geometries(url, variables=[var], **kw)[var]
+    full = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    train = full.chunks[SplitName.TRAIN.value][:max_chunks]
+    manifest = SplitManifest(
+        n_chunks=full.n_chunks,
+        sample_chunk_size=full.sample_chunk_size,
+        n_samples=full.n_samples,
+        chunks={"train": train, "val": [], "test": []},
+        seed=full.seed,
+    )
+    outer_nbytes = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
+    budget = (len(train) + 2) * outer_nbytes  # hold every probed chunk + a margin
+    ds = InSituDataset(
+        url,
+        manifest,
+        geometries={var: geom},
+        split=SplitName.TRAIN,
+        batch_size=16,
+        block_chunks=block_chunks,
+        to_tensor=False,
+        shuffle=False,
+        cache_dir=cache_dir,
+        cache_budget_bytes=budget,
+        **kw,
+    )
+    bps = int(np.prod(geom.inner_shape)) * 4
+
+    def epoch_mb(epoch: int) -> float:
+        ds.set_epoch(epoch)
+        n = 0
+        t = time.perf_counter()
+        for b in ds:
+            n += b.arrays[var].shape[0]
+        return n * bps / 1e6 / (time.perf_counter() - t)
+
+    cold, warm = epoch_mb(0), epoch_mb(1)
+    ds.close()
+    return cold, warm
+
+
 def _raw_get_mb_s(url, var, kw, concurrency, max_chunks) -> float:
     """Fetch raw (still-encoded) chunk objects via obstore — no decode.
 
@@ -155,6 +202,11 @@ def main() -> None:
         "(default probe-profile.svg; .json => speedscope). Needs ptrace_scope=0 "
         "or sudo; see bench/_profile.py.",
     )
+    p.add_argument(
+        "--cache-dir",
+        default=None,
+        help="run the cross-epoch cache test (sec 1c): cold vs cached epoch, mmap slots here",
+    )
     p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
@@ -207,6 +259,14 @@ def main() -> None:
                 f"   max_inflight={mi:>4}: {med:8.1f} MB/s  ({xs[0][0]:.0f}-{xs[-1][0]:.0f})"
                 f"  resident={resident} chunks"
             )
+
+    if a.cache_dir:
+        print(f"\n1c) cross-epoch cache ({a.max_chunks} chunks, budget holds all, mmap):")
+        cold, warm = _insitu_cache(
+            a.url, a.var, kw, max_chunks=a.max_chunks, block_chunks=bc, cache_dir=a.cache_dir
+        )
+        print(f"   epoch 0 (cold):   {cold:8.1f} MB/s")
+        print(f"   epoch 1 (cached): {warm:8.1f} MB/s   ({warm / cold:.1f}x cold)")
 
     if not a.no_raw:
         print("\n2) raw obstore concurrent GET MB/s (no decode):")

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .cache import ChunkCache, DiskCache, MemoryCache
 from .io import AsyncChunkReader, IOConfig
 from .plan import ReadPlan, build_read_plan, build_stored_chunk_reads, dedup_ratio
 from .pool import ChunkPool
@@ -46,14 +45,11 @@ __all__ = [
     "AsyncChunkReader",
     "Batch",
     "BatchTransform",
-    "ChunkCache",
     "ChunkPool",
     "ChunkRead",
     "ChunkTransform",
     "DecodedChunk",
-    "DiskCache",
     "IOConfig",
-    "MemoryCache",
     "ReadPlan",
     "Scheduler",
     "SchedulerConfig",

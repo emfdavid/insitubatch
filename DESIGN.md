@@ -183,8 +183,8 @@ spatially or shrink `sample_chunk`). See [docs/tuning.md](docs/tuning.md).
 ### The buffer is the cache (ChunkPool)
 
 Once V2 manages the slots itself, the assembly buffer **is** a pool of prepped
-(decoded + chunk-transformed) chunks — exactly what `ChunkCache` stores. So
-`ShuffleBlockBuffer`, `MemoryCache`, and `DiskCache` collapse into one **`ChunkPool`**
+(decoded + chunk-transformed) chunks — exactly what a chunk cache stores. So
+the shuffle-block buffer and the chunk cache collapse into one **`ChunkPool`**
 parameterized by:
 
 - **backing** — heap (numpy) *or* mmap'd `.npy` on NVMe; the scatter writes straight
@@ -217,9 +217,8 @@ Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
   cross-epoch decode-once reuse (the scheduler skips fetch+decode+transform on a
   still-resident chunk). The pool is dataset-owned (persists across epochs); B1's
   `resident_cap` admission unified into the budget (consumer `unpin` replaces
-  `evict`, eviction is unpinned-LRU). Remaining: retire the now-unused standalone
-  `MemoryCache`/`DiskCache`, and cross-*run* persistence (stable content key + index
-  rebuild on reopen).
+  `evict`, eviction is unpinned-LRU). Remaining: cross-*run* persistence (stable
+  content key + index rebuild on reopen).
 
 Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurrency
 — v1 (concurrency = `block_chunks`) rises in both; V2 (`block_chunks` fixed small,
@@ -300,10 +299,9 @@ from the 1052 peak is benign oversubscription, not a sawtooth; the sweet spot is
 | `shuffle.py` | chunk permutation + shuffle-block / sequential order + quality metric |
 | `plan.py` | `build_read_plan` (outer-chunk + gather, for the reader) + `build_stored_chunk_reads` (tile reads, for the scheduler) |
 | `scheduler.py` | `Scheduler` — one `max_inflight` budget over stored-chunk reads; fetch→decode→scatter; residency admission |
-| `pool.py` | `ChunkPool` — the assembly buffer *and* the cache: byte budget + pin/unpin + LRU, heap or mmap backing (try_admit/scatter/wait_ready/gather/unpin) |
+| `pool.py` | `ChunkPool` — the assembly buffer *and* the cache: byte budget + pin/unpin + LRU, heap or mmap'd-`.npy` backing (try_admit/scatter/wait_ready/gather/unpin) |
 | `source.py` | `InSituDataset` (IterableDataset) — prefetch producer over the scheduler+pool, block-granular eviction, optional torch handoff |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
-| `cache.py` | `ChunkCache` protocol + `MemoryCache` / `DiskCache` (byte-LRU of prepped chunks). **Superseded by the `ChunkPool` budget/LRU in B2 — now unused by the engine, pending retirement** |
 
 ## Open questions / spikes
 
@@ -370,9 +368,8 @@ at `2*block_chunks`); the v1 shuffle-block buffer is retired. **Acceptance passe
 on fat-spatial S3: 1052 MB/s at `max_inflight=32` (beats the 930 v1 peak) with
 residency flat across the concurrency sweep. **B2 done** — the `ChunkPool` is now
 the cache too (byte budget + pin/unpin + LRU, heap or mmap backing; cross-epoch
-decode-once reuse via `cache_dir`/`cache_budget_bytes`). **Not yet built:** retire
-the now-unused standalone `MemoryCache`/`DiskCache` + cross-*run* persistence,
-`Regrid` + the GPU/device stage (M2), JAX/TF surfaces (M3).
+decode-once reuse via `cache_dir`/`cache_budget_bytes`). **Not yet built:** cross-*run*
+persistence, `Regrid` + the GPU/device stage (M2), JAX/TF surfaces (M3).
 
 ## Roadmap / milestones
 
@@ -416,9 +413,9 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   bounded working set). Raise `cache_budget_bytes` past the working set and drained
   chunks are retained for cross-epoch **decode-once** reuse (the scheduler skips
   fetch+decode+transform on a hit); `cache_dir` spills to NVMe. The v1 `cache=`
-  intercept and the standalone `MemoryCache`/`DiskCache` are superseded — caching
-  stopped being a separate intercept and became "don't evict." Deferred: retire the
-  dead cache classes, cross-*run* index rebuild + content fingerprint, an L1/L2
+  intercept and the standalone cache classes were retired — caching is no longer a
+  separate intercept, it became "don't evict." Deferred: cross-*run* index rebuild +
+  content fingerprint, an L1/L2
   (RAM+NVMe) tier, and cached cross-variable derived variables.
 
 Reach track (broaden + make a splash):
