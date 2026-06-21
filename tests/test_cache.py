@@ -1,20 +1,17 @@
-"""Caches: byte-LRU (memory + disk) and cross-epoch reuse of prepped chunks."""
+"""Caches: byte-bounded LRU of prepped chunks (memory + disk).
+
+These are standalone unit tests of the cache classes. In B1 the V2 scheduler ships
+cache-off (read-once); dataset-level cross-epoch reuse returns in B2, where the
+ChunkPool subsumes these backings behind the same ``ChunkCache`` protocol -- so the
+classes (and this coverage) stay live, but the InSituDataset ``cache=`` intercept
+is gone for now.
+"""
 
 from __future__ import annotations
 
-import collections
-
 import numpy as np
-import pytest
 
-from insitubatch import (
-    DiskCache,
-    MemoryCache,
-    SplitName,
-    open_geometries,
-    split_by_chunk,
-)
-from insitubatch.source import InSituDataset
+from insitubatch import DiskCache, MemoryCache
 from insitubatch.types import ChunkRead, DecodedChunk
 
 
@@ -73,47 +70,3 @@ def test_disk_cache_byte_lru_unlinks(tmp_path) -> None:
     assert c.get("t2m", 1) is None
     assert len(c) == 2
     assert len(list(d.glob("*.npy"))) == 2  # evicted file actually unlinked
-
-
-# -- cross-epoch reuse through InSituDataset (memory + disk) ----------------
-
-
-@pytest.mark.parametrize("kind", ["memory", "disk"])
-def test_cache_reuses_prepped_chunks_across_epochs(write_zarr, tmp_path, kind) -> None:
-    url, _ = write_zarr(n=160, spc=8)
-    geom = open_geometries(url)["t2m"]
-    manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
-    cache = MemoryCache(10_000_000) if kind == "memory" else DiskCache(tmp_path / "c", 10_000_000)
-
-    transformed: collections.Counter[int] = collections.Counter()
-
-    def count(chunk: DecodedChunk) -> DecodedChunk:
-        transformed[chunk.read.chunk_index] += 1
-        return chunk
-
-    ds = InSituDataset(
-        url,
-        manifest,
-        split=SplitName.TRAIN,
-        batch_size=4,
-        block_chunks=4,
-        cache=cache,
-        to_tensor=False,
-        chunk_transforms=[count],
-    )
-    for epoch in range(2):
-        ds.set_epoch(epoch)
-        for _ in ds:
-            pass
-
-    assert set(transformed) == set(manifest.chunks[SplitName.TRAIN.value])
-    assert all(v == 1 for v in transformed.values()), dict(transformed)  # decoded once
-    assert cache.hits > 0
-
-
-def test_no_cache_by_default(write_zarr) -> None:
-    url, _ = write_zarr(n=80, spc=8)
-    geom = open_geometries(url)["t2m"]
-    manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
-    ds = InSituDataset(url, manifest, split=SplitName.TRAIN, to_tensor=False)
-    assert ds.cache is None

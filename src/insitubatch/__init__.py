@@ -10,10 +10,13 @@ See DESIGN.md for the full rationale.
 
 from __future__ import annotations
 
-from .buffer import BufferConfig, ShuffleBlockBuffer
+from importlib.metadata import PackageNotFoundError, version
+
 from .cache import ChunkCache, DiskCache, MemoryCache
 from .io import AsyncChunkReader, IOConfig
-from .plan import ReadPlan, build_read_plan, dedup_ratio
+from .plan import ReadPlan, build_read_plan, build_stored_chunk_reads, dedup_ratio
+from .pool import ChunkPool
+from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import (
     block_shuffled_order,
     chunk_permutation,
@@ -28,17 +31,23 @@ from .transforms import (
     StandardScaler,
     fit_standard_scaler,
 )
-from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk, SplitName
+from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk, SplitName, StoredChunkRead
 
-__version__ = "0.0.1"
+# Single source of truth is pyproject.toml -> installed dist metadata; never a
+# second hardcoded string to drift. Fallback covers running from a source tree
+# with no install (rare in this uv-managed repo, but keeps import non-fatal).
+try:
+    __version__ = version("insitubatch")
+except PackageNotFoundError:  # pragma: no cover - uninstalled source tree
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "ArrayGeometry",
     "AsyncChunkReader",
     "Batch",
     "BatchTransform",
-    "BufferConfig",
     "ChunkCache",
+    "ChunkPool",
     "ChunkRead",
     "ChunkTransform",
     "DecodedChunk",
@@ -46,12 +55,15 @@ __all__ = [
     "IOConfig",
     "MemoryCache",
     "ReadPlan",
-    "ShuffleBlockBuffer",
+    "Scheduler",
+    "SchedulerConfig",
     "SplitManifest",
     "SplitName",
     "StandardScaler",
+    "StoredChunkRead",
     "block_shuffled_order",
     "build_read_plan",
+    "build_stored_chunk_reads",
     "chunk_permutation",
     "dedup_ratio",
     "ensure_local_dir",
