@@ -153,6 +153,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh && source "$HOME/.bashrc"
 sudo yum install git
 git clone git@github.com:emfdavid/insitubatch.git && cd insitubatch
 uv sync --extra torch --extra bench
+uv run pytest -q                       # sanity-check the install before the long run
 
 # --- generate the chunk-size family (owner creds -> no request_payer needed) ---
 # (n, 721, 1440) f4 ~= 4.15 MB/sample; n=6000 ~= 25 GB per chunking, ~150 GB total.
@@ -172,6 +173,55 @@ uv run python -m bench --full --url-prefix "s3://$BUCKET/era5" \
 scp ec2-user@$IP:/home/ec2-user/insitubatch/bench/results/suite.jsonl bench/results/exp_a.jsonl
 
 
+```
+
+## 7b. Free-threaded (3.13t) — tests + probe acceptance, GIL off
+
+Validates the V2 scheduler under genuine GIL-free execution and re-measures the
+probe with the GIL disabled. **The catch:** `numcodecs` has no free-threaded wheel
+yet, so it *compiles from sdist* on 3.13t → the box needs a C/C++ toolchain (AL2023
+ships none by default). And on import it *re-enables the GIL* (not yet declared
+GIL-safe), so we force it off with `PYTHON_GIL=0` and assert that it took.
+
+```bash
+# --- toolchain for the numcodecs sdist build (the bit AL2023 lacks) ---
+sudo dnf install -y gcc gcc-c++          # or: sudo dnf groupinstall -y "Development Tools"
+
+# --- a SEPARATE env so the 3.12 .venv stays intact. torch/bench have no FT wheels
+#     yet, so this is core-deps-only (the torch tests skip via importorskip). ---
+uv python install 3.13t
+export FT_ENV="$HOME/insitu-ft"          # survives stop/start (NVMe /mnt is wiped)
+UV_PROJECT_ENVIRONMENT="$FT_ENV" uv sync --python 3.13t
+
+# --- prove the GIL is actually off (else everything below is a GIL-on no-op) ---
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t \
+  python -c "import sys, zarr, numcodecs; assert not sys._is_gil_enabled(); print('GIL-free OK')"
+
+# --- 1) run the suite GIL-free on the box (the pool's concurrent-scatter race test
+#        runs for real here) ---
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t pytest -q
+
+# --- 2) rerun the V2 probe acceptance GIL-free (owner creds -> no request_payer) ---
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t \
+  python -m bench.probe_decode --url "s3://$BUCKET/era5_fatspatial.zarr" --var t2m \
+  --max-chunks 16 --repeats 5 --decode-threads 8 --block-chunks 2 \
+  --max-inflight 8,16,32,64,128 --no-raw
+```
+
+What to look for: section 1 (`decode_threads` sweep) is where GIL-off could move the
+needle — if decode was GIL-serialized, the high-thread number should rise vs the
+GIL build. Section 1b should still show throughput flat + `resident` pinned at 4.
+The full multi-engine `python -m bench` suite can **not** run here (its
+workers/xbatcher engines need torch, which has no FT wheel) — only the core probe.
+
+Optional, to profile GIL-free with `probe_decode --profile` (py-spy `--native`
+self-attaches via ptrace, blocked by the default `ptrace_scope=1`):
+```bash
+sudo sysctl kernel.yama.ptrace_scope=0
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv run --python 3.13t \
+  python -m bench.probe_decode --url "s3://$BUCKET/era5_fatspatial.zarr" --var t2m \
+  --max-chunks 16 --repeats 3 --block-chunks 2 --max-inflight 32 --no-raw \
+  --profile /mnt/nvme/ft-probe.svg
 ```
 
 ## 8 back to local
