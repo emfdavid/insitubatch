@@ -34,15 +34,23 @@ So the GIL build is just the serialized (slower) case; free threading is upside.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import re
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk
 
 ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
+
+
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
 @dataclass(slots=True)
@@ -72,9 +80,18 @@ class ChunkPool:
         geometries: dict[str, ArrayGeometry],
         *,
         chunk_transforms: Sequence[ChunkTransform] = (),
+        backing_dir: str | Path | None = None,
     ) -> None:
         self._geom = geometries
         self._chunk_transforms = tuple(chunk_transforms)
+        # backing: heap (np.empty) or mmap'd .npy under backing_dir (point at NVMe).
+        # The scatter writes straight into the slot either way; mmap keeps the
+        # working set as reclaimable page cache rather than anon heap, and is the
+        # substrate the B2 cache spills to. Default heap (mmap is NVMe write traffic
+        # even for read-once -- DESIGN caveat).
+        self._dir = Path(backing_dir) if backing_dir is not None else None
+        if self._dir is not None:
+            self._dir.mkdir(parents=True, exist_ok=True)
         self._slots: dict[tuple[str, int], _Slot] = {}
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
@@ -106,10 +123,18 @@ class ChunkPool:
             if key in self._slots:
                 return
             self._slots[key] = _Slot(
-                data=np.empty(geom.slot_shape(chunk_index), dtype=geom.dtype),
+                data=self._alloc(array, chunk_index, geom.slot_shape(chunk_index), geom.dtype),
                 remaining=geom.n_inner_chunks(chunk_index),
             )
             self.max_resident = max(self.max_resident, len(self._positions()))
+
+    def _alloc(
+        self, array: str, chunk_index: int, shape: tuple[int, ...], dtype: np.dtype
+    ) -> np.ndarray:
+        if self._dir is None:
+            return np.empty(shape, dtype=dtype)
+        path = self._dir / f"{_safe(array)}__{chunk_index}.npy"
+        return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
 
     def scatter(
         self, array: str, chunk_index: int, inner_coord: tuple[int, ...], tile: np.ndarray
@@ -135,9 +160,27 @@ class ChunkPool:
         # Sole owner now: assemble-stage transforms on the whole outer chunk.
         prepped = self._apply_transforms(array, chunk_index, slot.data)
         with self._cv:
-            slot.data = prepped
+            slot.data = self._persist(slot.data, prepped)
             slot.ready = True
             self._cv.notify_all()
+
+    def _persist(self, current: np.ndarray, prepped: np.ndarray) -> np.ndarray:
+        """Land the prepped (post-transform) array in the slot's backing.
+
+        No transform (``prepped is current``) is a no-op -- the scatter already
+        wrote the slot. With a transform, heap just holds the new array; mmap writes
+        it back into the slot's file so the cached chunk stays on NVMe (a shape-
+        changing transform like regrid would need a re-sized memmap -- deferred).
+        """
+        if prepped is current or self._dir is None:
+            return prepped
+        if prepped.shape != current.shape:
+            raise NotImplementedError(
+                "mmap backing with a reshaping chunk_transform (e.g. regrid) is not "
+                "supported yet; use heap backing for that path."
+            )
+        current[:] = prepped  # write the transformed result into the memmap
+        return current
 
     def fail(self, array: str, chunk_index: int, error: BaseException) -> None:
         """Mark a slot failed so a waiting consumer re-raises instead of hanging.
@@ -228,9 +271,29 @@ class ChunkPool:
         regardless of how many variables share it.
         """
         with self._cv:
-            drop = [k for k in self._slots if k[1] in chunk_ids]
-            for k in drop:
-                del self._slots[k]
-            if drop:
+            drop_keys = [k for k in self._slots if k[1] in chunk_ids]
+            dropped = {cid for _array, cid in drop_keys}
+            for k in drop_keys:
+                self._free(self._slots.pop(k))
+            if drop_keys:
                 self._cv.notify_all()
-            return len({cid for _array, cid in drop})
+            return len(dropped)
+
+    def _free(self, slot: _Slot) -> None:
+        """Release a slot's backing: a no-op for heap, flush+close+unlink for mmap.
+
+        Read-once evicts the file (the B2 cache will instead retain it under LRU).
+        """
+        mmap = getattr(slot.data, "_mmap", None)
+        if mmap is not None:
+            fname = getattr(slot.data, "filename", None)
+            mmap.close()
+            if fname:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(fname)
+
+    def close(self) -> None:
+        """Free every remaining slot (mmap files included) -- e.g. on early exit."""
+        with self._cv:
+            for k in list(self._slots):
+                self._free(self._slots.pop(k))
