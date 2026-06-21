@@ -85,35 +85,45 @@ both on the public WeatherBench2 ERA5.
 flowchart TB
     SRC[("cloud zarr · gs:// / s3://")]:::cloud
     subgraph PLAN["planner — per epoch"]
-        PERM["chunk permutation + shuffle-block order"] --> RP["read plan:<br/>samples → DEDUPED chunk reads"]
+        PERM["chunk permutation + shuffle-block order"] --> RP["read plan:<br/>samples → deduped STORED-chunk (tile) reads"]
     end
-    subgraph LOOP["single async event loop · one thread"]
-        PROD["prefetch producer<br/>looks ahead d batches"] --> SEM["bounded fan-out · max_inflight"]
-        SEM --> OBS["obstore get_ranges_async"]
+    subgraph LOOP["scheduler · single async event loop · one thread"]
+        PROD["prefetch producer<br/>looks ahead d batches"] --> SEM["one budget · max_inflight tiles"]
+        SEM --> SKIP{"pool already<br/>holds it?"}
+        SKIP -->|"hit"| POOL
+        SKIP -->|"miss"| OBS["obstore get (stored chunk)"]
         OBS --> DEC["decode · GIL released"]
-        DEC --> CT["chunk_transform<br/>(vectorized)"]
+        DEC --> CT["chunk_transform (vectorized)"]
+        CT --> SCAT["scatter tile → outer-chunk slot"]
     end
-    CT --> CACHE["chunk cache<br/>RAM → NVMe (optional)"]
-    CACHE --> BUF["shuffle-block buffer<br/>bounded residency"]
-    BUF --> GTH["gather + batch_transform"]
+    SCAT --> POOL["ChunkPool — byte budget + pin/LRU<br/>buffer AND cache · heap or mmap NVMe"]
+    POOL --> GTH["gather + batch_transform"]
     GTH --> PQ["prefetch queue · depth d"]
     PQ --> GPU[("device + device_transform<br/>→ model step")]
-    SRC -->|"each chunk read ONCE"| OBS
+    SRC -->|"each stored chunk read ONCE"| OBS
     RP --> PROD
     GPU -.->|"pulls"| PQ
     PROD -.->|"refills ahead of consumption"| PQ
     classDef cloud fill:#cfe8ff,stroke:#379a4a;
 ```
 
-*Target pipeline.* Built today: planner, bounded fan-out, obstore reads, decode,
-chunk/batch transforms (M-T), chunk cache (M-C), buffer, gather, prefetch overlap
-(M1.5), torch surface. Planned: `Regrid` + `device_transform` (M2/M3).
+The unit of work is the **stored chunk** (an `(outer, inner)` tile), and one
+`max_inflight` budget spans every fetch — so read concurrency is one dial, with no
+nested inner/outer caps. Each decoded tile is scattered into its outer chunk's slot
+in the **ChunkPool**, which is the assembly buffer *and* the cache in one: a byte
+budget with pin/unpin + LRU, backed by heap or an mmap'd `.npy` on NVMe. Before
+fetching, the scheduler asks the pool whether it already holds a chunk — a hit
+(cross-epoch, since the pool persists) skips fetch + decode + transform entirely.
 
-Properties: parallelism in the loop (not processes); each chunk read once and
-amortized across every sample that touches it; residency bounded by
-`max(max_inflight, block_chunks)` chunks + the prefetch queue (depth `d`) + the
-cache budget — every term a tunable cap, none scaling with batch size or epoch
-length.
+*Built today:* planner, the scheduler + ChunkPool (cache included), chunk/batch
+transforms, prefetch overlap, the torch surface. *Planned:* `Regrid` +
+`device_transform`.
+
+Properties: parallelism in the loop (not processes); each stored chunk read once
+and amortized across every sample that touches it; **read concurrency
+(`max_inflight`) and residency (the pool's byte budget) are independent dials**;
+total memory is the budget + the prefetch queue (depth `d`) + the in-flight tiles —
+every term a tunable cap, none scaling with batch size or epoch length.
 
 ## Prefetch
 
@@ -121,12 +131,10 @@ length.
 assembles batches ahead of the consumer:
 
 - ✅ **Intra-batch concurrency** — a batch's missing chunks are fetched
-  concurrently via the async loop (`read_plan` fan-out under `max_inflight`). This
-  is what won the ~2.8× on the GRIB regime locally.
-- ✅ **Inter-batch overlap (M1.5)** — the producer assembles batches
-  N+1..N+`depth` while the caller works on batch N; the consumer just drains a
-  bounded queue. (A pre-M1.5 demand-driven loop left the event loop idle during
-  the compute step.)
+  concurrently via the async loop (stored-chunk fan-out under `max_inflight`).
+- ✅ **Inter-batch overlap** — the producer assembles batches N+1..N+`depth`
+  while the caller works on batch N; the consumer just drains a bounded queue. (A
+  demand-driven loop would leave the event loop idle during the compute step.)
 
 ### Design (producer/consumer pipeline)
 
@@ -141,21 +149,22 @@ flowchart LR
     Q -.->|"full ⇒ producer blocks<br/>(backpressure)"| ASM
 ```
 
-- **Producer** walks the draw order one shuffle-block ahead: a read-ahead thread
-  fetches block N+1's chunks while the consumer drains block N, then assembles
-  batches as chunks land and pushes them to a bounded `queue.Queue(maxsize=d)`.
+- **Producer** starts the scheduler over the epoch's chunks, then per shuffle-block
+  waits the block assembled, gathers its batches, and unpins it, pushing batches to
+  a bounded `queue.Queue(maxsize=d)`.
 - **Consumer** (`__iter__`) just pops finished batches → the train/infer step
   overlaps with IO+decode+assembly of the next `d` batches.
-- **Backpressure / memory bound** — queue depth `d` + buffer `block_chunks` cap
-  residency; a full queue pauses scheduling.
-- **Granularity (v1.5: one block ahead)** — IO is prefetched a whole shuffle-block
-  ahead, so block-boundary reads overlap the current block's compute. (At zero
-  per-batch compute the loader is IO-throughput-bound, so the boundary is only
-  smoothed, not removed — the network ceiling, not a scheduling gap.) A decoupled
-  scheduler that keeps many chunk reads continuously in flight is V2 (DESIGN.md M1.6).
+- **Backpressure / memory bound** — queue depth `d` + the pool's byte budget cap
+  residency; a full queue pauses the consumer, a full budget pauses admission.
+- **Continuous fetch** — the scheduler keeps `max_inflight` tiles in flight across
+  block boundaries, and the budget (sized to ~two blocks) lets it admit the next
+  block while the current one drains, so block-boundary IO overlaps compute. (At
+  zero per-batch compute the loader is IO-throughput-bound, so the boundary is only
+  smoothed, not removed — the network ceiling, not a scheduling gap.)
 - **Lifecycle** — early consumer exit sets a stop flag and drains the queue so a
-  producer parked on a full `put` can exit before the reader is closed.
-- **Knobs:** `prefetch_depth` (queue depth `d`), `max_inflight`, `block_chunks`.
+  producer parked on a full `put` can exit before the scheduler is closed.
+- **Knobs:** `prefetch_depth` (queue depth `d`), `max_inflight`, `block_chunks`,
+  `cache_budget_bytes`.
 
 Same shape as `torchdata.nodes.Prefetcher`, but async-native. This is what turns a
 throughput win into a *GPU-fed* win.
@@ -255,88 +264,61 @@ class Regrid:
 
 ## The caching continuum
 
-**The cache boundary IS the chunk-transform boundary.** The read plan keys every
-chunk as `(array, chunk_index)`, and `chunk_transforms` are deterministic and
-applied before shuffle — so the cache stores the **decoded + scaled + regridded**
-array, and a hit skips fetch *and* decode *and* normalize *and* regrid (not just
-bytes). One localized interception at the existing keyed boundary:
+**The cache boundary IS the chunk-transform boundary.** Every chunk is keyed
+`(array, chunk_index)`, and `chunk_transforms` are deterministic and applied before
+shuffle — so what's worth keeping is the **decoded + scaled + regridded** array, and
+a hit skips fetch *and* decode *and* normalize *and* regrid (not just bytes).
+`batch_transforms` (per-sample / random, post-shuffle) run after and are never
+cached. So `chunk_transforms` are exactly the deterministic prefix safe to persist.
 
-```python
-async def _fetch_and_decode(self, read: ChunkRead) -> DecodedChunk:
-    key = (read.array, read.chunk_index, self._pipeline_fingerprint)
-    hit = self._cache.get(key)
-    if hit is not None:
-        return hit                          # skips fetch + decode + scale + regrid
-    chunk = await self._raw_fetch_decode(read)
-    for t in self._chunk_transforms:        # deterministic, pre-shuffle
-        chunk = t(chunk)
-    self._cache.put(key, chunk)             # store the PREPPED chunk
-    return chunk
-```
+Dedup → buffer → cache is **one continuum** — and in the engine it is literally one
+object, the `ChunkPool`, parameterized by a byte budget:
 
-`batch_transforms` (per-sample / random, post-shuffle) are applied *after*
-retrieval and never cached. The three-stage split and the cache are the same idea
-seen twice: **chunk_transforms are exactly the deterministic prefix safe to
-persist.** The `fingerprint` invalidates the cache when stats or the transform
-list change.
-
-Dedup → buffer → cache is **one continuum**, all keyed `(array, chunk_index)`, all
-storing post-chunk-transform arrays:
-
-| layer | reuse scope | backing |
+| layer | reuse scope | how |
 |---|---|---|
-| read-plan dedup | within a request | — |
-| shuffle-block buffer | within an epoch | RAM (bounded) |
-| chunk cache | across epochs (+ runs via DiskCache) | `MemoryCache` (heap) or `DiskCache` (mmap NVMe), byte-LRU |
+| read-plan dedup | within a request | a chunk's tiles are fetched once, scattered into one slot |
+| assembly buffer | within an epoch | a small budget (the working set, ~2 blocks) |
+| cache | across epochs | a large budget retains drained chunks |
 
-The within-epoch buffer evicts by **last use** — a chunk is dropped only once no
-later batch in the epoch needs it — so each chunk is read and decoded **once per
-epoch even with the cache off** (a naive per-batch eviction would re-read chunks
-whose samples are scattered across a shuffle block).
+A chunk is **pinned** while the current epoch needs it; once its shuffle-block is
+drained it becomes **unpinned** — LRU-evictable but not dropped. The pool drops
+unpinned chunks only under budget pressure (evicting LRU to admit a miss). With a
+small budget that is prompt — the read-once buffer, where each chunk is still
+read+decoded **once per epoch** (a naive per-batch eviction would re-read chunks
+whose samples scatter across a shuffle block). Raise the budget past the working set
+and drained chunks linger, so a still-resident prepped chunk is a cross-epoch hit:
+the same machinery becomes the cache by *"don't evict."*
 
-The within-epoch buffer is the epoch-scoped special case; the cache generalizes it
-with a byte-bounded LRU. It is **pluggable** (`ChunkCache` protocol):
-`MemoryCache` (heap — fastest hit, but spends the RAM we bound) or `DiskCache`
-(mmap'd `.npy` on local NVMe — the RAM footprint becomes reclaimable kernel page
-cache, the cache is bounded on disk by bytes, and the working set stays bounded).
-Caching the *prepped* representation is strictly stronger than MSC's raw-byte NVMe
-cache for an ML pipeline. Default is no cache — pass an instance to enable.
+Backing is **heap or mmap** (`cache_dir` → mmap'd `.npy` on local NVMe): the scatter
+writes straight into the slot either way, so a hit needs no copy out of a separate
+cache. mmap makes the footprint reclaimable kernel page cache, bounded on disk by
+bytes, so the working set stays bounded. Caching the *prepped* representation is
+strictly stronger than a raw-byte NVMe cache for an ML pipeline. The default budget
+is the working set (read-once); raise `cache_budget_bytes` to cache.
 
 **Heavy-reuse tasks unlocked:** multi-epoch training (epoch 0 warms it); the
-fat-chunk regime (one chunk → many batches); scoring/verification (reference
-chunks reused across metrics, lead times, models); HPO/sweeps (disk tier amortizes
-prepped chunks across *runs*); datasets that fit in RAM/NVMe (effectively
-in-memory at GPU-fed speed after the first pass).
+fat-chunk regime (one chunk → many batches); scoring/verification (reference chunks
+reused across metrics, lead times, models); datasets that fit in RAM/NVMe
+(effectively in-memory at GPU-fed speed after the first pass).
 
-### Persistent (NVMe) tier — `DiskCache`
+### Cross-run persistence (deferred)
 
-**Built (v1):** one mmap'd `.npy` per prepped chunk on local NVMe, byte-bounded
-LRU (evict = `unlink`), in-process index → multi-epoch reuse with a reclaimable
-RAM footprint. **Remaining** for full cross-*run* reuse + the GDS path:
+Intra-run cross-epoch reuse is intrinsic (just don't evict). Surviving process exit
+needs more:
 
-- **The key needs a fingerprint.** RAM keys on `(array, chunk_index)` because one
-  cache instance == one fixed pipeline. A cross-run key must add a fingerprint of
-  (a) source identity (store URL + array + chunk version/etag) and (b) the
-  chunk-transform pipeline (stats + transform list), so changed data *or*
-  transforms invalidate. Fingerprinting arbitrary callables is the hard part —
-  require transforms to expose a stable `version` / config hash (e.g. hash the
-  `StandardScaler` stats).
-- **Two levels are worth considering.** A *raw-decoded* disk tier keyed by source
-  identity only (decode = the expensive cloud + decompress step) beneath the
-  *prepped* RAM tier. Transform experimentation then reuses decoded chunks without
-  a fingerprint, recomputing only the cheap transforms.
-- **Cross-run index (done within a run; future across runs).** The index is
-  in-process today; a dir scan on init (parse `(array, chunk)` + size) would
-  recover entries written by earlier runs.
-- **On-disk format (done):** one mmap'd `.npy` per chunk; near zero-copy read,
-  aligns with kvikio/GDS NVMe→GPU in M2. A packed store (lmdb/zarr) would cut
-  per-file overhead later.
-- **Two-tier eviction.** RAM LRU (chunk count) backed by NVMe (byte budget); a RAM
-  miss checks disk → `mmap`-load → promote.
-- **Concurrency.** Cross-process reuse needs atomic writes / immutable files +
-  light locking; readers `mmap` immutable entries.
-- **GDS synergy.** A persistent NVMe tier of prepped chunks is the natural feed
-  for the Phase-2 kvikio/GDS NVMe→GPU path — ties M-C's disk tier to M2.
+- **A content key.** Within a run the key is `(array, chunk_index)` because one pool
+  == one fixed pipeline. A cross-run key must add a fingerprint of (a) source
+  identity (store URL + array + chunk version/etag) and (b) the chunk-transform
+  pipeline (stats + transform list), so changed data *or* transforms invalidate.
+  Require transforms to expose a stable `version` / config hash.
+- **Index rebuild on reopen.** The slot files persist; a dir scan on init (parse
+  `(array, chunk)` + size) recovers entries written by earlier runs.
+- **A raw-decoded tier** keyed by source identity only (decode being the expensive
+  cloud + decompress step), beneath the prepped tier, would let transform
+  experimentation reuse decoded chunks without a fingerprint.
+- **GDS synergy.** A persistent NVMe tier of prepped `.npy` chunks is the natural
+  feed for the kvikio/GDS NVMe→GPU path; cross-process reuse then needs atomic
+  writes / immutable files + light locking.
 
 ## Earth2Studio integration
 

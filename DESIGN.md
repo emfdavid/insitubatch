@@ -209,11 +209,17 @@ Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
 
 ### Phasing
 
-- **B1** — V2 scheduler + a **heap `ChunkPool`** subsuming `ShuffleBlockBuffer`
-  (cache off, read-once). Lands the throughput/memory decoupling first.
-- **B2** — add mmap backing + LRU; the pool subsumes `MemoryCache`/`DiskCache` and
-  the separate `ChunkCache` intercept retires. Keep the `ChunkCache` *protocol* as
-  the pool's backing-store interface so the migration is mechanical.
+- **B1 ✅** — V2 scheduler + a **heap `ChunkPool`** subsuming `ShuffleBlockBuffer`
+  (cache off, read-once). Landed the throughput/memory decoupling first.
+- **B2 ✅** — `ChunkPool` gains a **byte budget + pin/unpin + LRU** and an optional
+  **mmap backing** (`open_memmap` direct-scatter). One machinery: a small budget is
+  read-once; a large budget (`cache_budget_bytes`) retains drained chunks for
+  cross-epoch decode-once reuse (the scheduler skips fetch+decode+transform on a
+  still-resident chunk). The pool is dataset-owned (persists across epochs); B1's
+  `resident_cap` admission unified into the budget (consumer `unpin` replaces
+  `evict`, eviction is unpinned-LRU). Remaining: retire the now-unused standalone
+  `MemoryCache`/`DiskCache`, and cross-*run* persistence (stable content key + index
+  rebuild on reopen).
 
 Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurrency
 — v1 (concurrency = `block_chunks`) rises in both; V2 (`block_chunks` fixed small,
@@ -294,10 +300,10 @@ from the 1052 peak is benign oversubscription, not a sawtooth; the sweet spot is
 | `shuffle.py` | chunk permutation + shuffle-block / sequential order + quality metric |
 | `plan.py` | `build_read_plan` (outer-chunk + gather, for the reader) + `build_stored_chunk_reads` (tile reads, for the scheduler) |
 | `scheduler.py` | `Scheduler` — one `max_inflight` budget over stored-chunk reads; fetch→decode→scatter; residency admission |
-| `pool.py` | `ChunkPool` — assembly slots (allocate/scatter/wait_ready/gather/evict); residency window; B2 cache backing |
+| `pool.py` | `ChunkPool` — the assembly buffer *and* the cache: byte budget + pin/unpin + LRU, heap or mmap backing (try_admit/scatter/wait_ready/gather/unpin) |
 | `source.py` | `InSituDataset` (IterableDataset) — prefetch producer over the scheduler+pool, block-granular eviction, optional torch handoff |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler`, `fit_standard_scaler` (Regrid + device stage: follow-up) |
-| `cache.py` | `ChunkCache` protocol + `MemoryCache` (heap) / `DiskCache` (mmap NVMe), byte-LRU of prepped chunks. Standalone in B1; the pool's backing in B2 |
+| `cache.py` | `ChunkCache` protocol + `MemoryCache` / `DiskCache` (byte-LRU of prepped chunks). **Superseded by the `ChunkPool` budget/LRU in B2 — now unused by the engine, pending retirement** |
 
 ## Open questions / spikes
 
@@ -362,9 +368,11 @@ pool, coalesced gather, torch surface, **chunk/batch transforms + `StandardScale
 training engine (one `max_inflight` budget over stored chunks, residency decoupled
 at `2*block_chunks`); the v1 shuffle-block buffer is retired. **Acceptance passed**
 on fat-spatial S3: 1052 MB/s at `max_inflight=32` (beats the 930 v1 peak) with
-residency flat across the concurrency sweep. **Not yet built:** B2 (mmap/LRU
-pool backing — the cache then rides the pool, M-C reintroduced there), `Regrid` +
-the GPU/device stage (M2), JAX/TF surfaces (M3).
+residency flat across the concurrency sweep. **B2 done** — the `ChunkPool` is now
+the cache too (byte budget + pin/unpin + LRU, heap or mmap backing; cross-epoch
+decode-once reuse via `cache_dir`/`cache_budget_bytes`). **Not yet built:** retire
+the now-unused standalone `MemoryCache`/`DiskCache` + cross-*run* persistence,
+`Regrid` + the GPU/device stage (M2), JAX/TF surfaces (M3).
 
 ## Roadmap / milestones
 
@@ -403,15 +411,15 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   Scope limits hold: chunk transforms are single-variable/single-chunk;
   cross-variable (e.g. windspeed) is batch-stage and uncached; cross-chunk is not
   v1.
-- **M-C — chunk cache.** 🔬 Byte-bounded LRU of *prepped* chunks (`ChunkCache`
-  protocol): **`MemoryCache`** (heap) and **`DiskCache`** (mmap'd `.npy` on local
-  NVMe — RAM footprint becomes reclaimable page cache, working set stays bounded).
-  The v1 `cache=`/`_fetch_and_decode` *intercept* was retired in V2 B1 (read-once);
-  the classes + unit tests stand. **B2 reintroduces caching as the `ChunkPool`
-  policy** (raise the byte budget, switch to LRU, opt into mmap backing) behind the
-  same `ChunkCache` protocol — caching stops being a separate intercept and becomes
-  "don't evict." Deferred: cross-*run* index rebuild + content fingerprint, an
-  L1/L2 (RAM+NVMe) tier, and cached cross-variable derived variables.
+- **M-C — chunk cache.** ✅ Caching **is** the `ChunkPool` policy (B2): a byte
+  budget + pin/unpin + LRU, with heap or mmap'd-`.npy` backing (NVMe page cache,
+  bounded working set). Raise `cache_budget_bytes` past the working set and drained
+  chunks are retained for cross-epoch **decode-once** reuse (the scheduler skips
+  fetch+decode+transform on a hit); `cache_dir` spills to NVMe. The v1 `cache=`
+  intercept and the standalone `MemoryCache`/`DiskCache` are superseded — caching
+  stopped being a separate intercept and became "don't evict." Deferred: retire the
+  dead cache classes, cross-*run* index rebuild + content fingerprint, an L1/L2
+  (RAM+NVMe) tier, and cached cross-variable derived variables.
 
 Reach track (broaden + make a splash):
 - **M3 — framework surfaces.** The core `Batch` is numpy; frameworks are thin

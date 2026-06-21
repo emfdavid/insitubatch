@@ -10,12 +10,12 @@ the recommended configuration is::
 ``num_workers=0`` because forking workers would re-introduce exactly the
 redundant-read / nested-parallelism problems we set out to avoid.
 
-The engine is the decoupled fetch scheduler (DESIGN.md, M1.6): one event loop
-streams stored-chunk reads under a single ``max_inflight`` budget and scatters
-decoded tiles into a :class:`ChunkPool`; this producer walks the shuffle order,
-waits on each block's assembled chunks, gathers coalesced batches, and evicts the
-block to free residency. Read concurrency (``max_inflight``) and shuffle span /
-residency (``block_chunks``) are independent dials.
+The engine is the fetch scheduler: one event loop streams stored-chunk reads under
+a single ``max_inflight`` budget and scatters decoded tiles into a
+:class:`ChunkPool`. This producer walks the shuffle order, waits on each block's
+assembled chunks, gathers coalesced batches, and unpins the block (making it
+LRU-evictable / retainable for reuse). Read concurrency (``max_inflight``) and the
+residency budget are independent dials. See [docs/architecture.md] for the pipeline.
 
 torch (and torchdata.nodes) are optional imports so the core engine stays
 framework-agnostic and importable on a box without torch installed.
@@ -31,15 +31,16 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .pool import ChunkPool
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest
 from .store import open_geometries
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName
 
-# Default for the single concurrency dial when the caller does not pin it. Unlike
-# v1 (where read concurrency followed block_chunks), max_inflight is independent
-# of the shuffle window -- it is sized to saturate the network, not the buffer.
+# Default for the single concurrency dial when the caller does not pin it.
+# max_inflight is independent of the shuffle window -- sized to saturate the
+# network, not the buffer.
 DEFAULT_MAX_INFLIGHT = 32
 
 # Optional torch surface. TYPE_CHECKING gives mypy a consistent view (the real
@@ -105,6 +106,8 @@ class InSituDataset(IterableDataset):
         to_tensor: bool = True,
         shuffle: bool = True,
         prefetch_depth: int = 2,
+        cache_dir: str | None = None,
+        cache_budget_bytes: int | None = None,
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: Any,
@@ -118,14 +121,14 @@ class InSituDataset(IterableDataset):
         self.split = split
         self.variables = list(self.geometries)
 
-        # v1 invariant: variables must share the sample axis (length + chunk size).
-        # The draw order and gather use a single chunk size for all variables.
+        # Variables must share the sample axis (length + chunk size): the draw order
+        # and gather use a single chunk size for all variables.
         spcs = {g.sample_chunk_size for g in self.geometries.values()}
         lengths = {g.n_samples for g in self.geometries.values()}
         if len(spcs) > 1 or len(lengths) > 1:
             raise ValueError(
                 "All variables must share the same sample-axis length and chunk "
-                f"size (v1 invariant); got sample_chunk_size={sorted(spcs)}, "
+                f"size; got sample_chunk_size={sorted(spcs)}, "
                 f"n_samples={sorted(lengths)}."
             )
 
@@ -138,19 +141,31 @@ class InSituDataset(IterableDataset):
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
-        self.resident_peak = 0  # peak resident outer chunks last epoch (observability)
+        self.resident_peak = 0  # peak resident outer chunks (observability)
 
-        # One concurrency dial (max_inflight, network) decoupled from the shuffle
-        # window (block_chunks). resident_cap = 2*block_chunks holds the current
-        # block plus one read-ahead block, so block-boundary IO overlaps compute
-        # (matching the v1 baseline residency in DESIGN's exp_c table). The invariant
-        # resident_cap >= block_chunks is required: a batch may draw across a whole
-        # block, so the block must be co-resident to gather. Exposed so the probe can
-        # tune decode_threads at iteration time.
-        self.scheduler_config = SchedulerConfig(
-            max_inflight=max_inflight or DEFAULT_MAX_INFLIGHT,
-            resident_cap=2 * block_chunks,
+        # The pool is the assembly buffer AND the cache, owned here so it persists
+        # across epochs. The byte budget is the single residency knob: the floor is
+        # the working set -- the current block plus one read-ahead block, all
+        # variables, must be co-resident (a batch draws across a whole block) -- and
+        # a larger budget (cache_budget_bytes) retains drained chunks for cross-epoch
+        # decode-once reuse. cache_dir spills slots to NVMe (mmap) instead of heap.
+        per_chunk_all_vars = sum(
+            g.sample_chunk_size * int(np.prod(g.inner_shape)) * g.dtype.itemsize
+            for g in self.geometries.values()
         )
+        working_set = 2 * block_chunks * int(per_chunk_all_vars)
+        self.cache_budget_bytes = max(int(cache_budget_bytes or 0), working_set)
+        self._pool = ChunkPool(
+            self.geometries,
+            chunk_transforms=self.chunk_transforms,
+            backing_dir=cache_dir,
+            budget_bytes=self.cache_budget_bytes,
+        )
+
+        # One concurrency dial (max_inflight, network), independent of the shuffle
+        # window (block_chunks) and the cache budget. Exposed so the probe can tune
+        # decode_threads at iteration time.
+        self.scheduler_config = SchedulerConfig(max_inflight=max_inflight or DEFAULT_MAX_INFLIGHT)
 
     def set_epoch(self, epoch: int) -> None:
         """Call from the training loop so each epoch reshuffles deterministically."""
@@ -178,12 +193,13 @@ class InSituDataset(IterableDataset):
 
         A producer thread starts the scheduler over the epoch's chunks (in draw
         order), then for each shuffle-block waits the block assembled, gathers its
-        batches, and evicts it; this consumer pops from a bounded queue (depth
+        batches, and unpins it; this consumer pops from a bounded queue (depth
         ``prefetch_depth``) that provides backpressure and inter-batch overlap.
 
-        The scheduler keeps ``max_inflight`` tiles continuously in flight and (via
-        ``resident_cap``) fetches one block ahead, so block-boundary IO overlaps
-        the current block's per-batch compute instead of stalling.
+        The scheduler keeps ``max_inflight`` tiles continuously in flight and, while
+        the cache budget has room, fetches one block ahead, so block-boundary IO
+        overlaps the current block's per-batch compute instead of stalling. Chunks
+        skipped because the pool already holds them (cross-epoch hits) cost no fetch.
         """
         geom = self.geometries[self.variables[0]]
         spc = geom.sample_chunk_size
@@ -213,7 +229,9 @@ class InSituDataset(IterableDataset):
                         for transform in self.batch_transforms:
                             batch = transform(batch)
                         out_q.put(batch)  # blocks when full -> backpressure
-                    sched.evict(set(block))  # frees residency for the next read-ahead
+                    # Release the block: now LRU-evictable (retained for reuse if the
+                    # budget allows), and unblocks admission of the next read-ahead.
+                    sched.unpin(set(block))
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
                 out_q.put(exc)
             finally:
@@ -222,8 +240,8 @@ class InSituDataset(IterableDataset):
         with Scheduler(
             self.store_url,
             self.geometries,
+            self._pool,
             self.scheduler_config,
-            chunk_transforms=self.chunk_transforms,
             **self.store_kwargs,
         ) as sched:
             producer = threading.Thread(
@@ -254,3 +272,15 @@ class InSituDataset(IterableDataset):
         import torch
 
         return {k: torch.from_numpy(v) for k, v in batch.arrays.items()}
+
+    def close(self) -> None:
+        """Release the cache pool's backing (mmap files, cached chunks).
+
+        The pool persists across epochs, so close it when done training -- not per
+        epoch. Idempotent; also called on GC.
+        """
+        self._pool.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):  # best-effort on GC
+            self._pool.close()

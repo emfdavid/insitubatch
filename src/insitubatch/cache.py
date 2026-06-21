@@ -104,7 +104,7 @@ def _safe(name: str) -> str:
 class DiskCache:
     """LRU of mmap'd ``.npy`` files (point ``cache_dir`` at local NVMe).
 
-    v1 keeps an in-process index, so reuse is within a process (multi-epoch). A
+    This implementation keeps an in-process index, so reuse is within a process. A
     dir scan on init for cross-*run* reuse + a content fingerprint in the key are
     a small follow-up (see docs/architecture.md). Linux/POSIX assumed: evicting a
     file still referenced by an open mmap unlinks it but keeps it readable until

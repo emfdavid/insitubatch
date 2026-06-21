@@ -129,8 +129,8 @@ def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
 
 
 def test_residency_is_bounded_by_block(write_zarr) -> None:
-    # Block-granular eviction holds the current block plus one read-ahead block
-    # (resident_cap = 2*block_chunks), independent of epoch length -- NOT the whole
+    # The default (no cache) budget = the working set: the current block plus one
+    # read-ahead block (2*block_chunks), independent of epoch length -- NOT the whole
     # split. The lower bound is one block: a batch may draw across a whole block,
     # so the block must be co-resident to gather.
     url, _ = write_zarr(n=160, spc=4)  # 40 chunks
@@ -150,3 +150,43 @@ def test_residency_is_bounded_by_block(write_zarr) -> None:
     for _ in ds:
         pass
     assert block_chunks <= ds.resident_peak <= 2 * block_chunks  # ~two blocks, not all 40
+
+
+@pytest.mark.parametrize("kind", ["heap", "mmap"])
+def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
+    # A cache budget large enough to hold the whole split -> every chunk is decoded
+    # + transformed exactly ONCE across two epochs; epoch 2 is served from the pool
+    # (cross-epoch reuse, the B2 win). Both backings: heap and mmap'd-on-NVMe.
+    url, _ = write_zarr(n=160, spc=8)  # 20 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+
+    transformed: collections.Counter[int] = collections.Counter()
+
+    def count(chunk):  # runs once per outer chunk, on the miss (decode) path
+        transformed[chunk.read.chunk_index] += 1
+        return chunk
+
+    ds = InSituDataset(
+        url,
+        manifest,
+        split=SplitName.TRAIN,
+        batch_size=4,
+        block_chunks=4,
+        shuffle=True,
+        seed=0,
+        to_tensor=False,
+        chunk_transforms=[count],
+        cache_dir=str(tmp_path / "cache") if kind == "mmap" else None,
+        cache_budget_bytes=10_000_000,  # >> the 20-chunk split -> nothing evicted
+    )
+    try:
+        for epoch in range(2):
+            ds.set_epoch(epoch)
+            for _ in ds:
+                pass
+    finally:
+        ds.close()
+
+    assert set(transformed) == set(manifest.chunks[SplitName.TRAIN.value])
+    assert all(v == 1 for v in transformed.values()), dict(transformed)  # once, not twice

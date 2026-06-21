@@ -92,7 +92,7 @@ def test_pool_scatter_reconstructs_array(tiled_store, var):
 
     pool = ChunkPool(geoms)
     for cid in range(geom.n_chunks):
-        pool.allocate(var, cid)
+        pool.try_admit(var, cid)
 
     # Scatter every tile from a thread pool: two tiles of one slot land at once,
     # so this exercises the disjoint-lock-free-copy / lock-published-ready rule.
@@ -128,9 +128,9 @@ def test_pool_concurrent_scatter_is_race_free() -> None:
     ref = np.random.default_rng(0).standard_normal((4, 64, 64)).astype("f4")
     coords = list(geom.inner_coords())
 
-    for _round in range(8):  # repeated alloc -> concurrent scatter -> gather -> evict
+    for _round in range(8):  # repeated admit -> concurrent scatter -> gather (fresh pool)
         pool = ChunkPool(geoms)
-        pool.allocate("v", 0)
+        pool.try_admit("v", 0)
 
         def scatter(ic, pool=pool, geom=geom, ref=ref) -> None:  # default-bind per round
             dst, _src = geom.tile_placement(0, ic)
@@ -143,13 +143,12 @@ def test_pool_concurrent_scatter_is_race_free() -> None:
         rows = np.array([[0, w] for w in range(4)], dtype=np.int64)
         got = pool.gather(rows, ["v"], geom.sample_chunk_size).arrays["v"]
         assert np.array_equal(got, ref)
-        pool.evict({0})
 
 
 @pytest.mark.parametrize("var", list(LAYOUTS))
 def test_pool_mmap_backing_parity_and_cleanup(tiled_store, tmp_path, var):
     """mmap-backed slots reconstruct == arr[:], live as files on disk, and the
-    files are freed on evict (read-once)."""
+    files are freed on close()."""
     url, srcs = tiled_store
     geoms = open_geometries(url, variables=[var])
     geom = geoms[var]
@@ -158,7 +157,7 @@ def test_pool_mmap_backing_parity_and_cleanup(tiled_store, tmp_path, var):
 
     pool = ChunkPool(geoms, backing_dir=backing)
     for cid in range(geom.n_chunks):
-        pool.allocate(var, cid)
+        pool.try_admit(var, cid)
         for inner in geom.inner_coords():
             pool.scatter(var, cid, inner, tiles[(cid, *inner)])
 
@@ -171,8 +170,8 @@ def test_pool_mmap_backing_parity_and_cleanup(tiled_store, tmp_path, var):
         got = pool.gather(rows, [var], spc).arrays[var]
         assert np.array_equal(got, srcs[var][cid * spc : cid * spc + n0])
 
-    pool.evict(set(range(geom.n_chunks)))
-    assert not list(backing.glob("*.npy")), "evict must unlink the slot files"
+    pool.close()
+    assert not list(backing.glob("*.npy")), "close() must unlink the slot files"
 
 
 def test_pool_mmap_backing_with_transform(tiled_store, tmp_path):
@@ -187,7 +186,7 @@ def test_pool_mmap_backing_with_transform(tiled_store, tmp_path):
         return chunk
 
     pool = ChunkPool(geoms, backing_dir=tmp_path / "s", chunk_transforms=[scale])
-    pool.allocate("single_inner", 0)
+    pool.try_admit("single_inner", 0)
     for inner in geom.inner_coords():
         pool.scatter("single_inner", 0, inner, tiles[(0, *inner)])
     pool.wait_ready("single_inner", 0)
@@ -203,23 +202,42 @@ def test_pool_wait_ready_raises_on_failure(tiled_store):
     url, _ = tiled_store
     geoms = open_geometries(url, variables=["spatial"])
     pool = ChunkPool(geoms)
-    pool.allocate("spatial", 0)
+    pool.try_admit("spatial", 0)
     pool.fail("spatial", 0, RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
         pool.wait_ready("spatial", 0)
 
 
-def test_pool_evict_frees_residency(tiled_store):
+def test_pool_lru_evicts_unpinned_under_budget(tiled_store):
+    """Admission evicts unpinned-LRU to make room; pinned chunks are never dropped,
+    and a still-resident chunk is retained (the cross-epoch-reuse mechanic)."""
     url, srcs = tiled_store
     geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
-    pool = ChunkPool(geoms)
-    for cid in range(geoms["single_inner"].n_chunks):
-        pool.allocate("single_inner", cid)
-        for inner in geoms["single_inner"].inner_coords():
+    spc = geom.sample_chunk_size
+    full_nbytes = spc * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
+    pool = ChunkPool(geoms, budget_bytes=2 * full_nbytes)  # holds two full chunks
+
+    def fill(cid):
+        assert pool.try_admit("single_inner", cid)
+        for inner in geom.inner_coords():
             pool.scatter("single_inner", cid, inner, tiles[(cid, *inner)])
-    resident = pool.resident_chunks
-    assert resident == geoms["single_inner"].n_chunks
-    dropped = pool.evict({0, 1})
-    assert dropped == 2
-    assert pool.resident_chunks == resident - 2
+        pool.wait_ready("single_inner", cid)
+
+    fill(0)
+    fill(1)
+    assert pool.resident_chunks == 2
+    # Budget full of *pinned* slots -> a third miss can't be admitted yet.
+    assert not pool.try_admit("single_inner", 2)
+    pool.unpin({0, 1})  # release -> now LRU-evictable (0 is LRU)
+    assert pool.try_admit("single_inner", 2)  # evicts chunk 0
+    for inner in geom.inner_coords():
+        pool.scatter("single_inner", 2, inner, tiles[(2, *inner)])
+    pool.wait_ready("single_inner", 2)
+
+    assert not pool.is_ready("single_inner", 0)  # LRU victim, gone
+    assert pool.is_ready("single_inner", 1)  # retained
+    rows = np.array([[1, w] for w in range(spc)], dtype=np.int64)
+    kept = pool.gather(rows, ["single_inner"], spc).arrays["single_inner"]
+    np.testing.assert_array_equal(kept, srcs["single_inner"][spc : 2 * spc])

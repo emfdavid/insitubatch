@@ -15,6 +15,7 @@ import pytest
 import zarr
 
 from insitubatch import ensure_local_dir, open_geometries, store_from_url
+from insitubatch.pool import ChunkPool
 from insitubatch.scheduler import Scheduler, SchedulerConfig
 from insitubatch.types import ArrayGeometry
 
@@ -36,8 +37,13 @@ def tiled_store(tmp_path):
     return url, srcs
 
 
-def _drain_in_order(sched: Scheduler, geom: ArrayGeometry, var: str, *, evict: bool) -> np.ndarray:
-    """Consumer stand-in: wait+gather every outer chunk in order, optionally evicting."""
+def _make(url, geoms, *, max_inflight=4, budget=None, **store_kwargs) -> Scheduler:
+    pool = ChunkPool(geoms, budget_bytes=budget)
+    return Scheduler(url, geoms, pool, SchedulerConfig(max_inflight=max_inflight), **store_kwargs)
+
+
+def _drain_in_order(sched: Scheduler, geom: ArrayGeometry, var: str, *, unpin: bool) -> np.ndarray:
+    """Consumer stand-in: wait+gather every outer chunk in order, optionally unpinning."""
     spc = geom.sample_chunk_size
     out = []
     for cid in range(geom.n_chunks):
@@ -45,26 +51,29 @@ def _drain_in_order(sched: Scheduler, geom: ArrayGeometry, var: str, *, evict: b
         n0 = len(geom.samples_in_chunk(cid))
         rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
         out.append(sched.pool.gather(rows, [var], spc).arrays[var])
-        if evict:
-            sched.evict({cid})
+        if unpin:
+            sched.unpin({cid})
     return np.concatenate(out, axis=0)
 
 
 @pytest.mark.parametrize("var", list(LAYOUTS))
-@pytest.mark.parametrize("resident_cap", [0, 2])  # unbounded, then bounded+evict
-def test_scheduler_fills_pool_matches_array(tiled_store, var, resident_cap):
+@pytest.mark.parametrize("bounded", [False, True])  # unbounded, then a 2-chunk budget
+def test_scheduler_fills_pool_matches_array(tiled_store, var, bounded):
     url, srcs = tiled_store
     geoms = open_geometries(url, variables=[var])
     geom = geoms[var]
-    cfg = SchedulerConfig(max_inflight=4, resident_cap=resident_cap)
+    budget = None
+    if bounded:
+        full = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
+        budget = 2 * full  # holds two full chunks; admission must evict to fit the 3rd
 
-    with Scheduler(url, geoms, cfg) as sched:
+    with _make(url, geoms, budget=budget) as sched:
         fut = sched.start(range(geom.n_chunks))
-        got = _drain_in_order(sched, geom, var, evict=resident_cap > 0)
+        got = _drain_in_order(sched, geom, var, unpin=bounded)
         fut.result(timeout=30)  # surface any driver error
-        assert sched.inflight_peak <= cfg.max_inflight  # the single budget holds
-        if resident_cap:
-            assert sched.pool.max_resident <= resident_cap  # admission bounded residency
+        assert sched.inflight_peak <= 4  # the single max_inflight budget holds
+        if bounded:
+            assert sched.pool.max_resident <= 2  # the byte budget bounds residency
 
     assert np.array_equal(got, srcs[var])
 
@@ -73,12 +82,11 @@ def test_scheduler_inflight_saturates_to_budget(tiled_store):
     """With many tiles and a small budget, in-flight peaks at exactly max_inflight."""
     url, _ = tiled_store
     geoms = open_geometries(url, variables=["spatial"])  # 3 chunks x 6 tiles = 18 reads
-    cfg = SchedulerConfig(max_inflight=4, resident_cap=0)
-    with Scheduler(url, geoms, cfg) as sched:
+    with _make(url, geoms, max_inflight=4) as sched:
         fut = sched.start(range(geoms["spatial"].n_chunks))
-        _drain_in_order(sched, geoms["spatial"], "spatial", evict=False)
+        _drain_in_order(sched, geoms["spatial"], "spatial", unpin=False)
         fut.result(timeout=30)
-        assert sched.inflight_peak == cfg.max_inflight
+        assert sched.inflight_peak == 4
 
 
 def test_scheduler_close_closes_the_loop(tiled_store):
@@ -91,7 +99,7 @@ def test_scheduler_close_closes_the_loop(tiled_store):
     """
     url, _ = tiled_store
     geoms = open_geometries(url, variables=["single_inner"])
-    sched = Scheduler(url, geoms)
+    sched = _make(url, geoms)
     sched.start(range(geoms["single_inner"].n_chunks))
     sched.close()
     assert sched._loop.is_closed()
@@ -101,7 +109,7 @@ def test_scheduler_poisons_pool_on_driver_failure(tiled_store):
     """A variable absent from the store fails array-open; the pool poison unblocks waiters."""
     url, _ = tiled_store
     ghost = ArrayGeometry(name="ghost", shape=(4, 2, 2), chunks=(2, 2, 2), dtype=np.dtype("f4"))
-    with Scheduler(url, {"ghost": ghost}) as sched:
+    with _make(url, {"ghost": ghost}) as sched:
         fut = sched.start([0, 1])
         with pytest.raises(Exception):  # noqa: B017 - zarr surfaces a store-specific error type
             fut.result(timeout=30)
