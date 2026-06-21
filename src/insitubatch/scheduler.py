@@ -1,36 +1,39 @@
-"""Scheduler: the decoupled fetch driver (DESIGN.md, M1.6).
+"""Scheduler: the fetch driver.
 
 One asyncio event loop streams *stored-chunk* (tile) reads under a single
 ``max_inflight`` budget, decodes each tile off the loop (numcodecs C, GIL
 released), and scatters it into its outer chunk's slot in a :class:`ChunkPool`.
-This is the inversion that breaks v1's coupling: read concurrency is dialed by
-``max_inflight`` alone, while residency/shuffle span is dialed by the pool's
-``resident_cap`` -- separately, with no nested concurrency caps and no inner/outer
-double-quantization.
+
+The point is that the two things you tune are independent: **read concurrency** is
+dialed by ``max_inflight`` alone, while **residency / shuffle span** is governed by
+the pool's byte budget -- no nested inner/outer concurrency caps, no double
+quantization of the fetch (reading one outer chunk per ``getitem`` and letting zarr
+stitch the inner grid under a second cap is what couples them). See
+[docs/architecture.md] for the full pipeline.
 
 Two bounded resources, deliberately distinct:
 
-* **``max_inflight``** (an ``asyncio.Semaphore``) -- tiles in flight; a slot is
-  held from fetch-start to scatter-done, spanning fetch + decode + scatter.
-* **``resident_cap``** (an ``asyncio.Semaphore`` over *outer positions*) -- how
-  many outer chunks may be resident in the pool at once. The admission loop
-  acquires one unit the first time it sees an outer chunk and allocates that
-  chunk's slots; the consumer releases it (cross-thread, via the loop) when it
-  evicts the drained chunk. Because the loop *blocks* on this acquire once the cap
-  is full, the number of outstanding fetch tasks is bounded by the resident
-  window -- not by the epoch length.
+* **in-flight** (``max_inflight``, an ``asyncio.Semaphore``) -- tiles in flight; a
+  slot is held from fetch-start to scatter-done, spanning fetch + decode + scatter.
+* **residency** (the pool's byte budget) -- admission (``pool.try_admit``) evicts
+  unpinned-LRU to make room and *pins* the chunk; when the working set fills the
+  budget (everything resident is pinned) the loop awaits a consumer ``unpin``. So
+  the number of outstanding fetch tasks is bounded by the resident window, not by
+  the epoch length.
 
-Hard invariant: ``resident_cap >= block_chunks``. A batch may draw from any chunk
-in its shuffle-block, so the whole block must be co-resident to gather; a smaller
-cap would deadlock waiting on a chunk that can never be admitted. The producer
-sets ``resident_cap = block_chunks + read_ahead`` (the read-ahead margin is what
-keeps the next block's IO overlapping the current block's compute).
+Per chunk the scheduler first asks the pool whether it already holds it
+(``pin_if_ready``): a still-resident prepped chunk is a hit and costs no fetch
+(cross-epoch reuse, since the pool persists across epochs). Misses are admitted and
+their tiles fetched. The consumer waits on slot readiness, gathers, and
+:meth:`unpin`\\s drained chunks. Errors propagate two ways -- a per-tile
+fetch/decode failure poisons just that chunk (``pool.fail``); a driver failure
+poisons the whole pool (``pool.set_error``) so any waiter re-raises instead of
+hanging.
 
-The hand-off to the consumer is the pool: the consumer thread waits on slot
-readiness, gathers, and calls :meth:`evict`. Errors propagate two ways -- a
-per-tile fetch/decode failure poisons just that chunk (``pool.fail``); a driver
-failure poisons the whole pool (``pool.set_error``) so any waiter re-raises
-instead of hanging.
+Budget floor: a batch may draw from any chunk in its shuffle-block, so the whole
+block must be co-resident to gather -- the budget must hold at least one block (the
+producer sizes it to two: the current block plus one read-ahead block, so
+block-boundary IO overlaps the current block's compute).
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 
 from .plan import build_stored_chunk_reads
-from .pool import ChunkPool, ChunkTransform
+from .pool import ChunkPool
 from .store import store_from_url
 from .types import ArrayGeometry, StoredChunkRead
 
@@ -58,12 +61,8 @@ from .types import ArrayGeometry, StoredChunkRead
 class SchedulerConfig:
     max_inflight: int = 32
     """Tiles in flight at once -- the single concurrency dial. Memory in flight
-    ~= max_inflight * stored_chunk_nbytes (+ transform scratch)."""
-
-    resident_cap: int = 0
-    """Outer chunks resident in the pool. ``0`` = unbounded (no admission
-    backpressure); the producer sets ``block_chunks + read_ahead``. Must be
-    ``>= block_chunks`` whenever batches draw across a shuffle-block."""
+    ~= max_inflight * stored_chunk_nbytes (+ transform scratch). Residency is
+    bounded separately by the pool's byte budget (admission evicts unpinned-LRU)."""
 
     decode_threads: int = 0
     """Size of the decode/scatter pool (GIL-releasing codec decode + the disjoint
@@ -72,7 +71,12 @@ class SchedulerConfig:
 
 @dataclass(slots=True)
 class _ArrayCtx:
-    """Per-variable handles for the stored-chunk fetch+decode path (spike-validated)."""
+    """Per-variable handles for the stored-chunk fetch+decode path.
+
+    Cached once per array: the store + key encoder address a stored chunk, the
+    codec pipeline + spec decode its bytes (this reconstructs exactly what
+    ``arr.getitem`` would stitch, for single-inner and spatially-chunked arrays).
+    """
 
     path: str
     store: object
@@ -85,27 +89,29 @@ class _ArrayCtx:
 
 
 class Scheduler:
-    """Owns one event loop, a decode pool, and a :class:`ChunkPool`; streams tiles.
+    """Owns one event loop + a decode pool; streams tiles into a caller-owned pool.
 
-    Synchronous, thread-friendly surface (the loop is hidden): :meth:`start` kicks
-    off the fetch stream for an ordered list of outer chunks; the consumer reads
-    assembled chunks via :attr:`pool` and frees residency via :meth:`evict`.
+    The :class:`ChunkPool` is passed in (dataset-owned, so it persists across epochs
+    as the cache). :meth:`start` streams the stored chunks of an ordered chunk list;
+    the consumer reads assembled chunks via :attr:`pool` and releases drained ones
+    via :meth:`unpin`. Per chunk the scheduler skips fetch if the pool already holds
+    it (a cross-epoch hit); misses are admitted against the pool's byte budget,
+    awaiting an unpin when the working set fills it.
     """
 
     def __init__(
         self,
         store_url: str,
         geometries: dict[str, ArrayGeometry],
+        pool: ChunkPool,
         config: SchedulerConfig | None = None,
-        *,
-        chunk_transforms: Sequence[ChunkTransform] = (),
         **store_kwargs: object,
     ) -> None:
         self._url = store_url
         self._store_kwargs = store_kwargs
         self._geometries = geometries
         self._config = config or SchedulerConfig()
-        self.pool = ChunkPool(geometries, chunk_transforms=chunk_transforms)
+        self.pool = pool  # caller-owned: persists across epochs (the cache)
         self._proto = default_buffer_prototype()
         self._arrays: dict[str, _ArrayCtx] = {}
 
@@ -117,7 +123,7 @@ class Scheduler:
         self._decode_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="insitu-dec")
         self._loop = asyncio.new_event_loop()
         self._inflight: asyncio.Semaphore | None = None
-        self._residency: asyncio.Semaphore | None = None
+        self._capacity: asyncio.Event | None = None  # set on unpin -> wakes a parked admit
         self._open_lock: asyncio.Lock | None = None
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="insitu-sched")
@@ -130,8 +136,7 @@ class Scheduler:
         asyncio.set_event_loop(self._loop)
         self._loop.set_default_executor(self._decode_pool)  # decode + scatter -> our pool
         self._inflight = asyncio.Semaphore(self._config.max_inflight)
-        cap = self._config.resident_cap
-        self._residency = asyncio.Semaphore(cap) if cap > 0 else None
+        self._capacity = asyncio.Event()
         self._open_lock = asyncio.Lock()
         self._loop.call_soon(self._ready.set)
         self._loop.run_forever()
@@ -152,7 +157,8 @@ class Scheduler:
         if not self._thread.is_alive():  # loop has exited run_forever -> safe to close
             self._loop.close()  # release the self-pipe now; don't leave it for __del__
         self._decode_pool.shutdown(wait=False, cancel_futures=True)
-        self.pool.close()  # free any slots left resident (mmap files) on early exit
+        # NB: the pool is caller-owned (persists across epochs as the cache) -- the
+        # dataset closes it, not us.
 
     async def _shutdown(self) -> None:
         # Cancel + drain in-flight tasks, but do NOT stop the loop here: stopping
@@ -182,48 +188,64 @@ class Scheduler:
         fut.add_done_callback(self._on_drive_done)
         return fut
 
-    def evict(self, chunk_ids: set[int]) -> int:
-        """Evict drained outer chunks and free their residency (thread-safe).
-
-        The single eviction entry point so pool residency and the admission
-        semaphore stay in lock-step. Returns outer positions dropped.
-        """
-        n = self.pool.evict(chunk_ids)
-        if n and self._residency is not None:
-            self._loop.call_soon_threadsafe(self._release_residency, n)
-        return n
-
-    def _release_residency(self, n: int) -> None:
-        assert self._residency is not None
-        for _ in range(n):
-            self._residency.release()
+    def unpin(self, chunk_ids: set[int]) -> None:
+        """Release drained outer chunks (thread-safe): now LRU-evictable, and wake
+        any admit parked on a full budget so it can evict them and proceed."""
+        self.pool.unpin(chunk_ids)
+        if self._capacity is not None:
+            self._loop.call_soon_threadsafe(self._capacity.set)
 
     def _on_drive_done(self, fut: Future) -> None:
-        try:
-            fut.result()
-        except Exception as exc:  # noqa: BLE001 - poison the pool; waiters re-raise
+        # Cancellation is normal: close() cancels a still-finishing drive at epoch
+        # end. Only a genuine driver exception poisons the pool (which now persists
+        # across epochs, so a spurious poison would break the next epoch).
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+        if exc is not None:
             self.pool.set_error(exc)
 
     # -- async internals ----------------------------------------------------
 
     async def _drive(self, reads: list[StoredChunkRead]) -> None:
         await self._ensure_arrays()
-        admitted: set[int] = set()
+        # Per (var, chunk): decided[k] = True if it was a cache hit (skip its tiles),
+        # False if a miss we admitted (fetch its tiles). reads are chunk-major so a
+        # (var, chunk) is first-seen on its first tile.
+        decided: dict[tuple[str, int], bool] = {}
         tasks: list[asyncio.Task] = []
         try:
-            for read in reads:  # chunk-major: a new chunk_index is first-seen here
-                if read.chunk_index not in admitted:
-                    if self._residency is not None:
-                        await self._residency.acquire()  # backpressure on resident chunks
-                    admitted.add(read.chunk_index)
-                    for var in self._geometries:
-                        self.pool.allocate(var, read.chunk_index)
+            for read in reads:
+                key = (read.array, read.chunk_index)
+                hit = decided.get(key)
+                if hit is None:
+                    hit = self.pool.pin_if_ready(read.array, read.chunk_index)
+                    if not hit:
+                        await self._admit(read.array, read.chunk_index)  # may await an unpin
+                    decided[key] = hit
+                if hit:
+                    continue  # cross-epoch hit: prepped chunk already resident, no fetch
                 tasks.append(asyncio.create_task(self._one(read)))
             await asyncio.gather(*tasks)
         except BaseException:
             for task in tasks:
                 task.cancel()
             raise
+
+    async def _admit(self, array: str, chunk_index: int) -> None:
+        """Admit a miss chunk against the byte budget, awaiting an unpin if full.
+
+        The clear-then-recheck guards the lost wakeup: if an unpin lands between a
+        failed admit and the clear, the recheck catches it; otherwise we wait for
+        the next unpin. (Admissions are serialized on the loop, so no admit races
+        another.)
+        """
+        assert self._capacity is not None
+        while not self.pool.try_admit(array, chunk_index):
+            self._capacity.clear()
+            if self.pool.try_admit(array, chunk_index):
+                return
+            await self._capacity.wait()
 
     async def _ensure_arrays(self) -> None:
         if self._arrays:
@@ -256,10 +278,10 @@ class Scheduler:
     async def _one(self, read: StoredChunkRead) -> None:
         """Fetch + decode + scatter one stored tile, holding one in-flight slot.
 
-        The slot spans all three stages (the budget is total concurrency, DESIGN).
-        Decode and the scatter memcpy run on the decode pool (GIL released); the
-        loop only awaits. A failure poisons just this chunk so the consumer's
-        ``wait_ready`` re-raises without stalling the rest.
+        The in-flight slot is held across all three stages, so ``max_inflight`` is
+        total concurrency. Decode and the scatter memcpy run on the decode pool (GIL
+        released); the loop only awaits. A failure poisons just this chunk so the
+        consumer's ``wait_ready`` re-raises without stalling the rest.
         """
         assert self._inflight is not None
         ctx = self._arrays[read.array]

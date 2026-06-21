@@ -56,7 +56,8 @@ class IOConfig:
     chunk's *inner* stored chunks are fetched at once). Set >= the inner grid count
     so a spatially-chunked field doesn't take an extra partial wave (15 inner chunks
     at concurrency 10 = 2 waves ~= half rate). ``0`` = zarr default (10). This and
-    ``max_inflight`` are two nested caps; one flat budget is the V2 fetch scheduler."""
+    ``max_inflight`` are two nested caps -- which is why the training path uses the
+    flat-budget scheduler instead; this reader is the simple streaming primitive."""
 
 
 class AsyncChunkReader:
@@ -189,10 +190,11 @@ class AsyncChunkReader:
     async def _fetch_and_decode(self, read: ChunkRead) -> DecodedChunk:
         """Fetch + decode one chunk via the zarr v3 async codec pipeline.
 
-        The selection is exactly one chunk along the sample axis, full on the
-        inner dims (the v1 sample-geometry contract). zarr fans the underlying
-        byte-range reads out through obstore and runs the decode pipeline; for
-        single-chunk inner dims this touches exactly one stored chunk.
+        The selection is exactly one chunk along the sample axis, full on the inner
+        dims (the sample-geometry contract: a sample is a slice of the sample axis
+        that does not cross a chunk boundary). zarr fans the underlying byte-range
+        reads out through obstore and runs the decode pipeline; for single-chunk
+        inner dims this touches exactly one stored chunk.
 
         Decode runs via zarr's codec pipeline, which offloads the GIL-releasing
         decompression to the loop's executor (our bounded ``insitu-decode`` pool),

@@ -43,10 +43,11 @@ class Gather:
 class ReadPlan:
     """A deduplicated batch of chunk reads plus the gather map back to samples.
 
-    One ``ReadPlan`` typically covers enough samples to (a) saturate the async
-    fan-out and (b) fill the shuffle-block buffer. ``reads`` is what the IO
-    driver fetches; ``gathers[v]`` reconstructs the requested samples for
-    variable ``v`` from the decoded chunks.
+    One ``ReadPlan`` covers a set of requested samples; ``reads`` is the minimal
+    set of chunks the IO driver fetches, and ``gathers[v]`` reconstructs the
+    requested samples for variable ``v`` from the decoded chunks. (This is the
+    outer-chunk plan used by the streaming reader; the training scheduler plans at
+    stored-chunk granularity -- see ``build_stored_chunk_reads``.)
     """
 
     reads: list[ChunkRead]

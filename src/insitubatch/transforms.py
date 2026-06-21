@@ -11,7 +11,7 @@ stages; ``device_transform`` lives in the framework adapters (M2/M3).
   per-sample random augmentation, channel stacking. Not cached.
 
 Rule of thumb: per-variable + per-chunk + deterministic -> chunk stage;
-cross-variable or per-sample-random -> batch stage; cross-chunk -> not v1.
+cross-variable or per-sample-random -> batch stage; cross-chunk -> not supported.
 """
 
 from __future__ import annotations

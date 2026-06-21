@@ -1,16 +1,24 @@
-"""ChunkPool: the batch-assembly buffer (and, in B2, the cache).
+"""ChunkPool: the batch-assembly buffer *and* the cache -- one machinery.
 
 The scheduler fetches at *stored chunk* (tile) granularity and scatters each
 decoded tile into its outer chunk's pre-allocated array. The pool owns those
-arrays -- the "slots" -- across their whole life: allocate (size to the assembled
-chunk) -> scatter tiles (disjoint writes from the decode pool) -> mark ready (when
-the last tile lands) -> gather batches (coalesced, on the consumer thread) ->
-evict (when a shuffle-block is fully drained). It plays the residency +
-coalesced-gather role of the old shuffle-block buffer, generalized to
-tile-at-a-time fill; B2 swaps the slot *backing* (heap -> mmap'd ``.npy``) and the
-*policy* (read-once -> LRU) to subsume the chunk cache.
+arrays -- the "slots" -- across their whole life: admit (size to the assembled
+chunk, evicting unpinned-LRU for room) -> scatter tiles (disjoint writes from the
+decode pool) -> mark ready (when the last tile lands) -> gather batches (coalesced,
+on the consumer thread) -> unpin (when a shuffle-block is fully drained).
 
-Implements the assembly half of the M1.6 decoupled fetch scheduler (DESIGN.md).
+Buffer and cache differ only in budget + backing, so they are the same code:
+
+* a **byte budget** with **pin/unpin + LRU** eviction. A chunk is pinned while the
+  current epoch needs it; unpinned chunks stay resident (retained) until budget
+  pressure evicts them in LRU order. A small budget is read-once (unpinned chunks
+  evicted promptly); a large budget retains drained chunks so a still-resident
+  prepped chunk is a hit next epoch -- decode-once reuse.
+* a **backing**: heap (``np.empty``) or mmap'd ``.npy`` on NVMe (``open_memmap``),
+  the scatter writing straight into the slot either way; mmap keeps the working set
+  as reclaimable page cache rather than anon heap.
+
+See [docs/architecture.md] for where this sits in the pipeline.
 
 Thread-safety / free-threading (the load-bearing invariant)
 -----------------------------------------------------------
@@ -38,6 +46,7 @@ import contextlib
 import os
 import re
 import threading
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,20 +68,28 @@ class _Slot:
 
     data: np.ndarray
     remaining: int  # inner tiles not yet scattered; 0 => fully assembled
+    nbytes: int  # slot size, charged to the budget (fixed at admit)
     ready: bool = False
     error: BaseException | None = None
 
 
 class ChunkPool:
-    """Bounded pool of assembling/assembled outer-chunk slots, keyed ``(array, chunk_index)``.
+    """Byte-budgeted pool of outer-chunk slots, keyed ``(array, chunk_index)``.
 
-    Residency is bounded by the *caller* (the scheduler admits new outer chunks,
-    the consumer evicts drained ones); the pool exposes ``resident_chunks`` /
-    ``max_resident`` for that policy and observability but does not itself block on
-    a cap -- admission/backpressure lives in the scheduler so it never parks a
-    decode worker mid-flight. ``chunk_transforms`` run once per outer chunk on the
-    *assembled* array (the v1 per-chunk contract; per-tile fusion is a later
-    opt-in), so a hit reflects decode + transform exactly like the old buffer.
+    The pool is the assembly buffer *and* the cache. A slot is **pinned** while the
+    current epoch needs it (in-flight or block-not-yet-drained) and **unpinned** once
+    its block is drained;
+    unpinned slots stay resident (retained for cross-epoch reuse) until budget
+    pressure evicts them in LRU order. ``budget_bytes`` is the single knob:
+
+    * small (~``2*block_chunks`` worth) -> read-once (unpinned evicted promptly);
+    * large + persistent across epochs -> a decode-once cache (a still-resident
+      prepped chunk is a hit, skipping fetch + decode + transform).
+
+    Eviction targets unpinned-LRU only; a slot is never unpinned before it is
+    ready+drained, so an in-flight or in-use chunk is never dropped. Backing is heap
+    or mmap (see ``backing_dir``); ``chunk_transforms`` run once per outer chunk on
+    the *assembled* array, so a hit reflects decode + transform.
     """
 
     def __init__(
@@ -81,23 +98,29 @@ class ChunkPool:
         *,
         chunk_transforms: Sequence[ChunkTransform] = (),
         backing_dir: str | Path | None = None,
+        budget_bytes: int | None = None,
     ) -> None:
         self._geom = geometries
         self._chunk_transforms = tuple(chunk_transforms)
         # backing: heap (np.empty) or mmap'd .npy under backing_dir (point at NVMe).
-        # The scatter writes straight into the slot either way; mmap keeps the
-        # working set as reclaimable page cache rather than anon heap, and is the
-        # substrate the B2 cache spills to. Default heap (mmap is NVMe write traffic
-        # even for read-once -- DESIGN caveat).
+        # The scatter writes straight into the slot either way; mmap keeps the working
+        # set as reclaimable page cache rather than anon heap. Default heap: scattering
+        # into mmap is NVMe write traffic even when never reused, so reach for it to
+        # spill a working set past RAM or for cross-epoch reuse, not for plain streaming.
         self._dir = Path(backing_dir) if backing_dir is not None else None
         if self._dir is not None:
             self._dir.mkdir(parents=True, exist_ok=True)
-        self._slots: dict[tuple[str, int], _Slot] = {}
+        self._budget = budget_bytes  # None => unbounded (never self-evicts)
+        self._bytes = 0
+        # OrderedDict in recency order (LRU front -> MRU back); pinned keys are
+        # exempt from eviction.
+        self._slots: OrderedDict[tuple[str, int], _Slot] = OrderedDict()
+        self._pinned: set[tuple[str, int]] = set()
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
 
-    # -- residency observability (caller owns the policy) -------------------
+    # -- observability ------------------------------------------------------
 
     def _positions(self) -> set[int]:
         """Distinct outer chunk indices currently resident (call under the lock)."""
@@ -108,25 +131,93 @@ class ChunkPool:
         with self._cv:
             return len(self._positions())
 
-    # -- allocate / scatter / complete --------------------------------------
+    @property
+    def resident_bytes(self) -> int:
+        with self._cv:
+            return self._bytes
 
-    def allocate(self, array: str, chunk_index: int) -> None:
-        """Create the slot for one outer chunk if absent (idempotent, non-blocking).
+    # -- admission / pinning / eviction -------------------------------------
 
-        The scheduler calls this when it first admits an outer chunk, before
-        scattering any of its tiles. Sized to ``slot_shape`` so a short final
-        chunk fits exactly.
+    def try_admit(self, array: str, chunk_index: int) -> bool:
+        """Reserve + allocate + pin one outer chunk, evicting unpinned-LRU for room.
+
+        Returns ``True`` once the slot exists and is pinned (idempotent if already
+        resident -- e.g. another variable's tile admitted this position). Returns
+        ``False`` only when the budget is full of *pinned* slots: the working set
+        exceeds the budget, so the caller must wait for the consumer to unpin one.
         """
         key = (array, chunk_index)
         geom = self._geom[array]
+        nbytes = int(np.prod(geom.slot_shape(chunk_index), dtype=np.int64)) * geom.dtype.itemsize
         with self._cv:
             if key in self._slots:
-                return
+                # Only reached on a miss (a ready chunk is taken by pin_if_ready), so
+                # any resident slot here is a stale partial left by a cancelled epoch
+                # -- drop it and rebuild fresh rather than reuse a half-filled buffer.
+                self._drop(key)
+            if not self._make_room(nbytes):
+                return False
             self._slots[key] = _Slot(
                 data=self._alloc(array, chunk_index, geom.slot_shape(chunk_index), geom.dtype),
                 remaining=geom.n_inner_chunks(chunk_index),
+                nbytes=nbytes,
             )
+            self._bytes += nbytes
+            self._pin(key)
             self.max_resident = max(self.max_resident, len(self._positions()))
+            return True
+
+    def is_ready(self, array: str, chunk_index: int) -> bool:
+        """True if the chunk is resident, fully assembled, and not failed (a hit)."""
+        with self._cv:
+            slot = self._slots.get((array, chunk_index))
+            return slot is not None and slot.ready and slot.error is None
+
+    def pin_if_ready(self, array: str, chunk_index: int) -> bool:
+        """Atomically pin a resident, ready chunk (a cache hit) and touch its LRU.
+
+        Returns ``True`` on a hit (caller skips fetch+decode+transform), ``False``
+        if the chunk is absent or still assembling (a miss -> ``try_admit``). One
+        lock so the check and the pin can't race an eviction in between.
+        """
+        with self._cv:
+            slot = self._slots.get((array, chunk_index))
+            if slot is not None and slot.ready and slot.error is None:
+                self._pin((array, chunk_index))
+                return True
+            return False
+
+    def unpin(self, chunk_ids: set[int]) -> None:
+        """Release the given drained outer chunks: now LRU-evictable, not yet dropped.
+
+        Replaces eviction -- the pool decides *when* to drop (lazily, under budget
+        pressure), so unpinned chunks linger for cross-epoch reuse. Wakes any admit
+        parked on a full budget.
+        """
+        with self._cv:
+            for key in [k for k in self._slots if k[1] in chunk_ids]:
+                self._pinned.discard(key)
+            self._cv.notify_all()
+
+    def _pin(self, key: tuple[str, int]) -> None:  # call under the lock
+        self._pinned.add(key)
+        self._slots.move_to_end(key)  # MRU
+
+    def _make_room(self, nbytes: int) -> bool:  # call under the lock
+        if self._budget is None:
+            return True
+        while self._bytes + nbytes > self._budget:
+            victim = next((k for k in self._slots if k not in self._pinned), None)
+            if victim is None:  # everything resident is pinned -> no room
+                return False
+            self._drop(victim)
+        return True
+
+    def _drop(self, key: tuple[str, int]) -> None:  # call under the lock
+        slot = self._slots.pop(key)
+        self._pinned.discard(key)  # no stale pin if dropping a (rare) pinned partial
+        self._bytes -= slot.nbytes
+        self._free(slot)
 
     def _alloc(
         self, array: str, chunk_index: int, shape: tuple[int, ...], dtype: np.dtype
@@ -216,7 +307,7 @@ class ChunkPool:
             chunk = transform(chunk)
         return chunk.data
 
-    # -- consume: wait / gather / evict -------------------------------------
+    # -- consume: wait / gather ---------------------------------------------
 
     def wait_ready(self, array: str, chunk_index: int) -> None:
         """Block until the outer chunk is fully assembled (or raise its error).
@@ -242,10 +333,9 @@ class ChunkPool:
 
         Caller must have waited for every referenced outer chunk to be ready.
         Draws are grouped by chunk so each slot is touched once (one coalesced
-        fancy-index); ``data`` and ``sample_indices`` come out in the same grouped
-        order, so row ``i`` of every variable refers to the same sample. The
-        grouped-by-chunk gather math is unchanged from the shuffle-block buffer;
-        only the source (assembled slot vs buffered whole chunk) differs.
+        fancy-index, never a Python per-sample loop); ``data`` and ``sample_indices``
+        come out in the same grouped order, so row ``i`` of every variable refers to
+        the same sample.
         """
         chunk_ids = rows[:, 0]
         within = rows[:, 1]
@@ -262,27 +352,11 @@ class ChunkPool:
         arrays = {var: np.concatenate(pieces, axis=0) for var, pieces in out.items()}
         return Batch(arrays=arrays, sample_indices=np.concatenate(idx_pieces))
 
-    def evict(self, chunk_ids: set[int]) -> int:
-        """Drop every variable's slot for the given drained outer chunks.
-
-        Returns the number of distinct outer *positions* actually dropped (not
-        slots) -- that is what the scheduler releases back to the residency
-        budget, so admission stays in lock-step with one unit per outer chunk
-        regardless of how many variables share it.
-        """
-        with self._cv:
-            drop_keys = [k for k in self._slots if k[1] in chunk_ids]
-            dropped = {cid for _array, cid in drop_keys}
-            for k in drop_keys:
-                self._free(self._slots.pop(k))
-            if drop_keys:
-                self._cv.notify_all()
-            return len(dropped)
-
     def _free(self, slot: _Slot) -> None:
         """Release a slot's backing: a no-op for heap, flush+close+unlink for mmap.
 
-        Read-once evicts the file (the B2 cache will instead retain it under LRU).
+        Dropping a slot drops its cached bytes (intra-run); cross-*run* persistence
+        (keep the file + a content-keyed index) is the deferred follow-up.
         """
         mmap = getattr(slot.data, "_mmap", None)
         if mmap is not None:
@@ -293,7 +367,9 @@ class ChunkPool:
                     os.unlink(fname)
 
     def close(self) -> None:
-        """Free every remaining slot (mmap files included) -- e.g. on early exit."""
+        """Free every remaining slot (mmap files included) -- e.g. on teardown."""
         with self._cv:
             for k in list(self._slots):
                 self._free(self._slots.pop(k))
+            self._bytes = 0
+            self._pinned.clear()

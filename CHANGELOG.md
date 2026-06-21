@@ -16,18 +16,29 @@ no oversubscription collapse.
   residency is decoupled at `resident_cap = 2*block_chunks`. **Read concurrency
   (`max_inflight`) and shuffle span / residency (`block_chunks`) are now
   independent dials.**
+- **B2 — the pool is the cache.** `ChunkPool` gains a **byte budget + pin/unpin +
+  LRU** and an optional **mmap backing** (`np.lib.format.open_memmap` direct-scatter
+  on NVMe — no `np.save` copy). One machinery: a small budget is read-once; a large
+  budget retains drained chunks for **cross-epoch decode-once reuse** (the scheduler
+  skips fetch+decode+transform for a still-resident chunk). The pool is now
+  dataset-owned (persists across epochs); `InSituDataset` gains `cache_dir` and
+  `cache_budget_bytes`, and `close()`. B1's `resident_cap` admission is **unified**
+  into the budget (admission evicts unpinned-LRU; consumer `unpin` replaces `evict`).
 - **Free-threading-ready:** pool readiness is published through a lock (not the
   GIL), so the disjoint-scatter design is correct on 3.13t as well as the GIL build.
+  Validated GIL-free incl. the new pin/LRU admission.
 - **`AsyncChunkReader` kept** as the streaming-chunk primitive (used by
   `fit_standard_scaler`); only the v1 *training* path was removed.
 - **`__version__`** now derives from package metadata (pyproject is the single
   source of truth).
 - **Breaking (pre-1.0):** `buffer.py` (`ShuffleBlockBuffer`, `BufferConfig`)
-  removed; `InSituDataset(cache=...)` removed — B1 is read-once. Cross-epoch reuse
-  returns in B2 as a `ChunkPool` policy (same `ChunkCache` protocol);
-  `MemoryCache`/`DiskCache` remain. Observability attr `buffer_peak` →
-  `resident_peak`. New exports: `Scheduler`, `SchedulerConfig`, `ChunkPool`,
-  `StoredChunkRead`, `build_stored_chunk_reads`.
+  removed; the v1 `InSituDataset(cache=...)` reader intercept removed — caching is
+  now the `ChunkPool` policy (`cache_dir` / `cache_budget_bytes`). `Scheduler` takes
+  a caller-owned `pool`; `SchedulerConfig.resident_cap` removed (the budget governs
+  residency). Observability attr `buffer_peak` → `resident_peak`. New exports:
+  `Scheduler`, `SchedulerConfig`, `ChunkPool`, `StoredChunkRead`,
+  `build_stored_chunk_reads`. The standalone `MemoryCache`/`DiskCache` are now
+  unused by the engine (the pool subsumes them) — retirement is a follow-up.
 
 ## 0.0.2
 
