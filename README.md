@@ -23,8 +23,9 @@ The classic PyTorch `DataLoader` spreads work across worker **processes**, each
 running a *synchronous* `__getitem__`. Against cloud Zarr that means no shared
 chunk cache (every worker re-reads the same chunk), no way to drive async
 obstore, and dask thread pools nested inside forked workers. `insitubatch`
-**inverts** it: one async event loop drives concurrent reads; a bounded
-shuffle-block buffer assembles batches; torch runs `num_workers=0`.
+**inverts** it: one async event loop streams stored chunks under a single
+concurrency budget and scatters them into a bounded pool that assembles batches —
+the pool doubles as the cache; torch runs `num_workers=0`.
 
 ## Status
 
@@ -36,14 +37,17 @@ map-style baseline re-decodes a whole chunk per sample; insitubatch reads each
 chunk once. Full numbers + methodology:
 [the benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/).
 
-Built: planner + chunk-aligned splits, async obstore reads with bounded fan-out, a
-shuffle-block buffer with one-block read-ahead, chunk/batch **transforms** (incl. a
-fitted `StandardScaler`), **prefetch**, a pluggable **chunk cache** (heap or
-mmap-on-NVMe, byte-LRU), the torch surface, and runnable [examples](examples/). Not
-yet built: `Regrid` + the **GPU/device** transform stage; JAX/TF surfaces. The
-**V2 decoupled fetch scheduler** (one concurrency budget over inner+outer chunks,
-buffer-as-cache) is designed and de-risked — see the roadmap in
-[DESIGN.md](DESIGN.md).
+The engine is the **decoupled fetch scheduler**: reads flatten to *stored chunks*
+under one `max_inflight` budget (no nested inner/outer concurrency caps), decoded
+tiles scatter into a **`ChunkPool`** that is the assembly buffer *and* the cache
+(byte budget + pin/LRU, heap or mmap-on-NVMe). **Read concurrency and
+residency/shuffle span are independent dials** — the decoupling reaches ~1 GB/s at
+flat, low memory (validated on S3; see below). Built: planner + chunk-aligned
+splits, async obstore reads, the scheduler + pool (with **cross-epoch decode-once
+caching**), chunk/batch **transforms** (incl. a fitted `StandardScaler`),
+**prefetch**, the torch surface, and runnable [examples](examples/); validated
+free-threading-correct on 3.13t. Not yet built: `Regrid` + the **GPU/device**
+transform stage; JAX/TF surfaces — see the roadmap in [DESIGN.md](DESIGN.md).
 
 📖 **Docs:** <https://emfdavid.github.io/insitubatch/>
 (see [Tuning](https://emfdavid.github.io/insitubatch/tuning/) for the
