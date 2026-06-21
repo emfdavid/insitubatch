@@ -6,8 +6,8 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv
+# Virtual environments (.venv-ft etc. for the free-threaded test env)
+.venv*
 
 # JetBrains IDE
 .idea/

@@ -64,6 +64,44 @@ uv sync --extra torch    # add the torch IterableDataset surface
 uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 ```
 
+## Tests
+
+```bash
+uv run pytest -q                              # the suite
+uv run ruff check src tests bench             # lint
+uv run mypy src                               # types
+```
+
+The torch-handoff tests skip unless torch is installed (`uv sync --extra torch`);
+the same is enforced in CI.
+
+### Free-threaded (3.13t)
+
+The engine is free-threading-correct by construction: the `ChunkPool`'s scatter
+does its disjoint copy **before** the lock and publishes readiness **under** it, so
+the lock — not the GIL — is the happens-before edge to the consuming gather. The
+race probe is `test_pool_concurrent_scatter_is_race_free` (64 tiles, 32 threads).
+
+Run the suite GIL-free on a free-threaded interpreter:
+
+```bash
+uv python install 3.13t
+# Separate env so the default .venv stays put. numcodecs has no free-threaded
+# wheel yet, so it compiles from sdist (needs a C/C++ compiler: Xcode CLT on
+# macOS, gcc/gcc-c++ on Linux). torch/bench have no FT wheels -> core deps only.
+UV_PROJECT_ENVIRONMENT=.venv-ft uv sync --python 3.13t
+
+# numcodecs re-enables the GIL on import (not yet declared GIL-safe), so force it
+# off and confirm it took before trusting the run:
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
+  python -c "import sys, zarr, numcodecs; assert not sys._is_gil_enabled(); print('GIL-free OK')"
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t pytest -q
+```
+
+CI mirrors this: a `{3.12, 3.13}` matrix plus a `3.13t` job that asserts the GIL is
+actually off before testing. (The free-threading *benefit* still waits on numcodecs
+shipping a GIL-safe build; our code is ready — see [DESIGN.md](DESIGN.md).)
+
 ## Shape of the API
 
 ```python
