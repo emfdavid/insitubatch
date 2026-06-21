@@ -36,7 +36,7 @@ from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest
 from .store import open_geometries
-from .types import ArrayGeometry, Batch, DecodedChunk, SplitName
+from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRead
 
 # Default for the single concurrency dial when the caller does not pin it.
 # max_inflight is independent of the shuffle window -- sized to saturate the
@@ -108,6 +108,7 @@ class InSituDataset(IterableDataset):
         prefetch_depth: int = 2,
         cache_dir: str | None = None,
         cache_budget_bytes: int | None = None,
+        on_bad_chunk: str = "raise",
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: Any,
@@ -142,6 +143,11 @@ class InSituDataset(IterableDataset):
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
         self.resident_peak = 0  # peak resident outer chunks (observability)
+        # Stored tiles NaN-filled in the last epoch (when on_bad_chunk="nan") -- which
+        # (array, chunk_index, inner_coord) reads were corrupt/truncated. len() is the
+        # count. Inspect after iterating to log/quarantine bad chunks.
+        self.bad_chunks: list[StoredChunkRead] = []
+        self._on_bad_chunk = on_bad_chunk
 
         # The pool is the assembly buffer AND the cache, owned here so it persists
         # across epochs. The byte budget is the single residency knob: the floor is
@@ -165,7 +171,9 @@ class InSituDataset(IterableDataset):
         # One concurrency dial (max_inflight, network), independent of the shuffle
         # window (block_chunks) and the cache budget. Exposed so the probe can tune
         # decode_threads at iteration time.
-        self.scheduler_config = SchedulerConfig(max_inflight=max_inflight or DEFAULT_MAX_INFLIGHT)
+        self.scheduler_config = SchedulerConfig(
+            max_inflight=max_inflight or DEFAULT_MAX_INFLIGHT, on_bad_chunk=on_bad_chunk
+        )
 
     def set_epoch(self, epoch: int) -> None:
         """Call from the training loop so each epoch reshuffles deterministically."""
@@ -265,6 +273,7 @@ class InSituDataset(IterableDataset):
                         out_q.get(timeout=0.05)
                 producer.join(timeout=10)
                 self.resident_peak = sched.pool.max_resident  # peak residency this epoch
+                self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
 
     def _maybe_tensor(self, batch: Batch) -> Batch | dict:
         if not self.to_tensor:

@@ -262,6 +262,32 @@ class Regrid:
 - **ARCO `chunk-1`** → reuse the same weights as a sparse tensor in a
   `device_transform` (batched on GPU), since per-chunk == per-sample there.
 
+## Bad / corrupt chunks
+
+Real archives — especially GRIB-under-zarr (HRRR) — ship the occasional truncated or
+corrupt stored chunk. By default a decode failure **fails fast** (`on_bad_chunk="raise"`).
+Set `on_bad_chunk="nan"` and a bad (or missing) tile is filled with NaN (float dtypes)
+or the array's fill value instead of poisoning the epoch — the outer chunk assembles
+with a hole that you repair with an ordinary `chunk_transform`:
+
+```python
+def fill_nan(chunk):                      # your policy: climatology, interpolate, ...
+    np.nan_to_num(chunk.data, copy=False, nan=0.0)
+    return chunk
+
+ds = InSituDataset(url, manifest, on_bad_chunk="nan", chunk_transforms=[fill_nan])
+for batch in ds:
+    ...
+print(ds.bad_chunks)   # the (array, chunk_index, inner_coord) reads that were bad this epoch
+```
+
+Granularity is the **stored** chunk (tile), so one corrupt inner tile NaNs only its
+region of the outer chunk, not the whole field. A failure *during scatter* (a genuine
+bug, not a bad chunk) still poisons — the policy only covers fetch/decode. Dropping
+NaN-containing *samples* is deliberately not automatic (it would break the fixed-shape
+vectorized gather); exclude known-bad chunks at the split/manifest level instead
+(`ds.bad_chunks` gives you the list to quarantine).
+
 ## The caching continuum
 
 **The cache boundary IS the chunk-transform boundary.** Every chunk is keyed

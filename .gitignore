@@ -21,3 +21,6 @@ site/
 
 # macOS
 .DS_Store
+
+# local backlog scratch (not tracked)
+ISSUES.md

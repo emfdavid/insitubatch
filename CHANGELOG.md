@@ -27,6 +27,12 @@ no oversubscription collapse.
 - **Free-threading-ready:** pool readiness is published through a lock (not the
   GIL), so the disjoint-scatter design is correct on 3.13t as well as the GIL build.
   Validated GIL-free incl. the new pin/LRU admission.
+- **Bad/truncated chunks** (`on_bad_chunk`, default `"raise"`): real GRIB-under-zarr
+  archives (HRRR) have corrupt stored chunks. `"nan"` fills a failed tile with NaN
+  (float) or the fill value instead of poisoning the epoch — the caller then handles
+  NaN with a `chunk_transform`. The corrupt reads are listed in `ds.bad_chunks` (the
+  `(array, chunk_index, inner_coord)` tiles) for logging/quarantine. A failure
+  *during scatter* still poisons (a genuine bug, not a bad chunk).
 - **`AsyncChunkReader` kept** as the streaming-chunk primitive (used by
   `fit_standard_scaler`); only the v1 *training* path was removed.
 - **`__version__`** now derives from package metadata (pyproject is the single

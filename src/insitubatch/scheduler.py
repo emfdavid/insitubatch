@@ -68,6 +68,14 @@ class SchedulerConfig:
     """Size of the decode/scatter pool (GIL-releasing codec decode + the disjoint
     scatter memcpy run here). ``0`` = auto = ``min(32, cpu+4)``."""
 
+    on_bad_chunk: str = "raise"
+    """What to do when a stored chunk fails to fetch/decode (truncated/corrupt --
+    common in GRIB-under-zarr archives like HRRR). ``"raise"`` (default) fails fast;
+    ``"nan"`` fills that tile with NaN (float dtypes) or the fill value, so the chunk
+    assembles with a hole instead of poisoning the epoch -- the caller then handles
+    NaN with a ``chunk_transform`` (interpolate / drop). Bad reads are recorded in
+    ``Scheduler.bad_chunks``."""
+
 
 @dataclass(slots=True)
 class _ArrayCtx:
@@ -86,6 +94,14 @@ class _ArrayCtx:
     chunk_shape: tuple[int, ...]
     fill_value: object
     dtype: np.dtype
+
+
+def _bad_fill(ctx: _ArrayCtx) -> object:
+    """Value to fill a bad/truncated tile with under ``on_bad_chunk='nan'``: NaN for
+    float arrays, else the array's fill value (0 if it has none)."""
+    if np.issubdtype(ctx.dtype, np.floating):
+        return np.nan
+    return ctx.fill_value if ctx.fill_value is not None else 0
 
 
 class Scheduler:
@@ -111,7 +127,12 @@ class Scheduler:
         self._store_kwargs = store_kwargs
         self._geometries = geometries
         self._config = config or SchedulerConfig()
+        if self._config.on_bad_chunk not in ("raise", "nan"):
+            raise ValueError(
+                f"on_bad_chunk must be 'raise' or 'nan', got {self._config.on_bad_chunk!r}"
+            )
         self.pool = pool  # caller-owned: persists across epochs (the cache)
+        self.bad_chunks: list[StoredChunkRead] = []  # tiles NaN-filled this run (observability)
         self._proto = default_buffer_prototype()
         self._arrays: dict[str, _ArrayCtx] = {}
 
@@ -280,8 +301,9 @@ class Scheduler:
 
         The in-flight slot is held across all three stages, so ``max_inflight`` is
         total concurrency. Decode and the scatter memcpy run on the decode pool (GIL
-        released); the loop only awaits. A failure poisons just this chunk so the
-        consumer's ``wait_ready`` re-raises without stalling the rest.
+        released); the loop only awaits. A *fetch/decode* failure is a bad/truncated
+        chunk -> the ``on_bad_chunk`` policy decides (poison, or NaN-fill and carry
+        on). A failure *during scatter* is a genuine bug and always poisons.
         """
         assert self._inflight is not None
         ctx = self._arrays[read.array]
@@ -289,17 +311,32 @@ class Scheduler:
             self._inflight_now += 1
             self.inflight_peak = max(self.inflight_peak, self._inflight_now)
             try:
-                key = ctx.path + "/" + ctx.encode(read.coords)
-                buf = await ctx.store.get(key, prototype=self._proto)  # type: ignore[attr-defined]
-                if buf is None:  # absent chunk == all fill_value (zarr's getitem semantics)
-                    tile = np.full(ctx.chunk_shape, ctx.fill_value, dtype=ctx.dtype)
-                else:
-                    [decoded] = list(await ctx.codec.decode([(buf, ctx.spec)]))  # type: ignore[attr-defined]
-                    tile = decoded.as_numpy_array()
-                await self._loop.run_in_executor(
-                    None, self.pool.scatter, read.array, read.chunk_index, read.inner_coord, tile
-                )
-            except Exception as exc:  # noqa: BLE001 - poison this chunk, surface to consumer
-                self.pool.fail(read.array, read.chunk_index, exc)
+                try:
+                    tile = await self._fetch_decode(read, ctx)
+                except Exception as exc:  # noqa: BLE001 - bad/truncated stored chunk
+                    if self._config.on_bad_chunk != "nan":
+                        self.pool.fail(read.array, read.chunk_index, exc)
+                        return
+                    self.bad_chunks.append(read)
+                    tile = np.full(ctx.chunk_shape, _bad_fill(ctx), dtype=ctx.dtype)
+                try:
+                    await self._loop.run_in_executor(
+                        None,
+                        self.pool.scatter,
+                        read.array,
+                        read.chunk_index,
+                        read.inner_coord,
+                        tile,
+                    )
+                except Exception as exc:  # noqa: BLE001 - a scatter failure is a real bug
+                    self.pool.fail(read.array, read.chunk_index, exc)
             finally:
                 self._inflight_now -= 1
+
+    async def _fetch_decode(self, read: StoredChunkRead, ctx: _ArrayCtx) -> np.ndarray:
+        key = ctx.path + "/" + ctx.encode(read.coords)
+        buf = await ctx.store.get(key, prototype=self._proto)  # type: ignore[attr-defined]
+        if buf is None:  # absent chunk == all fill_value (zarr's getitem semantics)
+            return np.full(ctx.chunk_shape, ctx.fill_value, dtype=ctx.dtype)
+        [decoded] = list(await ctx.codec.decode([(buf, ctx.spec)]))  # type: ignore[attr-defined]
+        return decoded.as_numpy_array()
