@@ -24,6 +24,7 @@ import numpy as np
 import zarr
 
 from insitubatch import (
+    SplitManifest,
     SplitName,
     open_geometries,
     split_by_chunk,
@@ -128,7 +129,13 @@ def run(
     return engines[cfg.engine](cfg, geom, manifest, cache_dir, store_kwargs)
 
 
-def _run_insitu(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
+def _run_insitu(
+    cfg: Cfg,
+    geom: ArrayGeometry,
+    manifest: SplitManifest,
+    cache_dir: str | None,
+    store_kwargs: dict,
+) -> list[Result]:
     if cfg.cache != "none":
         # B1 ships read-once (the V2 throughput/memory decoupling). Cross-epoch
         # reuse returns in B2 on the ChunkPool; fail loudly rather than silently
@@ -160,11 +167,17 @@ def _run_insitu(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     return out
 
 
-def _run_naive(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
-    arr = zarr.open_group(store=store_from_url(cfg.url, **store_kwargs), mode="r")[cfg.var]
+def _run_naive(
+    cfg: Cfg,
+    geom: ArrayGeometry,
+    manifest: SplitManifest,
+    cache_dir: str | None,
+    store_kwargs: dict,
+) -> list[Result]:
+    arr = zarr.open_array(store=store_from_url(cfg.url, **store_kwargs), path=cfg.var, mode="r")
     spc = geom.sample_chunk_size
 
-    def batches():
+    def batches() -> Iterator[np.ndarray]:
         for c in manifest.chunks[SplitName.TRAIN.value]:
             s0, s1 = c * spc, min(c * spc + spc, geom.n_samples)
             yield np.asarray(arr[s0:s1])
@@ -176,9 +189,15 @@ def _run_naive(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     return out
 
 
-def _run_memory(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
-    group = zarr.open_group(store=store_from_url(cfg.url, **store_kwargs), mode="r")
-    full = np.asarray(group[cfg.var][:])
+def _run_memory(
+    cfg: Cfg,
+    geom: ArrayGeometry,
+    manifest: SplitManifest,
+    cache_dir: str | None,
+    store_kwargs: dict,
+) -> list[Result]:
+    arr = zarr.open_array(store=store_from_url(cfg.url, **store_kwargs), path=cfg.var, mode="r")
+    full = np.asarray(arr[:])
     idx0 = manifest.sample_indices(SplitName.TRAIN, geom)
     out = []
     for epoch in range(cfg.epochs):
@@ -186,7 +205,7 @@ def _run_memory(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
         if cfg.shuffle:
             np.random.default_rng((cfg.seed, epoch)).shuffle(idx)
 
-        def batches(idx=idx):
+        def batches(idx: np.ndarray = idx) -> Iterator[np.ndarray]:
             for i in range(0, len(idx), cfg.batch_size):
                 yield full[idx[i : i + cfg.batch_size]]
 
@@ -200,20 +219,21 @@ class _SampleReader:
     opening its own zarr handle per worker. Must be top-level (not a closure) so
     it pickles to DataLoader worker processes under the `spawn` start method."""
 
-    def __init__(self, url: str, var: str, idx, store_kwargs: dict) -> None:
+    def __init__(self, url: str, var: str, idx: np.ndarray, store_kwargs: dict) -> None:
         self.url = url
         self.var = var
         self.idx = idx
         self.store_kwargs = store_kwargs
-        self._arr = None  # opened lazily, once per worker
+        self._arr: zarr.Array | None = None  # opened lazily, once per worker
 
     def __len__(self) -> int:
         return len(self.idx)
 
-    def __getitem__(self, i: int):
+    def __getitem__(self, i: int) -> np.ndarray:
         if self._arr is None:
-            grp = zarr.open_group(store=store_from_url(self.url, **self.store_kwargs), mode="r")
-            self._arr = grp[self.var]
+            self._arr = zarr.open_array(
+                store=store_from_url(self.url, **self.store_kwargs), path=self.var, mode="r"
+            )
         return np.asarray(self._arr[int(self.idx[i])])
 
 
@@ -234,7 +254,13 @@ def _worker_mp_context(num_workers: int) -> str | None:
     return "spawn"
 
 
-def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
+def _run_workers(
+    cfg: Cfg,
+    geom: ArrayGeometry,
+    manifest: SplitManifest,
+    cache_dir: str | None,
+    store_kwargs: dict,
+) -> list[Result]:
     from torch.utils.data import DataLoader  # optional baseline dependency
 
     idx = manifest.sample_indices(SplitName.TRAIN, geom)
@@ -242,8 +268,10 @@ def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     # pool warm: the worker model's startup is then paid once (epoch-0 TTFB), not every
     # epoch. That's the tuned baseline (benchmark_plan.md: no strawman). shuffle still
     # reshuffles each iteration. persistent_workers requires num_workers>0.
-    loader = DataLoader(
-        _SampleReader(cfg.url, cfg.var, idx, store_kwargs),
+    # _SampleReader is a map-style dataset (len/getitem) but isn't a torch Dataset
+    # subclass -- it stays torch-free at module scope so it pickles to spawn workers.
+    loader: DataLoader = DataLoader(
+        _SampleReader(cfg.url, cfg.var, idx, store_kwargs),  # type: ignore[arg-type]
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         shuffle=cfg.shuffle,
@@ -259,7 +287,13 @@ def _run_workers(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
     return out
 
 
-def _run_xbatcher(cfg, geom, manifest, cache_dir, store_kwargs) -> list[Result]:
+def _run_xbatcher(
+    cfg: Cfg,
+    geom: ArrayGeometry,
+    manifest: SplitManifest,
+    cache_dir: str | None,
+    store_kwargs: dict,
+) -> list[Result]:
     import xarray as xr  # optional bench dependency
     import xbatcher
     from torch.utils.data import DataLoader

@@ -27,7 +27,8 @@ for the thesis and [docs/architecture.md](docs/architecture.md) for the pipeline
 ## Toolchain
 
 - **`uv`** manages everything (env, deps, running tools).
-- Verify: `uv run ruff check src tests bench`, `uv run mypy src`, `uv run pytest -q`.
+- Verify: `uv run ruff check src tests bench examples`, `uv run mypy src bench examples`,
+  `uv run pytest -q`.
 - Pre-commit (ruff + mypy): `uv run pre-commit install` once; runs on every commit.
 - Build: `uv build`. Sync env: `uv sync` (extras: `--extra torch`, `--extra gpu`).
 - Python ≥ 3.12, src layout (`src/insitubatch/`), build backend `uv_build`.

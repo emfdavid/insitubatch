@@ -15,6 +15,7 @@ Same code targets local or cloud -- only the ``--url`` scheme changes::
 from __future__ import annotations
 
 import argparse
+from typing import Literal
 
 import numpy as np
 import zarr
@@ -62,7 +63,7 @@ def make_dataset(
     group = zarr.open_group(store=store, mode="w")
     rng = np.random.default_rng(seed)
     chunks = (sample_chunk, *inner_chunks)
-    compressors = "auto" if compress else None
+    compressors: Literal["auto"] | None = "auto" if compress else None
 
     # Slab size = a whole number of sample-axis chunks fitting in write_batch_mb.
     bytes_per_row = int(np.prod(inner)) * 4

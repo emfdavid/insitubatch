@@ -43,6 +43,8 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from multiprocessing.context import BaseContext
+from typing import Any
 
 import numpy as np
 
@@ -70,7 +72,7 @@ def _storage_options(url: str, request_payer: bool) -> dict:
     return {}
 
 
-def _mp_context(mode: str, num_workers: int):
+def _mp_context(mode: str, num_workers: int) -> str | BaseContext | None:
     """Resolve a DataLoader multiprocessing_context for a named regime."""
     if not num_workers or mode == "fork":
         return None if mode != "fork" else "fork"
@@ -99,7 +101,7 @@ class _CenterCrop:
     """Top-level (picklable) wrapper: center-crop each xbatcher sample to (h, w) and
     drop the singleton time axis, so a batch collates to (batch, h, w)."""
 
-    def __init__(self, base, h: int, w: int) -> None:
+    def __init__(self, base: Any, h: int, w: int) -> None:  # base: xbatcher MapDataset
         self.base = base
         self.h = h
         self.w = w
@@ -107,7 +109,7 @@ class _CenterCrop:
     def __len__(self) -> int:
         return len(self.base)
 
-    def __getitem__(self, i: int):
+    def __getitem__(self, i: int) -> Any:  # torch tensor from the xbatcher MapDataset
         x = self.base[i]  # (1, LAT, LON) tensor from xbatcher MapDataset
         x = x.reshape(x.shape[-2], x.shape[-1])
         lat, lon = x.shape
@@ -156,8 +158,8 @@ def run_xbatcher_demo(
     for _ in range(num_epochs):
         # Fresh loader each epoch: this measures *cold start*, the inference-relevant
         # cost (the bench/ suite uses persistent workers to measure steady state).
-        loader = DataLoader(
-            base,
+        loader: DataLoader = DataLoader(
+            base,  # type: ignore[arg-type]  # _CenterCrop is map-style but not a torch Dataset
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=shuffle,
