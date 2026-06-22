@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import tempfile
 import time
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import zarr
@@ -72,13 +74,14 @@ def fit_over_loader(ds: InSituDataset) -> tuple[dict[str, StandardScaler], float
     ds.set_epoch(0)
     n, t = 0, time.perf_counter()
     for batch in ds:
+        assert isinstance(batch, Batch)  # to_tensor=False -> numpy Batch, not a tensor dict
         for v in ds.variables:
             scalers[v].partial_fit(batch.arrays[v].reshape(-1, 1))
         n += len(batch.sample_indices)
     return scalers, time.perf_counter() - t, n
 
 
-def make_batch_scaler(scalers: dict[str, StandardScaler]):
+def make_batch_scaler(scalers: dict[str, StandardScaler]) -> Callable[[Batch], Batch]:
     """A batch_transform that applies the fitted scalers (post-gather, per batch)."""
 
     def scale(batch: Batch) -> Batch:
@@ -95,7 +98,7 @@ def run_demo(
     url: str | None = None,
     cache_dir: str | None = None,
     verbose: bool = True,
-    **store_kwargs: object,
+    **store_kwargs: Any,
 ) -> dict:
     tmp = None
     if url is None:
@@ -130,7 +133,9 @@ def run_demo(
     grp = zarr.open_group(store=store_from_url(url, **store_kwargs), mode="r")
     max_err = 0.0
     for v, s in scalers.items():
-        true = np.asarray(grp[v][:])
+        arr = grp[v]
+        assert isinstance(arr, zarr.Array)
+        true = np.asarray(arr[:])
         max_err = max(max_err, abs(s.mean_[0] - true.mean()), abs(s.scale_[0] - true.std()))
 
     # 2) attach the scaler as a BATCH transform; re-iterate (warm: cache hits) ---------
@@ -138,11 +143,15 @@ def run_demo(
     ds.set_epoch(1)
     means, stds, t = [], [], time.perf_counter()
     for batch in ds:
+        assert isinstance(batch, Batch)  # to_tensor=False -> numpy Batch
         for v in ds.variables:
             means.append(float(batch.arrays[v].mean()))
             stds.append(float(batch.arrays[v].std()))
     warm_s = time.perf_counter() - t
 
+    stats: dict[str, tuple[float, float]] = {
+        v: (float(s.mean_[0]), float(s.scale_[0])) for v, s in scalers.items()
+    }
     summary = {
         "samples": n,
         "fit_s": fit_s,
@@ -151,11 +160,11 @@ def run_demo(
         "stat_max_err": max_err,
         "scaled_mean": float(np.mean(means)),
         "scaled_std": float(np.mean(stds)),
-        "stats": {v: (float(s.mean_[0]), float(s.scale_[0])) for v, s in scalers.items()},
+        "stats": stats,
     }
     if verbose:
         print(f"fit pass (cold, decodes + caches): {n} samples in {fit_s:.3f}s")
-        for v, (m, sd) in summary["stats"].items():
+        for v, (m, sd) in stats.items():
             print(f"   {v}: mean={m:8.3f}  std={sd:7.3f}")
         print(f"   partial_fit vs true global stats: max |err| = {max_err:.2e}  ✓")
         print(

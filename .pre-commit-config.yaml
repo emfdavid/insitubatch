@@ -18,8 +18,8 @@ repos:
         types_or: [python, pyi]
         require_serial: true
       - id: mypy
-        name: mypy (src)
-        entry: uv run mypy src
+        name: mypy (src+bench+examples)
+        entry: uv run mypy src bench examples
         language: system
         pass_filenames: false
         always_run: true

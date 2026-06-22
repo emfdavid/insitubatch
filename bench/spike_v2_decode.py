@@ -53,6 +53,7 @@ async def fetch_decode_scatter(url: str, var: str, max_inflight: int) -> np.ndar
             slice(i * c, min((i + 1) * c, s)) for i, c, s in zip(coords, chunks, shape, strict=True)
         )
         src = tuple(slice(0, sl.stop - sl.start) for sl in dst)
+        assert tile is not None  # decode returns None only for a missing chunk; spike has none
         out[dst] = tile.as_numpy_array()[src]
 
     await asyncio.gather(*(one(c) for c in itertools.product(*grid)))

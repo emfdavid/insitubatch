@@ -36,12 +36,13 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from typing import Any
 
 import numpy as np
 import obstore
 import zarr
 
-from insitubatch import SplitManifest, SplitName, open_geometries, split_by_chunk
+from insitubatch import Batch, SplitManifest, SplitName, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.store import store_from_url
 
@@ -68,7 +69,14 @@ def _stats(fn: Callable[[], float], repeats: int) -> tuple[float, float, float]:
 
 
 def _insitu(
-    url, var, kw, *, decode_threads, max_chunks, block_chunks=2, max_inflight=32
+    url: str,
+    var: str,
+    kw: dict[str, Any],
+    *,
+    decode_threads: int,
+    max_chunks: int,
+    block_chunks: int = 2,
+    max_inflight: int = 32,
 ) -> tuple[float, int]:
     """One insitu pass over the first ``max_chunks`` chunks; (MB/s, peak resident chunks).
 
@@ -95,6 +103,7 @@ def _insitu(
     n = 0
     t = time.perf_counter()
     for b in ds:
+        assert isinstance(b, Batch)  # to_tensor=False -> numpy Batch, not a tensor dict
         n += b.arrays[var].shape[0]
         if n >= limit:
             break
@@ -102,7 +111,21 @@ def _insitu(
     return n * bps / 1e6 / dt, ds.resident_peak
 
 
-def _insitu_cache(url, var, kw, *, max_chunks, block_chunks, cache_dir) -> tuple[float, float]:
+def _insitu_mb(url: str, var: str, kw: dict[str, Any], **opts: int) -> float:
+    """Just the MB/s of an :func:`_insitu` pass -- a typed target for ``partial`` in
+    the ``show`` sweeps (a ``lambda x=x:`` loop-capture defeats mypy inference)."""
+    return _insitu(url, var, kw, **opts)[0]
+
+
+def _insitu_cache(
+    url: str,
+    var: str,
+    kw: dict[str, Any],
+    *,
+    max_chunks: int,
+    block_chunks: int,
+    cache_dir: str,
+) -> tuple[float, float]:
     """Two epochs over the first ``max_chunks`` chunks with a budget that holds them
     all; returns (cold MB/s, warm MB/s). The manifest is restricted to exactly those
     chunks so read-ahead can't LRU-evict the early ones before epoch 1 -- which is
@@ -141,6 +164,7 @@ def _insitu_cache(url, var, kw, *, max_chunks, block_chunks, cache_dir) -> tuple
         n = 0
         t = time.perf_counter()
         for b in ds:
+            assert isinstance(b, Batch)  # to_tensor=False -> numpy Batch
             n += b.arrays[var].shape[0]
         return n * bps / 1e6 / (time.perf_counter() - t)
 
@@ -149,7 +173,9 @@ def _insitu_cache(url, var, kw, *, max_chunks, block_chunks, cache_dir) -> tuple
     return cold, warm
 
 
-def _raw_get_mb_s(url, var, kw, concurrency, max_chunks) -> float:
+def _raw_get_mb_s(
+    url: str, var: str, kw: dict[str, Any], concurrency: int, max_chunks: int
+) -> float:
     """Fetch raw (still-encoded) chunk objects via obstore — no decode.
 
     Enumerates the *real* stored-chunk grid (outer x inner) from the array's
@@ -264,9 +290,15 @@ def main() -> None:
     for dt in (int(x) for x in a.decode_threads.split(",")):
         show(
             f"decode_threads={dt or 'auto':>4}",
-            lambda dt=dt: _insitu(
-                a.url, a.var, kw, decode_threads=dt, max_chunks=a.max_chunks, block_chunks=bc
-            )[0],
+            partial(
+                _insitu_mb,
+                a.url,
+                a.var,
+                kw,
+                decode_threads=dt,
+                max_chunks=a.max_chunks,
+                block_chunks=bc,
+            ),
         )
 
     print(f"\n1b) insitu MB/s + peak residency vs max_inflight (block_chunks={bc}, decode auto):")
@@ -320,7 +352,7 @@ def main() -> None:
         for label, u in (("compressed", a.url), ("uncompressed", none_url)):
             show(
                 f"{label:12}",
-                lambda u=u: _insitu(u, "t2m", {}, decode_threads=0, max_chunks=a.max_chunks)[0],
+                partial(_insitu_mb, u, "t2m", {}, decode_threads=0, max_chunks=a.max_chunks),
             )
 
 
