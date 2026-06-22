@@ -256,6 +256,61 @@ scp ec2-user@$IP:insitubatch/bench/results/suite.jsonl /tmp/suite.jsonl
 uv run python -m bench.plot --in /tmp/suite.jsonl --out docs/figures --cdn
 ```
 
+## 9. S3 Express One Zone — the IO-ceiling stress test
+
+A single-AZ, low-latency directory bucket (`--x-s3`). It *raises the raw-GET
+ceiling*, so it tests whether the loader keeps up (the thesis) or the Python
+orchestration becomes the bound. **The VM must be in the same AZ as the bucket**
+(`us-east-1c` here) or the latency win is gone — check on the box:
+
+```bash
+T=$(curl -sX PUT http://169.254.169.254/latest/api/token \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+curl -s -H "X-aws-ec2-metadata-token: $T" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone   # want us-east-1c
+```
+
+```bash
+# 1) Resolve us-east-1c -> its AZ ID (the account-specific mapping)
+export AZID=$(aws ec2 describe-availability-zones --region us-east-1 \
+  --query "AvailabilityZones[?ZoneName=='us-east-1c'].ZoneId" --output text)
+echo "us-east-1c -> $AZID"          # e.g. use1-az6
+
+# 2) Create the S3 Express One Zone directory bucket (name MUST end --<azid>--x-s3)
+export XBUCKET="insitubatch-bench--${AZID}--x-s3"
+aws s3api create-bucket --region us-east-1 --bucket "$XBUCKET" \
+  --create-bucket-configuration \
+  "Location={Type=AvailabilityZone,Name=${AZID}},Bucket={Type=Directory,DataRedundancy=SingleAvailabilityZone}"
+echo "created $XBUCKET"
+```
+
+# 3) Grant the instance role s3express access (directory buckets use a new action;
+#    `ListDirectoryBuckets` is a separate account-level perm you do NOT need --
+#    put/get/list + CreateSession, which obstore uses, is enough).
+```bash
+cat > /tmp/s3x.json <<JSON
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+ "Action":"s3express:CreateSession",
+ "Resource":"arn:aws:s3express:us-east-1:${ACCT}:bucket/${XBUCKET}"}]}
+JSON
+aws iam put-role-policy --role-name insitubatch-bench \
+  --policy-name s3express --policy-document file:///tmp/s3x.json
+```
+
+Smoke test. obstore needs `s3_express=True` (the `--s3-express` flag / `s3_express=`
+kwarg) -- it is **not** inferred from the bucket name; `AWS_S3_EXPRESS=true` is the
+env-var equivalent.
+```bash
+uv run python bench/make_dataset.py --url "s3://$XBUCKET/smoke.zarr" \
+  --sample-chunk 8 --n-samples 16 --inner 64,64 --s3-express
+uv run python -c "from insitubatch import open_geometries; \
+  print(open_geometries('s3://$XBUCKET/smoke.zarr', s3_express=True))"
+```
+
+The actual Express comparison datasets + probe commands live in the benchmark plan
+(`bench/benchmark_plan.md`).
+
+
 ## External reproducers (a different AWS account)
 ```python
 from insitubatch import open_geometries, split_by_chunk
