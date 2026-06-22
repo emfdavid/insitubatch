@@ -307,8 +307,12 @@ renders after a run.
 
 - **Tune the baselines** (`num_workers`, xbatcher batch dims) to their best; report
   the tuning.
-- **Cold vs warm** controlled (fresh process / cache-off for read-once; the warmup
-  burst in the runner only primes the HTTP/TLS pool, not the data cache).
+- **Cold vs warm** controlled. The runner warms **every** prefix before timing
+  (each `_c<spc>.zarr` is its own S3 key prefix with a separate request-rate ramp);
+  the probe does one throwaway prewarm burst at the top (`--no-warm` to disable).
+  The prewarm primes obstore's TLS pool **and** the per-prefix ramp — not the data
+  cache, so read-once/cold-vs-warm comparisons stay honest (the cache test's epoch-0
+  becomes S3-warm/pool-cold, isolating decode+pool reuse from the S3 ramp).
 - **≥3 repeats** (5 for the noisy probe sweeps), report median + min/max; exclude
   warmup batches (`--warmup-batches`).
 - **Provenance** in every row: instance type, region, NIC, vCPU, codec, date.

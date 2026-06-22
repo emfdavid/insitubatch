@@ -73,23 +73,25 @@ def run_suite(
 
     # Warm S3/obstore before timing: a cold prefix is rate-limited and the HTTP/TLS
     # pool is empty, so the first config otherwise eats ~30 s of ramp-up and reads
-    # at ~1 stream (see exp_a). One throwaway burst at the max concurrency fixes it.
-    if warmup_batches and urls:
-        spc0 = next(iter(urls))
+    # at ~1 stream (see exp_a). The TLS/connection pool is per-host so one burst
+    # carries across prefixes, but S3's request-rate ramp is *per object-key prefix*
+    # -- and each chunk size is its own `_c<spc>.zarr` prefix -- so warm every URL.
+    bc_warm = max(block_chunks_sweep)
+    for spc, url in urls.items() if warmup_batches else ():
         warm = Cfg(
             engine="insitu",
-            url=urls[spc0],
+            url=url,
             storage=storage,
-            sample_chunk=spc0,
+            sample_chunk=spc,
             batch_size=batch_size,
-            block_chunks=max(block_chunks_sweep),
+            block_chunks=bc_warm,
             max_batches=warmup_batches,
             epochs=1,
         )
         if verbose:
-            print(f"warmup: {warmup_batches} batches @ bc{max(block_chunks_sweep)} ...", flush=True)
+            print(f"warmup c{spc}: {warmup_batches} batches @ bc{bc_warm} ...", flush=True)
         try:
-            run(warm, cache_dir=str(scratch / "warmup"), store_kwargs=store_kwargs)
+            run(warm, cache_dir=str(scratch / f"warmup_c{spc}"), store_kwargs=store_kwargs)
         except Exception as exc:  # noqa: BLE001 - warmup is best-effort
             if verbose:
                 print(f"  warmup failed: {type(exc).__name__}: {exc}")

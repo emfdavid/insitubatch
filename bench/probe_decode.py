@@ -210,6 +210,12 @@ def main() -> None:
         help="run the cross-epoch cache test (sec 1c): cold vs cached epoch, mmap slots here",
     )
     p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
+    p.add_argument(
+        "--no-warm",
+        action="store_true",
+        help="skip the throwaway prewarm burst (warms obstore's TLS pool + the S3 "
+        "per-prefix request-rate ramp so the first sweep point isn't cold)",
+    )
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
     p.add_argument(
@@ -232,6 +238,28 @@ def main() -> None:
         print(f"   {label}: {med:8.1f} MB/s  ({lo:.0f}-{hi:.0f})")
 
     bc = a.block_chunks
+
+    # Prewarm: a cold S3 prefix is rate-limited and obstore's TLS pool is empty, so
+    # the first sweep point otherwise eats the ramp-up and reads at ~1 stream. One
+    # throwaway burst at the top fixes it for every section below (and makes 1c's
+    # "cold" epoch S3-warm/pool-cold, isolating decode+pool reuse from the S3 ramp).
+    if not a.no_warm:
+        mi_warm = max(int(x) for x in a.max_inflight.split(","))
+        print(f"0) prewarm: {a.max_chunks} chunks @ max_inflight={mi_warm} (discarded) ...")
+        try:
+            _insitu(
+                a.url,
+                a.var,
+                kw,
+                decode_threads=0,
+                max_chunks=a.max_chunks,
+                block_chunks=bc,
+                max_inflight=mi_warm,
+            )
+        except Exception as exc:  # noqa: BLE001 - prewarm is best-effort
+            print(f"   prewarm failed: {type(exc).__name__}: {exc}")
+        print()
+
     print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, block_chunks={bc}):")
     for dt in (int(x) for x in a.decode_threads.split(",")):
         show(
