@@ -48,9 +48,16 @@ def run_suite(
     max_batches: int = 0,
     warmup_batches: int = 32,
     request_payer: bool = False,
+    s3_express: bool = False,
     verbose: bool = True,
 ) -> list[Result]:
-    store_kwargs = {"request_payer": True} if request_payer else {}
+    store_kwargs: dict[str, bool] = {}
+    if request_payer:
+        store_kwargs["request_payer"] = True
+    # S3 Express One Zone (directory buckets, --x-s3): obstore needs s3_express=True;
+    # it is NOT inferred from the bucket name. (env equivalent: AWS_S3_EXPRESS=true)
+    if s3_express:
+        store_kwargs["s3_express"] = True
     if url_prefix:
         urls = {spc: f"{url_prefix}_c{spc}.zarr" for spc in chunk_sizes}
     else:
@@ -192,6 +199,9 @@ def main() -> None:
     )
     p.add_argument("--cache-dir", default=None, help="mmap cache scratch dir (point at NVMe)")
     p.add_argument("--request-payer", action="store_true")
+    p.add_argument(
+        "--s3-express", action="store_true", help="data lives in an S3 Express directory bucket"
+    )
     p.add_argument("--plot", action="store_true", help="render Plotly graphs after the run")
     p.add_argument("--fig-dir", default="bench/figures")
     a = p.parse_args()
@@ -207,6 +217,7 @@ def main() -> None:
         request_payer=a.request_payer,
         max_batches=a.max_batches,
         warmup_batches=a.warmup_batches,
+        s3_express=a.s3_express,
         worker_sweep=tuple(int(x) for x in a.num_workers.split(",")),
         compute_ms_sweep=tuple(float(x) for x in a.compute_ms.split(",")),
     )
