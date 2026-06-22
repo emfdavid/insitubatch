@@ -49,12 +49,14 @@ from ._profile import record_pyspy
 from .make_dataset import make_dataset
 
 
-def _store_kwargs(url: str, anon: bool, request_payer: bool) -> dict:
+def _store_kwargs(url: str, anon: bool, request_payer: bool, s3_express: bool) -> dict:
     kw: dict = {}
     if anon or url.startswith("gs://"):
         kw["skip_signature"] = True
     if request_payer:
         kw["request_payer"] = True
+    if s3_express:  # S3 Express One Zone directory bucket (--x-s3); not inferred from the name
+        kw["s3_express"] = True
     return kw
 
 
@@ -210,6 +212,9 @@ def main() -> None:
     p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
     p.add_argument("--anon", action="store_true", help="anonymous (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
+    p.add_argument(
+        "--s3-express", action="store_true", help="target an S3 Express One Zone directory bucket"
+    )
     a = p.parse_args()
 
     tmp = None
@@ -219,7 +224,7 @@ def main() -> None:
         a.url = f"file://{tmp}/era5.zarr"
         a.var = "t2m"
         make_dataset(a.url, n_samples=512, inner=(721, 1440), sample_chunk=8, variables=["t2m"])
-    kw = _store_kwargs(a.url, a.anon, a.request_payer)
+    kw = _store_kwargs(a.url, a.anon, a.request_payer, a.s3_express)
     print(f"probe {a.url}  var={a.var}  first {a.max_chunks} chunks\n")
 
     def show(label: str, fn: Callable[[], float]) -> None:

@@ -34,6 +34,7 @@ def make_dataset(
     inner_chunks: tuple[int, ...] | None = None,
     write_batch_mb: int = 1024,
     write_concurrency: int = 32,
+    s3_express: bool = False,
 ) -> None:
     """Write a ``(n_samples, *inner)`` array per variable, chunked along axis 0.
 
@@ -54,7 +55,10 @@ def make_dataset(
     if len(inner_chunks) != len(inner):
         raise ValueError(f"inner_chunks {inner_chunks} must match inner dims {inner}")
     ensure_local_dir(url)
-    store = store_from_url(url, read_only=False)
+    # S3 Express One Zone (directory buckets, --x-s3): obstore needs s3_express=True;
+    # it is NOT inferred from the bucket name. (env equivalent: AWS_S3_EXPRESS=true)
+    store_kwargs = {"s3_express": True} if s3_express else {}
+    store = store_from_url(url, read_only=False, **store_kwargs)
     group = zarr.open_group(store=store, mode="w")
     rng = np.random.default_rng(seed)
     chunks = (sample_chunk, *inner_chunks)
@@ -147,6 +151,9 @@ def main() -> None:
         "--write-batch-mb", type=int, default=1024, help="slab size (RAM bound) per write"
     )
     p.add_argument("--write-concurrency", type=int, default=32, help="zarr in-flight chunk writes")
+    p.add_argument(
+        "--s3-express", action="store_true", help="target an S3 Express One Zone directory bucket"
+    )
     a = p.parse_args()
 
     sample_chunk = (
@@ -163,6 +170,7 @@ def main() -> None:
         inner_chunks=a.inner_chunks,
         write_batch_mb=a.write_batch_mb,
         write_concurrency=a.write_concurrency,
+        s3_express=a.s3_express,
     )
 
 
