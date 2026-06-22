@@ -98,8 +98,18 @@ obstore's flat band across the whole `sample_chunk` sweep (c1 ≈ 1 MB … c32 �
 
 Sizing: N≈3000 at `batch_size=32` is ~96 batches/epoch, so timed runs cap at
 **`--max-batches 64`** — comfortably inside one epoch (no wrap) and plenty for a
-stable median. The heaviest store is `era5_c32` at ~3.2 GB compressed; the fat
-grids are ~3.3 GB each.
+stable median. Each family member is ~3.2 GB; the fat grids ~3.3 GB each.
+
+> **What the `make_dataset` print reports — and what we measure.** The
+> `~N MB uncompressed` line is the *logical* size (`n_samples × inner × 4`),
+> printed for a quick sanity check — not a `stat` of the written store. The values
+> are `standard_normal` f32, which is **incompressible**, so `compress=auto` (zstd)
+> shrinks them ~0% and the **on-disk footprint ≈ this number**. That is deliberate:
+> bytes-moved ≈ uncompressed keeps the MB/s and "% of raw-GET ceiling" math clean,
+> and the codec still runs on the decode path (zstd decompress per chunk) so the
+> decode-cost story is real. Caveat: real ERA5 compresses ~2–4×, so this synthetic
+> data moves *more* bytes/sample than production (conservative for the network
+> ceiling) — see the `make_dataset` docstring ("synthetic-but-realistic").
 
 ### Make the datasets
 
