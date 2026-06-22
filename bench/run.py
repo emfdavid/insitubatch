@@ -217,7 +217,15 @@ def main() -> None:
             inner=(64, 64),
             batch_size=32,
             block_chunks_sweep=(8, 32),
-            worker_sweep=(8, 16, 32),  # ~1 stream/worker; tune up to vCPUs (no strawman)
+            # Baselines run at their tuned BEST (~vCPUs), one config -- NOT swept low.
+            # The claim is "vs the best-tuned baseline"; sweeping low num_workers just
+            # times the baseline being slow. (Find the best once with --num-workers
+            # 8,16,32 on a single --chunk-sizes, separately.)
+            worker_sweep=(32,),
+            # memory (B3, in-RAM ceiling) preloads the WHOLE array (ignores
+            # --max-batches) -- a reference, not the comparison. Run it on its own on a
+            # moderate set; keep it out of the spectrum sweep.
+            engines=("naive", "workers", "xbatcher", "insitu"),
             compute_ms_sweep=(0.0, 10.0),
         )
     if a.engines:
