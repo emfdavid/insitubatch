@@ -67,16 +67,16 @@ sample_chunk` of their bytes; insitu reads once. The advantage therefore grows l
 with chunk size and shrinks to a slight *loss* at the GRIB end (`c1`, one sample/chunk —
 nothing to amortize).
 
-<iframe src="figures/g1_throughput_vs_chunk.html" width="100%" height="480" frameborder="0"></iframe>
+<iframe src="../figures/g1_throughput_vs_chunk.html" width="100%" height="480" frameborder="0"></iframe>
 
 ### Throughput by engine, and the baseline tuning
 
-<iframe src="figures/g2_ablation.html" width="100%" height="420" frameborder="0"></iframe>
+<iframe src="../figures/g2_ablation.html" width="100%" height="420" frameborder="0"></iframe>
 
 The DataLoader baselines are reported at their best `num_workers` — they keep scaling
 toward 32 and still top out well below insitu:
 
-<iframe src="figures/g7_worker_tuning.html" width="100%" height="420" frameborder="0"></iframe>
+<iframe src="../figures/g7_worker_tuning.html" width="100%" height="420" frameborder="0"></iframe>
 
 For reference, the in-memory ceiling (whole array in RAM, zero IO) runs ~7.6–7.9 GB/s;
 insitu at `c8` is ~0.7 GB/s — the gap is IO, not loader overhead (see story 4).
@@ -116,7 +116,7 @@ The cross-epoch probe on `fat_g16` confirms it independently (1006 → 4509, 4.5
 worker stacks have **no shared cross-epoch cache** — they re-read S3 every epoch — so this
 is the result that flips the GRIB end back to insitu for *multi-epoch training*.
 
-<iframe src="figures/g4_cache_epochs.html" width="100%" height="420" frameborder="0"></iframe>
+<iframe src="../figures/g4_cache_epochs.html" width="100%" height="420" frameborder="0"></iframe>
 
 ---
 
