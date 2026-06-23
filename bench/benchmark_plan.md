@@ -337,14 +337,17 @@ clean TTFB story the G5 probe's cross-engine column can't give. Needs the `bench
 uv run python -m examples.wb2_xbatcher --wb2 --compare --subregion 48,48 --max-batches 100 \
   | tee bench/results/wb2_xbatcher.log
 
-# insitu equivalent: one in-process event loop, num_workers=0 -- no spawn, first batch in ms.
+# insitu equivalent: one in-process event loop, num_workers=0 -- no spawn, reads each
+# time-chunk once. Add --num-epochs 2 --cache-resident to also show the cross-epoch cache.
 uv run python -m examples.wb2_dataloader --wb2 --subregion 48,48 --max-batches 100 \
   | tee bench/results/wb2_dataloader.log
 ```
 
-The contrast (synthetic preview): xbatcher pays **~2.5–2.8 s** to first batch (and spawn
-costs ~43 s wall to re-import per worker; forkserver-preload trims it to ~2.7 s), while
-insitu's event loop is **~11 ms**. That is the framing — xbatcher is the domain-standard
+The contrast **on the real WeatherBench2 store** (8 workers): xbatcher manages **~40–60
+samples/s** at **~1.9–3.3 s** to first batch (`forkserver-preload` lowest TTFB, as
+designed), while insitu runs **~2250 samples/s** at **~320 ms** — **~40× the throughput**,
+because WB2's fat time-chunks make the per-sample decode brutal for the worker stack and
+insitu reads each chunk once. That is the framing — xbatcher is the domain-standard
 *batch definition*, but its **engine is worker-process brute force** (many procs, heavy
 memory, slow cold start); insitu keeps the ndim batch semantics with one async loop,
 **batteries-included across the chunk spectrum** — its edge grows with samples-per-chunk
