@@ -55,7 +55,7 @@ def test_unequal_chunking_raises(tmp_path) -> None:
     manifest = split_by_chunk(geoms["u10"], fractions=(0.8, 0.1, 0.1))
 
     with pytest.raises(ValueError, match="same sample-axis"):
-        InSituDataset(url, manifest, geometries=geoms, to_tensor=False)
+        InSituDataset(url, manifest, geometries=geoms)
 
 
 def test_shuffle_false_is_in_order(write_zarr) -> None:
@@ -67,7 +67,6 @@ def test_shuffle_false_is_in_order(write_zarr) -> None:
         manifest,
         split=SplitName.TRAIN,
         shuffle=False,
-        to_tensor=False,
         batch_size=5,
         block_chunks=2,
     )
@@ -85,7 +84,6 @@ def test_shuffle_true_covers_but_reorders(write_zarr) -> None:
         manifest,
         shuffle=True,
         seed=1,
-        to_tensor=False,
         batch_size=5,
         block_chunks=4,
     )
@@ -117,7 +115,6 @@ def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
         block_chunks=20,
         shuffle=True,
         seed=0,
-        to_tensor=False,
         chunk_transforms=[count],
     )
     ds.set_epoch(0)
@@ -144,7 +141,6 @@ def test_residency_is_bounded_by_block(write_zarr) -> None:
         block_chunks=block_chunks,
         shuffle=True,
         seed=0,
-        to_tensor=False,
     )
     ds.set_epoch(0)
     for _ in ds:
@@ -175,7 +171,6 @@ def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
         block_chunks=4,
         shuffle=True,
         seed=0,
-        to_tensor=False,
         chunk_transforms=[count],
         cache_dir=str(tmp_path / "cache") if kind == "mmap" else None,
         cache_budget_bytes=10_000_000,  # >> the 20-chunk split -> nothing evicted
@@ -198,7 +193,7 @@ def test_sample_range_subsets_what_the_dataset_reads(write_zarr) -> None:
     url, _ = write_zarr(n=80, spc=8)  # 10 chunks
     geom = open_geometries(url)["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0), sample_range=(16, 40))
-    ds = InSituDataset(url, manifest, shuffle=False, to_tensor=False, batch_size=8)
+    ds = InSituDataset(url, manifest, shuffle=False, batch_size=8)
     ds.set_epoch(0)
     idx = np.concatenate([b.sample_indices for b in ds])
     assert set(idx.tolist()) == set(range(16, 40))  # chunks 2,3,4 -> samples 16..39

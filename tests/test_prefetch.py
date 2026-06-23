@@ -50,7 +50,6 @@ def test_producer_runs_ahead_of_consumer(tmp_path) -> None:
         batch_size=4,
         block_chunks=2,
         prefetch_depth=2,
-        to_tensor=False,
         batch_transforms=[record],
     )
     ds.set_epoch(0)
@@ -82,7 +81,6 @@ def test_prefetch_preserves_values_and_coverage(tmp_path) -> None:
         batch_size=4,
         block_chunks=2,
         prefetch_depth=3,
-        to_tensor=False,
     )
     ds.set_epoch(0)
 
@@ -117,7 +115,6 @@ def test_partial_iteration_reaps_producer(tmp_path) -> None:
         batch_size=4,
         block_chunks=2,
         prefetch_depth=2,
-        to_tensor=False,
     )
 
     ds.set_epoch(0)
@@ -160,7 +157,6 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
         batch_size=4,
         block_chunks=2,
         prefetch_depth=2,
-        to_tensor=False,
     )
 
     # epoch 0: pull one batch, let the producer read ahead (pinning), then abort.

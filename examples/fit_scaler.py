@@ -74,7 +74,6 @@ def fit_over_loader(ds: InSituDataset) -> tuple[dict[str, StandardScaler], float
     ds.set_epoch(0)
     n, t = 0, time.perf_counter()
     for batch in ds:
-        assert isinstance(batch, Batch)  # to_tensor=False -> numpy Batch, not a tensor dict
         for v in ds.variables:
             scalers[v].partial_fit(batch.arrays[v].reshape(-1, 1))
         n += len(batch.sample_indices)
@@ -124,7 +123,6 @@ def run_demo(
         batch_size=16,
         block_chunks=4,
         shuffle=False,
-        to_tensor=False,
         cache_dir=cache_dir or (f"{tmp}/cache" if tmp else None),
         cache_budget_bytes=4 << 30,
         **store_kwargs,
@@ -147,7 +145,6 @@ def run_demo(
     ds.set_epoch(1)
     means, stds, t = [], [], time.perf_counter()
     for batch in ds:
-        assert isinstance(batch, Batch)  # to_tensor=False -> numpy Batch
         for v in ds.variables:
             means.append(float(batch.arrays[v].mean()))
             stds.append(float(batch.arrays[v].std()))

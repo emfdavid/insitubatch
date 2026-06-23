@@ -1,14 +1,20 @@
-"""Torch handoff surface.
+"""The core batch stream: a framework-neutral iterable of numpy ``Batch`` objects.
 
-Ties the pieces together and exposes them to PyTorch *without* using the classic
-DataLoader worker model. Parallelism lives in :class:`Scheduler`'s event loop, so
-the recommended configuration is::
+:class:`InSituDataset` ties the pieces together and yields assembled numpy batches.
+It inherits nothing framework-specific -- parallelism lives in :class:`Scheduler`'s
+event loop, not a worker pool. Framework handoff (torch / JAX / TF) is a thin,
+optional DLPack adapter layer in :mod:`insitubatch.frameworks`; the core never
+imports a framework, so ``import insitubatch`` works on a box without any installed.
+For PyTorch::
 
-    loader = DataLoader(InSituDataset(...), batch_size=None, num_workers=0)
+    from insitubatch.frameworks import as_torch
+    loader = DataLoader(as_torch(InSituDataset(...)), batch_size=None, num_workers=0)
 
 ``batch_size=None`` because the dataset already yields assembled batches;
 ``num_workers=0`` because forking workers would re-introduce exactly the
-redundant-read / nested-parallelism problems we set out to avoid.
+redundant-read / nested-parallelism problems we set out to avoid. JAX iterates the
+dataset directly (``frameworks.to_jax`` per batch); TF wraps it
+(``frameworks.as_tf_dataset``).
 
 The engine is the fetch scheduler: one event loop streams stored-chunk reads under
 a single ``max_inflight`` budget and scatters decoded tiles into a
@@ -16,9 +22,6 @@ a single ``max_inflight`` budget and scatters decoded tiles into a
 assembled chunks, gathers coalesced batches, and unpins the block (making it
 LRU-evictable / retainable for reuse). Read concurrency (``max_inflight``) and the
 residency budget are independent dials. See [docs/architecture.md] for the pipeline.
-
-torch (and torchdata.nodes) are optional imports so the core engine stays
-framework-agnostic and importable on a box without torch installed.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import contextlib
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 
@@ -42,22 +45,6 @@ from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRea
 # max_inflight is independent of the shuffle window -- sized to saturate the
 # network, not the buffer.
 DEFAULT_MAX_INFLIGHT = 32
-
-# Optional torch surface. TYPE_CHECKING gives mypy a consistent view (the real
-# IterableDataset) regardless of whether torch is installed in the checking env;
-# the runtime branch handles torch-less installs.
-if TYPE_CHECKING:
-    from torch.utils.data import IterableDataset
-
-    _HAS_TORCH = True
-else:
-    try:
-        from torch.utils.data import IterableDataset
-
-        _HAS_TORCH = True
-    except ImportError:  # pragma: no cover - torch-less installs
-        IterableDataset = object
-        _HAS_TORCH = False
 
 
 def _partition_blocks(order: np.ndarray, block_chunks: int) -> list[tuple[int, int, np.ndarray]]:
@@ -84,12 +71,14 @@ def _partition_blocks(order: np.ndarray, block_chunks: int) -> list[tuple[int, i
     ]
 
 
-class InSituDataset(IterableDataset):
-    """An IterableDataset that streams shuffled batches from a Zarr archive.
+class InSituDataset:
+    """A framework-neutral iterable that streams shuffled numpy batches from Zarr.
 
     One epoch = permute the split's chunks -> walk shuffle-blocks -> for each
     block, stream-fetch its stored chunks into the pool, gather coalesced batches,
-    evict the block.
+    evict the block. Iterating yields numpy :class:`Batch` objects; convert to a
+    framework with :mod:`insitubatch.frameworks` (``as_torch`` / ``to_jax`` /
+    ``as_tf_dataset``).
     """
 
     def __init__(
@@ -103,7 +92,6 @@ class InSituDataset(IterableDataset):
         block_chunks: int = 16,
         max_inflight: int | None = None,
         seed: int = 0,
-        to_tensor: bool = True,
         shuffle: bool = True,
         prefetch_depth: int = 2,
         cache_dir: str | None = None,
@@ -136,7 +124,6 @@ class InSituDataset(IterableDataset):
         self.batch_size = batch_size
         self.block_chunks = block_chunks
         self.seed = seed
-        self.to_tensor = to_tensor and _HAS_TORCH
         self.shuffle = shuffle
         self.prefetch_depth = max(int(prefetch_depth), 1)
         self.chunk_transforms = tuple(chunk_transforms)
@@ -196,7 +183,7 @@ class InSituDataset(IterableDataset):
             )
         return sequential_order(chunk_ids, spc, geom.n_samples)
 
-    def __iter__(self) -> Iterator[Batch | dict]:
+    def __iter__(self) -> Iterator[Batch]:
         """Drain assembled batches from a background producer (prefetch).
 
         A producer thread starts the scheduler over the epoch's chunks (in draw
@@ -269,7 +256,7 @@ class InSituDataset(IterableDataset):
                         break
                     if isinstance(item, Exception):
                         raise item
-                    yield self._maybe_tensor(item)
+                    yield item
             finally:
                 # Signal stop, then drain so a producer parked on a full queue can
                 # proceed and exit before the scheduler (context manager) is closed.
@@ -280,13 +267,6 @@ class InSituDataset(IterableDataset):
                 producer.join(timeout=10)
                 self.resident_peak = sched.pool.max_resident  # peak residency this epoch
                 self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
-
-    def _maybe_tensor(self, batch: Batch) -> Batch | dict:
-        if not self.to_tensor:
-            return batch
-        import torch
-
-        return {k: torch.from_numpy(v) for k, v in batch.arrays.items()}
 
     def close(self) -> None:
         """Release the cache pool's backing (mmap files, cached chunks).

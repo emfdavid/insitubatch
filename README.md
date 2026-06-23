@@ -64,15 +64,19 @@ chunks↔concurrency↔memory model).
 ## Install
 
 ```bash
-pip install insitubatch              # core engine
-pip install "insitubatch[torch]"     # + the torch IterableDataset surface
+pip install insitubatch              # core engine (numpy Batch; no framework)
+pip install "insitubatch[torch]"     # + torch DLPack adapter (insitubatch.frameworks)
+pip install "insitubatch[jax]"       # + JAX adapter
+pip install "insitubatch[tf]"        # + TensorFlow adapter
 ```
 
 For development:
 
 ```bash
 uv sync                  # core engine + dev tools
-uv sync --extra torch    # add the torch IterableDataset surface
+uv sync --extra torch    # add the torch handoff (frameworks.as_torch)
+uv sync --extra jax      # add the JAX handoff (frameworks.to_jax)
+uv sync --extra tf       # add the TF handoff (frameworks.as_tf_dataset)
 uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 ```
 
@@ -119,10 +123,13 @@ on the GIL is the point (see [DESIGN.md](DESIGN.md)).
 
 ## Shape of the API
 
+The core `InSituDataset` is a **framework-neutral iterable of numpy `Batch` objects** —
+it inherits nothing framework-specific. Handoff to torch / JAX / TF is a thin, optional
+DLPack adapter layer in `insitubatch.frameworks`; the core imports no framework.
+
 ```python
 from insitubatch import open_geometries, split_by_chunk, SplitName
 from insitubatch.source import InSituDataset
-from torch.utils.data import DataLoader
 
 url = "file:///data/era5.zarr"           # or "s3://bucket/era5.zarr" — same code
 geoms = open_geometries(url)             # {var: ArrayGeometry} from zarr metadata
@@ -131,12 +138,26 @@ manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 ds = InSituDataset(url, manifest, split=SplitName.TRAIN,
                    batch_size=32, block_chunks=16)
 
-# parallelism lives in insitubatch's event loop, not in workers:
-loader = DataLoader(ds, batch_size=None, num_workers=0)
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)
-    for batch in loader:                 # {var: torch.Tensor}
+    for batch in ds:                     # numpy Batch: {var: np.ndarray} + sample_indices
         ...
+```
+
+Hand off to a framework (zero-copy on CPU via DLPack). The ecosystems differ — torch
+needs a `Dataset` subclass, JAX iterates directly, TF wraps via `from_generator`:
+
+```python
+from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset
+from torch.utils.data import DataLoader
+
+# torch: parallelism is in our event loop, so num_workers=0, batch_size=None
+loader = DataLoader(as_torch(ds), batch_size=None, num_workers=0)   # {var: torch.Tensor}
+
+for batch in ds:            # JAX: iterate the dataset, convert each batch
+    jbatch = to_jax(batch)  # {var: jax.Array}
+
+tfds = as_tf_dataset(ds)    # a tf.data.Dataset
 ```
 
 ## License

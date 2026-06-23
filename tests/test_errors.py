@@ -26,7 +26,7 @@ def test_error_propagates_through_prefetch(write_zarr) -> None:
     url, _ = write_zarr(n=40, spc=8)
     geom = open_geometries(url)["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
-    ds = InSituDataset(url, manifest, to_tensor=False, chunk_transforms=[_boom])
+    ds = InSituDataset(url, manifest, chunk_transforms=[_boom])
     ds.set_epoch(0)
     with pytest.raises(ValueError, match="boom"):
         list(ds)
@@ -45,14 +45,12 @@ def test_bad_chunk_raises_by_default_then_nan_fills(write_zarr) -> None:
     assert chunk.exists(), f"chunk file not found: {chunk}"
     chunk.write_bytes(b"\x00\x01\x02\x03")
 
-    ds = InSituDataset(url, manifest, shuffle=False, to_tensor=False, batch_size=8)
+    ds = InSituDataset(url, manifest, shuffle=False, batch_size=8)
     ds.set_epoch(0)
     with pytest.raises(Exception):  # noqa: B017 - decode raises a codec-specific type
         list(ds)
 
-    ds = InSituDataset(
-        url, manifest, shuffle=False, to_tensor=False, batch_size=8, on_bad_chunk="nan"
-    )
+    ds = InSituDataset(url, manifest, shuffle=False, batch_size=8, on_bad_chunk="nan")
     ds.set_epoch(0)
     batches = list(ds)
     idx = np.concatenate([b.sample_indices for b in batches])

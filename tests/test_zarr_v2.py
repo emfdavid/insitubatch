@@ -59,7 +59,6 @@ def test_iterates_store_v2_and_v3(
         shuffle=False,
         batch_size=8,
         block_chunks=2,
-        to_tensor=False,
     )
     ds.set_epoch(0)
 

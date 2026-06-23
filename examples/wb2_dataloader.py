@@ -143,7 +143,6 @@ def run_demo(
         cache_budget_bytes=cache_budget_bytes,
         shuffle=shuffle,
         seed=seed,
-        to_tensor=False,
         batch_transforms=[_subregion_crop(var, subregion, seed)],
         **store_kwargs,
     )

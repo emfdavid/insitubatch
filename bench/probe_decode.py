@@ -42,7 +42,7 @@ import numpy as np
 import obstore
 import zarr
 
-from insitubatch import Batch, SplitManifest, SplitName, open_geometries, split_by_chunk
+from insitubatch import SplitManifest, SplitName, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.store import store_from_url
 
@@ -93,7 +93,6 @@ def _insitu(
         batch_size=16,
         block_chunks=block_chunks,
         max_inflight=max_inflight,
-        to_tensor=False,
         shuffle=False,
         **kw,
     )
@@ -103,7 +102,6 @@ def _insitu(
     n = 0
     t = time.perf_counter()
     for b in ds:
-        assert isinstance(b, Batch)  # to_tensor=False -> numpy Batch, not a tensor dict
         n += b.arrays[var].shape[0]
         if n >= limit:
             break
@@ -151,7 +149,6 @@ def _insitu_cache(
         split=SplitName.TRAIN,
         batch_size=16,
         block_chunks=block_chunks,
-        to_tensor=False,
         shuffle=False,
         cache_dir=cache_dir,
         cache_budget_bytes=budget,
@@ -164,7 +161,6 @@ def _insitu_cache(
         n = 0
         t = time.perf_counter()
         for b in ds:
-            assert isinstance(b, Batch)  # to_tensor=False -> numpy Batch
             n += b.arrays[var].shape[0]
         return n * bps / 1e6 / (time.perf_counter() - t)
 
