@@ -32,11 +32,18 @@ Changelog = "https://github.com/emfdavid/insitubatch/blob/main/CHANGELOG.md"
 Issues = "https://github.com/emfdavid/insitubatch/issues"
 
 [project.optional-dependencies]
-# Torch handoff surface (IterableDataset / torchdata.nodes). Kept optional so the
-# core engine stays framework-agnostic and importable without torch.
+# Framework handoff surfaces (insitubatch.frameworks): thin DLPack adapters over the
+# numpy Batch. All optional -- the core engine imports no framework. torch needs a
+# base class (DataLoader subclass); JAX iterates directly; TF wraps via from_generator.
 torch = [
     "torch>=2.2",
     "torchdata>=0.10",
+]
+jax = [
+    "jax>=0.4.30",
+]
+tf = [
+    "tensorflow>=2.16",
 ]
 # GPU-native path (zero-copy chunk -> cupy -> dlpack -> torch, optional nvCOMP
 # decode). Pulls CUDA wheels; only resolvable on a CUDA box, hence isolated here.

@@ -162,7 +162,6 @@ def _run_insitu(
         prefetch_depth=cfg.prefetch_depth,
         shuffle=cfg.shuffle,
         seed=cfg.seed,
-        to_tensor=False,
         cache_dir=cdir,
         cache_budget_bytes=budget,
         **store_kwargs,

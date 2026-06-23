@@ -49,9 +49,13 @@ for the why.
 
 ## Shape of the API
 
+The core `InSituDataset` is a framework-neutral iterable of numpy `Batch` objects;
+torch / JAX / TF handoff is a thin optional DLPack adapter in `insitubatch.frameworks`.
+
 ```python
 from insitubatch import open_geometries, split_by_chunk, SplitName
 from insitubatch.source import InSituDataset
+from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset
 from torch.utils.data import DataLoader
 
 url = "file:///data/era5.zarr"           # or "s3://bucket/era5.zarr" — same code
@@ -61,12 +65,15 @@ manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 ds = InSituDataset(url, manifest, split=SplitName.TRAIN,
                    batch_size=32, block_chunks=16)
 
-# parallelism lives in insitubatch's event loop, not in workers:
-loader = DataLoader(ds, batch_size=None, num_workers=0)
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)
-    for batch in loader:                 # {var: torch.Tensor}
+    for batch in ds:                     # numpy Batch: {var: np.ndarray} + sample_indices
         ...
+
+# Framework handoff (zero-copy on CPU via DLPack):
+loader = DataLoader(as_torch(ds), batch_size=None, num_workers=0)  # torch: {var: torch.Tensor}
+jbatch = to_jax(next(iter(ds)))                                    # JAX:   {var: jax.Array}
+tfds = as_tf_dataset(ds)                                           # TF:    tf.data.Dataset
 ```
 
 A runnable, network-free version of this — paralleling the Earthmover
@@ -84,7 +91,9 @@ uv run python -m examples.wb2_dataloader \
 
 ```bash
 uv sync                  # core engine + dev tools
-uv sync --extra torch    # add the torch IterableDataset surface
+uv sync --extra torch    # torch handoff (frameworks.as_torch)
+uv sync --extra jax      # JAX handoff (frameworks.to_jax)
+uv sync --extra tf       # TF handoff (frameworks.as_tf_dataset)
 uv sync --extra bench    # benchmark suite (xbatcher baseline + plotly)
 uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 ```

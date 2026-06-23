@@ -311,7 +311,8 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
 | `plan.py` | `build_stored_chunk_reads` — a draw order's chunks → deduped stored-chunk (tile) reads for the scheduler |
 | `scheduler.py` | `Scheduler` — one `max_inflight` budget over stored-chunk reads; fetch→decode→scatter; residency admission |
 | `pool.py` | `ChunkPool` — the assembly buffer *and* the cache: byte budget + pin/unpin + LRU, heap or mmap'd-`.npy` backing (try_admit/scatter/wait_ready/gather/unpin) |
-| `source.py` | `InSituDataset` (IterableDataset) — prefetch producer over the scheduler+pool, block-granular eviction, optional torch handoff |
+| `source.py` | `InSituDataset` — framework-neutral iterable of numpy `Batch`; prefetch producer over the scheduler+pool, block-granular eviction (inherits nothing) |
+| `frameworks.py` | thin optional DLPack adapters over the numpy `Batch`: `as_torch` (DataLoader subclass), `to_jax`, `to_tf` / `as_tf_dataset` (from_generator) |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler` (chunk-stage applier; fit over the loader — see `examples/fit_scaler.py`) |
 
 ## Open questions / spikes
@@ -435,11 +436,14 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   (RAM+NVMe) tier, and cached cross-variable derived variables.
 
 Reach track (broaden + make a splash):
-- **M3 — framework surfaces.** The core `Batch` is numpy; frameworks are thin
-  DLPack adapters, never core deps. Add **JAX first** (no native loader; the
-  weather/climate frontier — GraphCast, NeuralGCM — is JAX/torch, not TF), then
-  a **TF** surface via `tf.data.from_generator` + `prefetch(AUTOTUNE)`
-  opportunistically. Same async engine, multiple framework fronts.
+- **M3 — framework surfaces (done).** The core `Batch` is numpy and the engine
+  inherits no framework; handoff is thin DLPack adapters in `frameworks.py`
+  (`as_torch` / `to_jax` / `to_tf` + `as_tf_dataset`), each an optional extra.
+  The shapes are the ecosystems': torch needs a `Dataset` subclass, JAX iterates
+  directly (no native loader; the weather/climate frontier — GraphCast, NeuralGCM
+  — is JAX/torch, not TF), TF wraps via `tf.data.from_generator`. Same async
+  engine, multiple framework fronts. Next: `device_transform` (on-device, post
+  DLPack) and `prefetch(AUTOTUNE)` tuning land with the GPU path (M2).
 - **M4 — NVIDIA Earth2Studio target** (grounded in `data/arco.py`, `run.py`,
   `data/utils.py`). Their pipeline is `DataSource → xr.DataArray → fetch_data →
   prep_data_array → (torch.Tensor, coords) → model.create_iterator`. xarray is

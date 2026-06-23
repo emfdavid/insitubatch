@@ -35,7 +35,6 @@ def test_transforms_prefetch_reconstruct(write_zarr) -> None:
         batch_size=6,
         block_chunks=3,
         prefetch_depth=2,
-        to_tensor=False,
         chunk_transforms=[scaler],
     )
 
