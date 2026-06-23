@@ -258,6 +258,19 @@ uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   | tee bench/results/story4_ceiling.log
 ```
 
+**Flamegraph — the native hot path (supports story 4 + the FT framing).** `--profile`
+wraps the sec-1b sweep in `py-spy --native`, which sees obstore (Rust) and numcodecs (C);
+the picture is time in **Rust IO + C decode + numpy**, with only a thin Python sliver —
+*why* we're IO/decode-bound and *why* free-threading has no GIL-held work to accelerate.
+Run it on the regular env (py-spy is in `--extra bench`) at one steady-state concurrency:
+
+```bash
+sudo sysctl -w kernel.yama.ptrace_scope=0   # once; py-spy --native needs ptrace
+uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
+  --max-inflight 64 --max-chunks 256 --repeats 3 --no-decode-sweep --no-raw \
+  --profile bench/results/profile_fat_g16.svg
+```
+
 ### Memory by engine (the G5 rebuild)
 
 `probe_memory` runs **each engine in its own subprocess** and samples peak RSS over the
@@ -346,11 +359,12 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
   --decode-threads 1,2,4,8,16,32 --max-inflight 64 --max-chunks 256 --repeats 5 \
   | tee bench/results/ft_decode_threads.log
 
-# max_inflight sweep + flamegraph (decode_threads panel already covered above)
+# max_inflight sweep (decode_threads panel already covered above). No --profile here:
+# the native-hot-path flamegraph is the regular-env story-4 artifact, env-agnostic.
 PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
   python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   --max-inflight 1,2,4,8,16,32,64,128 --max-chunks 256 --repeats 5 --no-decode-sweep \
-  --profile bench/results/ft_profile.svg | tee bench/results/ft_inflight.log
+  | tee bench/results/ft_inflight.log
 ```
 
 > The output banner must read a **3.13 free-threaded** interpreter — if it says
