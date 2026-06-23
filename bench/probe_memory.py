@@ -12,6 +12,12 @@ insitu's bounded working set vs ``num_workers x prefetch`` growth is finally
 measurable. Use a read-once config (no ``--cache-dir``) so the comparison is anon
 working set, apples to apples.
 
+It also runs **two epochs** and reports **time-to-first-batch** for both: epoch 0 is
+**cold** (pays the DataLoader worker spawn / event-loop start), epoch 1 is **warm** (the
+baselines' persistent workers + the OS page cache are hot). That cold→warm TTFB split is
+where insitu wins biggest at the GRIB end — its first batch is ~constant while the worker
+stacks pay seconds of spin-up.
+
     uv run python -m bench.probe_memory --url s3://bucket/era5_c1.zarr \
       --engines insitu,workers,xbatcher --num-workers 32 --max-batches 64
 """
@@ -78,11 +84,18 @@ def _monitor(pid: int, interval: float) -> tuple[int, int, int]:
 
 
 def _child(cfg: Cfg, store_kwargs: dict, q: MPQueue) -> None:
-    """Run one engine to completion in this subprocess; report median MB/s back."""
+    """Run one engine here; report (warm MB/s, cold TTFB ms, warm TTFB ms) back.
+
+    One Result per epoch -> row 0 is the cold epoch (worker spawn / loop start), the
+    last is warm (persistent workers + hot page cache).
+    """
     try:
         rows = run(cfg, store_kwargs=store_kwargs)
-        mbs = sorted(r.mb_per_s for r in rows)
-        q.put(("ok", mbs[len(mbs) // 2] if mbs else 0.0))
+        if not rows:
+            q.put(("ok", (0.0, 0.0, 0.0)))
+            return
+        cold, warm = rows[0], rows[-1]
+        q.put(("ok", (warm.mb_per_s, cold.ttfb_ms, warm.ttfb_ms)))
     except Exception as exc:  # noqa: BLE001 - forwarded to the parent for the table
         q.put(("err", f"{type(exc).__name__}: {exc}"))
 
@@ -100,7 +113,7 @@ def main() -> None:
     p.add_argument("--block-chunks", type=int, default=16, help="insitu residency window")
     p.add_argument("--num-workers", type=int, default=32, help="DataLoader workers (B1/B2)")
     p.add_argument("--max-batches", type=int, default=64, help="batches/epoch; reach steady state")
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=2, help="2 -> cold (ep0) + warm (ep1) TTFB")
     p.add_argument("--interval-ms", type=float, default=25.0, help="RSS poll interval")
     p.add_argument("--anon", action="store_true", help="anonymous store (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
@@ -118,9 +131,12 @@ def main() -> None:
     # spawn (not fork): obstore's tokio runtime isn't fork-safe, and it matches how the
     # DataLoader engines start their own workers -- so the tree we measure is realistic.
     ctx = mp.get_context("spawn")
-    print(f"peak RSS by engine  {a.url}")
+    print(f"peak RSS + TTFB by engine  {a.url}")
     print(f"c{a.sample_chunk}  nw={a.num_workers}  bs={a.batch_size}  mb={a.max_batches}\n")
-    print(f"{'engine':9} {'peakRSS_MB':>10} {'anon_MB':>8} {'procs':>5} {'MB/s':>7}")
+    print(
+        f"{'engine':9} {'peakRSS_MB':>10} {'anon_MB':>8} {'procs':>5} "
+        f"{'ttfb_cold':>9} {'ttfb_warm':>9} {'warmMB/s':>8}"
+    )
     for engine in a.engines.split(","):
         cfg = Cfg(
             engine=engine,
@@ -144,9 +160,11 @@ def main() -> None:
         if status == "err":
             print(f"{engine:9} {'skip':>10}  {payload}")
             continue
+        assert isinstance(payload, tuple)  # ok-payload is (warm MB/s, cold TTFB, warm TTFB)
+        mb_warm, ttfb_cold, ttfb_warm = payload
         print(
-            f"{engine:9} {peak_rss / 1e6:10.0f} {peak_anon / 1e6:8.0f} "
-            f"{peak_n:5d} {float(payload):7.1f}"
+            f"{engine:9} {peak_rss / 1e6:10.0f} {peak_anon / 1e6:8.0f} {peak_n:5d} "
+            f"{ttfb_cold:9.0f} {ttfb_warm:9.0f} {mb_warm:8.1f}"
         )
 
 
