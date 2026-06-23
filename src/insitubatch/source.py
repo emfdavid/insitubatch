@@ -215,6 +215,12 @@ class InSituDataset(IterableDataset):
         blocks = _partition_blocks(order, self.block_chunks)
         ordered_chunks = [int(c) for _rstart, _rstop, cids in blocks for c in cids]
 
+        # Start clean: release any pins a prior epoch leaked (an early break leaves its
+        # read-ahead pinned in the persistent pool -> would shrink this epoch's budget
+        # until admission deadlocks). The prior scheduler is fully closed here, so no
+        # pin/unpin can race. Resident chunks stay (unpinned) for cross-epoch reuse.
+        self._pool.unpin_all()
+
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
         stop = threading.Event()
 

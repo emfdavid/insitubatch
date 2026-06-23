@@ -199,6 +199,20 @@ class ChunkPool:
                 self._pinned.discard(key)
             self._cv.notify_all()
 
+    def unpin_all(self) -> None:
+        """Release every pin (epoch boundary): all resident chunks become evictable.
+
+        A pin is per-epoch working state, not cache membership -- ready chunks stay
+        resident (unpinned) for cross-epoch reuse. No pin should survive an epoch: an
+        aborted epoch (early ``break``) leaves its read-ahead and un-drained current
+        block pinned, which would shrink the next epoch's budget until ``try_admit``
+        can free no room and the driver deadlocks. Called at the next epoch's start,
+        when the prior scheduler is fully closed (no pin/unpin can race this).
+        """
+        with self._cv:
+            self._pinned.clear()
+            self._cv.notify_all()
+
     def _pin(self, key: tuple[str, int]) -> None:  # call under the lock
         self._pinned.add(key)
         self._slots.move_to_end(key)  # MRU
