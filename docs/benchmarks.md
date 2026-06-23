@@ -8,6 +8,24 @@ dataset matrix, run commands, and the win-claim gate are in the
 The post-V2 architecture tells **four stories**. Story 1 has first real numbers
 from an S3 run; 2–4 and the framing sections fill in as the matrix runs on the box.
 
+## Who wins where
+
+insitubatch is the **batteries-included** choice across two operating points:
+
+- **Inference (cold start).** It pays no worker-pool startup — first batch in ~0.2 s vs
+  the worker stacks' 1–15 s — and a production inference service can't keep a hot 32-worker
+  pool alive anyway. insitu wins cold-start at **every** chunk size measured.
+- **Training (across the chunk spectrum).** It uses **8–25× less memory** (one process, not
+  32), reads each chunk **once** (vs the baselines' per-sample re-decode), and brings a
+  **cross-epoch cache** the worker stacks don't have. Throughput beats the best-tuned
+  baseline from `c2` up — to **~25×** at fat chunks.
+
+The honest exception: at the degenerate **GRIB end (`c1`, one sample per chunk)**, xbatcher
+is ~30% faster on *single-pass* throughput — but at **25× the memory** and **6× the TTFB**,
+and a re-read every epoch. So xbatcher is a fine *batch definition* with a worker-process
+*engine* that's competitive only at that one extreme; insitubatch keeps the ndim batch
+semantics and generalizes across the spectrum.
+
 !!! note "Real run — first results (`exp_b`)"
     Story 1 below is from a **real S3 run** on the
     [`c6id.8xlarge`](https://github.com/emfdavid/insitubatch/blob/main/bench/ops_aws.md)

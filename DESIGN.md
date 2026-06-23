@@ -31,7 +31,7 @@ zarr v3 async store and builds the layer those projects stopped one step short o
 | Neighbor | Why insitubatch is different |
 |---|---|
 | **MosaicML Streaming / WebDataset** | They require **resharding** into a sample-oriented format (MDS/tar) — a full ETL copy, and a "sample" becomes an opaque blob. insitubatch trains **in place** on the existing ndim Zarr; splits/shuffle/batches live in **coordinate space**. |
-| **xbatcher + DataLoader (Earthmover stack)** | Great batch *definition*; weak *engine* — rides torch worker processes (no async, no shared cache, redundant reads). We keep ndim-native batch semantics, replace the engine with async-IO-as-driver. |
+| **xbatcher + DataLoader (Earthmover stack)** | Great batch *definition*, **brute-force engine** — N torch worker **processes** (slow cold start, memory ∝ workers, no shared cache, redundant per-sample decode). Competitive only at the GRIB / one-sample-per-chunk end; a partial solution that doesn't generalize. We keep the ndim batch semantics and replace the engine with one async loop: better **cold start** (inference), and better **memory + cache + ops** across the chunk spectrum (training). |
 | **DALI / kvikio / nvCOMP** | The GPU compute/decompress path — a *peer* we interop with (cupy→dlpack→torch, optional nvCOMP), not the orchestration. |
 | **anemoi-datasets** | Weather-locked, opinionated schema. We are general ndim arrays. |
 | **dask / Ray Data** | General compute schedulers. We deliberately keep dask **off the hot path** (its nested thread pools inside forked workers are the problem). |
