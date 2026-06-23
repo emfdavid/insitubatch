@@ -339,6 +339,15 @@ renders after a run.
 - **G3 — peak RSS (anon) vs `block_chunks`** while `max_inflight` rises: insitu's
   working set flat (bounded by block + inflight) vs `workers` growing with
   `num_workers × prefetch_factor`. Story 2 memory.
+  > **Blocked on a valid measurement (the G5/memory rebuild — do first).** Today
+  > `peak_rss_mb` reads `/proc/self/status` of the **single suite process**, so (a) it's
+  > a monotonic high-water shared by every engine run in that process (all engines
+  > report the same number) and (b) it **excludes the 32 worker child processes** — so
+  > `workers`/`xbatcher`, whose whole memory cost is the fan-out, look *lighter* than
+  > insitu. The fix: run **each engine config in its own subprocess** (clean per-engine
+  > high-water) and sample **peak RSS over the whole process tree** (main + children,
+  > e.g. `psutil` polled on a timer, since workers hold chunks transiently). Report
+  > total peak + the anon/file split. Until then, **do not cite RSS** in any comparison.
 - **G4 — epoch-1 cold vs epoch-2 warm** with a large cache budget. Story 3.
 - **G5 — decoded MB/s as % of raw-GET ceiling** per chunk size, S3 vs Express.
   Story 4.
