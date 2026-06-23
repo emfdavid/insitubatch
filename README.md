@@ -103,8 +103,11 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t pytest -q
 ```
 
 CI mirrors this: a `{3.12, 3.13}` matrix plus a `3.13t` job that asserts the GIL is
-actually off before testing. (The free-threading *benefit* still waits on numcodecs
-shipping a GIL-safe build; our code is ready — see [DESIGN.md](DESIGN.md).)
+actually off before testing. Throughput is **GIL-independent by design** — fetch
+(obstore/Rust), decode (numcodecs zstd, C), and scatter/gather (vectorized numpy) all
+release the GIL — so 3.13t runs at the **same speed** as the GIL build, not faster. The
+free-threading work is **correctness + future-proofing, not a speedup**; *not depending*
+on the GIL is the point (see [DESIGN.md](DESIGN.md)).
 
 ## Shape of the API
 

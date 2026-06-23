@@ -339,12 +339,16 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
   - **Validated on 3.13t (B1):** the engine runs correctly GIL-free — the pool's
     disjoint lock-free scatter + lock-published readiness hold under true parallel
     execution (`test_pool_concurrent_scatter_is_race_free`, the `test-freethreaded`
-    CI job). **Caveat (the FT upside is gated upstream, not by us):** `numcodecs`
+    CI job). **Caveat (running FT cleanly is gated upstream, not by us):** `numcodecs`
     has not yet declared itself GIL-safe, so importing the codec stack *re-enables*
-    the GIL on 3.13t. We override with `PYTHON_GIL=0` (its codecs already release
-    the GIL, so this is safe in practice), but the real free-threaded *benefit*
-    waits on numcodecs shipping `Py_MOD_GIL_NOT_USED`. Our code is ready; the
-    dependency is the long pole.
+    the GIL on 3.13t. We override with `PYTHON_GIL=0` (its codecs already release the
+    GIL, so this is safe in practice). What numcodecs shipping `Py_MOD_GIL_NOT_USED`
+    would buy is running FT *without* the override — **not a speedup**: throughput is
+    GIL-independent by design (fetch/decode/scatter all release the GIL, scheduling is
+    one asyncio loop), so 3.13t *matches* the GIL build rather than beating it. Decode
+    even parallelizes under the GIL (zstd releases it — the `decode_threads` sweep
+    scales on the GIL build). The 3.13t value is correctness + future-proofing; *not
+    depending* on the GIL is the win.
 - **Cross-variable derived fields** — reads already co-schedule per-variable
   chunkings (the plan keys each variable by its own chunk size); the open
   part is a *cached* derived variable (e.g. windspeed), which needs sample-axis
