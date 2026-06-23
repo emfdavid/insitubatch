@@ -263,19 +263,34 @@ uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
 `probe_memory` runs **each engine in its own subprocess** and samples peak RSS over the
 whole **process tree** (so the 32 DataLoader workers of `workers`/`xbatcher` are counted
 — the suite's `peak_rss_mb` saw only the main process). It also runs **two epochs** and
-reports **TTFB cold (ep0, worker-spawn cost) and warm (ep1)** plus warm MB/s — the full
-GRIB-end comparison (memory + cold/warm TTFB + throughput) in one shot. Read-once (no
-`--cache-dir`), so RSS is the anon working set, apples to apples. Run at the GRIB end
-(c1, where both the fan-out and the cold-start cost are starkest) and a fat chunk (c8):
+reports **TTFB cold (ep0, worker-spawn cost) and warm (ep1)** plus warm MB/s. Read-once
+(no `--cache-dir`), so RSS is the anon working set, apples to apples. Prewarm is automatic
+(stable run-over-run). Two runs, each a *different* memory mechanism:
+
+**GRIB end (c1) — the fan-out.** The baselines pay the per-worker interpreter floor 32×;
+insitu is one process. This is where cold-start TTFB also wins biggest.
 
 ```bash
 uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c1.zarr --storage s3 \
   --engines insitu,workers,xbatcher --sample-chunk 1 \
   --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_c1.log
-uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c8.zarr --storage s3 \
-  --engines insitu,workers,xbatcher --sample-chunk 8 \
-  --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_c8.log
 ```
+
+**Fat end (era5_fat, sc=200) — the redundant decode, in memory form.** Each of 32 workers
+materializes the **full 208 MB field per sample**, so the same fat chunk is held many
+times over (~6.6 GB); insitu reads it once. **Set `--block-chunks 2`** — insitu residency
+is `2 × block_chunks × chunk_bytes`, so the default 16 would hold ~6.6 GB at a 208 MB
+chunk and *tie* the workers; `bc=2` keeps insitu's residency ~0.8 GB and the contrast real.
+
+```bash
+uv run python -m bench.probe_memory --url s3://$BUCKET/era5_fat.zarr --storage s3 \
+  --engines insitu,workers,xbatcher --sample-chunk 200 --block-chunks 2 \
+  --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_fat.log
+```
+
+(If the box is memory-tight, the workers' fat-chunk fan-out — 32 × 208 MB × prefetch —
+can be large; drop `--num-workers` if it pressures RAM. A c8 family run would just
+re-confirm the c1 ratio — baseline-dominated — so it isn't the informative fat point.)
 
 This folds in **G6 (TTFB)**: at c1, insitu trades ~0.76× throughput for a dramatically
 faster cold start (local nw=4 preview: cold TTFB ~27 ms vs workers ~1200 ms / xbatcher
