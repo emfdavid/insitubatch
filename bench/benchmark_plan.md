@@ -262,9 +262,11 @@ uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
 
 `probe_memory` runs **each engine in its own subprocess** and samples peak RSS over the
 whole **process tree** (so the 32 DataLoader workers of `workers`/`xbatcher` are counted
-— the suite's `peak_rss_mb` saw only the main process). Read-once (no `--cache-dir`), so
-it's the anon working set, apples to apples. Run at the GRIB end (c1, where the worker
-fan-out cost is starkest) and a fat chunk (c8):
+— the suite's `peak_rss_mb` saw only the main process). It also runs **two epochs** and
+reports **TTFB cold (ep0, worker-spawn cost) and warm (ep1)** plus warm MB/s — the full
+GRIB-end comparison (memory + cold/warm TTFB + throughput) in one shot. Read-once (no
+`--cache-dir`), so RSS is the anon working set, apples to apples. Run at the GRIB end
+(c1, where both the fan-out and the cold-start cost are starkest) and a fat chunk (c8):
 
 ```bash
 uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c1.zarr --storage s3 \
@@ -275,8 +277,10 @@ uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c8.zarr --storage s3
   --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_c8.log
 ```
 
-Pairs with the **TTFB** win (G6): at c1, insitu trades ~0.76× throughput for ~5× faster
-time-to-first-batch **and** a bounded single-process footprint vs the 33-process fan-out.
+This folds in **G6 (TTFB)**: at c1, insitu trades ~0.76× throughput for a dramatically
+faster cold start (local nw=4 preview: cold TTFB ~27 ms vs workers ~1200 ms / xbatcher
+~1660 ms — worker-spawn cost) **and** a bounded single-process footprint vs the
+33-process fan-out. Warm TTFB converges once the worker pools are hot.
 
 ### Free-threading readiness panels
 
