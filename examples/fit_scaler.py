@@ -97,6 +97,7 @@ def run_demo(
     *,
     url: str | None = None,
     cache_dir: str | None = None,
+    variables: list[str] | None = None,
     verbose: bool = True,
     **store_kwargs: Any,
 ) -> dict:
@@ -107,7 +108,10 @@ def run_demo(
     if url.startswith("gs://"):
         store_kwargs["skip_signature"] = True  # public bucket, anonymous read
 
-    geoms = open_geometries(url, **store_kwargs)
+    # A real store (WeatherBench2) has many variables on *different* sample axes (coords,
+    # pressure levels); InSituDataset requires one shared sample axis, so select a
+    # compatible set. None = every variable (fine for the synthetic two-var store).
+    geoms = open_geometries(url, variables=variables, **store_kwargs)
     var0 = next(iter(geoms))
     manifest = split_by_chunk(geoms[var0], fractions=(1.0, 0.0, 0.0))
 
@@ -185,9 +189,23 @@ def main() -> None:
     p.add_argument("--wb2", action="store_true", help="use public WeatherBench2 ERA5 (GCS)")
     p.add_argument("--url", default=None, help="zarr URL (default: synthetic file://)")
     p.add_argument("--cache-dir", default=None, help="spill the cache to this dir (NVMe)")
+    p.add_argument(
+        "--variables",
+        default=None,
+        help="comma list; must share the sample axis + chunking. --wb2 default: two "
+        "surface fields. Synthetic/other URLs default to every variable in the store.",
+    )
     a = p.parse_args()
     url = WB2 if a.wb2 else a.url
-    run_demo(url=url, cache_dir=a.cache_dir)
+    if a.variables:
+        variables = a.variables.split(",")
+    elif a.wb2:
+        # WB2 surface fields share the (time, lat, lon) grid + chunking; two with
+        # different mean/scale make the per-variable standardization visible.
+        variables = ["2m_temperature", "10m_u_component_of_wind"]
+    else:
+        variables = None
+    run_demo(url=url, cache_dir=a.cache_dir, variables=variables)
 
 
 if __name__ == "__main__":
