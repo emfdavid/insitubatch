@@ -322,6 +322,35 @@ pool to spawn) **and** a bounded single-process footprint vs the 33-process fan-
 >   here, but take the **clean cold-start comparison from `examples/wb2_xbatcher.py`**
 >   (fresh loader per epoch, isolated). The memory + procs columns are the solid deliverable.
 
+### Cold-start on WeatherBench2 (the Earthmover demo, head-to-head)
+
+The bench engines run synthetic ERA5-shaped data; these two examples run the **public
+WeatherBench2 ARCO store** (gs://, anonymous) through the *actual* Earthmover stack and
+the insitu equivalent — a recognizable, reproducible cold-start comparison. This is the
+clean TTFB story the G5 probe's cross-engine column can't give. Needs the `bench` extra
+(xbatcher, gcsfs) + torch; drop `--wb2` for a network-free synthetic sanity run.
+
+```bash
+# Earthmover stack (xbatcher + torch DataLoader): worker-process brute force. --compare
+# sweeps the worker start methods -- spawn re-imports per worker (slow), forkserver/preload
+# amortize it -- and prints the mp-mode TTFB table.
+uv run python -m examples.wb2_xbatcher --wb2 --compare --subregion 48,48 --max-batches 100 \
+  | tee bench/results/wb2_xbatcher.log
+
+# insitu equivalent: one in-process event loop, num_workers=0 -- no spawn, first batch in ms.
+uv run python -m examples.wb2_dataloader --wb2 --subregion 48,48 --max-batches 100 \
+  | tee bench/results/wb2_dataloader.log
+```
+
+The contrast (synthetic preview): xbatcher pays **~2.5–2.8 s** to first batch (and spawn
+costs ~43 s wall to re-import per worker; forkserver-preload trims it to ~2.7 s), while
+insitu's event loop is **~11 ms**. That is the framing — xbatcher is the domain-standard
+*batch definition*, but its **engine is worker-process brute force** (many procs, heavy
+memory, slow cold start); insitu keeps the ndim batch semantics with one async loop,
+**batteries-included across the chunk spectrum** — its edge grows with samples-per-chunk
+and needs enough chunks in flight to saturate IO (it only gives ground in the pathological
+few-giant-single-inner-chunk case, which spatial chunking fixes).
+
 ### Free-threading readiness panels
 
 **What these show (and don't).** insitubatch's throughput is **GIL-independent**: fetch
