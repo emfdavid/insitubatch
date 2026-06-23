@@ -255,17 +255,37 @@ uv run python bench/probe_decode.py --url s3://$BUCKET/era5_fat_g16.zarr \
 
 ### Free-threading readiness panels
 
-3.13t build, GIL forced off (numcodecs re-enables it on import — see the
-[numcodecs GIL gate] note), `decode_threads` controlled (≤ n_cores) and swept:
+Free-threading is **3.13t only** — there is no free-threaded 3.12, so `PYTHON_GIL=0`
+on the default env is a silent no-op (you get GIL numbers). Use a separate 3.13t env
+and **pin the interpreter on `uv run`**, exactly as the README's "Free-threaded
+(3.13t)" section (numcodecs re-enables the GIL on import — see the
+[numcodecs GIL gate] note — so the GIL must be forced off):
 
 ```bash
-PYTHON_GIL=0 uv run python bench/probe_decode.py --url s3://$BUCKET/era5_c1.zarr \
+# once: build the FT env on the free-threaded interpreter
+uv python install 3.13t
+UV_PROJECT_ENVIRONMENT=.venv-ft uv sync --python 3.13t --extra bench
+# always assert the GIL is actually off before trusting any FT number
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
+  python -c "import sys, zarr, numcodecs; assert not sys._is_gil_enabled(); print('GIL-free OK')"
+```
+
+`decode_threads` controlled (≤ n_cores) and swept:
+
+```bash
+FT="PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t"
+$FT python bench/probe_decode.py --url s3://$BUCKET/era5_c1.zarr \
   --decode-threads 1,2,4,8,16,32 --max-inflight 64 --max-chunks 256 --repeats 5 \
   | tee bench/results/ft_decode_threads.log
-PYTHON_GIL=0 uv run python bench/probe_decode.py --url s3://$BUCKET/era5_fat_g16.zarr \
+$FT python bench/probe_decode.py --url s3://$BUCKET/era5_fat_g16.zarr \
   --max-inflight 1,2,4,8,16,32,64,128 --max-chunks 256 --repeats 5 \
   --profile bench/results/ft_profile.svg | tee bench/results/ft_inflight.log
 ```
+
+> The output banner must read a **3.13 free-threaded** interpreter — if it says
+> `CPython 3.12.x`, the pin didn't take and you're measuring the GIL. The FT *upside*
+> is still gated on numcodecs shipping a GIL-safe build (the engine is ready); these
+> panels show the ceiling and the gate, not a win.
 
 ### S3 Express One Zone stress (story 4 on a directory bucket)
 
