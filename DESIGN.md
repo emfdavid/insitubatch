@@ -431,9 +431,19 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   chunks are retained for cross-epoch **decode-once** reuse (the scheduler skips
   fetch+decode+transform on a hit); `cache_dir` spills to NVMe. The v1 `cache=`
   intercept and the standalone cache classes were retired — caching is no longer a
-  separate intercept, it became "don't evict." Deferred: cross-*run* index rebuild +
-  content fingerprint, an L1/L2
-  (RAM+NVMe) tier, and cached cross-variable derived variables.
+  separate intercept, it became "don't evict." Deferred: an L1/L2 (RAM+NVMe) tier and
+  cached cross-variable derived variables (cross-*run* persistence is M-C2).
+- **M-C2 — cross-run persistent cache.** The mmap'd `.npy` slots under `cache_dir`
+  already *survive* the process (they are files on NVMe), but nothing rebuilds the
+  index to reuse them — so each new run re-fetches + re-decodes from S3. Add a
+  **persisted slot index** (`(array, chunk_index) → file`, with shape/dtype and the
+  chunk-transform version) rebuilt on startup, gated by a **content fingerprint**
+  (store URL + zarr metadata + codec + chunk-transform identity) so stale slots are
+  invalidated when the data or pipeline changes. Then decode-once amortizes across
+  *runs*, not just epochs — a relaunched job, a hyperparameter sweep, or several
+  processes on one box read decoded chunks straight from NVMe (no S3, no decode).
+  Scope: a read-through cache keyed by fingerprint; a shared/networked cache tier and
+  the L1/L2 split above are later.
 - **M-W — windowed / multi-offset sampling (sample geometry v2).** The forecasting
   unlock, and a prerequisite for the canonical WeatherBench examples and the M4
   "around their models" play. Today a batch draws **one shared time index for all
@@ -512,6 +522,11 @@ Backlog (deferred, unscheduled):
   with the documented xarray pattern; a no-xarray
   `samples_for_time_range(url, "time", start, stop) → indices` reading the 1-D coord
   via the store is a small nice-to-have.
+- **Spatial / inner-dimension subsetting.** Outer (time) subsetting shipped
+  (`sample_range`); selecting a **lat/lon region or a level subset** still reads the
+  whole field and crops at the batch stage (wasteful IO). The on-thesis fix selects
+  only the stored chunks intersecting the inner region in the plan (coordinate-space,
+  like the outer split), so IO scales with the subregion, not the full grid.
 - **FT bench methodology.** Prewarm + controlled `decode_threads` sweep landed in the
   bench refresh; remaining is reporting the **p50/p95 distribution** (not just
   median/min-max) for the noisy free-threaded probe points.
