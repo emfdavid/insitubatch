@@ -434,6 +434,38 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   separate intercept, it became "don't evict." Deferred: cross-*run* index rebuild +
   content fingerprint, an L1/L2
   (RAM+NVMe) tier, and cached cross-variable derived variables.
+- **M-W — windowed / multi-offset sampling (sample geometry v2).** The forecasting
+  unlock, and a prerequisite for the canonical WeatherBench examples and the M4
+  "around their models" play. Today a batch draws **one shared time index for all
+  variables**, so input@t / target@t+1 is inexpressible; shuffle destroys temporal
+  adjacency (so a `batch_transform` can't pair times either); and a precomputed
+  shifted-target var means **resharding — impossible on read-only public ERA5/HRRR**.
+  Fix: a sample becomes an **anchor `t` + a window spec** mapping roles
+  (`input`/`target`) to sets of time-offsets; each `(var, t+offset)` stays a
+  *within-chunk single-index read* (the no-cross-chunk-**read** invariant holds — what
+  generalizes is that one *sample* may now reference several chunks). Gather runs per
+  role; `Batch` grows a lead axis (`x: {var:(B,L_in,*inner)}`,
+  `y: {var:(B,L_out,*inner)}`); anchors with any offset outside `[0,T)` are dropped at
+  manifest build. Shuffle/`split_by_chunk` operate on **anchors** (with a guard band so
+  a target can't leak across a split boundary); residency/pinning is **per-window** (a
+  sample pins the union of chunks its offsets touch — the block budget sizes to the
+  span), and offsets that share a chunk decode once (overlapping windows → strong
+  cross-sample cache reuse). The lead axis flows through `batch_transform` → the DLPack
+  adapters unchanged.
+
+  **Scope decision: multi-offset sampling is sufficient for Earth2Studio and for
+  training forecasters; promoting a window to a single cross-chunk contiguous-slab read
+  is an explicit non-goal.** Every temporal access in E2S/forecasting is a *finite set
+  of discrete offsets from an anchor* — rollout reads only the initial condition
+  (FourCastNet/Pangu/SFNO: 1 step; GraphCast: 2 = offsets `{-1,0}`), the model generates
+  futures; scoring reads ground truth at enumerable lead times; training pairs an input
+  history with a target horizon. And multi-offset sampling already *expresses a
+  contiguous window* as the offset range `0..L-1` over the **same** chunks a slab read
+  would touch (we decode chunk-granular, so L point-gathers from a decoded chunk are
+  cheap) — so a cross-chunk slab read buys only marginal gather-ergonomics for very long
+  windows. Recorded so it isn't relitigated. Validation: a synthetic *advected-field*
+  forecast where a tiny model beats persistence, then the WeatherBench framework
+  examples ride on top.
 
 Reach track (broaden + make a splash):
 - **M3 — framework surfaces (done).** The core `Batch` is numpy and the engine
@@ -460,8 +492,26 @@ Reach track (broaden + make a splash):
       coords)` tensor batches straight from insitubatch (zarr → DLPack → torch),
       bypassing DataSource/fetch_data/xarray. `coords` is a light OrderedDict,
       not the xarray machinery. This is the "closer to the GPU" headline.
+      **Depends on M-W** (multi-offset sampling) for the input-history / lead-time
+      supervision — which is sufficient here (no cross-chunk window reads needed).
   Honesty bar: NVIDIA prefers **MSC** (fsspec-based; obstore can still beat it
   cold) and caches via `AsyncCachingFileSystem`, so target MSC *cold-cache* on an
   IO-bound workload (scoring/hindcast/large or lagged ensembles, NOT a single-IC
   ensemble, which is rollout-bound). GFS/GRIB: later, our degenerate sweet spot
   via virtual-zarr.
+
+Backlog (deferred, unscheduled):
+- **Bad/corrupt chunks — Phase 2.** Phase 1 shipped (`on_bad_chunk="raise"|"nan"`,
+  `ds.bad_chunks`). Deferred: a bad-chunk **registry** + an optional pre-scan
+  validation pass that records bad chunks into the `SplitManifest` so training
+  excludes them up front; and an **end-to-end HRRR (GRIB-under-zarr) showcase**
+  (`on_bad_chunk="nan"` + a fill `chunk_transform`) once a public HRRR-via-virtualizarr
+  store is handy. (Sample-level NaN drop stays out — it breaks the fixed-shape gather;
+  chunk-level manifest exclusion is the sane "drop.")
+- **Time-coordinate helper.** `split_by_chunk(sample_range=…)` (chunk-aligned) shipped
+  with the documented xarray pattern; a no-xarray
+  `samples_for_time_range(url, "time", start, stop) → indices` reading the 1-D coord
+  via the store is a small nice-to-have.
+- **FT bench methodology.** Prewarm + controlled `decode_threads` sweep landed in the
+  bench refresh; remaining is reporting the **p50/p95 distribution** (not just
+  median/min-max) for the noisy free-threaded probe points.
