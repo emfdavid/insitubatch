@@ -205,7 +205,7 @@ compute = pure IO so the sawtooth is visible:
 
 ```bash
 for ds in era5_c1 era5_fat era5_fat_g4 era5_fat_g16 era5_fat_g36; do
-  uv run python bench/probe_decode.py --url s3://$BUCKET/$ds.zarr \
+  uv run python -m bench.probe_decode --url s3://$BUCKET/$ds.zarr \
     --max-inflight 1,2,4,8,16,32,64,128,256 --block-chunks 32 \
     --max-chunks 256 --repeats 5 --no-raw \
     | tee bench/results/story2_sawtooth_$ds.log
@@ -227,7 +227,7 @@ uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
 Point the cache dir at instance-store NVMe (`c6id`/`i4i`/`c7gd`):
 
 ```bash
-uv run python bench/probe_decode.py --url s3://$BUCKET/era5_fat_g16.zarr \
+uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   --max-inflight 64 --block-chunks 32 \
   --max-chunks 256 --repeats 3 --cache-dir /mnt/nvme/insitu-cache \
   | tee bench/results/story3_cache_probe.log
@@ -248,7 +248,7 @@ The probe's sec-2 raw-GET section (on by default) reads the same bytes with no
 decode/gather; compare insitu's decoded MB/s (sec 1b) against it:
 
 ```bash
-uv run python bench/probe_decode.py --url s3://$BUCKET/era5_fat_g16.zarr \
+uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   --max-inflight 64 --concurrency 8,16,32,64 --max-chunks 256 --repeats 5 \
   | tee bench/results/story4_ceiling.log
 ```
@@ -274,10 +274,10 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
 
 ```bash
 FT="PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t"
-$FT python bench/probe_decode.py --url s3://$BUCKET/era5_c1.zarr \
+$FT python -m bench.probe_decode --url s3://$BUCKET/era5_c1.zarr \
   --decode-threads 1,2,4,8,16,32 --max-inflight 64 --max-chunks 256 --repeats 5 \
   | tee bench/results/ft_decode_threads.log
-$FT python bench/probe_decode.py --url s3://$BUCKET/era5_fat_g16.zarr \
+$FT python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   --max-inflight 1,2,4,8,16,32,64,128 --max-chunks 256 --repeats 5 \
   --profile bench/results/ft_profile.svg | tee bench/results/ft_inflight.log
 ```
@@ -291,7 +291,7 @@ $FT python bench/probe_decode.py --url s3://$BUCKET/era5_fat_g16.zarr \
 
 ```bash
 # raw-GET ceiling + insitu on Express
-uv run python bench/probe_decode.py --s3-express \
+uv run python -m bench.probe_decode --s3-express \
   --url s3://$XBUCKET/era5_fat_g16.zarr \
   --max-inflight 64 --concurrency 8,16,32,64 --max-chunks 256 --repeats 5 \
   | tee bench/results/express_ceiling.log
