@@ -5,9 +5,6 @@ suite isolates each optimization against good-faith, **tuned** baselines; the fu
 dataset matrix, run commands, and the win-claim gate are in the
 [benchmark plan](https://github.com/emfdavid/insitubatch/blob/main/bench/benchmark_plan.md).
 
-The post-V2 architecture tells **four stories**. Story 1 has first real numbers
-from an S3 run; 2–4 and the framing sections fill in as the matrix runs on the box.
-
 ## Who wins where
 
 insitubatch is the **batteries-included** choice across two operating points:
@@ -17,23 +14,23 @@ insitubatch is the **batteries-included** choice across two operating points:
   pool alive anyway. insitu wins cold-start at **every** chunk size measured.
 - **Training (across the chunk spectrum).** It uses **8–25× less memory** (one process, not
   32), reads each chunk **once** (vs the baselines' per-sample re-decode), and brings a
-  **cross-epoch cache** the worker stacks don't have. Throughput beats the best-tuned
-  baseline from `c2` up — to **~25×** at fat chunks.
+  **cross-epoch cache** (warm epochs at ~4 GB/s) the worker stacks don't have. Throughput
+  beats the best-tuned baseline from `c2` up — to **~25×** at fat chunks.
 
 The honest exception: at the degenerate **GRIB end (`c1`, one sample per chunk)**, xbatcher
 is ~30% faster on *single-pass* throughput — but at **25× the memory** and **6× the TTFB**,
-and a re-read every epoch. So xbatcher is a fine *batch definition* with a worker-process
-*engine* that's competitive only at that one extreme; insitubatch keeps the ndim batch
-semantics and generalizes across the spectrum.
+and a re-read every epoch (so multi-epoch training flips back to insitu via the cache, 9×
+warm). xbatcher is a fine *batch definition* with a worker-process *engine* competitive
+only at that one extreme; insitubatch keeps the ndim batch semantics and generalizes.
 
-!!! note "Real run — first results (`exp_b`)"
-    Story 1 below is from a **real S3 run** on the
+!!! note "Real run"
+    Numbers below are from a **real S3 run** on a
     [`c6id.8xlarge`](https://github.com/emfdavid/insitubatch/blob/main/bench/ops_aws.md)
-    (32 vCPU, in-region S3), not a laptop: ERA5-shaped data, `721×1440` fields
-    (4.15 MB/sample), `sample_chunk=8`, a bounded slice (128 batches/config) with a
-    warm-up burst first to clear S3 cold-start. Both stacks are **tuned** — insitu
-    swept over `block_chunks`, the worker baselines over `num_workers` up to 32 (=
-    vCPUs) — so this is not a strawman.
+    (32 vCPU, in-region S3 + S3 Express), not a laptop: coarsened ERA5 `361×720`
+    fields, the `era5_c{1..32}` chunk-size family plus fat-spatial grids, ≥3 repeats
+    with a warm-up burst to clear S3 cold-start. Both baselines are **tuned**
+    (`num_workers` swept to 32 = vCPUs); insitu is swept over `block_chunks` — not a
+    strawman.
 
 ## The comparison set
 
@@ -54,81 +51,119 @@ DataLoader baselines over `num_workers`).
 
 insitubatch reads each stored chunk **once** and vector-gathers every sample inside
 it; a map-style `__getitem__` decodes the whole containing chunk to return **one**
-sample. At `sample_chunk=8`, insitubatch delivers **~8× the throughput** of the
-best-tuned baseline and reaches its first batch **~10× sooner**:
+sample. So the win *grows with samples-per-chunk* — throughput vs the best-tuned
+baseline (MB/s, warm), across the chunk spectrum:
 
-| stack (tuned) | throughput | time-to-first-batch |
-|---|---:|---:|
-| **insitubatch** (`bc=64`) | **1172 MB/s** | ~1 s |
-| xbatcher + DataLoader (`nw=32`) | 146 MB/s | ~10 s |
-| map-style workers (`nw=32`) | 125 MB/s | ~10–13 s |
+| sample_chunk | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|--:|--:|--:|--:|--:|--:|
+| **insitu** | 283 | 483 | 514 | **630** | 617 | **657** |
+| xbatcher (tuned) | 372 | 432 | 242 | 101 | 55 | 26 |
+| workers (tuned) | 292 | 420 | 216 | 85 | 43 | 31 |
+| naive | 30 | 43 | 56 | 31 | 20 | 21 |
+| **insitu vs best** | 0.76× | 1.1× | 2.1× | **6.2×** | **11×** | **~21–25×** |
 
-The 8× is exactly `sample_chunk`: both stacks move ~the same *raw* bytes/s
-(~1.1 GB/s, the network ceiling), but the map-style stack wastes 7/8 of its bytes
-re-decoding the same chunk for each sample. The gap therefore grows linearly with
-chunk size (and shrinks to ~1× at GRIB/chunk=1) — which the chunk-size spectrum
-(below) is built to show.
+The baselines re-decode the containing chunk per sample, so they waste `(sample_chunk−1)/
+sample_chunk` of their bytes; insitu reads once. The advantage therefore grows linearly
+with chunk size and shrinks to a slight *loss* at the GRIB end (`c1`, one sample/chunk —
+nothing to amortize).
 
-### Throughput by engine (tuned)
+<iframe src="figures/g1_throughput_vs_chunk.html" width="100%" height="480" frameborder="0"></iframe>
 
-<iframe src="figures/g2_ablation.html" width="100%" height="480" frameborder="0"></iframe>
+### Throughput by engine, and the baseline tuning
 
-### Baseline tuning curve
+<iframe src="figures/g2_ablation.html" width="100%" height="420" frameborder="0"></iframe>
 
-Throughput vs `num_workers` for the DataLoader baselines — this is what "tuned to
-their best" means, and where the best-of points above come from. They keep scaling
-toward ~32 workers and still top out ~8× below insitu.
+The DataLoader baselines are reported at their best `num_workers` — they keep scaling
+toward 32 and still top out well below insitu:
 
-<iframe src="figures/g7_worker_tuning.html" width="100%" height="480" frameborder="0"></iframe>
+<iframe src="figures/g7_worker_tuning.html" width="100%" height="420" frameborder="0"></iframe>
 
-### Time-to-first-batch
-
-Worker spin-up (32 processes + cold reads) vs the event loop's first read.
-
-<iframe src="figures/g6_ttfb.html" width="100%" height="480" frameborder="0"></iframe>
-
-### Throughput vs the chunk-size spectrum
-
-_Pending the `era5_c{1..32}` family run (story-1 spectrum command in the plan)._ The
-8× is predicted to grow with chunk size; this is the figure that makes that claim
-falsifiable across the GRIB→fat spectrum. Renders as `figures/g1_throughput_vs_chunk.html`.
+For reference, the in-memory ceiling (whole array in RAM, zero IO) runs ~7.6–7.9 GB/s;
+insitu at `c8` is ~0.7 GB/s — the gap is IO, not loader overhead (see story 4).
 
 ---
 
 ## Story 2 — the V2 decoupling
 
-Read concurrency (`max_inflight`) is decoupled from residency/shuffle
-(`block_chunks`): throughput climbs to the knee then stays flat, and **memory stays
-flat**, as `max_inflight` rises at fixed `block_chunks`. In the zero-compute case it
-shows the **sawtooth** — peaks where `max_inflight` evenly divides the tiles per
-batch, which is why the fat regime needs inner (spatial) chunking to restore
-concurrency (see [Architecture](architecture.md)).
+Read concurrency (`max_inflight`) is decoupled from residency/shuffle (`block_chunks`):
+throughput climbs to the network knee and **stays flat**, while residency is **pinned**,
+as `max_inflight` rises. V1's nested caps produced a sawtooth; V2's single semaphore
+smooths it — so the result is a clean rise-to-plateau, the same on every spatial grid
+(`era5_fat_g4/g16/g36`):
 
-_Pending the `probe_decode` `max_inflight` sweep across the spatial-grid datasets
-(`era5_fat_g4/g16/g36`) and the `--block-chunks` memory-flatness suite run._
+| max_inflight | 1 | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| MB/s (`fat_g16`) | 23 | 108 | 276 | 883 | 1078 | 1071 | 1102 | 1129 |
+| resident chunks | 16 | 16 | 16 | 16 | 16 | 16 | 16 | 16 |
+
+You dial throughput from 23 → ~1130 MB/s purely via `max_inflight`, at **constant memory**
+— concurrency and residency are independent knobs.
 
 ---
 
 ## Story 3 — the cache (decode-once across epochs)
 
-With a large cache budget, epoch-2 reads come from the pool (heap or mmap'd `.npy`)
-instead of re-fetching and re-decoding, so warm ≫ cold. The probe's cross-epoch test
-showed ~2.5× cold→warm at `sample_chunk=8`; the epoch-over-epoch suite figure
-renders as `figures/g4_cache_epochs.html`.
+With a budget that holds the split (`--caches resident`, spilled to NVMe), epoch 2 reads
+come from the pool — no S3, no decode — so warm ≫ cold:
 
-_Pending the `epochs≥2` suite run with `--cache-dir` on instance-store NVMe._
+| sample_chunk | cold MB/s | warm MB/s | speedup |
+|---|--:|--:|--:|
+| c1 | 430 | **3977** | **9.2×** |
+| c8 | 777 | 4526 | 5.8× |
+| c32 | 750 | 4557 | 6.1× |
+
+The cross-epoch probe on `fat_g16` confirms it independently (1006 → 4509, 4.5×). The
+worker stacks have **no shared cross-epoch cache** — they re-read S3 every epoch — so this
+is the result that flips the GRIB end back to insitu for *multi-epoch training*.
+
+<iframe src="figures/g4_cache_epochs.html" width="100%" height="420" frameborder="0"></iframe>
 
 ---
 
-## Story 4 — efficiency vs the ceiling
+## Story 4 — efficiency vs the raw-GET ceiling
 
-The honest "how much of the NIC are we keeping" number: insitu's decoded MB/s as a
-**% of the raw-GET ceiling** (obstore reading the same bytes with no decode/gather).
-Story 1 already shows both stacks pinned at ~1.1 GB/s raw on the `c6id.8xlarge`, so
-the headline is decode/gather overhead, not network.
+How much of the NIC do we keep? insitu's decoded MB/s as a **% of the raw-GET ceiling**
+(obstore reading the same bytes, no decode/gather), on `fat_g16`:
 
-_Pending the `probe_decode` raw-GET section on S3 and on **S3 Express One Zone**
-(`--s3-express`), where single-digit-ms GETs stress the loader hardest._
+| storage | insitu (decoded) | raw-GET ceiling | % kept |
+|---|--:|--:|--:|
+| S3 | 1187 | 1467 | **81%** |
+| S3 Express One Zone | 1261 | 1501 | **84%** |
+
+So ~80% of the network ceiling survives decode + gather. S3 Express saturates the ceiling
+at **concurrency 16** (single-digit-ms GETs) where regular S3 needs 32–64, and it rescues
+the GRIB end: insitu `c1` runs **820 MB/s on Express vs 283 on S3 (2.9×)**.
+
+---
+
+## Memory + cold-start by engine (G5/G6)
+
+The suite's per-row RSS can't compare engines (single-process high-water; the 32 worker
+children of `workers`/`xbatcher` aren't counted). `probe_memory` runs each engine in its
+**own subprocess** and samples peak RSS over the whole **process tree**. Read-once (anon
+working set), so it's apples-to-apples:
+
+**c1 (GRIB):**
+
+| engine | peak RSS | procs | TTFB cold | warm MB/s |
+|---|--:|--:|--:|--:|
+| **insitu** | **0.9 GB** | **1** | **0.2 s** | 333 |
+| workers | 19.9 GB | 35 | 3.3 s | 534 |
+| xbatcher | 22.6 GB | 34 | 1.3 s | 588 |
+
+**c16 (fat) — insitu wins every axis:**
+
+| engine | peak RSS | procs | TTFB cold | warm MB/s |
+|---|--:|--:|--:|--:|
+| **insitu** | **3.1 GB** | **1** | **0.7 s** | **908** |
+| workers | 23.4 GB | 34 | 15.3 s | 47.9 |
+| xbatcher | 27.1 GB | 34 | 15.6 s | 48.9 |
+
+→ **~8× memory, ~19× throughput, ~22× TTFB.** insitu's footprint is one Python+obstore
+process (paid once); the baselines pay the interpreter floor **32×** plus a 208 MB field
+re-decoded per sample at fat chunks. The independent **WeatherBench2** cold-start run
+(`examples/wb2_xbatcher.py` vs `wb2_dataloader.py`) tells the same story in isolation:
+xbatcher ~2.5 s to first batch (spawn ~43 s wall) vs insitu's event loop ~11 ms.
 
 ---
 
@@ -138,47 +173,34 @@ insitubatch's throughput is **GIL-independent by design**: the heavy work alread
 outside the GIL — fetch (obstore/Rust), decode (numcodecs zstd, C), scatter/gather
 (vectorized numpy) — and scheduling is a single asyncio loop, so there is no GIL-held
 hot path for free-threading to accelerate. (Decode even parallelizes *under* the GIL:
-zstd releases it, so the `decode_threads` sweep scales on the GIL build too.) On the
-3.13 free-threaded build the engine is **correct** — the scatter is disjoint and
-readiness is published under the lock, so the lock, not the GIL, is the happens-before
-edge — and it runs at the **same speed** as the GIL build.
+zstd releases it, so the `decode_threads` sweep scales 1→2 on the GIL build too.) On the
+3.13 free-threaded build the engine is **correct** — the scatter is disjoint and readiness
+is published under the lock, so the lock, not the GIL, is the happens-before edge — and it
+runs at the **same speed** as the GIL build.
 
-So the free-threading story is **correctness + future-proofing, not a speedup** — and
-*not depending* on the GIL being gone is a stronger position than needing it. numcodecs
-re-enabling the GIL on import only affects Python-level parallelism, which our
-GIL-releasing hot path doesn't use. The panels are a no-regression check (control
-`decode_threads ≤ cores`, report p50/p95).
-
-_Pending the `PYTHON_GIL=0` probe panels (a no-regression check vs the GIL build)._
-
----
+So free-threading here is **correctness + future-proofing, not a speedup** — and *not
+depending* on the GIL is a stronger position than needing it. The
+[flamegraph](https://github.com/emfdavid/insitubatch/blob/main/bench/results/profile_fat_g16.svg)
+(`py-spy --native`) makes it visual: time is in Rust IO + C decode + numpy, with only a
+thin Python sliver.
 
 ## Deferred
 
-- **Prefetch overlap vs per-batch compute** (`g3_throughput_vs_compute.html`) — needs
-  a `compute_ms` sweep; insitu stays GPU-fed while baselines stall once IO-bound.
-- **Resident memory by engine** — _tool built (`bench/probe_memory.py`), pending the S3
-  numbers._ The suite's `peak_rss_mb` couldn't compare engines (a single-process
-  monotonic high-water that counts only the main process, missing the 32 worker children
-  of `workers`/`xbatcher` — their whole cost). `probe_memory` runs each engine in its own
-  subprocess and samples **peak RSS over the process tree** (main + children). This is the
-  memory half of the win — insitu's bounded single-process working set vs the
-  `num_workers × prefetch` fan-out — and pairs with the TTFB result (the GRIB-end
-  trade: ~0.76× throughput for a bounded footprint + ~5× faster first batch).
+- **Prefetch overlap vs per-batch compute** (`g3`) — needs a `compute_ms` sweep; insitu
+  stays GPU-fed while baselines stall once IO-bound.
+- **GPU-native path** (M2) — `device_transform` after DLPack; GPU-utilization graphs.
 
 ## Reproduce
 
 Full dataset matrix and per-story commands are in the
 [benchmark plan](https://github.com/emfdavid/insitubatch/blob/main/bench/benchmark_plan.md).
-The story-1 slice on a pre-generated S3 family:
+The story-1 spectrum on a pre-generated S3 family, then rebuild the figures:
 
 ```bash
-# tune the baselines once, then the spectrum at the tuned best
 uv run python -m bench --url-prefix "s3://$BUCKET/era5" --storage s3 \
-  --out bench/results/story1_spectrum.jsonl --fig-dir bench/figures/story1 \
+  --out bench/results/story1_spectrum.jsonl \
   --engines naive,workers,xbatcher,insitu --chunk-sizes 1,2,4,8,16,32 \
-  --num-workers 32 --max-batches 64 --repeats 3 --warmup-batches 32 --plot
+  --num-workers 32 --max-batches 64 --repeats 3 --warmup-batches 32
 
-# (re)build the embeddable, CDN-loaded figures used on this page
 uv run python -m bench.plot --in bench/results/story1_spectrum.jsonl --out docs/figures --cdn
 ```
