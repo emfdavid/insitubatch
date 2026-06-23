@@ -237,6 +237,12 @@ def main() -> None:
     )
     p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
     p.add_argument(
+        "--no-decode-sweep",
+        action="store_true",
+        help="skip sec 1 (the decode_threads sweep) -- a one-time decode-saturation "
+        "check; redundant when you only want the sec-1b max_inflight sawtooth",
+    )
+    p.add_argument(
         "--no-warm",
         action="store_true",
         help="skip the throwaway prewarm burst (warms obstore's TLS pool + the S3 "
@@ -286,20 +292,21 @@ def main() -> None:
             print(f"   prewarm failed: {type(exc).__name__}: {exc}")
         print()
 
-    print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, block_chunks={bc}):")
-    for dt in (int(x) for x in a.decode_threads.split(",")):
-        show(
-            f"decode_threads={dt or 'auto':>4}",
-            partial(
-                _insitu_mb,
-                a.url,
-                a.var,
-                kw,
-                decode_threads=dt,
-                max_chunks=a.max_chunks,
-                block_chunks=bc,
-            ),
-        )
+    if not a.no_decode_sweep:
+        print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, block_chunks={bc}):")
+        for dt in (int(x) for x in a.decode_threads.split(",")):
+            show(
+                f"decode_threads={dt or 'auto':>4}",
+                partial(
+                    _insitu_mb,
+                    a.url,
+                    a.var,
+                    kw,
+                    decode_threads=dt,
+                    max_chunks=a.max_chunks,
+                    block_chunks=bc,
+                ),
+            )
 
     print(f"\n1b) insitu MB/s + peak residency vs max_inflight (block_chunks={bc}, decode auto):")
     print("    V2 wants throughput flat (not falling) past the knee, residency pinned.")

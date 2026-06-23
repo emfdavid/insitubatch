@@ -207,7 +207,7 @@ compute = pure IO so the sawtooth is visible:
 for ds in era5_c1 era5_fat era5_fat_g4 era5_fat_g16 era5_fat_g36; do
   uv run python -m bench.probe_decode --url s3://$BUCKET/$ds.zarr \
     --max-inflight 1,2,4,8,16,32,64,128,256 --block-chunks 32 \
-    --max-chunks 256 --repeats 5 --no-raw \
+    --max-chunks 256 --repeats 5 --no-raw --no-decode-sweep \
     | tee bench/results/story2_sawtooth_$ds.log
 done
 ```
