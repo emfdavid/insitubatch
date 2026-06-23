@@ -278,17 +278,22 @@ class Scheduler:
             store = store_from_url(self._url, **self._store_kwargs)  # type: ignore[arg-type]
             for name, geom in self._geometries.items():
                 aa = await za.open_array(store=store, path=name, mode="r")
+                # Format-agnostic: zarr-v2 metadata exposes `dtype`/`encode_chunk_key`
+                # where v3 has `data_type`/`chunk_key_encoding.encode_chunk_key` -- so the
+                # engine reads public v2 stores (WeatherBench2 ARCO) as well as v3.
+                meta = aa.metadata
+                dtype = getattr(meta, "data_type", None) or meta.dtype
                 spec = ArraySpec(
-                    shape=aa.metadata.chunks,
-                    dtype=aa.metadata.data_type,
-                    fill_value=aa.metadata.fill_value,
+                    shape=meta.chunks,
+                    dtype=dtype,
+                    fill_value=meta.fill_value,
                     config=aa.config,
                     prototype=self._proto,
                 )
                 self._arrays[name] = _ArrayCtx(
                     path=aa.store_path.path,
                     store=aa.store_path.store,
-                    encode=aa.metadata.chunk_key_encoding.encode_chunk_key,
+                    encode=meta.encode_chunk_key,
                     codec=aa.codec_pipeline,
                     spec=spec,
                     chunk_shape=tuple(aa.metadata.chunks),
