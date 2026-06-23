@@ -292,10 +292,21 @@ uv run python -m bench.probe_memory --url s3://$BUCKET/era5_fat.zarr --storage s
 can be large; drop `--num-workers` if it pressures RAM. A c8 family run would just
 re-confirm the c1 ratio — baseline-dominated — so it isn't the informative fat point.)
 
-This folds in **G6 (TTFB)**: at c1, insitu trades ~0.76× throughput for a dramatically
-faster cold start (local nw=4 preview: cold TTFB ~27 ms vs workers ~1200 ms / xbatcher
-~1660 ms — worker-spawn cost) **and** a bounded single-process footprint vs the
-33-process fan-out. Warm TTFB converges once the worker pools are hot.
+This folds in **G6 (TTFB)**: insitu's TTFB is clean (~210 ms, flat cold/warm — no worker
+pool to spawn) **and** a bounded single-process footprint vs the 33-process fan-out.
+
+> **Reading the columns — two caveats.**
+> - **`warmMB/s` is read-once (no insitu cache), deliberately.** Caching here would size
+>   the pool to the whole split and balloon insitu's RSS, defeating the memory
+>   measurement. So at c1 insitu *loses* throughput (read-once, GRIB end — consistent
+>   with story 1); the cache-warm throughput win is **story 3** (4.5×), measured
+>   separately. Don't mix them.
+> - **Cross-engine TTFB from this probe is confounded** — engines run sequentially over
+>   one S3 prefix (cumulative warming) and each subprocess has its own cold TLS pool, so
+>   `workers` (2nd) vs `xbatcher` (3rd) cold TTFB isn't a clean spawn-cost comparison, and
+>   xbatcher's per-batch xarray cost can make its warm ≥ cold. Use insitu's TTFB from
+>   here, but take the **clean cold-start comparison from `examples/wb2_xbatcher.py`**
+>   (fresh loader per epoch, isolated). The memory + procs columns are the solid deliverable.
 
 ### Free-threading readiness panels
 
