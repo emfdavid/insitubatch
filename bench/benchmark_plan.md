@@ -270,15 +270,21 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
   python -c "import sys, zarr, numcodecs; assert not sys._is_gil_enabled(); print('GIL-free OK')"
 ```
 
-`decode_threads` controlled (≤ n_cores) and swept:
+`decode_threads` controlled (≤ n_cores) and swept. The env vars must be **inline on
+each command** — a `VAR=val …` prefix stashed in a shell variable and run as `$VAR …`
+is parsed as a command name, not an assignment (`PYTHON_GIL=0: command not found`):
 
 ```bash
-FT="PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t"
-$FT python -m bench.probe_decode --url s3://$BUCKET/era5_c1.zarr \
+# decode_threads panel (this is the sec-1 sweep -- keep it here)
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
+  python -m bench.probe_decode --url s3://$BUCKET/era5_c1.zarr \
   --decode-threads 1,2,4,8,16,32 --max-inflight 64 --max-chunks 256 --repeats 5 \
   | tee bench/results/ft_decode_threads.log
-$FT python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
-  --max-inflight 1,2,4,8,16,32,64,128 --max-chunks 256 --repeats 5 \
+
+# max_inflight sweep + flamegraph (decode_threads panel already covered above)
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
+  python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
+  --max-inflight 1,2,4,8,16,32,64,128 --max-chunks 256 --repeats 5 --no-decode-sweep \
   --profile bench/results/ft_profile.svg | tee bench/results/ft_inflight.log
 ```
 
