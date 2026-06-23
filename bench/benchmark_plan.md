@@ -276,21 +276,22 @@ uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c1.zarr --storage s3
   --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_c1.log
 ```
 
-**Fat end (era5_fat, sc=200) — the redundant decode, in memory form.** Each of 32 workers
-materializes the **full 208 MB field per sample**, so the same fat chunk is held many
-times over (~6.6 GB); insitu reads it once. **Set `--block-chunks 2`** — insitu residency
-is `2 × block_chunks × chunk_bytes`, so the default 16 would hold ~6.6 GB at a 208 MB
-chunk and *tie* the workers; `bc=2` keeps insitu's residency ~0.8 GB and the contrast real.
+**Fat chunk (c16) — insitu wins *both* memory and throughput.** The baselines re-decode
+the 16-sample chunk per sample across 32 workers and pay the interpreter floor 32× → still
+~20 GB; insitu reads each chunk once with bounded residency (`2 × 16 × 16.6 MB ≈ 0.5 GB`,
+default `block_chunks` is fine) → ~1 GB. Unlike c1, at c16 insitu **also wins throughput**
+(story 1: ~11×), so this is the clean "wins on both axes" point.
 
 ```bash
-uv run python -m bench.probe_memory --url s3://$BUCKET/era5_fat.zarr --storage s3 \
-  --engines insitu,workers,xbatcher --sample-chunk 200 --block-chunks 2 \
-  --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_fat.log
+uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c16.zarr --storage s3 \
+  --engines insitu,workers,xbatcher --sample-chunk 16 \
+  --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_c16.log
 ```
 
-(If the box is memory-tight, the workers' fat-chunk fan-out — 32 × 208 MB × prefetch —
-can be large; drop `--num-workers` if it pressures RAM. A c8 family run would just
-re-confirm the c1 ratio — baseline-dominated — so it isn't the informative fat point.)
+(The genuinely fat `era5_fat`, sc=200, is the most dramatic *memory* contrast — each of 32
+workers materializes the full 208 MB field per sample — but the per-sample decode of a
+208 MB chunk makes the baselines impractically slow to run; c16 proves the same memory
+win and pairs it with a throughput win, fast.)
 
 This folds in **G6 (TTFB)**: insitu's TTFB is clean (~210 ms, flat cold/warm — no worker
 pool to spawn) **and** a bounded single-process footprint vs the 33-process fan-out.
