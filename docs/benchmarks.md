@@ -139,14 +139,14 @@ _Pending the `PYTHON_GIL=0` probe panels (a no-regression check vs the GIL build
 
 - **Prefetch overlap vs per-batch compute** (`g3_throughput_vs_compute.html`) — needs
   a `compute_ms` sweep; insitu stays GPU-fed while baselines stall once IO-bound.
-- **Resident memory by engine** (`g5_peak_memory.html`) — the measurement is confounded
-  today: a single-process suite makes `ru_maxrss` a monotonic high-water shared by every
-  engine, and it counts only the main process — so the 32 worker children of
-  `workers`/`xbatcher` (their whole memory cost) aren't measured. The rebuild runs each
-  engine config in its own subprocess and samples **peak RSS over the process tree**
-  (main + children). This is load-bearing for the story — insitu's bounded working set
-  vs `num_workers × prefetch` growth is the memory half of the win, and can't be shown
-  until then.
+- **Resident memory by engine** — _tool built (`bench/probe_memory.py`), pending the S3
+  numbers._ The suite's `peak_rss_mb` couldn't compare engines (a single-process
+  monotonic high-water that counts only the main process, missing the 32 worker children
+  of `workers`/`xbatcher` — their whole cost). `probe_memory` runs each engine in its own
+  subprocess and samples **peak RSS over the process tree** (main + children). This is the
+  memory half of the win — insitu's bounded single-process working set vs the
+  `num_workers × prefetch` fan-out — and pairs with the TTFB result (the GRIB-end
+  trade: ~0.76× throughput for a bounded footprint + ~5× faster first batch).
 
 ## Reproduce
 

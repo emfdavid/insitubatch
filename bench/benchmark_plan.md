@@ -258,6 +258,26 @@ uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   | tee bench/results/story4_ceiling.log
 ```
 
+### Memory by engine (the G5 rebuild)
+
+`probe_memory` runs **each engine in its own subprocess** and samples peak RSS over the
+whole **process tree** (so the 32 DataLoader workers of `workers`/`xbatcher` are counted
+— the suite's `peak_rss_mb` saw only the main process). Read-once (no `--cache-dir`), so
+it's the anon working set, apples to apples. Run at the GRIB end (c1, where the worker
+fan-out cost is starkest) and a fat chunk (c8):
+
+```bash
+uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c1.zarr --storage s3 \
+  --engines insitu,workers,xbatcher --sample-chunk 1 \
+  --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_c1.log
+uv run python -m bench.probe_memory --url s3://$BUCKET/era5_c8.zarr --storage s3 \
+  --engines insitu,workers,xbatcher --sample-chunk 8 \
+  --num-workers 32 --batch-size 32 --max-batches 64 | tee bench/results/g5_memory_c8.log
+```
+
+Pairs with the **TTFB** win (G6): at c1, insitu trades ~0.76× throughput for ~5× faster
+time-to-first-batch **and** a bounded single-process footprint vs the 33-process fan-out.
+
 ### Free-threading readiness panels
 
 **What these show (and don't).** insitubatch's throughput is **GIL-independent**: fetch
