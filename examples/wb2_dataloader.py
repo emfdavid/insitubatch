@@ -18,6 +18,7 @@ window crosses chunk boundaries and is not supported yet. So each sample here is
 single-timestep field cropped to a spatial subregion.
 
     uv run python -m examples.wb2_dataloader --wb2 --max-batches 100   # public WeatherBench2 GCS
+    uv run python -m examples.wb2_dataloader --wb2 --num-epochs 2 --cache-resident  # decode-once
     uv run python -m examples.wb2_dataloader \
         --url s3://bucket/era5.zarr --var 2m_temperature --subregion 48,48 \
         --batch-size 32 --train-step-ms 10 --request-payer
@@ -99,7 +100,8 @@ def run_demo(
     batch_size: int = 16,
     block_chunks: int = 8,
     prefetch_depth: int = 2,
-    cache: str = "none",
+    cache_resident: bool = False,
+    cache_dir: str | None = None,
     train_step_ms: float = 0.0,
     num_epochs: int = 1,
     max_batches: int = 0,
@@ -121,11 +123,13 @@ def run_demo(
 
     geom = open_geometries(url, variables=[var], **store_kwargs)[var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
-    # Caching is the pool's policy: a large budget retains decoded chunks across
-    # epochs (decode-once); cache_dir spills the slots to NVMe (mmap) vs heap.
-    # "none" leaves the default read-once budget.
-    cache_dir = tempfile.mkdtemp(prefix="wb2-cache-") if cache == "disk" else None
-    cache_budget_bytes = (8 << 30) if cache in ("memory", "disk") else None
+    # Caching is the pool's policy (V2: "don't evict"). --cache-resident sizes the budget
+    # to hold the whole train split, so epoch 2+ is served from the pool (decode-once);
+    # --cache-dir spills the slots to NVMe (mmap) instead of heap. Default: read-once.
+    cache_budget_bytes = None
+    if cache_resident:
+        per_chunk = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
+        cache_budget_bytes = (len(manifest.chunks[SplitName.TRAIN.value]) + 2) * per_chunk
 
     ds = InSituDataset(
         url,
@@ -174,7 +178,7 @@ def run_demo(
         "seconds": dt,
         "samples_per_s": total / dt if dt else 0.0,
         "mean_wait_ms": 1e3 * float(np.mean(waits)) if waits else 0.0,
-        "cache": cache,
+        "cache_resident": cache_resident,
         "train_step_ms": train_step_ms,
     }
     if verbose:
@@ -204,7 +208,12 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--block-chunks", type=int, default=8)
     p.add_argument("--prefetch-depth", type=int, default=2)
-    p.add_argument("--cache", choices=["none", "memory", "disk"], default="none")
+    p.add_argument(
+        "--cache-resident",
+        action="store_true",
+        help="hold the whole train split in the pool -> epoch 2+ decode-once (else read-once)",
+    )
+    p.add_argument("--cache-dir", default=None, help="spill the resident cache to NVMe (mmap)")
     p.add_argument("--train-step-ms", type=float, default=0.0)
     p.add_argument("--num-epochs", type=int, default=1)
     p.add_argument("--max-batches", type=int, default=0, help="cap batches per epoch (0 = all)")
@@ -219,7 +228,8 @@ def main() -> None:
         batch_size=a.batch_size,
         block_chunks=a.block_chunks,
         prefetch_depth=a.prefetch_depth,
-        cache=a.cache,
+        cache_resident=a.cache_resident,
+        cache_dir=a.cache_dir,
         train_step_ms=a.train_step_ms,
         num_epochs=a.num_epochs,
         max_batches=a.max_batches,
