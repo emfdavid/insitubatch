@@ -161,9 +161,10 @@ working set), so it's apples-to-apples:
 
 → **~8× memory, ~19× throughput, ~22× TTFB.** insitu's footprint is one Python+obstore
 process (paid once); the baselines pay the interpreter floor **32×** plus a 208 MB field
-re-decoded per sample at fat chunks. The independent **WeatherBench2** cold-start run
-(`examples/wb2_xbatcher.py` vs `wb2_dataloader.py`) tells the same story in isolation:
-xbatcher ~2.5 s to first batch (spawn ~43 s wall) vs insitu's event loop ~11 ms.
+re-decoded per sample at fat chunks. The independent **WeatherBench2** cold-start example
+(`examples/wb2_xbatcher.py` vs `wb2_dataloader.py`) shows the same spawn-cost contrast in
+isolation: worker spin-up is **seconds** (process spawn — data-independent, and `spawn`
+re-imports per worker for ~40 s wall), the event loop's first batch is **milliseconds**.
 
 ---
 
