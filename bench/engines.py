@@ -48,7 +48,7 @@ class Cfg:
     max_inflight: int | None = None  # None -> follows block_chunks (read concurrency)
     prefetch_depth: int = 2
     num_workers: int = 4
-    cache: str = "none"  # none | memory | disk
+    cache: str = "none"  # insitu: "none" (read-once working set) | "resident" (hold the split)
     compute_ms: float = 0.0
     epochs: int = 1
     max_batches: int = 0  # cap batches/epoch (0 = full) -> bounded, predictable run time
@@ -136,13 +136,21 @@ def _run_insitu(
     cache_dir: str | None,
     store_kwargs: dict,
 ) -> list[Result]:
-    if cfg.cache != "none":
-        # B1 ships read-once (the V2 throughput/memory decoupling). Cross-epoch
-        # reuse returns in B2 on the ChunkPool; fail loudly rather than silently
-        # mislabel a cache-off run as cached.
-        raise NotImplementedError(
-            f"insitu cache={cfg.cache!r} is B2 (ChunkPool LRU); B1 is read-once. Use cache=none."
-        )
+    # Caching is the pool's byte budget (V2: "don't evict"), not a separate intercept:
+    #   "none"     -> working-set budget only; epoch 2 re-reads from the store.
+    #   "resident" -> budget holds the *whole train split*, so epoch 2 is a cache hit
+    #                 (cross-epoch decode-once), spilled to cache_dir (NVMe) if given.
+    # The cache story (epochs>=2) needs "resident" + full epochs so epoch 0 caches the
+    # whole split and any epoch-1 draw order hits.
+    if cfg.cache not in ("none", "resident"):
+        raise ValueError(f"insitu cache={cfg.cache!r}; expected 'none' or 'resident'")
+    budget: int | None = None
+    cdir: str | None = None
+    if cfg.cache == "resident":
+        per_chunk = int(np.prod(geom.inner_shape)) * geom.dtype.itemsize * geom.sample_chunk_size
+        n_train = len(manifest.chunks[SplitName.TRAIN.value])
+        budget = (n_train + 2) * per_chunk  # hold every train chunk + a margin
+        cdir = cache_dir
     ds = InSituDataset(
         cfg.url,
         manifest,
@@ -155,6 +163,8 @@ def _run_insitu(
         shuffle=cfg.shuffle,
         seed=cfg.seed,
         to_tensor=False,
+        cache_dir=cdir,
+        cache_budget_bytes=budget,
         **store_kwargs,
     )
     out = []
