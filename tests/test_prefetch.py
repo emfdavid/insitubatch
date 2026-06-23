@@ -97,6 +97,44 @@ def test_prefetch_preserves_values_and_coverage(tmp_path) -> None:
     assert sorted(all_seen.tolist()) == sorted(train.tolist())
 
 
+def test_partial_iteration_reaps_producer(tmp_path) -> None:
+    """Stopping early (a bare ``break``) must reap the producer thread.
+
+    Every other test drains fully (``for b in ds`` / ``list``), so the early-break
+    teardown path -- which ``--max-batches``, ``islice``, step budgets, and early
+    stopping all hit -- went uncovered. That is exactly where task cancellation lives
+    and where the leaked-pin deadlock hid. Assert the prefetch thread is joined, not
+    left parked. (Reuse-after-partial is covered, with a timeout guard, by the next
+    test.)
+    """
+    url = _write(tmp_path, n=160, spc=8)
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        url,
+        manifest,
+        split=SplitName.TRAIN,
+        batch_size=4,
+        block_chunks=2,
+        prefetch_depth=2,
+        to_tensor=False,
+    )
+
+    ds.set_epoch(0)
+    it = iter(ds)
+    for i, _ in enumerate(it):  # consume a couple, then stop short
+        if i == 1:
+            break
+    it.close()  # deterministic teardown (a bare break leaves this to GC)
+
+    # The producer thread must be joined by teardown, not left parked on wait_ready.
+    # (Reuse-after-partial is covered, with a timeout guard, by the next test.)
+    assert not any(t.name == "insitu-prefetch" and t.is_alive() for t in threading.enumerate()), (
+        "prefetch thread survived partial-iteration teardown"
+    )
+    ds.close()
+
+
 def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
     """A capped epoch (early break) must not poison the next epoch.
 
