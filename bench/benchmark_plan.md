@@ -30,9 +30,11 @@ of these:
    honest "how much of the NIC are we keeping" number. *(probe_decode 2)*
 
 Plus two framing sections, not headline claims:
-- **Free-threading readiness** — we're correct and faster-at-peak under 3.13t, the
-  ecosystem (numcodecs re-enables the GIL) isn't. Run the FT panels to show the
-  ceiling and the upstream gate. *(probe_decode under `PYTHON_GIL=0`)*
+- **Free-threading readiness** — throughput is **GIL-independent by design**: the heavy
+  work already runs outside the GIL (Rust IO, C zstd, vectorized numpy), so 3.13t
+  performs the same as the GIL build. The FT work bought **correctness** (disjoint
+  scatter, publish under the lock) and future-proofing, **not** a speedup. Run the FT
+  panels as a **no-regression** check, not to chase a win. *(probe_decode under `PYTHON_GIL=0`)*
 - **S3 Express One Zone** — the IO-ceiling stress test: single-digit-ms GETs push
   the loader, not the network. Re-run story 4 on a directory bucket. *(`--s3-express`)*
 
@@ -258,8 +260,17 @@ uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
 
 ### Free-threading readiness panels
 
-Free-threading is **3.13t only** — there is no free-threaded 3.12, so `PYTHON_GIL=0`
-on the default env is a silent no-op (you get GIL numbers). Use a separate 3.13t env
+**What these show (and don't).** insitubatch's throughput is **GIL-independent**: fetch
+(obstore/Rust), decode (numcodecs zstd, C), and scatter/gather (vectorized numpy) all
+release the GIL, and scheduling is a single asyncio loop — so there is no GIL-held hot
+path for free-threading to speed up. Empirically, decode already parallelizes *under
+the GIL* (the `fat_g16` `decode_threads` sweep scales 1→2 even on the GIL build, because
+zstd releases it). So these panels are a **no-regression / correctness** check on 3.13t,
+not a speedup demo; do not expect (or report) an FT win. The remaining GIL-held slice is
+thin per-chunk Python bookkeeping, kept small by the O(chunks)-not-O(samples) rule.
+
+Operationally: free-threading is **3.13t only** — there is no free-threaded 3.12, so
+`PYTHON_GIL=0` on the default env is a silent no-op (you get GIL numbers). Use a separate 3.13t env
 and **pin the interpreter on `uv run`**, exactly as the README's "Free-threaded
 (3.13t)" section (numcodecs re-enables the GIL on import — see the
 [numcodecs GIL gate] note — so the GIL must be forced off):
@@ -292,9 +303,10 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
 ```
 
 > The output banner must read a **3.13 free-threaded** interpreter — if it says
-> `CPython 3.12.x`, the pin didn't take and you're measuring the GIL. The FT *upside*
-> is still gated on numcodecs shipping a GIL-safe build (the engine is ready); these
-> panels show the ceiling and the gate, not a win.
+> `CPython 3.12.x`, the pin didn't take and you're measuring the GIL. Expect the FT
+> numbers to **match** the GIL build (that is the result: GIL-independence), not beat
+> it. numcodecs re-enabling the GIL on import only matters for Python-level
+> parallelism, which our GIL-releasing hot path doesn't rely on.
 
 ### S3 Express One Zone stress (story 4 on a directory bucket)
 
@@ -345,8 +357,10 @@ renders after a run.
 - **≥3 repeats** (5 for the noisy probe sweeps), report median + min/max; exclude
   warmup batches (`--warmup-batches`).
 - **Provenance** in every row: instance type, region, NIC, vCPU, codec, date.
-- **Show where we lose** (fat chunks on local disk; the FT median swing) — honesty
-  earns the wins.
+- **Show where we lose / draw** (fat chunks on local disk; insitu below the baselines
+  at the GRIB end `c1`; FT matching — not beating — the GIL build) — honesty earns the
+  wins. The FT median swing is oversubscription noise (`decode_threads ≈ cpu+4 > cores`),
+  not signal; control `decode_threads ≤ cores` and report p50/p95.
 
 ## Phasing
 

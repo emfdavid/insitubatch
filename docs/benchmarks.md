@@ -116,13 +116,22 @@ _Pending the `probe_decode` raw-GET section on S3 and on **S3 Express One Zone**
 
 ## Free-threading readiness
 
-We are **correct and faster-at-peak** under the 3.13 free-threaded build (decode
-parallelism helps once the GIL is off), but the **ecosystem isn't ready**: numcodecs
-re-enables the GIL on import, so the upside is gated upstream (force `PYTHON_GIL=0`).
-The FT panels report the `decode_threads` distribution (p50/p95, not just the median)
-and a `py-spy --native` flamegraph to localize jitter.
+insitubatch's throughput is **GIL-independent by design**: the heavy work already runs
+outside the GIL — fetch (obstore/Rust), decode (numcodecs zstd, C), scatter/gather
+(vectorized numpy) — and scheduling is a single asyncio loop, so there is no GIL-held
+hot path for free-threading to accelerate. (Decode even parallelizes *under* the GIL:
+zstd releases it, so the `decode_threads` sweep scales on the GIL build too.) On the
+3.13 free-threaded build the engine is **correct** — the scatter is disjoint and
+readiness is published under the lock, so the lock, not the GIL, is the happens-before
+edge — and it runs at the **same speed** as the GIL build.
 
-_Pending the `PYTHON_GIL=0` probe panels._
+So the free-threading story is **correctness + future-proofing, not a speedup** — and
+*not depending* on the GIL being gone is a stronger position than needing it. numcodecs
+re-enabling the GIL on import only affects Python-level parallelism, which our
+GIL-releasing hot path doesn't use. The panels are a no-regression check (control
+`decode_threads ≤ cores`, report p50/p95).
+
+_Pending the `PYTHON_GIL=0` probe panels (a no-regression check vs the GIL build)._
 
 ---
 
