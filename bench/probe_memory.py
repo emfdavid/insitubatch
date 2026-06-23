@@ -115,6 +115,13 @@ def main() -> None:
     p.add_argument("--max-batches", type=int, default=64, help="batches/epoch; reach steady state")
     p.add_argument("--epochs", type=int, default=2, help="2 -> cold (ep0) + warm (ep1) TTFB")
     p.add_argument("--interval-ms", type=float, default=25.0, help="RSS poll interval")
+    p.add_argument(
+        "--warmup-batches",
+        type=int,
+        default=32,
+        help="throwaway read to prime S3's per-prefix rate state (else throughput -- and "
+        "insitu's throughput-correlated peak -- creep up run-over-run); 0=off",
+    )
     p.add_argument("--anon", action="store_true", help="anonymous store (public gs:// / s3://)")
     p.add_argument("--request-payer", action="store_true")
     p.add_argument("--s3-express", action="store_true")
@@ -128,10 +135,32 @@ def main() -> None:
     if a.s3_express:
         store_kwargs["s3_express"] = True
 
+    # Prewarm once: prime S3's server-side per-prefix rate state, which otherwise warms
+    # across separate runs and drags throughput -- and insitu's throughput-correlated peak
+    # -- up run-over-run. A throwaway insitu read in the parent; with spawn (below) the
+    # children are fresh, so the parent's obstore runtime never reaches them.
+    if a.warmup_batches and a.url.startswith(("s3://", "gs://")):
+        print(f"prewarm: {a.warmup_batches} batches (discarded) ...")
+        warm = Cfg(
+            engine="insitu",
+            url=a.url,
+            storage=a.storage,
+            sample_chunk=a.sample_chunk,
+            var=a.var,
+            batch_size=a.batch_size,
+            block_chunks=a.block_chunks,
+            max_batches=a.warmup_batches,
+            epochs=1,
+        )
+        try:
+            run(warm, store_kwargs=store_kwargs)
+        except Exception as exc:  # noqa: BLE001 - prewarm is best-effort
+            print(f"  prewarm failed: {type(exc).__name__}: {exc}")
+
     # spawn (not fork): obstore's tokio runtime isn't fork-safe, and it matches how the
     # DataLoader engines start their own workers -- so the tree we measure is realistic.
     ctx = mp.get_context("spawn")
-    print(f"peak RSS + TTFB by engine  {a.url}")
+    print(f"\npeak RSS + TTFB by engine  {a.url}")
     print(f"c{a.sample_chunk}  nw={a.num_workers}  bs={a.batch_size}  mb={a.max_batches}\n")
     print(
         f"{'engine':9} {'peakRSS_MB':>10} {'anon_MB':>8} {'procs':>5} "
