@@ -35,7 +35,7 @@ def run_suite(
     storage: str = "file",
     chunk_sizes: Sequence[int] = (1, 8),
     engines: Sequence[str] = ("naive", "workers", "xbatcher", "insitu", "memory"),
-    caches: Sequence[str] = ("none", "memory", "disk"),
+    caches: Sequence[str] = ("none",),  # insitu only: "none" (read-once) | "resident" (hold split)
     n_samples: int = 128,
     inner: tuple[int, ...] = (16, 16),
     batch_size: int = 16,
@@ -99,7 +99,7 @@ def run_suite(
     results: list[Result] = []
     # Total configs, so the progress line can show [i/total] + ETA on long S3 runs.
     total = len(urls) * sum(
-        1  # cache is a pool budget, not a suite axis -> insitu runs cache=none here
+        (len(caches) if e == "insitu" else 1)  # insitu honors "none"/"resident"
         * (len(block_chunks_sweep) if e == "insitu" else 1)
         * (len(worker_sweep) if e in _DATALOADER_ENGINES else 1)
         * len(compute_ms_sweep)
@@ -115,10 +115,11 @@ def run_suite(
         )
 
     # block_chunks (shuffle window / residency) is an insitu-only axis; read concurrency
-    # is max_inflight. Caching is the pool's byte budget, not a suite axis -> cache=none.
+    # is max_inflight. Caching is the pool's byte budget (V2: "don't evict"): insitu
+    # honors `caches` ("none" | "resident"); baselines are always read-once.
     for spc, url in urls.items():
         for engine in engines:
-            engine_caches = ("none",)
+            engine_caches = tuple(caches) if engine == "insitu" else ("none",)
             nw_values = tuple(worker_sweep) if engine in _DATALOADER_ENGINES else (0,)
             bc_values = (
                 tuple(block_chunks_sweep) if engine == "insitu" else (block_chunks_sweep[0],)
@@ -186,7 +187,9 @@ def main() -> None:
     p.add_argument("--storage", default="file", choices=["file", "s3"])
     p.add_argument("--full", action="store_true", help="chunk-size spectrum + sweeps")
     p.add_argument("--engines", default=None, help="comma list of engines to run")
-    p.add_argument("--caches", default=None, help="insitu cache variants (comma: none,memory,disk)")
+    p.add_argument(
+        "--caches", default=None, help="insitu cache mode(s), comma: none (read-once) | resident"
+    )
     p.add_argument("--chunk-sizes", default=None, help="comma list, e.g. 1,2,4,8,16,32")
     p.add_argument("--block-chunks", default=None, help="insitu read-concurrency sweep (comma)")
     p.add_argument("--epochs", type=int, default=2)

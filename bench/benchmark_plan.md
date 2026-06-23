@@ -233,13 +233,16 @@ uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   | tee bench/results/story3_cache_probe.log
 ```
 
-Epoch-over-epoch via the suite (cold epoch-1 vs warm epoch-2):
+Epoch-over-epoch via the suite (cold epoch-1 vs warm epoch-2). Two essentials, or the
+warm epoch shows no benefit: **`--caches resident`** sizes the pool to hold the whole
+train split (read-once "none" re-reads each epoch), and **full epochs** (no
+`--max-batches`) so epoch 0 caches the entire split and any epoch-1 draw order hits:
 
 ```bash
 uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
   --out bench/results/story3_cache.jsonl --fig-dir bench/figures/story3 \
-  --engines insitu --chunk-sizes 1,8,32 --epochs 2 \
-  --max-batches 64 --repeats 3 --cache-dir /mnt/nvme/insitu-cache --plot
+  --engines insitu --caches resident --chunk-sizes 1,8,32 --epochs 2 \
+  --repeats 3 --cache-dir /mnt/nvme/insitu-cache --plot
 ```
 
 ### Story 4 — efficiency vs the raw-GET ceiling
