@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 import numpy as np
@@ -32,12 +32,23 @@ class ArrayGeometry:
     time for ERA5/HRRR) explicitly, because that is the axis we split, shuffle,
     and batch along. The trailing dims are carried opaquely as ``inner_shape``
     and are kept contiguous to preserve partial zero-copy.
+
+    ``offset`` makes a variable a *windowed view*: it reads ``array[anchor + offset]``
+    around a shared sample anchor. Two geometries with the same ``path`` and different
+    ``offset`` (e.g. ``g`` and ``g.shift(1)``) are two views of one array -- they decode
+    once and share slots. Offset 0 is not special; everything is relative to the anchor.
     """
 
     path: str  # the array's zarr path within the store, e.g. "t2m" or "surface/hourly/t2m"
     shape: tuple[int, ...]
     chunks: tuple[int, ...]
     dtype: np.dtype
+    offset: int = 0  # sample-axis read shift: this view reads array[anchor + offset]
+
+    def shift(self, k: int) -> ArrayGeometry:
+        """A view of the same array read ``k`` samples later (composes: ``shift(1).shift(1)``
+        is ``offset += 2``). Declare a forecast target as ``g.shift(horizon)``."""
+        return replace(self, offset=self.offset + k)
 
     @property
     def n_samples(self) -> int:
