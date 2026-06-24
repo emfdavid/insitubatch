@@ -77,18 +77,30 @@ def _insitu(
     max_chunks: int,
     block_chunks: int = 2,
     max_inflight: int = 32,
+    window: int = 0,
 ) -> tuple[float, int]:
     """One insitu pass over the first ``max_chunks`` chunks; (MB/s, peak resident chunks).
 
     ``block_chunks`` sets the shuffle window / residency; ``max_inflight`` is the
     single network-concurrency dial (V2 -- no nested ``read_concurrency`` cap).
+
+    ``window`` adds a forecast view-set: the anchor input plus ``window`` shifted
+    targets (``geom.shift(1..window)``) read from the same array. With ``window=0`` it
+    is the plain single-variable baseline; ``window>0`` exercises the offset gather,
+    per-block read-union, and *refcounted* residency that plain reads do not -- the cost
+    most exposed at the GRIB end (one sample/chunk = max chunk-rate = max pin/unpin/lock
+    churn) and under free-threading. MB/s counts the anchor-input bytes either way, so
+    the windowing machinery's overhead shows as a drop at equal anchor rate.
     """
     geom = open_geometries(url, variables=[var], **kw)[var]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    geoms = {var: geom}
+    for k in range(1, window + 1):
+        geoms[f"{var}_t{k}"] = geom.shift(k)
     ds = InSituDataset(
         url,
         manifest,
-        geometries={var: geom},
+        geometries=geoms,
         split=SplitName.TRAIN,
         batch_size=16,
         block_chunks=block_chunks,
@@ -216,6 +228,14 @@ def main() -> None:
         help="fixed shuffle window / residency for the max_inflight sweep (sec 1b)",
     )
     p.add_argument("--max-inflight", default="8,16,32,64", help="sec 1b sweep (the V2 dial)")
+    p.add_argument(
+        "--window",
+        type=int,
+        default=0,
+        help="forecast views: anchor input + N shifted targets (0 = plain single var). "
+        "Exercises the windowed offset-gather + refcounted residency; pair with a c1 "
+        "store (max chunk-rate) and/or PYTHON_GIL=0 to surface any lock serialization.",
+    )
     p.add_argument("--concurrency", default="1,4,8,16,32", help="sec 2 raw-GET sweep")
     p.add_argument(
         "--profile",
@@ -283,10 +303,14 @@ def main() -> None:
                 max_chunks=a.max_chunks,
                 block_chunks=bc,
                 max_inflight=mi_warm,
+                window=a.window,
             )
         except Exception as exc:  # noqa: BLE001 - prewarm is best-effort
             print(f"   prewarm failed: {type(exc).__name__}: {exc}")
         print()
+
+    if a.window:
+        print(f"(windowed: anchor input + {a.window} shifted target view(s); MB/s = input bytes)\n")
 
     if not a.no_decode_sweep:
         print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, block_chunks={bc}):")
@@ -301,6 +325,7 @@ def main() -> None:
                     decode_threads=dt,
                     max_chunks=a.max_chunks,
                     block_chunks=bc,
+                    window=a.window,
                 ),
             )
 
@@ -318,6 +343,7 @@ def main() -> None:
                     max_chunks=a.max_chunks,
                     block_chunks=bc,
                     max_inflight=mi,
+                    window=a.window,
                 )
                 for _ in range(a.repeats)
             )

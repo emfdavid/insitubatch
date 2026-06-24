@@ -405,6 +405,57 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
 > it. numcodecs re-enabling the GIL on import only matters for Python-level
 > parallelism, which our GIL-releasing hot path doesn't rely on.
 
+### Windowed-sampling overhead (M-W refcount no-regression)
+
+Windowed sampling (a variable read at `anchor + offset`) added a *refcounted* residency
+(`pool._pinned: dict[key,int]` + a per-epoch `claimed` flag) in place of the boolean pin
+set. That bookkeeping runs **under `pool._cv`** and is **O(chunks), not O(samples)** — so
+any added lock-held work is largest where chunk-rate is highest (the **GRIB end, `c1`,
+one sample/chunk**) and most exposed under **free-threading**, where there is no GIL
+incidentally serialising and `pool._cv` is the only contention point. That is the config
+to watch for a regression.
+
+`probe_decode --window N` builds a forecast view-set (anchor input + `N` shifted targets,
+`geom.shift(1..N)`) and routes the sec-1 (`decode_threads`) and sec-1b (`max_inflight`)
+sweeps through it. `--window 0` is the exact plain-single-variable baseline. MB/s counts
+the anchor-input bytes either way, so the machinery's per-anchor overhead shows as a drop
+at equal anchor rate. Two reads:
+
+- **No-regression of the baseline.** `--window 0` on `c1` should match the pre-M-W
+  numbers (the refcount must not slow plain reads). Compare GIL vs FT — FT must still
+  *match* the GIL build (the project's GIL-independence result), not regress.
+- **What windowing costs.** `--window 1` (and higher) vs `--window 0`: the offset
+  gather + larger per-block read-union + cross-block refcount. Expect a small per-anchor
+  drop and a wider `resident=` (windowed working set), **flat across `max_inflight`** —
+  the V2 residency-decoupling must survive windowing.
+
+```bash
+# GRIB end, max chunk-rate: baseline vs forecast, GIL build
+uv run python -m bench.probe_decode --url s3://$BUCKET/era5_c1.zarr \
+  --decode-threads 1,2,4,8,16,32 --max-inflight 64 --max-chunks 256 --repeats 5 \
+  --window 0 | tee bench/results/window_c1_w0.log
+uv run python -m bench.probe_decode --url s3://$BUCKET/era5_c1.zarr \
+  --decode-threads 1,2,4,8,16,32 --max-inflight 64 --max-chunks 256 --repeats 5 \
+  --window 1 | tee bench/results/window_c1_w1.log
+
+# the lock-serialisation check: same on free-threaded 3.13t (GIL forced off). If the
+# refcount serialises, the decode_threads sweep will not scale (or w1 << w0) under FT.
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
+  python -m bench.probe_decode --url s3://$BUCKET/era5_c1.zarr \
+  --decode-threads 1,2,4,8,16,32 --max-inflight 64 --max-chunks 256 --repeats 5 \
+  --window 1 | tee bench/results/window_c1_w1_ft.log
+```
+
+Local (free) shape check: `make_dataset --url file://… --sample-chunk 1 --inner 96,96`
+then the same `probe_decode --window 0/1` — proves the wiring and shows the residency
+widening, though absolute async wins need S3.
+
+> **Known follow-up (not a regression, a sizing slack).** The residency budget sums
+> bytes *per label*; aliased views share one decoded slot, so an `N+1`-view window
+> over-allocates the working set ~`(N+1)×`. Safe (conservative, never deadlocks) but
+> bigger than needed — summing per *path* would tighten it. Visible as `resident=` higher
+> than the non-windowed run at the same `block_chunks`.
+
 ### S3 Express One Zone stress (story 4 on a directory bucket)
 
 ```bash
