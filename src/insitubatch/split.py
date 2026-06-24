@@ -17,12 +17,31 @@ which split, so a run is reproducible and shareable.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
 from .types import ArrayGeometry, SplitName
+
+
+def valid_anchor_range(offsets: Iterable[int], n_samples: int) -> tuple[int, int]:
+    """Half-open ``[lo, hi)`` of anchor sample-indices whose *every* windowed read
+    ``anchor + offset`` stays in ``[0, n_samples)`` -- the anchors a windowed dataset
+    may draw, with array-edge anchors dropped.
+
+    Offsets ``{-1, 0, 1}`` over ``T`` samples -> anchors ``[1, T-1)``. Range is the
+    *only* validity the engine enforces; whether the user's offset choices define a
+    meaningful (non-leaky) task is theirs to decide (DESIGN, M-W). Empty/too-wide
+    windows return an empty range ``(lo, lo)``.
+    """
+    offs = list(offsets)
+    if not offs:
+        return (0, n_samples)
+    lo = max(0, -min(offs))
+    hi = n_samples - max(0, max(offs))
+    return (lo, max(lo, hi))
 
 
 @dataclass(slots=True)

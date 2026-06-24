@@ -21,7 +21,7 @@ from .shuffle import (
     sequential_order,
     shuffle_quality,
 )
-from .split import SplitManifest, split_by_chunk
+from .split import SplitManifest, split_by_chunk, valid_anchor_range
 from .store import StoreLike, as_store, ensure_local_dir, open_geometries, store_from_url
 from .transforms import (
     BatchTransform,
@@ -63,4 +63,5 @@ __all__ = [
     "shuffle_quality",
     "split_by_chunk",
     "store_from_url",
+    "valid_anchor_range",
 ]
