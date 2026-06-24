@@ -105,6 +105,34 @@ def test_scheduler_close_closes_the_loop(tiled_store):
     assert sched._loop.is_closed()
 
 
+def test_scheduler_aliased_labels_open_and_decode_once(tiled_store):
+    """Two windowed views of one array (same path, different offset) open the array
+    once and share one set of decoded slots -- the decode-once invariant end-to-end.
+
+    Offset is not yet applied to the draw/gather, so both labels currently read the
+    same samples; phase 2b makes ``next`` lead by one. What 2a proves is purely that
+    aliasing by ``path`` collapses the fetch: one open, one array's worth of slots.
+    """
+    url, srcs = tiled_store
+    base = open_geometries(url, variables=["single_inner"])["single_inner"]
+    geoms = {"now": base, "next": base.shift(1)}  # one array, two views
+    spc = base.sample_chunk_size
+    with _make(url, geoms) as sched:
+        fut = sched.start(range(base.n_chunks))
+        now, nxt = [], []
+        for cid in range(base.n_chunks):
+            sched.pool.wait_ready(base.path, cid)  # slots are keyed by path
+            rows = np.array([[cid, w] for w in range(len(base.samples_in_chunk(cid)))], np.int64)
+            now.append(sched.pool.gather(rows, ["now"], spc).arrays["now"])
+            nxt.append(sched.pool.gather(rows, ["next"], spc).arrays["next"])
+        fut.result(timeout=30)  # surface any driver error
+        assert len(sched._arrays) == 1  # opened once: deduped by path
+        assert len(sched.pool._slots) == base.n_chunks  # one array's slots, not two
+
+    assert np.array_equal(np.concatenate(now), srcs["single_inner"])
+    assert np.array_equal(np.concatenate(nxt), srcs["single_inner"])  # 2b: nxt leads by 1
+
+
 def test_scheduler_poisons_pool_on_driver_failure(tiled_store):
     """A variable absent from the store fails array-open; the pool poison unblocks waiters."""
     url, _ = tiled_store

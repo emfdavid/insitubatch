@@ -276,8 +276,12 @@ class Scheduler:
             if self._arrays:
                 return
             store = as_store(self._store, **self._store_kwargs)  # type: ignore[arg-type]
-            for name, geom in self._geometries.items():
-                aa = await za.open_array(store=store, path=name, mode="r")
+            # Open each distinct array once, keyed by its zarr path: several windowed
+            # views (same path, different offset) share one open + one decode path.
+            for geom in self._geometries.values():
+                if geom.path in self._arrays:
+                    continue
+                aa = await za.open_array(store=store, path=geom.path, mode="r")
                 # Format-agnostic: zarr-v2 metadata exposes `dtype`/`encode_chunk_key`
                 # where v3 has `data_type`/`chunk_key_encoding.encode_chunk_key` -- so the
                 # engine reads public v2 stores (WeatherBench2 ARCO) as well as v3.
@@ -290,7 +294,7 @@ class Scheduler:
                     config=aa.config,
                     prototype=self._proto,
                 )
-                self._arrays[name] = _ArrayCtx(
+                self._arrays[geom.path] = _ArrayCtx(
                     path=aa.store_path.path,
                     store=aa.store_path.store,
                     encode=meta.encode_chunk_key,
