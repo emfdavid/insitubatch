@@ -9,25 +9,19 @@ interface. One in-process event loop fans out the IO; there is no ``num_workers`
 The data is ``earthmover-public/weatherbench2`` (public). ERA5 is grouped by
 resolution (``era5/6h_64x32``, ``6h_240x121``, ``6h_1440x721``); pick one with
 ``--group``. Each sample is a single timestep (the outer axis) cropped to a random
-spatial patch (a ``batch_transform``).
+spatial patch (a ``batch_transform``). Needs ``al auth login`` (or
+``ARRAYLAKE_TOKEN``) and ``uv sync --extra arraylake``.
 
-    # real data: needs `al auth login` (or ARRAYLAKE_TOKEN) and:
-    #   uv sync --extra arraylake
-    uv run python -m examples.wb2_arraylake --source arraylake
+    uv run python -m examples.wb2_arraylake
 
     # heavier-IO grid, a few epochs, simulated 10ms train step
-    uv run python -m examples.wb2_arraylake --source arraylake \
+    uv run python -m examples.wb2_arraylake \
         --group era5/6h_1440x721 --num-epochs 2 --train-step-ms 10
-
-    # offline: tiny synthetic local Icechunk repo, no network or credentials
-    uv run python -m examples.wb2_arraylake
 """
 
 from __future__ import annotations
 
 import argparse
-import shutil
-import tempfile
 import time
 from collections.abc import Callable
 
@@ -47,9 +41,6 @@ WB2_GROUP = "era5/6h_240x121"
 DEFAULT_VAR = "2m_temperature"
 
 
-# --------------------------------------------------------------------------- #
-# Store access: one Icechunk store, from the cloud or a local synthetic repo.
-# --------------------------------------------------------------------------- #
 def open_arraylake_store(repo: str, *, branch: str = "main") -> Store:
     """Open an Arraylake repo and return its read-only Icechunk session store.
 
@@ -61,32 +52,6 @@ def open_arraylake_store(repo: str, *, branch: str = "main") -> Store:
 
     ic_repo = Client().get_repo(repo)
     return ic_repo.readonly_session(branch).store
-
-
-def open_synthetic_store(
-    tmp: str, *, n: int = 256, lat: int = 64, lon: int = 64, spc: int = 8, var: str = DEFAULT_VAR
-) -> Store:
-    """Write a tiny local Icechunk repo shaped like WB2 (nested under WB2_GROUP).
-
-    No network, no credentials -- exercises the same nested-group, store-passing
-    code path as the real repo so the example is runnable offline.
-    """
-    import icechunk
-    import zarr
-
-    repo = icechunk.Repository.create(icechunk.local_filesystem_storage(tmp))
-    session = repo.writable_session("main")
-    group = zarr.open_group(store=session.store, mode="a", path=WB2_GROUP)
-    arr = group.create_array(
-        var,
-        shape=(n, lat, lon),
-        chunks=(spc, lat, lon),
-        dtype="f4",
-        dimension_names=("time", "longitude", "latitude"),
-    )
-    arr[:] = np.random.default_rng(0).standard_normal((n, lat, lon)).astype("f4")
-    session.commit("synthetic wb2")
-    return repo.readonly_session("main").store
 
 
 def _crop(patch: tuple[int, int], seed: int) -> Callable[[Batch], Batch]:
@@ -183,7 +148,6 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--source", choices=["arraylake", "synthetic"], default="synthetic")
     p.add_argument("--repo", default=ARRAYLAKE_REPO, help="Arraylake repo (org/name)")
     p.add_argument("--branch", default="main")
     p.add_argument("--var", default=DEFAULT_VAR)
@@ -197,29 +161,19 @@ def main() -> None:
     p.add_argument("--no-shuffle", action="store_true")
     a = p.parse_args()
 
-    tmp = None
-    if a.source == "synthetic":
-        tmp = tempfile.mkdtemp(prefix="wb2-al-")
-        store = open_synthetic_store(tmp, var=a.var)
-    else:
-        store = open_arraylake_store(a.repo, branch=a.branch)
-
-    try:
-        run(
-            store,
-            var=a.var,
-            group=a.group,
-            patch=a.patch,
-            batch_size=a.batch_size,
-            block_chunks=a.block_chunks,
-            num_epochs=a.num_epochs,
-            max_batches=a.max_batches,
-            train_step_ms=a.train_step_ms,
-            shuffle=not a.no_shuffle,
-        )
-    finally:
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
+    store = open_arraylake_store(a.repo, branch=a.branch)
+    run(
+        store,
+        var=a.var,
+        group=a.group,
+        patch=a.patch,
+        batch_size=a.batch_size,
+        block_chunks=a.block_chunks,
+        num_epochs=a.num_epochs,
+        max_batches=a.max_batches,
+        train_step_ms=a.train_step_ms,
+        shuffle=not a.no_shuffle,
+    )
 
 
 if __name__ == "__main__":
