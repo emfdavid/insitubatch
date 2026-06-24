@@ -14,7 +14,7 @@ import pytest
 
 from insitubatch import open_geometries, split_by_chunk, valid_anchor_range
 from insitubatch.source import InSituDataset
-from insitubatch.types import ArrayGeometry
+from insitubatch.types import ArrayGeometry, Batch
 
 
 def _geom(n: int = 20, offset: int = 0) -> ArrayGeometry:
@@ -50,6 +50,33 @@ def test_valid_anchor_range_empty_when_window_exceeds_array() -> None:
     assert lo >= hi  # no anchor can satisfy it
 
 
+# -- Batch offsets metadata + projection helpers -------------------------------
+
+
+def test_batch_read_indices_and_stack() -> None:
+    arrays = {
+        "t_m1": np.arange(6).reshape(3, 2),
+        "t_0": np.arange(6, 12).reshape(3, 2),
+        "t_1": np.arange(12, 18).reshape(3, 2),
+    }
+    batch = Batch(
+        arrays=arrays,
+        sample_indices=np.array([5, 6, 7]),
+        offsets={"t_m1": -1, "t_0": 0, "t_1": 1},
+    )
+    # read_indices = anchor + offset (label provenance); absent label defaults to 0.
+    np.testing.assert_array_equal(batch.read_indices("t_0"), [5, 6, 7])
+    np.testing.assert_array_equal(batch.read_indices("t_m1"), [4, 5, 6])
+    np.testing.assert_array_equal(batch.read_indices("t_1"), [6, 7, 8])
+    np.testing.assert_array_equal(batch.read_indices("missing"), [5, 6, 7])
+
+    # stack assembles a multi-step window along a new axis, in the given label order.
+    window = batch.stack(["t_m1", "t_0", "t_1"])
+    assert window.shape == (3, 3, 2)
+    for k, label in enumerate(["t_m1", "t_0", "t_1"]):
+        np.testing.assert_array_equal(window[:, k], arrays[label])
+
+
 # -- end-to-end windowed sampling through the real dataset ---------------------
 
 
@@ -81,6 +108,22 @@ def test_windowed_forecast_target_leads_input(write_zarr, shuffle) -> None:
     # Edge anchor (t = T-1, whose +1 read is off the array) is dropped; all others
     # are covered exactly once.
     assert sorted(anchors.tolist()) == list(range(39))
+
+
+def test_windowed_batch_carries_offsets(write_zarr) -> None:
+    """The Batch records each label's offset, so a label's true read indices and a
+    stacked window can be recovered downstream (the Phase 3 metadata + helpers)."""
+    ds, src = _forecast_dataset(write_zarr, n=40, spc=8, shuffle=False, batch_size=7, seed=0)
+    ds.set_epoch(0)
+    batch = list(ds)[0]
+
+    assert batch.offsets == {"x": 0, "y": 1}
+    np.testing.assert_array_equal(batch.read_indices("x"), batch.sample_indices)
+    np.testing.assert_array_equal(batch.read_indices("y"), batch.sample_indices + 1)
+    # the stacked window aligns with the per-label arrays it was built from
+    window = batch.stack(["x", "y"])
+    np.testing.assert_array_equal(window[:, 0], batch.arrays["x"])
+    np.testing.assert_array_equal(window[:, 1], batch.arrays["y"])
 
 
 def test_windowed_history_and_target(write_zarr) -> None:

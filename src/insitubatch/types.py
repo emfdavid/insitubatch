@@ -11,7 +11,7 @@ chunk, async fan-out is everything).
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
@@ -196,10 +196,37 @@ class DecodedChunk:
 class Batch:
     """A model-ready batch.
 
-    ``arrays`` maps variable name -> stacked array of shape ``(batch, *inner)``.
-    ``sample_indices`` records provenance (which global samples, in order) for
-    determinism checks and resumption.
+    ``arrays`` maps variable *label* -> stacked array of shape ``(batch, *inner)``.
+    ``sample_indices`` is the per-row *anchor* sample index ``t`` (provenance for
+    determinism / resumption). ``offsets`` maps each label to its sample-axis read
+    offset, so label ``v`` of row ``i`` was read from global sample ``sample_indices[i]
+    + offsets[v]``. A plain (non-windowed) batch has every offset 0; a forecast batch
+    pairs e.g. an input at offset 0 with a target at offset ``horizon``.
+
+    The batch stays a flat ``{label: array}`` dict -- there is no lead/role axis in the
+    engine. Use :meth:`stack` to assemble a multi-step window into one array and
+    :meth:`read_indices` for a label's true provenance.
     """
 
     arrays: dict[str, np.ndarray]
     sample_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    offsets: dict[str, int] = field(default_factory=dict)  # label -> sample-axis read offset
+
+    def read_indices(self, label: str) -> np.ndarray:
+        """Global sample index each row of ``label`` was read from: ``anchor + offset``.
+
+        Provenance for a windowed view (e.g. to confirm a target leads its input by the
+        intended horizon). Defaults the offset to 0 for a label without one recorded.
+        """
+        return self.sample_indices + self.offsets.get(label, 0)
+
+    def stack(self, labels: Sequence[str], axis: int = 1) -> np.ndarray:
+        """Stack several labels into one array along a new ``axis`` (default 1).
+
+        The obvious way to build a multi-step input window from a set of time-shifted
+        views, e.g. ``batch.stack(["t_m2", "t_m1", "t_0"])`` -> ``(batch, 3, *inner)``.
+        Order follows ``labels``; row ``i`` of every label shares anchor
+        ``sample_indices[i]``, so the stacked steps stay aligned. The caller chooses the
+        labels and their order -- the engine does not impose a window layout.
+        """
+        return np.stack([self.arrays[label] for label in labels], axis=axis)
