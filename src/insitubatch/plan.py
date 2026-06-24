@@ -35,16 +35,17 @@ def build_stored_chunk_reads(
     first. Each outer chunk expands to its inner grid; every variable contributes
     its own grid (variables may chunk the inner dims differently). Order is
     ``chunk -> variable -> inner`` so a whole outer chunk's tiles are scheduled
-    together (it can be assembled and drained promptly). Dedup is
-    belt-and-suspenders -- a draw order visits each outer chunk once -- but makes
-    the function safe to call with repeated ids.
+    together (it can be assembled and drained promptly). Reads are keyed by the
+    array *path* (not the dict label), so several windowed views of one array
+    (same path, different ``offset``) collapse to a single fetch -- decode-once.
+    Dedup also makes the function safe to call with repeated ids.
     """
     reads: list[StoredChunkRead] = []
     seen: set[StoredChunkRead] = set()
     for cid in chunk_ids:
-        for name, geom in geometries.items():
+        for geom in geometries.values():
             for inner in geom.inner_coords():
-                read = StoredChunkRead(array=name, chunk_index=int(cid), inner_coord=inner)
+                read = StoredChunkRead(array=geom.path, chunk_index=int(cid), inner_coord=inner)
                 if read not in seen:
                     seen.add(read)
                     reads.append(read)
