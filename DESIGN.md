@@ -493,6 +493,39 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   forecast where a tiny model beats persistence, then the WeatherBench framework
   examples ride on top.
 
+  **As built (PR #4, through Phase 3) — deviations from the sketch above.** The engine
+  stayed simpler than the role/lead-axis design:
+    - A variable is a `(label, path, offset)` **view**; a window is just several views
+      of one array (`{"x": g, "y": g.shift(1)}`). `Batch` stays a **flat `{label:
+      array}` dict** — *no* lead axis, *no* `input`/`target` roles in the engine. It
+      carries an `offsets` metadata dict; `Batch.read_indices(label)` and
+      `Batch.stack(labels)` are the projection helpers (the user composes the window).
+    - **No guard band.** The engine enforces *range validity only* (`anchor+offset ∈
+      [0,T)`, `valid_anchor_range` drops edge anchors); offset 0 is not special
+      ("relativity"). Partitioned anchors give disjoint train/val labels for any offset
+      (injective translation), and the shared boundary timestep is only ever a val
+      *input*, never scored — so a guard band is unnecessary. Task meaningfulness
+      (non-degenerate offset choices) is the **user's** responsibility, not the engine's.
+    - Residency is **reference-counted** (`pool._pinned: dict[key,int]`, not a boolean
+      set) because a windowed chunk can feed several blocks; a per-epoch `claimed` flag
+      orders pin→consume→release across the epoch boundary (fixes a cross-epoch
+      gather/leak race). windowed+shuffle holds the **whole split** resident (shuffle
+      spills reads into arbitrary blocks); bounded-residency windowed+shuffle (per-block
+      re-fetch) is deferred. Decode-once across views holds (slots key on `path`).
+
+  **Deferred — refcount hot-path cost (accept for now).** The refcounted residency +
+  offset-aware `gather` add ~**3.5%** to the *non-windowed* path at the **GRIB-end local
+  worst case** (one sample/chunk, ~36 KB blobs where decode is ≈ free, GIL build) — not
+  residency (`resident` unchanged) and not the per-block setup (a fast-path there moved
+  nothing); it is per-batch gather + per-chunk `dict`/`claimed` bookkeeping under
+  `pool._cv`. It shrinks toward noise with real chunk sizes (decode/IO dominate) and is
+  invisible on blob-store datasets. The deliberate microscope for this — and for any
+  future *locking* work — is a **tiny local store with negligible decode** under
+  **free-threading** (`PYTHON_GIL=0`, where `pool._cv` is the only contention point);
+  the harness recipe is in [bench/benchmark_plan.md](bench/benchmark_plan.md)
+  ("Windowed-sampling overhead"). Correctness was the bar for PR #4; the lever, if real-
+  `c1`-on-S3 ever shows it matters, is a non-windowed `gather` fast-path.
+
 Reach track (broaden + make a splash):
 - **M3 — framework surfaces (done).** The core `Batch` is numpy and the engine
   inherits no framework; handoff is thin DLPack adapters in `frameworks.py`

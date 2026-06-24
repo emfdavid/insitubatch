@@ -446,9 +446,38 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
   --window 1 | tee bench/results/window_c1_w1_ft.log
 ```
 
-Local (free) shape check: `make_dataset --url file://… --sample-chunk 1 --inner 96,96`
-then the same `probe_decode --window 0/1` — proves the wiring and shows the residency
-widening, though absolute async wins need S3.
+**Local lock-stress harness (the deliberate microscope).** A *tiny* local store with
+**negligible decode** is the right tool to stress the pool's locking, precisely because
+it is unrealistic: with ~36 KB blobs at `sample_chunk=1`, fetch+decode is ≈ free, so the
+per-chunk Python bookkeeping under `pool._cv` (admit / pin / unpin / `claimed` / gather)
+becomes the *dominant* cost — the opposite of a blob-store dataset, where IO+decode bury
+it. Build it once and probe `--window 0` (plain) vs `--window 1` (forecast), on the GIL
+build and again under free-threading:
+
+```bash
+uv run python bench/make_dataset.py --url file:///tmp/probe_c1.zarr \
+  --n-samples 512 --inner 96,96 --sample-chunk 1 --variables t2m
+# GIL build: baseline vs forecast (median of 9; resident must stay flat across max_inflight)
+uv run python -m bench.probe_decode --url file:///tmp/probe_c1.zarr \
+  --max-chunks 256 --repeats 9 --no-raw --no-warm --max-inflight 32 --window 0
+uv run python -m bench.probe_decode --url file:///tmp/probe_c1.zarr \
+  --max-chunks 256 --repeats 9 --no-raw --no-warm --max-inflight 32 --window 1
+# free-threaded 3.13t: PYTHON_GIL=0 makes pool._cv the only contention point -- the real
+# locking test (the GIL otherwise serializes incidentally and hides _cv contention).
+PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
+  python -m bench.probe_decode --url file:///tmp/probe_c1.zarr \
+  --max-chunks 256 --repeats 9 --no-raw --no-warm --max-inflight 32 --window 1
+```
+
+Baseline reading (recorded for future work; **accepted, not fixed** — correctness was the
+M-W PR's bar): vs `main` (boolean pin set) on this store, the refcounted branch's
+`--window 0` ran ~**3.5%** slower (`137.5` → `132.6` MB/s, median of 9 over several
+interleaved passes; `resident=4` unchanged). It is **not** the per-block read-union setup
+(a fast-path there moved nothing) and **not** residency — it is the per-batch offset-aware
+`gather` plus per-chunk `dict`/`claimed` ops. On real `c1`-on-S3 (1 MB chunks) decode/IO
+dominate and this shrinks toward noise; the lever, if it ever matters there, is a
+non-windowed `gather` fast-path (old concatenate when every offset is 0). Compare this
+harness's `main`-vs-branch and GIL-vs-FT deltas before touching the lock.
 
 > **Known follow-up (not a regression, a sizing slack).** The residency budget sums
 > bytes *per label*; aliased views share one decoded slot, so an `N+1`-view window
