@@ -71,6 +71,15 @@ docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.26",
 ]
+icechunk = [
+    "icechunk>=0.2",
+]
+# Arraylake catalog access for examples/wb2_arraylake.py: the client vends
+# credentials for the public earthmover-public/weatherbench2 Icechunk repo (and
+# pulls icechunk in).
+arraylake = [
+    "arraylake>=0.14",
+]
 
 [dependency-groups]
 dev = [

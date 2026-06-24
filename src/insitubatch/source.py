@@ -38,7 +38,7 @@ from .pool import ChunkPool
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest
-from .store import open_geometries
+from .store import StoreLike, open_geometries
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRead
 
 # Default for the single concurrency dial when the caller does not pin it.
@@ -83,7 +83,7 @@ class InSituDataset:
 
     def __init__(
         self,
-        store_url: str,
+        store: StoreLike,
         manifest: SplitManifest,
         geometries: dict[str, ArrayGeometry] | None = None,
         split: SplitName = SplitName.TRAIN,
@@ -101,10 +101,10 @@ class InSituDataset:
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
         **store_kwargs: Any,
     ) -> None:
-        self.store_url = store_url
+        self.store = store
         self.store_kwargs = store_kwargs
         self.geometries = (
-            geometries if geometries is not None else open_geometries(store_url, **store_kwargs)
+            geometries if geometries is not None else open_geometries(store, **store_kwargs)
         )
         self.manifest = manifest
         self.split = split
@@ -239,7 +239,7 @@ class InSituDataset:
                 out_q.put(self._SENTINEL)
 
         with Scheduler(
-            self.store_url,
+            self.store,
             self.geometries,
             self._pool,
             self.scheduler_config,

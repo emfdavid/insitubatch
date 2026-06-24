@@ -22,7 +22,7 @@ from .shuffle import (
     shuffle_quality,
 )
 from .split import SplitManifest, split_by_chunk
-from .store import ensure_local_dir, open_geometries, store_from_url
+from .store import StoreLike, as_store, ensure_local_dir, open_geometries, store_from_url
 from .transforms import (
     BatchTransform,
     ChunkTransform,
@@ -51,7 +51,9 @@ __all__ = [
     "SplitManifest",
     "SplitName",
     "StandardScaler",
+    "StoreLike",
     "StoredChunkRead",
+    "as_store",
     "block_shuffled_order",
     "build_stored_chunk_reads",
     "chunk_permutation",
