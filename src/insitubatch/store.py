@@ -101,7 +101,7 @@ def open_geometries(
                 "open_geometries handles arrays (variables), not subgroups."
             )
         out[name] = ArrayGeometry(
-            name=name,
+            path=name,
             shape=tuple(arr.shape),
             chunks=tuple(arr.chunks),
             dtype=np.dtype(arr.dtype),
