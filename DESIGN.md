@@ -31,7 +31,7 @@ zarr v3 async store and builds the layer those projects stopped one step short o
 | Neighbor | Why insitubatch is different |
 |---|---|
 | **MosaicML Streaming / WebDataset** | They require **resharding** into a sample-oriented format (MDS/tar) — a full ETL copy, and a "sample" becomes an opaque blob. insitubatch trains **in place** on the existing ndim Zarr; splits/shuffle/batches live in **coordinate space**. |
-| **xbatcher + DataLoader (Earthmover stack)** | Great batch *definition*, **brute-force engine** — N torch worker **processes** (slow cold start, memory ∝ workers, no shared cache, redundant per-sample decode). Competitive only at the GRIB / one-sample-per-chunk end; a partial solution that doesn't generalize. We keep the ndim batch semantics and replace the engine with one async loop: better **cold start** (inference), and better **memory + cache + ops** across the chunk spectrum (training). |
+| **xbatcher + DataLoader (Earthmover stack)** | xbatcher (Earthmover / pangeo) is the standard, elegant way to *define* ndim batches; its torch-worker engine (N **processes**) is strongest at the GRIB / one-sample-per-chunk end, and elsewhere pays worker cold start, memory ∝ workers, no shared cache, and per-sample decode. insitubatch keeps those same ndim batch semantics and offers a *different engine* — one async loop — that wins **cold start** (inference) and **memory + cache + ops** across the chunk spectrum (training). Complementary tools; pick by regime (and we tune xbatcher well before any comparison). |
 | **DALI / kvikio / nvCOMP** | The GPU compute/decompress path — a *peer* we interop with (cupy→dlpack→torch, optional nvCOMP), not the orchestration. |
 | **anemoi-datasets** | Weather-locked, opinionated schema. We are general ndim arrays. |
 | **dask / Ray Data** | General compute schedulers. We deliberately keep dask **off the hot path** (its nested thread pools inside forked workers are the problem). |
@@ -526,8 +526,10 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   ("Windowed-sampling overhead"). Correctness was the bar for PR #4; the lever, if real-
   `c1`-on-S3 ever shows it matters, is a non-windowed `gather` fast-path.
 
-  **Phase 4 (examples) — the advected-field forecast, plan.** One `InSituDataset` feeds
-  three framework training loops, to show the numpy `Batch` + DLPack thesis end to end:
+  **Phase 4 (examples) — the advected-field forecast. ✅ implemented (`examples/advection/`).**
+  One `InSituDataset` feeds three framework training loops, showing the numpy `Batch` +
+  DLPack thesis end to end; on the synthetic field the same tiny CNN beats persistence
+  ~1.6× in torch, JAX, and TF (identical dataset + architecture). Plan as built:
     - **Task:** a *direct* 24-hour forecast. Inputs `{t2m, u10, v10}` at anchor `t`
       (cross-variable, same index) → target `t2m` at `t + 24h` (`g.shift(horizon)`):
       `horizon = 24` steps on the 1-hourly synthetic store, `4` on the 6-hourly

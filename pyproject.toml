@@ -41,6 +41,10 @@ torch = [
 ]
 jax = [
     "jax>=0.4.30",
+    # flax + optax are the idiomatic JAX training stack the advection example uses; the
+    # bare `to_jax` DLPack adapter needs only jax itself.
+    "flax>=0.8",
+    "optax>=0.2",
 ]
 tf = [
     "tensorflow>=2.16",
