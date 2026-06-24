@@ -7,9 +7,13 @@ every read ``anchor + offset`` stays on the array.
 
 from __future__ import annotations
 
-import numpy as np
+import time
 
-from insitubatch import valid_anchor_range
+import numpy as np
+import pytest
+
+from insitubatch import open_geometries, split_by_chunk, valid_anchor_range
+from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry
 
 
@@ -44,3 +48,129 @@ def test_valid_anchor_range_drops_edge_anchors() -> None:
 def test_valid_anchor_range_empty_when_window_exceeds_array() -> None:
     lo, hi = valid_anchor_range([0, 25], 20)  # window wider than the array
     assert lo >= hi  # no anchor can satisfy it
+
+
+# -- end-to-end windowed sampling through the real dataset ---------------------
+
+
+def _forecast_dataset(write_zarr, *, n, spc, shuffle, **kw):
+    """A dataset with two views of one array: input ``x`` at the anchor, target ``y``
+    one step ahead (``shift(1)``) -- the canonical forecast setup, no reshard."""
+    url, srcs = write_zarr(n=n, spc=spc)
+    geom = open_geometries(url)["t2m"]
+    geoms = {"x": geom, "y": geom.shift(1)}
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(url, manifest, geometries=geoms, shuffle=shuffle, **kw)
+    return ds, srcs["t2m"]
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_windowed_forecast_target_leads_input(write_zarr, shuffle) -> None:
+    """Each row pairs input x[t] with target y[t+1] from the same in-place array, and
+    every batch holds that relation regardless of shuffle (gather is anchor-indexed)."""
+    ds, src = _forecast_dataset(write_zarr, n=40, spc=8, shuffle=shuffle, batch_size=7, seed=3)
+    ds.set_epoch(0)
+    seen = []
+    for batch in ds:
+        anchor = batch.sample_indices
+        np.testing.assert_array_equal(batch.arrays["x"], src[anchor])  # x = array[t]
+        np.testing.assert_array_equal(batch.arrays["y"], src[anchor + 1])  # y = array[t+1]
+        seen.append(anchor)
+
+    anchors = np.concatenate(seen)
+    # Edge anchor (t = T-1, whose +1 read is off the array) is dropped; all others
+    # are covered exactly once.
+    assert sorted(anchors.tolist()) == list(range(39))
+
+
+def test_windowed_history_and_target(write_zarr) -> None:
+    """A three-view window {-1, 0, +1} drops both edge anchors and reads each offset."""
+    url, srcs = write_zarr(n=24, spc=4)
+    src = srcs["t2m"]
+    geom = open_geometries(url)["t2m"]
+    geoms = {"prev": geom.shift(-1), "now": geom, "next": geom.shift(1)}
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(url, manifest, geometries=geoms, shuffle=True, batch_size=5, seed=1)
+    ds.set_epoch(0)
+
+    anchors = []
+    for batch in ds:
+        a = batch.sample_indices
+        np.testing.assert_array_equal(batch.arrays["prev"], src[a - 1])
+        np.testing.assert_array_equal(batch.arrays["now"], src[a])
+        np.testing.assert_array_equal(batch.arrays["next"], src[a + 1])
+        anchors.append(a)
+    # valid anchors for {-1,0,1} over T=24 are [1, 23): both ends dropped.
+    assert sorted(np.concatenate(anchors).tolist()) == list(range(1, 23))
+
+
+def test_windowed_eviction_and_cross_epoch_reuse(write_zarr) -> None:
+    """Windowed forecast with a budget far smaller than the split, over several epochs:
+    chunks are admitted, evicted, and (cross-epoch) reused under churn. Every batch must
+    still pair x[t] with y[t+1] -- the regression guard for the cross-epoch eviction race
+    where a chunk freed for a miss was gathered as stale memory."""
+    url, srcs = write_zarr(n=160, spc=8)  # 20 chunks
+    src = srcs["t2m"]
+    geom = open_geometries(url)["t2m"]
+    geoms = {"x": geom, "y": geom.shift(1)}
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    # block_chunks=2, no override: the windowed working set holds only a few blocks, so
+    # 20 chunks force repeated eviction. shuffle=False keeps the read-union local (the
+    # tight budget is viable) while still exercising churn and cross-epoch reuse.
+    ds = InSituDataset(url, manifest, geometries=geoms, shuffle=False, batch_size=5, block_chunks=2)
+    for epoch in range(3):
+        ds.set_epoch(epoch)
+        anchors = []
+        for batch in ds:
+            a = batch.sample_indices
+            np.testing.assert_array_equal(batch.arrays["x"], src[a])
+            np.testing.assert_array_equal(batch.arrays["y"], src[a + 1])
+            anchors.append(a)
+        assert sorted(np.concatenate(anchors).tolist()) == list(range(159))  # drop t=159
+
+
+def test_windowed_partial_iteration_then_clean_epoch(write_zarr) -> None:
+    """Abort a windowed epoch mid-stream, then run a full one.
+
+    An early break leaves pinned and in-flight (not-ready) chunks in the persistent
+    pool. The next epoch must reconstruct the forecast correctly -- no deadlock, no
+    stale data -- and afterwards the pool's counters and slots must be clean: every
+    reference released and no abandoned not-ready partial lingering.
+    """
+    url, srcs = write_zarr(n=160, spc=8)  # 20 chunks
+    src = srcs["t2m"]
+    geom = open_geometries(url)["t2m"]
+    geoms = {"x": geom, "y": geom.shift(1)}
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        url,
+        manifest,
+        geometries=geoms,
+        shuffle=True,
+        batch_size=4,
+        block_chunks=2,
+        prefetch_depth=2,
+        seed=2,
+    )
+
+    # epoch 0: pull one batch, let the producer pin + read ahead (in-flight), then abort.
+    ds.set_epoch(0)
+    it = iter(ds)
+    next(it)
+    time.sleep(0.2)
+    it.close()  # GeneratorExit -> teardown; leaves pins/partials in the persistent pool
+
+    # epoch 1: full pass must be correct despite the leftovers.
+    ds.set_epoch(1)
+    anchors = []
+    for batch in ds:
+        a = batch.sample_indices
+        np.testing.assert_array_equal(batch.arrays["x"], src[a])
+        np.testing.assert_array_equal(batch.arrays["y"], src[a + 1])
+        anchors.append(a)
+    assert sorted(np.concatenate(anchors).tolist()) == list(range(159))
+
+    # counters/slots clean: all references released, no abandoned not-ready slot.
+    assert ds._pool._pinned == {}
+    assert all(slot.ready for slot in ds._pool._slots.values())
+    ds.close()

@@ -71,6 +71,7 @@ class _Slot:
     nbytes: int  # slot size, charged to the budget (fixed at admit)
     ready: bool = False
     error: BaseException | None = None
+    claimed: bool = False  # the driver has referenced it *this epoch* (see wait_ready)
 
 
 class ChunkPool:
@@ -116,10 +117,12 @@ class ChunkPool:
             self._dir.mkdir(parents=True, exist_ok=True)
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
         self._bytes = 0
-        # OrderedDict in recency order (LRU front -> MRU back); pinned keys are
-        # exempt from eviction.
+        # OrderedDict in recency order (LRU front -> MRU back). Eviction targets only
+        # a *ready, unreferenced* slot: a not-ready slot is an in-flight fetch, and a
+        # refcounted slot is held by a live block (windows let one chunk be read by
+        # several blocks at once, so pins are reference-counted, not a boolean).
         self._slots: OrderedDict[tuple[str, int], _Slot] = OrderedDict()
-        self._pinned: set[tuple[str, int]] = set()
+        self._pinned: dict[tuple[str, int], int] = {}  # key -> refcount (>0 == pinned)
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
@@ -143,28 +146,34 @@ class ChunkPool:
     # -- admission / pinning / eviction -------------------------------------
 
     def try_admit(self, array: str, chunk_index: int) -> bool:
-        """Reserve + allocate + pin one outer chunk, evicting unpinned-LRU for room.
+        """Reserve + allocate + reference one outer-chunk slot, evicting ready-LRU for room.
 
-        Returns ``True`` once the slot exists and is pinned (idempotent if already
-        resident -- e.g. another variable's tile admitted this position). Returns
-        ``False`` only when the budget is full of *pinned* slots: the working set
-        exceeds the budget, so the caller must wait for the consumer to unpin one.
+        Admission takes one reference (incref) and *claims* the slot for this epoch (so
+        the consumer's :meth:`wait_ready` won't gather it until the driver has referenced
+        it -- see there), so the slot stays resident from its in-flight fetch through to
+        the consumer's release. The driver fetches each chunk once per epoch, so an
+        eviction before consume could not be re-fetched and would deadlock the waiter.
+        The consumer releases each chunk at its *last* use (:meth:`unpin_keys`); windowed
+        reads let one chunk be referenced by several blocks, hence reference counts, not a
+        boolean. Idempotent if already resident (incref only). Returns ``False`` only when
+        the budget is full of in-flight or referenced slots -- the caller awaits a release.
         """
         key = (array, chunk_index)
         geom = self._by_path[array]
         nbytes = int(np.prod(geom.slot_shape(chunk_index), dtype=np.int64)) * geom.dtype.itemsize
         with self._cv:
             if key in self._slots:
-                # Only reached on a miss (a ready chunk is taken by pin_if_ready), so
-                # any resident slot here is a stale partial left by a cancelled epoch
-                # -- drop it and rebuild fresh rather than reuse a half-filled buffer.
-                self._drop(key)
+                self._pin(key)  # already resident (in-flight or ready hit) -> incref, reuse
+                self._slots[key].claimed = True
+                self._cv.notify_all()  # a ready hit may now satisfy a waiter
+                return True
             if not self._make_room(nbytes):
                 return False
             self._slots[key] = _Slot(
                 data=self._alloc(array, chunk_index, geom.slot_shape(chunk_index), geom.dtype),
                 remaining=geom.n_inner_chunks(chunk_index),
                 nbytes=nbytes,
+                claimed=True,
             )
             self._bytes += nbytes
             self._pin(key)
@@ -178,62 +187,99 @@ class ChunkPool:
             return slot is not None and slot.ready and slot.error is None
 
     def pin_if_ready(self, array: str, chunk_index: int) -> bool:
-        """Atomically pin a resident, ready chunk (a cache hit) and touch its LRU.
+        """Incref + return ``True`` iff the chunk is resident, ready, and not failed.
 
-        Returns ``True`` on a hit (caller skips fetch+decode+transform), ``False``
-        if the chunk is absent or still assembling (a miss -> ``try_admit``). One
-        lock so the check and the pin can't race an eviction in between.
+        A cross-epoch cache hit the driver can skip fetching -- but it must still be
+        referenced so it stays resident through the consumer's use (released at last
+        use like an admitted chunk), else it could be evicted before the waiter gathers
+        it and, since the driver fetches each chunk once, deadlock. One lock so the
+        check and the incref cannot race an eviction in between.
         """
         with self._cv:
-            slot = self._slots.get((array, chunk_index))
+            key = (array, chunk_index)
+            slot = self._slots.get(key)
             if slot is not None and slot.ready and slot.error is None:
-                self._pin((array, chunk_index))
+                self._pin(key)
+                slot.claimed = True  # publish the claim so a waiter may now proceed
+                self._cv.notify_all()
                 return True
             return False
 
-    def unpin(self, chunk_ids: set[int]) -> None:
-        """Release the given drained outer chunks: now LRU-evictable, not yet dropped.
+    def pin_keys(self, keys: set[tuple[str, int]]) -> None:
+        """Reference (incref) a set of ``(path, chunk_index)`` slots for a live block.
 
-        Replaces eviction -- the pool decides *when* to drop (lazily, under budget
-        pressure), so unpinned chunks linger for cross-epoch reuse. Wakes any admit
-        parked on a full budget.
+        Windows make one chunk readable by several concurrent blocks, so pins are
+        reference-counted: each block that needs a slot increfs it on entry and
+        decrefs it on drain (:meth:`unpin_keys`). A slot with refcount > 0 is never
+        evicted. Pinning a not-yet-allocated key is fine -- the count is recorded and
+        the slot, once admitted, inherits it.
         """
         with self._cv:
-            for key in [k for k in self._slots if k[1] in chunk_ids]:
-                self._pinned.discard(key)
+            for key in keys:
+                self._pin(key)
+
+    def unpin_keys(self, keys: set[tuple[str, int]]) -> None:
+        """Release (decref) a block's ``(path, chunk_index)`` references.
+
+        A slot dropping to refcount 0 becomes LRU-evictable (retained for cross-epoch
+        reuse until budget pressure drops it), not dropped now. Wakes any admit parked
+        on a full budget.
+        """
+        with self._cv:
+            for key in keys:
+                self._unpin_one(key)
             self._cv.notify_all()
 
     def unpin_all(self) -> None:
-        """Release every pin (epoch boundary): all resident chunks become evictable.
+        """Epoch boundary reset: clear every pin and drop abandoned partials.
 
         A pin is per-epoch working state, not cache membership -- ready chunks stay
-        resident (unpinned) for cross-epoch reuse. No pin should survive an epoch: an
+        resident (unpinned) for cross-epoch reuse. No pin may survive an epoch: an
         aborted epoch (early ``break``) leaves its read-ahead and un-drained current
-        block pinned, which would shrink the next epoch's budget until ``try_admit``
-        can free no room and the driver deadlocks. Called at the next epoch's start,
-        when the prior scheduler is fully closed (no pin/unpin can race this).
+        block referenced, which would shrink the next epoch's budget until admission
+        can free no room and the driver deadlocks. A *not-ready* slot at this boundary
+        is an abandoned partial (its fetch was cancelled mid-flight) -- it can never be
+        a valid cache entry, so drop it; that also restores the in-epoch invariant
+        "not ready => in flight" that protects fetches from eviction. Called at the
+        next epoch's start, when the prior scheduler is fully closed (no race).
         """
         with self._cv:
             self._pinned.clear()
+            for key in [k for k, slot in self._slots.items() if not slot.ready]:
+                self._drop(key)
+            for slot in self._slots.values():
+                slot.claimed = False  # a retained chunk must be re-claimed next epoch
             self._cv.notify_all()
 
     def _pin(self, key: tuple[str, int]) -> None:  # call under the lock
-        self._pinned.add(key)
-        self._slots.move_to_end(key)  # MRU
+        self._pinned[key] = self._pinned.get(key, 0) + 1
+        if key in self._slots:
+            self._slots.move_to_end(key)  # MRU (the slot may not be allocated yet)
+
+    def _unpin_one(self, key: tuple[str, int]) -> None:  # call under the lock
+        n = self._pinned.get(key, 0)
+        if n <= 1:
+            self._pinned.pop(key, None)
+        else:
+            self._pinned[key] = n - 1
 
     def _make_room(self, nbytes: int) -> bool:  # call under the lock
         if self._budget is None:
             return True
         while self._bytes + nbytes > self._budget:
-            victim = next((k for k in self._slots if k not in self._pinned), None)
-            if victim is None:  # everything resident is pinned -> no room
+            # Evict the LRU slot that is ready *and* unreferenced; a not-ready slot is
+            # an in-flight fetch and a refcounted slot is held by a live block.
+            victim = next(
+                (k for k, s in self._slots.items() if k not in self._pinned and s.ready), None
+            )
+            if victim is None:  # everything resident is in-flight or pinned -> no room
                 return False
             self._drop(victim)
         return True
 
     def _drop(self, key: tuple[str, int]) -> None:  # call under the lock
         slot = self._slots.pop(key)
-        self._pinned.discard(key)  # no stale pin if dropping a (rare) pinned partial
+        self._pinned.pop(key, None)  # no stale refcount if dropping a (rare) pinned partial
         self._bytes -= slot.nbytes
         self._free(slot)
 
@@ -328,17 +374,24 @@ class ChunkPool:
     # -- consume: wait / gather ---------------------------------------------
 
     def wait_ready(self, array: str, chunk_index: int) -> None:
-        """Block until the outer chunk is fully assembled (or raise its error).
+        """Block until the outer chunk is assembled *and claimed this epoch* (or raise).
 
-        Wakes on three conditions: the chunk is ready, the chunk failed
-        (:meth:`fail`), or the whole pool was poisoned (:meth:`set_error`) -- the
-        last covers a driver death before this chunk was even allocated, so a
-        consumer never waits forever on a chunk that will never arrive.
+        Waiting on ``claimed`` (set by the driver's admit / pin_if_ready) closes a
+        cross-epoch race: a chunk still resident-and-ready from the prior epoch would
+        otherwise be gathered before the driver references it, letting the consumer's
+        last-use release land before the driver's pin -- a lost release that leaks a
+        reference (and, worse, lets the driver evict a chunk mid-gather). Requiring the
+        claim orders pin-before-consume-before-release. Wakes on: ready+claimed, the
+        chunk failed (:meth:`fail`), or the pool was poisoned (:meth:`set_error`, covering
+        a driver death before this chunk was allocated).
         """
         key = (array, chunk_index)
         with self._cv:
             self._cv.wait_for(
-                lambda: self._error is not None or (key in self._slots and self._slots[key].ready)
+                lambda: (
+                    self._error is not None
+                    or (key in self._slots and self._slots[key].ready and self._slots[key].claimed)
+                )
             )
             if self._error is not None:
                 raise self._error
@@ -347,29 +400,32 @@ class ChunkPool:
             raise error
 
     def gather(self, rows: np.ndarray, variables: list[str], sample_chunk_size: int) -> Batch:
-        """Assemble one batch from ``[chunk_id, within]`` draw rows.
+        """Assemble one batch from ``[chunk_id, within]`` *anchor* draw rows.
 
-        Caller must have waited for every referenced outer chunk to be ready.
-        Draws are grouped by chunk so each slot is touched once (one coalesced
-        fancy-index, never a Python per-sample loop); ``data`` and ``sample_indices``
-        come out in the same grouped order, so row ``i`` of every variable refers to
-        the same sample.
+        Each row is one sample anchor ``t = chunk_id*spc + within``; each variable
+        reads its array at ``t + offset`` (offset 0 is the plain non-windowed case).
+        Output is in anchor-row order: row ``i`` of every variable is the same anchor,
+        ``sample_indices[i] == t_i``. Per variable the reads are grouped by the
+        variable's *own* (offset-shifted) chunk -- one coalesced fancy-index per chunk,
+        never a Python per-sample loop. The caller must have waited every referenced
+        ``(path, offset-shifted chunk)`` ready.
         """
-        chunk_ids = rows[:, 0]
-        within = rows[:, 1]
-        uniq = np.unique(chunk_ids)
+        spc = sample_chunk_size
+        anchor = rows[:, 0].astype(np.int64) * spc + rows[:, 1].astype(np.int64)  # (N,)
+        n = anchor.shape[0]
 
-        out: dict[str, list[np.ndarray]] = {v: [] for v in variables}
-        names = {v: self._geom[v].path for v in variables}  # label -> underlying array
-        idx_pieces: list[np.ndarray] = []
-        for cid in uniq:
-            w = within[chunk_ids == cid]
-            idx_pieces.append(cid * sample_chunk_size + w)
-            for var in variables:
-                out[var].append(self._slots[(names[var], int(cid))].data[w])
-
-        arrays = {var: np.concatenate(pieces, axis=0) for var, pieces in out.items()}
-        return Batch(arrays=arrays, sample_indices=np.concatenate(idx_pieces))
+        arrays: dict[str, np.ndarray] = {}
+        for var in variables:
+            geom = self._geom[var]
+            sample = anchor + geom.offset  # this view reads array[anchor + offset]
+            read_cid = sample // spc
+            within = sample % spc
+            out = np.empty((n, *geom.inner_shape), dtype=geom.dtype)
+            for cid in np.unique(read_cid):
+                mask = read_cid == cid  # rows that read this chunk -> one coalesced index
+                out[mask] = self._slots[(geom.path, int(cid))].data[within[mask]]
+            arrays[var] = out
+        return Batch(arrays=arrays, sample_indices=anchor)
 
     def _free(self, slot: _Slot) -> None:
         """Release a slot's backing: a no-op for heap, flush+close+unlink for mmap.

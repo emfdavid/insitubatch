@@ -37,7 +37,7 @@ import numpy as np
 from .pool import ChunkPool
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
-from .split import SplitManifest
+from .split import SplitManifest, valid_anchor_range
 from .store import StoreLike, open_geometries
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRead
 
@@ -142,11 +142,32 @@ class InSituDataset:
         # variables, must be co-resident (a batch draws across a whole block) -- and
         # a larger budget (cache_budget_bytes) retains drained chunks for cross-epoch
         # decode-once reuse. cache_dir spills slots to NVMe (mmap) instead of heap.
-        per_chunk_all_vars = sum(
-            g.sample_chunk_size * int(np.prod(g.inner_shape)) * g.dtype.itemsize
-            for g in self.geometries.values()
+        #
+        # Windows widen the floor. A windowed read (any nonzero offset) crosses a chunk
+        # boundary, so an anchor chunk's read-union spans up to 2 + ceil(span/spc)
+        # chunks per variable (span = max offset - min offset); with every offset 0 the
+        # factor is 1 -- the plain 2 * block_chunks working set.
+        spc0 = next(iter(self.geometries.values())).sample_chunk_size
+        offsets = [g.offset for g in self.geometries.values()]
+        span = max(offsets) - min(offsets)
+        windowed = any(o != 0 for o in offsets)
+        window_factor = 2 + (-(-span // spc0)) if windowed else 1  # 2 + ceil(span/spc)
+        per_chunk_all_vars = int(
+            sum(
+                g.sample_chunk_size * int(np.prod(g.inner_shape)) * g.dtype.itemsize
+                for g in self.geometries.values()
+            )
         )
-        working_set = 2 * block_chunks * int(per_chunk_all_vars)
+        working_set = 2 * block_chunks * window_factor * per_chunk_all_vars
+        if windowed and self.shuffle:
+            # Shuffle permutes chunk order, so a windowed read can spill into chunks
+            # owned by any other block: a chunk admitted early may be needed late. Until
+            # bounded residency (re-fetch the spill) lands, hold the whole split resident
+            # -- decode-once, the accepted memory cost of windows (spill to NVMe via
+            # cache_dir on large splits). Sequential (eval) windows spill only locally
+            # and keep the tight working set above.
+            n_split_chunks = len(self.manifest.chunks[self.split.value])
+            working_set = max(working_set, n_split_chunks * per_chunk_all_vars)
         self.cache_budget_bytes = max(int(cache_budget_bytes or 0), working_set)
         self._pool = ChunkPool(
             self.geometries,
@@ -173,7 +194,7 @@ class InSituDataset:
         chunk_ids = np.asarray(self.manifest.chunks[self.split.value], dtype=np.int64)
         spc = geom.sample_chunk_size
         if self.shuffle:
-            return block_shuffled_order(
+            order = block_shuffled_order(
                 chunk_ids,
                 spc,
                 geom.n_samples,
@@ -181,7 +202,32 @@ class InSituDataset:
                 seed=self.seed,
                 epoch=self._epoch,
             )
-        return sequential_order(chunk_ids, spc, geom.n_samples)
+        else:
+            order = sequential_order(chunk_ids, spc, geom.n_samples)
+        return self._drop_edge_anchors(order, spc, geom.n_samples)
+
+    def _drop_edge_anchors(self, order: np.ndarray, spc: int, n_samples: int) -> np.ndarray:
+        """Keep only anchors whose every windowed read ``anchor + offset`` is on the
+        array. Offset 0 (no window) keeps the whole order. Anchors are dropped, not
+        their chunks, so an edge chunk still contributes its interior anchors."""
+        offsets = [g.offset for g in self.geometries.values()]
+        lo, hi = valid_anchor_range(offsets, n_samples)
+        if lo == 0 and hi == n_samples:
+            return order
+        anchor = order[:, 0] * spc + order[:, 1]
+        return order[(anchor >= lo) & (anchor < hi)]
+
+    def _block_read_keys(self, block_rows: np.ndarray, spc: int) -> set[tuple[str, int]]:
+        """The ``(path, chunk)`` slots a block's anchors read across all variables --
+        the residency set to pin while draining it. A windowed variable reads
+        ``anchor + offset``, so its read chunks may spill into neighbouring blocks'
+        chunks; the refcounted pins let those shared chunks be held by both blocks."""
+        anchor = block_rows[:, 0].astype(np.int64) * spc + block_rows[:, 1].astype(np.int64)
+        keys: set[tuple[str, int]] = set()
+        for geom in self.geometries.values():
+            read_cid = (anchor + geom.offset) // spc
+            keys.update((geom.path, int(c)) for c in np.unique(read_cid))
+        return keys
 
     def __iter__(self) -> Iterator[Batch]:
         """Drain assembled batches from a background producer (prefetch).
@@ -211,17 +257,30 @@ class InSituDataset:
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
         stop = threading.Event()
 
+        # Per-block read-union keys (path, chunk) -- what each block reads across all
+        # variables' offsets. A windowed read can spill into chunks owned by any other
+        # block (shuffle permutes chunk order), and the driver fetches each chunk only
+        # once, so a chunk must stay resident from admit until its *last* referencing
+        # block drains. Release each chunk exactly there (last_use).
+        block_keys = [self._block_read_keys(order[rs:re], spc) for rs, re, _ in blocks]
+        release: list[set[tuple[str, int]]] = [set() for _ in blocks]
+        last_use: dict[tuple[str, int], int] = {}
+        for bi, keys in enumerate(block_keys):
+            for key in keys:
+                last_use[key] = bi  # later block overwrites -> ends on the max index
+        for key, bi in last_use.items():
+            release[bi].add(key)
+
         def produce(sched: Scheduler) -> None:
             bs = self.batch_size
             try:
                 sched.start(ordered_chunks)
-                for rstart, rstop, block_cids in blocks:
-                    block = [int(c) for c in block_cids]
-                    # A block's batches draw across all its chunks, so wait the whole
-                    # block assembled before gathering (each wait is cheap once ready).
-                    for cid in block:
-                        for var in self.variables:
-                            sched.pool.wait_ready(var, cid)
+                for bi, (rstart, rstop, _cids) in enumerate(blocks):
+                    # A block's batches draw across its whole read-union, so wait it all
+                    # assembled (and claimed by the driver -- see ChunkPool.wait_ready)
+                    # before gathering; each wait is cheap once ready.
+                    for path, cid in block_keys[bi]:
+                        sched.pool.wait_ready(path, cid)
                     for start in range(rstart, rstop, bs):
                         if stop.is_set():
                             return
@@ -230,9 +289,11 @@ class InSituDataset:
                         for transform in self.batch_transforms:
                             batch = transform(batch)
                         out_q.put(batch)  # blocks when full -> backpressure
-                    # Release the block: now LRU-evictable (retained for reuse if the
-                    # budget allows), and unblocks admission of the next read-ahead.
-                    sched.unpin(set(block))
+                    # Release the driver's reference on chunks whose *last* use is this
+                    # block: now LRU-evictable (retained for reuse if budget allows),
+                    # unblocking the read-ahead. Chunks read again later keep their
+                    # reference until then.
+                    sched.unpin_block(release[bi])
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
                 out_q.put(exc)
             finally:

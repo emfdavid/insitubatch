@@ -39,14 +39,37 @@ def build_stored_chunk_reads(
     array *path* (not the dict label), so several windowed views of one array
     (same path, different ``offset``) collapse to a single fetch -- decode-once.
     Dedup also makes the function safe to call with repeated ids.
+
+    ``chunk_ids`` are *anchor* chunks. A windowed variable reads ``array[anchor +
+    offset]``, so its anchor chunk's samples map to one or two offset-shifted *read*
+    chunks; each is expanded here (clamped to the array, since edge anchors that would
+    read off the array are dropped from the draw upstream). With every ``offset == 0``
+    this is exactly ``anchor chunk -> itself``.
     """
     reads: list[StoredChunkRead] = []
     seen: set[StoredChunkRead] = set()
     for cid in chunk_ids:
         for geom in geometries.values():
-            for inner in geom.inner_coords():
-                read = StoredChunkRead(array=geom.path, chunk_index=int(cid), inner_coord=inner)
-                if read not in seen:
-                    seen.add(read)
-                    reads.append(read)
+            for read_cid in _read_chunks(geom, int(cid)):
+                for inner in geom.inner_coords():
+                    read = StoredChunkRead(geom.path, read_cid, inner)
+                    if read not in seen:
+                        seen.add(read)
+                        reads.append(read)
     return reads
+
+
+def _read_chunks(geom: ArrayGeometry, anchor_chunk: int) -> range:
+    """Offset-shifted read chunks an anchor chunk needs for ``geom`` (1-2, clamped).
+
+    The anchor samples ``[start, stop)`` of ``anchor_chunk`` read array samples
+    ``[start+offset, stop-1+offset]``; clamp to ``[0, n_samples)`` (edge anchors are
+    dropped from the draw) and return the half-open range of chunks they span.
+    """
+    spc = geom.sample_chunk_size
+    anchors = geom.samples_in_chunk(anchor_chunk)
+    lo = max(0, anchors.start + geom.offset)
+    hi = min(geom.n_samples - 1, anchors.stop - 1 + geom.offset)
+    if lo > hi:  # the whole anchor chunk reads off the array (edge); nothing to fetch
+        return range(0)
+    return range(lo // spc, hi // spc + 1)
