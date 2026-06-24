@@ -425,7 +425,8 @@ class ChunkPool:
                 mask = read_cid == cid  # rows that read this chunk -> one coalesced index
                 out[mask] = self._slots[(geom.path, int(cid))].data[within[mask]]
             arrays[var] = out
-        return Batch(arrays=arrays, sample_indices=anchor)
+        offsets = {var: self._geom[var].offset for var in variables}
+        return Batch(arrays=arrays, sample_indices=anchor, offsets=offsets)
 
     def _free(self, slot: _Slot) -> None:
         """Release a slot's backing: a no-op for heap, flush+close+unlink for mmap.
