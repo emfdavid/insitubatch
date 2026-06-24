@@ -526,6 +526,37 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   ("Windowed-sampling overhead"). Correctness was the bar for PR #4; the lever, if real-
   `c1`-on-S3 ever shows it matters, is a non-windowed `gather` fast-path.
 
+  **Phase 4 (examples) — the advected-field forecast, plan.** One `InSituDataset` feeds
+  three framework training loops, to show the numpy `Batch` + DLPack thesis end to end:
+    - **Task:** a *direct* 24-hour forecast. Inputs `{t2m, u10, v10}` at anchor `t`
+      (cross-variable, same index) → target `t2m` at `t + 24h` (`g.shift(horizon)`):
+      `horizon = 24` steps on the 1-hourly synthetic store, `4` on the 6-hourly
+      WeatherBench2 store. The 24 h displacement is what makes advection (and the wind
+      inputs) *matter* vs persistence. The input window is assembled with
+      `Batch.stack(["t2m","u10","v10"])` → `(B, 3, H, W)`; the target is
+      `batch.arrays["t2m_next"]`.
+    - **No autoregressive rollout.** Chaining `n+1 → n+2 …` is a modeling/operational
+      choice, not the data layer's job — insitu delivers `(inputs@t, target@t+h)` pairs;
+      composing forecasts at serving time is the user's. Inference is a single forward
+      pass: forecast 24 h from the last available data.
+    - **One dataset → torch / JAX / TF.** `examples/advection/data.py` builds the store +
+      the single `forecast_dataset()`; `train_{torch,jax,tf}.py` each define the *same*
+      tiny CNN (3→1 channels) and a framework-native loop over the shared dataset via the
+      adapters (`as_torch` / `to_jax` / `as_tf_dataset`). Near-identical files differing
+      only in framework calls — the parallelism is the message. Shared numpy eval
+      (`rmse`, persistence baseline) in `data.py`.
+    - **Two stores, honest framing.** Synthetic advected field (seeded, time-constant
+      spatially-varying wind; tests + the pedagogical "beats persistence" result, true by
+      construction). WeatherBench2 6-hourly ARCO (`--wb2`, the real cloud store the
+      existing `wb2_*` examples use) runs the *same code* on real ERA5 — claim "same
+      pipeline, real data, no reshard", **not** SOTA skill (t2m persistence at a 24 h
+      multiple is a strong baseline; don't over-claim). A third real source may be
+      swapped in by URL + variable names.
+    - **Tests:** torch is in CI (`--extra torch`) — test data-gen advects, the dataset
+      yields the right windowed pairs, and torch training beats persistence on the
+      synthetic. JAX/TF gated with `importorskip` (their extras), mirroring
+      `test_jax.py` / `test_tf.py`.
+
 Reach track (broaden + make a splash):
 - **M3 — framework surfaces (done).** The core `Batch` is numpy and the engine
   inherits no framework; handoff is thin DLPack adapters in `frameworks.py`
