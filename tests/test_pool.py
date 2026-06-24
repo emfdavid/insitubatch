@@ -81,6 +81,39 @@ def test_build_stored_chunk_reads_expands_and_dedups(tiled_store):
     assert all(r.chunk_index == 0 for r in reads[:first_c1])
 
 
+def test_pool_aliased_labels_decode_once(tiled_store):
+    """Two variable *labels* backed by one underlying array (``geom.name``) share a single
+    decoded slot per chunk -- decode-once across offsets (the M-W pool path-keying).
+
+    The pool must key slots on the array name, not the dict label, and ``gather`` must map
+    each label back to its array. Today the label *is* the name, so the engine can't
+    express two views (e.g. ``t2m_now`` / ``t2m_next``) of one array sharing a decode.
+    """
+    url, srcs = tiled_store
+    array = "single_inner"
+    base = open_geometries(url, variables=[array])[array]  # base.name == array
+    geoms = {"now": base, "next": base}  # two labels, one underlying array
+    tiles = asyncio.run(_decode_tiles(url, array))
+    reads = build_stored_chunk_reads(range(base.n_chunks), {array: base})
+
+    pool = ChunkPool(geoms)
+    for cid in range(base.n_chunks):
+        pool.try_admit(array, cid)  # admit by array name
+    for read in reads:
+        pool.scatter(read.array, read.chunk_index, read.inner_coord, tiles[read.coords])
+
+    spc = base.sample_chunk_size
+    for cid in range(base.n_chunks):
+        pool.wait_ready(array, cid)
+    n0 = len(base.samples_in_chunk(0))
+    rows = np.array([[0, w] for w in range(n0)], dtype=np.int64)
+    batch = pool.gather(rows, ["now", "next"], spc)
+
+    assert len(pool._slots) == base.n_chunks  # one slot per chunk, not one per (label, chunk)
+    np.testing.assert_array_equal(batch.arrays["now"], batch.arrays["next"])
+    np.testing.assert_array_equal(batch.arrays["now"], srcs[array][:n0])
+
+
 @pytest.mark.parametrize("var", list(LAYOUTS))
 def test_pool_scatter_reconstructs_array(tiled_store, var):
     """Concurrent tile scatter assembles each outer chunk == arr[:] (FT stress)."""
