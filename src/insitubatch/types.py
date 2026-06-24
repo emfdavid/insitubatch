@@ -34,7 +34,7 @@ class ArrayGeometry:
     and are kept contiguous to preserve partial zero-copy.
     """
 
-    name: str
+    path: str  # the array's zarr path within the store, e.g. "t2m" or "surface/hourly/t2m"
     shape: tuple[int, ...]
     chunks: tuple[int, ...]
     dtype: np.dtype

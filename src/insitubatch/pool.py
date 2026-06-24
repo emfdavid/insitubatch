@@ -101,10 +101,10 @@ class ChunkPool:
         budget_bytes: int | None = None,
     ) -> None:
         self._geom = geometries  # label -> geometry (a label is one (array, offset) view)
-        # Slots are keyed by the underlying array *name*, not the variable label, so two
+        # Slots are keyed by the underlying array *path*, not the variable label, so two
         # views of one array (e.g. t2m_now / t2m_next) share a single decode. One
-        # representative geometry per name suffices for slot sizing (aliases share shape).
-        self._by_name = {g.name: g for g in geometries.values()}
+        # representative geometry per path suffices for slot sizing (aliases share shape).
+        self._by_path = {g.path: g for g in geometries.values()}
         self._chunk_transforms = tuple(chunk_transforms)
         # backing: heap (np.empty) or mmap'd .npy under backing_dir (point at NVMe).
         # The scatter writes straight into the slot either way; mmap keeps the working
@@ -151,7 +151,7 @@ class ChunkPool:
         exceeds the budget, so the caller must wait for the consumer to unpin one.
         """
         key = (array, chunk_index)
-        geom = self._by_name[array]
+        geom = self._by_path[array]
         nbytes = int(np.prod(geom.slot_shape(chunk_index), dtype=np.int64)) * geom.dtype.itemsize
         with self._cv:
             if key in self._slots:
@@ -257,7 +257,7 @@ class ChunkPool:
         """
         key = (array, chunk_index)
         slot = self._slots[key]  # allocated by the scheduler before any scatter
-        dst, src = self._by_name[array].tile_placement(chunk_index, inner_coord)
+        dst, src = self._by_path[array].tile_placement(chunk_index, inner_coord)
         slot.data[dst] = tile[src]  # disjoint, fixed-shape: lock-free (rule 1)
 
         with self._cv:
@@ -319,7 +319,7 @@ class ChunkPool:
     def _apply_transforms(self, array: str, chunk_index: int, data: np.ndarray) -> np.ndarray:
         if not self._chunk_transforms:
             return data
-        offset = chunk_index * self._by_name[array].sample_chunk_size
+        offset = chunk_index * self._by_path[array].sample_chunk_size
         chunk = DecodedChunk(read=ChunkRead(array, chunk_index), data=data, sample_offset=offset)
         for transform in self._chunk_transforms:  # vectorized numpy -> GIL released
             chunk = transform(chunk)
@@ -360,7 +360,7 @@ class ChunkPool:
         uniq = np.unique(chunk_ids)
 
         out: dict[str, list[np.ndarray]] = {v: [] for v in variables}
-        names = {v: self._geom[v].name for v in variables}  # label -> underlying array
+        names = {v: self._geom[v].path for v in variables}  # label -> underlying array
         idx_pieces: list[np.ndarray] = []
         for cid in uniq:
             w = within[chunk_ids == cid]

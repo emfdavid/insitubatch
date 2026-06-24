@@ -108,7 +108,7 @@ def test_scheduler_close_closes_the_loop(tiled_store):
 def test_scheduler_poisons_pool_on_driver_failure(tiled_store):
     """A variable absent from the store fails array-open; the pool poison unblocks waiters."""
     url, _ = tiled_store
-    ghost = ArrayGeometry(name="ghost", shape=(4, 2, 2), chunks=(2, 2, 2), dtype=np.dtype("f4"))
+    ghost = ArrayGeometry(path="ghost", shape=(4, 2, 2), chunks=(2, 2, 2), dtype=np.dtype("f4"))
     with _make(url, {"ghost": ghost}) as sched:
         fut = sched.start([0, 1])
         with pytest.raises(Exception):  # noqa: B017 - zarr surfaces a store-specific error type
