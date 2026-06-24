@@ -261,9 +261,9 @@ def test_pool_lru_evicts_unpinned_under_budget(tiled_store):
     fill(0)
     fill(1)
     assert pool.resident_chunks == 2
-    # Budget full of *pinned* slots -> a third miss can't be admitted yet.
+    # Budget full of *referenced* slots -> a third miss can't be admitted yet.
     assert not pool.try_admit("single_inner", 2)
-    pool.unpin({0, 1})  # release -> now LRU-evictable (0 is LRU)
+    pool.unpin_keys({("single_inner", 0), ("single_inner", 1)})  # release -> LRU-evictable
     assert pool.try_admit("single_inner", 2)  # evicts chunk 0
     for inner in geom.inner_coords():
         pool.scatter("single_inner", 2, inner, tiles[(2, *inner)])
@@ -274,3 +274,61 @@ def test_pool_lru_evicts_unpinned_under_budget(tiled_store):
     rows = np.array([[1, w] for w in range(spc)], dtype=np.int64)
     kept = pool.gather(rows, ["single_inner"], spc).arrays["single_inner"]
     np.testing.assert_array_equal(kept, srcs["single_inner"][spc : 2 * spc])
+
+
+def test_pool_pin_is_reference_counted_not_boolean(tiled_store):
+    """A chunk read by several windowed blocks is pinned several times and must stay
+    resident until the *last* release -- a single unpin after a double-pin must not free
+    it (the boolean-set bug). Pins are counts: N pins need N unpins."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    full = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
+    pool = ChunkPool(geoms, budget_bytes=full)  # holds exactly one chunk
+
+    pool.try_admit("single_inner", 0)  # admission references it -> refcount 1
+    for inner in geom.inner_coords():
+        pool.scatter("single_inner", 0, inner, tiles[(0, *inner)])
+    pool.wait_ready("single_inner", 0)
+
+    pool.pin_keys({("single_inner", 0)})  # a second block references it -> 2
+    assert pool._pinned[("single_inner", 0)] == 2
+    pool.unpin_keys({("single_inner", 0)})  # one block done -> 1, still pinned
+    assert not pool.try_admit("single_inner", 1)  # budget full, chunk 0 not evictable
+    pool.unpin_keys({("single_inner", 0)})  # last block done -> 0, now evictable
+    assert ("single_inner", 0) not in pool._pinned
+    assert pool.try_admit("single_inner", 1)  # evicts chunk 0
+    assert ("single_inner", 0) not in pool._slots
+
+
+def test_pool_unpin_all_drops_abandoned_partial_keeps_ready(tiled_store):
+    """Epoch-boundary reset (unpin_all): clear every refcount, drop a not-ready
+    (abandoned) partial -- a half-scattered chunk a cancelled epoch left behind can
+    never be a valid cache entry -- but retain a fully ready chunk for cross-epoch
+    reuse, with the byte accounting reclaimed."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["spatial"])
+    geom = geoms["spatial"]
+    tiles = asyncio.run(_decode_tiles(url, "spatial"))
+    inner = list(geom.inner_coords())
+    assert len(inner) > 1  # need a multi-tile chunk to leave a real partial
+
+    pool = ChunkPool(geoms)
+    # chunk 0: only the first tile scattered -> not ready (abandoned partial)
+    pool.try_admit("spatial", 0)
+    pool.scatter("spatial", 0, inner[0], tiles[(0, *inner[0])])
+    assert not pool.is_ready("spatial", 0)
+    # chunk 1: fully scattered -> ready (a valid cache entry)
+    pool.try_admit("spatial", 1)
+    for ic in inner:
+        pool.scatter("spatial", 1, ic, tiles[(1, *ic)])
+    pool.wait_ready("spatial", 1)
+    bytes_ready = pool._slots[("spatial", 1)].nbytes
+
+    pool.unpin_all()
+
+    assert pool._pinned == {}  # every refcount cleared
+    assert ("spatial", 0) not in pool._slots  # abandoned partial dropped
+    assert pool.is_ready("spatial", 1)  # ready chunk retained (cross-epoch reuse)
+    assert pool._bytes == bytes_ready  # the partial's bytes were reclaimed

@@ -16,16 +16,18 @@ Two bounded resources, deliberately distinct:
 * **in-flight** (``max_inflight``, an ``asyncio.Semaphore``) -- tiles in flight; a
   slot is held from fetch-start to scatter-done, spanning fetch + decode + scatter.
 * **residency** (the pool's byte budget) -- admission (``pool.try_admit``) evicts
-  unpinned-LRU to make room and *pins* the chunk; when the working set fills the
-  budget (everything resident is pinned) the loop awaits a consumer ``unpin``. So
-  the number of outstanding fetch tasks is bounded by the resident window, not by
-  the epoch length.
+  ready-and-unreferenced LRU to make room and *references* (refcounted pin) the chunk,
+  so it stays resident from in-flight fetch through to the consumer's release; when the
+  budget is full of referenced slots the loop awaits a consumer release. So the number
+  of outstanding fetch tasks is bounded by the resident window, not by the epoch length.
 
-Per chunk the scheduler first asks the pool whether it already holds it
+Per chunk the scheduler first asks the pool whether it already holds it ready
 (``pin_if_ready``): a still-resident prepped chunk is a hit and costs no fetch
 (cross-epoch reuse, since the pool persists across epochs). Misses are admitted and
-their tiles fetched. The consumer waits on slot readiness, gathers, and
-:meth:`unpin`\\s drained chunks. Errors propagate two ways -- a per-tile
+their tiles fetched. The consumer waits on slot readiness, gathers, and releases each
+chunk at its *last* use (:meth:`unpin_block`) -- windowed reads let one chunk feed
+several blocks, so it is released only when no later block needs it. Errors propagate
+two ways -- a per-tile
 fetch/decode failure poisons just that chunk (``pool.fail``); a driver failure
 poisons the whole pool (``pool.set_error``) so any waiter re-raises instead of
 hanging.
@@ -209,10 +211,11 @@ class Scheduler:
         fut.add_done_callback(self._on_drive_done)
         return fut
 
-    def unpin(self, chunk_ids: set[int]) -> None:
-        """Release drained outer chunks (thread-safe): now LRU-evictable, and wake
-        any admit parked on a full budget so it can evict them and proceed."""
-        self.pool.unpin(chunk_ids)
+    def unpin_block(self, keys: set[tuple[str, int]]) -> None:
+        """Release references on a set of drained ``(path, chunk_index)`` slots
+        (thread-safe): the slots that hit refcount 0 become LRU-evictable; wake any
+        admit parked on a full budget so it can evict them and proceed."""
+        self.pool.unpin_keys(keys)
         if self._capacity is not None:
             self._loop.call_soon_threadsafe(self._capacity.set)
 
@@ -230,9 +233,11 @@ class Scheduler:
 
     async def _drive(self, reads: list[StoredChunkRead]) -> None:
         await self._ensure_arrays()
-        # Per (var, chunk): decided[k] = True if it was a cache hit (skip its tiles),
+        # Per (path, chunk): decided[k] = True if it was a cache hit (skip its tiles),
         # False if a miss we admitted (fetch its tiles). reads are chunk-major so a
-        # (var, chunk) is first-seen on its first tile.
+        # (path, chunk) is first-seen on its first tile. Residency is held by the
+        # consumer's per-block pins, not here -- admission only allocates the slot, and
+        # a not-ready (in-flight) slot is eviction-protected until its fetch completes.
         decided: dict[tuple[str, int], bool] = {}
         tasks: list[asyncio.Task] = []
         try:
