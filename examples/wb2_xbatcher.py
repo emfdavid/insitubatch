@@ -1,11 +1,14 @@
-"""The Earthmover ``dataloader-demo`` stack — xbatcher + torch DataLoader — with a
-focus on **cold-start latency** and how to kill it.
+"""Earthmover's ``dataloader-demo`` stack — xbatcher + torch DataLoader — with a
+focus on **cold-start latency** and how to cut it.
 
-This is the worker-process baseline that insitubatch replaces (see
-``examples/wb2_dataloader.py`` for the single-event-loop version). It loads an
-ERA5-style zarr with ``xarray`` + ``xbatcher`` and feeds a torch ``DataLoader``
-with ``num_workers`` worker processes, exactly as the community demo does:
-https://github.com/earth-mover/dataloader-demo
+xbatcher (from the Earthmover / pangeo community) is the domain-standard way to *define*
+ndim batches; this runs their published demo as-is — ``xarray`` + ``xbatcher`` for the
+batch definition, fed to a torch ``DataLoader`` with ``num_workers`` worker processes
+(https://github.com/earth-mover/dataloader-demo) — and uses it to study where the
+worker-process model spends startup time (useful whichever loader you ship). The
+companion ``examples/wb2_dataloader.py`` runs the *same task* on insitubatch's
+single-event-loop engine; the two are complementary engines for the same problem, and
+pairing them makes the cold-start trade-off concrete.
 
 **Why this script exists: inference startup.** Training amortizes worker spin-up
 over many epochs, so it barely shows. Inference usually does *not* — you make one
@@ -26,8 +29,10 @@ real cost, and the worker start method is the lever:
   attached to a different loop`` (obstore deadlocks instead). ``--mp fork`` still
   lets you reproduce the failure on purpose.
 
-insitubatch pays none of this: one in-process event loop, no fork, nothing to
-relaunch. That contrast is the point.
+insitubatch's single in-process event loop sidesteps this entirely — no fork, nothing
+to relaunch — so it starts fast from cold; this script exists to make the trade-off
+visible (and to show how ``forkserver-preload`` already cuts the worker-stack TTFB a
+lot) so you can pick what fits your workload.
 
     uv run python -m examples.wb2_xbatcher --wb2 --compare --max-batches 100  # teaching table
     uv run python -m examples.wb2_xbatcher --wb2 --max-batches 100  # one run, default regime

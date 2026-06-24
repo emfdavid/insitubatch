@@ -7,15 +7,16 @@ What differs:
 - **Storage is obstore.** Pass any zarr ``--url`` (e.g. an S3 ERA5 store); reads
   go through ``store_from_url`` (so ``--request-payer`` works for Requester-Pays).
 - **Parallelism is in the event loop, not workers.** There is no ``num_workers``
-  knob — insitubatch fans out IO on its async loop and prefetches; that's the
-  point of the comparison.
+  knob — insitubatch fans out IO on its async loop and prefetches; a different
+  parallelism model for the same batches.
 - **A spatial subregion is extracted with a ``batch_transform``** (random crop per
   sample), to echo the demo's patches.
 
-**v1 limitation vs the demo:** the demo samples 48x48 patches over *3 timesteps*.
-insitubatch v1 samples one timestep per sample (the outer axis); a multi-timestep
-window crosses chunk boundaries and is not supported yet. So each sample here is a
-single-timestep field cropped to a spatial subregion.
+**Multi-timestep windows:** the demo samples 48x48 patches over *3 timesteps*. That
+windowed, multi-offset access is now supported — declare each timestep as an offset view
+(``g``, ``g.shift(1)``, …); see ``examples/advection/`` for an input@t / target@t+h
+forecast. This script keeps a single-timestep spatial crop to isolate the storage +
+parallelism comparison.
 
     uv run python -m examples.wb2_dataloader --wb2 --max-batches 100   # public WeatherBench2 GCS
     uv run python -m examples.wb2_dataloader --wb2 --num-epochs 2 --cache-resident  # decode-once
@@ -24,8 +25,8 @@ single-timestep field cropped to a spatial subregion.
         --batch-size 32 --train-step-ms 10 --request-payer
     uv run python -m examples.wb2_dataloader            # tiny synthetic data, no network
 
-Compare the worker-process stack (and how to cut its startup) in
-``examples/wb2_xbatcher.py``.
+The companion ``examples/wb2_xbatcher.py`` runs the same task on Earthmover's xbatcher +
+DataLoader stack (and shows how to cut its startup cost).
 """
 
 from __future__ import annotations
