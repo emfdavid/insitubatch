@@ -53,7 +53,7 @@ from zarr.core.buffer import default_buffer_prototype
 
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
-from .store import store_from_url
+from .store import StoreLike, as_store
 from .types import ArrayGeometry, StoredChunkRead
 
 
@@ -117,13 +117,13 @@ class Scheduler:
 
     def __init__(
         self,
-        store_url: str,
+        store: StoreLike,
         geometries: dict[str, ArrayGeometry],
         pool: ChunkPool,
         config: SchedulerConfig | None = None,
         **store_kwargs: object,
     ) -> None:
-        self._url = store_url
+        self._store = store
         self._store_kwargs = store_kwargs
         self._geometries = geometries
         self._config = config or SchedulerConfig()
@@ -275,7 +275,7 @@ class Scheduler:
         async with self._open_lock:
             if self._arrays:
                 return
-            store = store_from_url(self._url, **self._store_kwargs)  # type: ignore[arg-type]
+            store = as_store(self._store, **self._store_kwargs)  # type: ignore[arg-type]
             for name, geom in self._geometries.items():
                 aa = await za.open_array(store=store, path=name, mode="r")
                 # Format-agnostic: zarr-v2 metadata exposes `dtype`/`encode_chunk_key`
