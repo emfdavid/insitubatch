@@ -91,6 +91,23 @@ uv run mypy src                               # types
 The torch-handoff tests skip unless torch is installed (`uv sync --extra torch`);
 the same is enforced in CI.
 
+> **One framework per interpreter.** torch, JAX and TensorFlow cannot be imported
+> into the same Python process — together they load duplicate OpenMP/XLA/protobuf
+> runtimes and the process hard-crashes (`SIGSEGV`, exit 139). So if you have more
+> than one adapter installed, run their tests in separate processes — pytest imports
+> every collected module up front, so `-m`/marker filtering is too late; only
+> `--ignore` keeps a framework out of the run:
+> ```bash
+> uv run pytest -q --ignore=tests/test_jax.py --ignore=tests/test_tf.py \
+>   --deselect tests/test_advection.py::test_jax_beats_persistence \
+>   --deselect tests/test_advection.py::test_tf_beats_persistence   # torch + core
+> uv run pytest -q tests/test_jax.py tests/test_advection.py::test_jax_beats_persistence  # JAX
+> uv run pytest -q tests/test_tf.py  tests/test_advection.py::test_tf_beats_persistence   # TF
+> ```
+> CI does exactly this on the all-extras 3.12 job (the single-framework jobs run one
+> pass). This is a framework-coexistence limitation, not an insitubatch one — the
+> core engine and each adapter are independent.
+
 ### Free-threaded (3.13t)
 
 The engine is free-threading-correct by construction: the `ChunkPool`'s scatter
