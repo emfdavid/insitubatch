@@ -19,6 +19,7 @@ import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any, cast
 
 import numpy as np
 import zarr
@@ -279,8 +280,10 @@ def _run_workers(
     # reshuffles each iteration. persistent_workers requires num_workers>0.
     # _SampleReader is a map-style dataset (len/getitem) but isn't a torch Dataset
     # subclass -- it stays torch-free at module scope so it pickles to spawn workers.
+    # DataLoader accepts it at runtime; cast(Any) satisfies the stub (which wants a Dataset)
+    # without a `type: ignore` that flips to "unused" when torch (its stub) isn't installed.
     loader: DataLoader = DataLoader(
-        _SampleReader(cfg.url, cfg.var, idx, store_kwargs),  # type: ignore[arg-type]  # map-style, not a Dataset
+        cast(Any, _SampleReader(cfg.url, cfg.var, idx, store_kwargs)),
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         shuffle=cfg.shuffle,

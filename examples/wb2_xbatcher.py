@@ -44,7 +44,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from multiprocessing.context import BaseContext
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -158,8 +158,11 @@ def run_xbatcher_demo(
     for _ in range(num_epochs):
         # Fresh loader each epoch: this measures *cold start*, the inference-relevant
         # cost (the bench/ suite uses persistent workers to measure steady state).
+        # base (_CenterCrop) is map-style (len/getitem) -- DataLoader accepts it at runtime;
+        # cast(Any) satisfies the stub (which wants a Dataset subclass) without a
+        # `type: ignore` that flips to "unused" when torch (its stub) isn't installed.
         loader: DataLoader = DataLoader(
-            base,  # type: ignore[arg-type]  # _CenterCrop is map-style (len/getitem), not a Dataset
+            cast(Any, base),
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=shuffle,
