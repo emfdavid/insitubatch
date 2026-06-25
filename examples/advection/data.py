@@ -20,14 +20,13 @@ regardless of the store, so the training files are store-agnostic.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import numpy as np
 import zarr
 
 from insitubatch import (
-    SplitName,
     ensure_local_dir,
     open_geometries,
     split_by_chunk,
@@ -130,7 +129,6 @@ def forecast_dataset(
     *,
     variables: tuple[str, str, str] = SYNTH_VARS,
     horizon: int = SYNTH_HORIZON,
-    split: SplitName = SplitName.TRAIN,
     batch_size: int = 32,
     shuffle: bool = True,
     **store_kwargs: Any,
@@ -140,8 +138,8 @@ def forecast_dataset(
     ``variables`` names the three input arrays in the store (synthetic short names or the
     WeatherBench2 long names); the dataset's labels are always ``t2m, u10, v10, target`` so
     the model code is store-agnostic. The target is the first variable shifted by
-    ``horizon`` -- two views of one array, no reshard. ``split_by_chunk`` partitions the
-    time axis (contiguous, the time-series default).
+    ``horizon`` -- two views of one array, no reshard. Iterate its ``.train`` / ``.val``
+    views; ``split_by_chunk`` partitions the time axis (contiguous, the time-series default).
     """
     opened = open_geometries(url, variables=list(variables), **store_kwargs)
     geoms = {label: opened[var] for label, var in zip(LABELS, variables, strict=True)}
@@ -151,7 +149,6 @@ def forecast_dataset(
         url,
         manifest,
         geometries=geoms,
-        split=split,
         batch_size=batch_size,
         shuffle=shuffle,
         **store_kwargs,
@@ -176,16 +173,17 @@ def rmse(pred: np.ndarray, target: np.ndarray) -> float:
     return float(np.sqrt(np.mean((pred - target) ** 2)))
 
 
-def evaluate(ds: InSituDataset, predict: Callable[[Batch], np.ndarray]) -> tuple[float, float]:
-    """24-hour-forecast skill on a held-out split: ``(model_rmse, persistence_rmse)``.
+def evaluate(view: Iterable[Batch], predict: Callable[[Batch], np.ndarray]) -> tuple[float, float]:
+    """24-hour-forecast skill on a held-out split view (e.g. ``ds.val``): ``(model_rmse,
+    persistence_rmse)``.
 
     ``predict`` maps a windowed ``Batch`` to the model's ``t2m(t+horizon)`` forecast
     ``(B, 1, H, W)`` (each framework supplies its own, so this stays framework-neutral).
-    Persistence -- predict no change -- is the baseline a useful model must beat.
+    Persistence -- predict no change -- is the baseline a useful model must beat. The view
+    is deterministic (eval splits don't shuffle), so no epoch is set.
     """
-    ds.set_epoch(0)
     preds, targets, persists = [], [], []
-    for batch in ds:
+    for batch in view:
         _x, persistence, target = inputs_and_targets(batch)
         preds.append(predict(batch))
         targets.append(target)
@@ -205,32 +203,17 @@ def cli() -> argparse.Namespace:
     return p.parse_args()
 
 
-def build_datasets(args: argparse.Namespace) -> tuple[InSituDataset, InSituDataset]:
-    """``(train, val)`` forecast datasets from CLI args. Synthetic by default (written
-    fresh -- deterministic, offline); ``--wb2`` reads the public WeatherBench2 store
-    (anonymous ``gs://``, real ERA5, 6-hourly so the 24 h horizon is 4 steps)."""
+def build_datasets(args: argparse.Namespace) -> InSituDataset:
+    """One forecast dataset from CLI args -- iterate ``ds.train`` / ``ds.val``. Synthetic by
+    default (written fresh -- deterministic, offline); ``--wb2`` reads the public
+    WeatherBench2 store (anonymous ``gs://``, real ERA5, 6-hourly so the 24 h horizon is 4
+    steps)."""
     if args.wb2:
         url, variables, horizon, kw = WB2_URL, WB2_VARS, WB2_HORIZON, {"skip_signature": True}
     else:
         url = args.url or "file:///tmp/insitu_advection.zarr"
         make_advection_store(url, n_steps=args.n_steps)
         variables, horizon, kw = SYNTH_VARS, SYNTH_HORIZON, {}
-    train = forecast_dataset(
-        url,
-        variables=variables,
-        horizon=horizon,
-        split=SplitName.TRAIN,
-        batch_size=args.batch_size,
-        shuffle=True,
-        **kw,
+    return forecast_dataset(
+        url, variables=variables, horizon=horizon, batch_size=args.batch_size, shuffle=True, **kw
     )
-    val = forecast_dataset(
-        url,
-        variables=variables,
-        horizon=horizon,
-        split=SplitName.VAL,
-        batch_size=args.batch_size,
-        shuffle=False,
-        **kw,
-    )
-    return train, val

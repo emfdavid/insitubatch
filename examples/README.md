@@ -3,6 +3,11 @@
 Runnable examples (not shipped in the wheel). Run from the repo root, e.g.
 `python -m examples.advection.train_torch`.
 
+The InsituDataset is a general purpose, batteries included, tool for batching zarr compatible 
+data into the python ML ecosystem. The examples are forecasting focused because there are large
+public zarr datasets available and the time shifting on insitu data is an added challenge that
+shows the generalization.
+
 ## advection/ — a 24-hour forecast, one dataset, three frameworks
 
 The M-W showcase: **multi-variable, windowed, train-in-place** sampling driving a real

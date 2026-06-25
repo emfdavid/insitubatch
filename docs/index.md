@@ -53,7 +53,7 @@ The core `InSituDataset` is a framework-neutral iterable of numpy `Batch` object
 torch / JAX / TF handoff is a thin optional DLPack adapter in `insitubatch.frameworks`.
 
 ```python
-from insitubatch import open_geometries, split_by_chunk, SplitName
+from insitubatch import open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset
 from torch.utils.data import DataLoader
@@ -62,18 +62,19 @@ url = "file:///data/era5.zarr"           # or "s3://bucket/era5.zarr" — same c
 geoms = open_geometries(url)             # {var: ArrayGeometry} from zarr metadata
 manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 
-ds = InSituDataset(url, manifest, split=SplitName.TRAIN,
-                   batch_size=32, block_chunks=16)
+ds = InSituDataset(url, manifest, batch_size=32, block_chunks=16)
 
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)
-    for batch in ds:                     # numpy Batch: {var: np.ndarray} + sample_indices
+    for batch in ds.train:               # numpy Batch: {var: np.ndarray} + sample_indices
+        ...
+    for batch in ds.val:                 # deterministic; shares the pool with train
         ...
 
 # Framework handoff (zero-copy on CPU via DLPack):
-loader = DataLoader(as_torch(ds), batch_size=None, num_workers=0)  # torch: {var: torch.Tensor}
-jbatch = to_jax(next(iter(ds)))                                    # JAX:   {var: jax.Array}
-tfds = as_tf_dataset(ds)                                           # TF:    tf.data.Dataset
+loader = DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)  # torch
+jbatch = to_jax(next(iter(ds.train)))                                    # JAX:   {var: jax.Array}
+tfds = as_tf_dataset(ds.val)                                             # TF:    tf.data.Dataset
 ```
 
 A runnable, network-free version of this — paralleling the Earthmover

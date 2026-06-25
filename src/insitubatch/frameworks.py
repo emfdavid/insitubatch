@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-from .source import InSituDataset
+from .source import _SplitView
 from .types import Batch
 
 if TYPE_CHECKING:  # annotations only; these are optional at runtime
@@ -70,11 +70,11 @@ def to_tf(batch: Batch) -> dict[str, Any]:
     return {k: tf.experimental.dlpack.from_dlpack(v.__dlpack__()) for k, v in batch.arrays.items()}
 
 
-def as_torch(ds: InSituDataset) -> IterableDataset:
-    """Wrap an :class:`InSituDataset` as a torch ``IterableDataset`` for ``DataLoader``.
+def as_torch(view: _SplitView) -> IterableDataset:
+    """Wrap a split view (e.g. ``ds.train``) as a torch ``IterableDataset`` for ``DataLoader``.
 
     Each yielded item is a ``dict[str, torch.Tensor]`` (via :func:`to_torch`). Use
-    ``DataLoader(as_torch(ds), batch_size=None, num_workers=0)``.
+    ``DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)``.
     """
     try:
         from torch.utils.data import IterableDataset
@@ -82,20 +82,20 @@ def as_torch(ds: InSituDataset) -> IterableDataset:
         raise _missing("PyTorch", "torch") from exc
 
     class _TorchStream(IterableDataset):
-        def __init__(self, stream: InSituDataset) -> None:
+        def __init__(self, stream: _SplitView) -> None:
             self._stream = stream
 
         def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
             for batch in self._stream:
                 yield to_torch(batch)
 
-    return _TorchStream(ds)
+    return _TorchStream(view)
 
 
-def as_tf_dataset(ds: InSituDataset, *, prefetch: int = 2) -> tf.data.Dataset:
-    """Wrap an :class:`InSituDataset` as a ``tf.data.Dataset`` via ``from_generator``.
+def as_tf_dataset(view: _SplitView, *, prefetch: int = 2) -> tf.data.Dataset:
+    """Wrap a split view (e.g. ``ds.val``) as a ``tf.data.Dataset`` via ``from_generator``.
 
-    ``output_signature`` is inferred from the dataset's geometries: each variable is
+    ``output_signature`` is inferred from the view's geometries: each variable is
     ``(None, *inner)`` (None = the variable last-batch size) with the variable's dtype.
     Note ``from_generator`` *copies* into the TF runtime; for a zero-copy handoff call
     :func:`to_tf` on the raw stream instead.
@@ -107,11 +107,11 @@ def as_tf_dataset(ds: InSituDataset, *, prefetch: int = 2) -> tf.data.Dataset:
 
     signature = {
         name: tf.TensorSpec(shape=(None, *geom.inner_shape), dtype=geom.dtype)
-        for name, geom in ds.geometries.items()
+        for name, geom in view.geometries.items()
     }
 
     def gen() -> Iterator[dict[str, Any]]:
-        for batch in ds:
+        for batch in view:
             yield batch.arrays
 
     tfds = tf.data.Dataset.from_generator(gen, output_signature=signature)

@@ -101,7 +101,6 @@ def _insitu(
         url,
         manifest,
         geometries=geoms,
-        split=SplitName.TRAIN,
         batch_size=16,
         block_chunks=block_chunks,
         max_inflight=max_inflight,
@@ -113,7 +112,7 @@ def _insitu(
     limit = max_chunks * geom.sample_chunk_size
     n = 0
     t = time.perf_counter()
-    for b in ds:
+    for b in ds.train:
         n += b.arrays[var].shape[0]
         if n >= limit:
             break
@@ -158,7 +157,6 @@ def _insitu_cache(
         url,
         manifest,
         geometries={var: geom},
-        split=SplitName.TRAIN,
         batch_size=16,
         block_chunks=block_chunks,
         shuffle=False,
@@ -172,7 +170,7 @@ def _insitu_cache(
         ds.set_epoch(epoch)
         n = 0
         t = time.perf_counter()
-        for b in ds:
+        for b in ds.train:
             n += b.arrays[var].shape[0]
         return n * bps / 1e6 / (time.perf_counter() - t)
 

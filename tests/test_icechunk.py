@@ -14,7 +14,6 @@ import pytest
 import zarr
 
 from insitubatch import (
-    SplitName,
     as_store,
     open_geometries,
     split_by_chunk,
@@ -67,17 +66,16 @@ def test_dataset_streams_from_icechunk_store(icechunk_store) -> None:
     ds = InSituDataset(
         store,
         manifest,
-        split=SplitName.TRAIN,
         shuffle=False,
         batch_size=5,
         block_chunks=2,
     )
     ds.set_epoch(0)
-    idx = np.concatenate([b.sample_indices for b in ds])
+    idx = np.concatenate([b.sample_indices for b in ds.train])
     assert idx.tolist() == list(range(40))  # strictly in order
 
     ds.set_epoch(0)
-    out = np.concatenate([b.arrays["t2m"] for b in ds], axis=0)
+    out = np.concatenate([b.arrays["t2m"] for b in ds.train], axis=0)
     np.testing.assert_array_equal(out, src)
 
 
@@ -95,7 +93,7 @@ def test_icechunk_matches_url_path(icechunk_store, write_zarr) -> None:
     def collect(spec):
         ds = InSituDataset(spec, manifest, shuffle=False, batch_size=5, block_chunks=2)
         ds.set_epoch(0)
-        return np.concatenate([b.arrays["t2m"] for b in ds], axis=0)
+        return np.concatenate([b.arrays["t2m"] for b in ds.train], axis=0)
 
     np.testing.assert_array_equal(collect(store), src)
     np.testing.assert_array_equal(collect(url), src)

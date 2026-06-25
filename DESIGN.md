@@ -512,6 +512,15 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
       gather/leak race). windowed+shuffle holds the **whole split** resident (shuffle
       spills reads into arbitrary blocks); bounded-residency windowed+shuffle (per-block
       re-fetch) is deferred. Decode-once across views holds (slots key on `path`).
+    - **Splits are iterable views, not a constructor arg.** `InSituDataset` is
+      split-agnostic; you iterate `ds.train` (shuffled) / `ds.val` / `ds.test` / `ds.all`
+      (deterministic), all sharing **one** `ChunkPool`. This matters *because* of windows:
+      a windowed read near a split boundary spills into the adjacent split's chunk, so the
+      splits' *chunk reads* overlap even though no sample leaks (the disjoint-anchor proof
+      is about samples, not chunks) -- one shared pool decodes those boundary chunks once,
+      where separate per-split datasets would decode them twice. Per-split *config* (e.g.
+      train-only augmentation) is intentionally not supported on one instance -- make a
+      second dataset for that; the default path stays clean.
 
   **Deferred — refcount hot-path cost (accept for now).** The refcounted residency +
   offset-aware `gather` add ~**3.5%** to the *non-windowed* path at the **GRIB-end local

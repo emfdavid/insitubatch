@@ -65,13 +65,12 @@ def test_shuffle_false_is_in_order(write_zarr) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         shuffle=False,
         batch_size=5,
         block_chunks=2,
     )
     ds.set_epoch(0)
-    idx = np.concatenate([b.sample_indices for b in ds])
+    idx = np.concatenate([b.sample_indices for b in ds.train])
     assert idx.tolist() == list(range(40))  # strictly in order
 
 
@@ -88,7 +87,7 @@ def test_shuffle_true_covers_but_reorders(write_zarr) -> None:
         block_chunks=4,
     )
     ds.set_epoch(0)
-    idx = np.concatenate([b.sample_indices for b in ds])
+    idx = np.concatenate([b.sample_indices for b in ds.train])
     assert sorted(idx.tolist()) == list(range(40))  # full coverage
     assert idx.tolist() != list(range(40))  # but not in order
 
@@ -110,7 +109,6 @@ def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=1,
         block_chunks=20,
         shuffle=True,
@@ -118,7 +116,7 @@ def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
         chunk_transforms=[count],
     )
     ds.set_epoch(0)
-    for _ in ds:
+    for _ in ds.train:
         pass
 
     assert set(decoded) == set(manifest.chunks[SplitName.TRAIN.value])
@@ -143,7 +141,7 @@ def test_residency_is_bounded_by_block(write_zarr) -> None:
         seed=0,
     )
     ds.set_epoch(0)
-    for _ in ds:
+    for _ in ds.train:
         pass
     assert block_chunks <= ds.resident_peak <= 2 * block_chunks  # ~two blocks, not all 40
 
@@ -166,7 +164,6 @@ def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=4,
         block_chunks=4,
         shuffle=True,
@@ -178,7 +175,7 @@ def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
     try:
         for epoch in range(2):
             ds.set_epoch(epoch)
-            for _ in ds:
+            for _ in ds.train:
                 pass
     finally:
         ds.close()
@@ -195,5 +192,41 @@ def test_sample_range_subsets_what_the_dataset_reads(write_zarr) -> None:
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0), sample_range=(16, 40))
     ds = InSituDataset(url, manifest, shuffle=False, batch_size=8)
     ds.set_epoch(0)
-    idx = np.concatenate([b.sample_indices for b in ds])
+    idx = np.concatenate([b.sample_indices for b in ds.train])
     assert set(idx.tolist()) == set(range(16, 40))  # chunks 2,3,4 -> samples 16..39
+
+
+def test_split_views_share_one_pool_and_cover_disjoint(write_zarr) -> None:
+    """train / val / test / all are views on *one* dataset sharing *one* pool; the splits
+    are disjoint and ``all`` is their union."""
+    url, _ = write_zarr(n=80, spc=8)  # 10 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(0.6, 0.2, 0.2))
+    ds = InSituDataset(url, manifest, batch_size=8, block_chunks=4)
+    pool = ds._pool  # the one pool every view shares
+
+    seen: dict[str, set[int]] = {}
+    for name in ("train", "val", "test"):
+        ds.set_epoch(0)
+        idx = np.concatenate([b.sample_indices for b in getattr(ds, name)])
+        seen[name] = set(idx.tolist())
+        assert ds._pool is pool  # iterating a view doesn't rebuild the pool
+
+    assert seen["train"].isdisjoint(seen["val"])
+    assert seen["train"].isdisjoint(seen["test"])
+    assert seen["val"].isdisjoint(seen["test"])
+    all_idx = set(np.concatenate([b.sample_indices for b in ds.all]).tolist())
+    assert all_idx == seen["train"] | seen["val"] | seen["test"]
+
+
+def test_val_view_is_deterministic_train_shuffles(write_zarr) -> None:
+    url, _ = write_zarr(n=80, spc=8)
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(0.6, 0.2, 0.2))
+    ds = InSituDataset(url, manifest, batch_size=8, block_chunks=4, shuffle=True, seed=1)
+    ds.set_epoch(0)
+    val0 = np.concatenate([b.sample_indices for b in ds.val])
+    ds.set_epoch(5)  # different epoch
+    val5 = np.concatenate([b.sample_indices for b in ds.val])
+    np.testing.assert_array_equal(val0, val5)  # val ignores epoch (no shuffle)
+    np.testing.assert_array_equal(val0, np.sort(val0))  # and is in order
