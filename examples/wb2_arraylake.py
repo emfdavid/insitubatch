@@ -17,6 +17,22 @@ spatial patch (a ``batch_transform``). Needs ``al auth login`` (or
     # heavier-IO grid, a few epochs, simulated 10ms train step
     uv run python -m examples.wb2_arraylake \
         --group era5/6h_1440x721 --num-epochs 2 --train-step-ms 10
+
+    # Reasonable settings for WAN access: subset to a window, cache to NVMe, full epochs.
+    # Caveat: under --cache-resident the pool budget holds the whole subset, which removes
+    # the engine's read-ahead backpressure -- so --max-inflight here doubles as the
+    # read-ahead throttle. Keep it modest (~16): a high value oversubscribes the network at
+    # the start of an uncached epoch (block 0 competes with the whole-subset prefetch) and
+    # inflates cold TTFB. A decoupled read-ahead cap would fix this (DESIGN.md roadmap, M-RA).
+    uv run python -m examples.wb2_arraylake \
+        --group era5/6h_1440x721 --max-inflight 16 --sample-range 0,180 --max-batches 0 \
+        --num-epochs 2 --cache-resident --cache-dir /tmp/insitu-cache
+
+    # Measured -- proximity to the store dominates (run near your data):
+    #   home network (high-latency WAN, tuned as above): TTFB 8.5 s, 7.9 samples/s
+    #   in-region AWS EC2 (untuned defaults):             TTFB 1.3 s,  60 samples/s
+    #     home: {'samples': 288, 'ttfb_ms': 8470.3, 'samples_per_s': 7.94, 'mean_wait_ms': 1006.9}
+    #     ec2:  {'samples': 320, 'ttfb_ms': 1269.6, 'samples_per_s': 60.24, 'mean_wait_ms': 115.6}
 """
 
 from __future__ import annotations
@@ -80,7 +96,9 @@ def run(
     block_chunks: int = 8,
     prefetch_depth: int = 2,
     max_inflight: int | None = None,
+    sample_range: tuple[int, int] | None = None,
     cache_resident: bool = False,
+    cache_dir: str | None = None,
     train_step_ms: float = 0.0,
     num_epochs: int = 1,
     max_batches: int = 0,
@@ -90,20 +108,42 @@ def run(
 ) -> dict:
     """Stream patches from ``store`` and report time-to-first-batch + throughput.
 
-    ``max_inflight`` is the latency dial: a high-latency store (streaming over the WAN)
-    needs many concurrent requests to keep the read-ahead fed, or block-boundary waits
-    show as a sawtooth (the next block isn't fetched while the current one drains). Raise
-    it well above the default 32 for a remote store. ``cache_resident`` sizes the pool to
-    the whole train split so epoch 2+ is served decode-once from the pool (no re-fetch).
+    ``max_inflight`` is the latency dial: over a high-latency network (streaming across the
+    WAN) you need many concurrent requests to keep the read-ahead fed, or block-boundary
+    waits show as a sawtooth (the next block isn't fetched while the current one drains).
+    Raise it well above the default 32 when the network round-trip is the bottleneck.
+
+    ``sample_range`` restricts training to a sample-axis (time) window -- essential for a
+    multi-decade store: the whole archive is hundreds of GB, and ``cache_resident`` sizes
+    the pool to the *whole train split*, so without subsetting it tries to hold (and, on
+    the first epoch, eagerly fetch) the entire thing -- minutes of allocation before the
+    first batch. Pick a window (e.g. one year of 6-hourly steps) so the cache fits; pair
+    with ``cache_dir`` to spill the slots to NVMe (mmap) instead of RAM. With a bounded,
+    cached split, epoch 2+ is served decode-once from the pool (no re-fetch).
     """
     qual = f"{group}/{var}" if group else var
     geom = open_geometries(store, variables=[qual])[qual]
-    manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
+    manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1), sample_range=sample_range)
 
     cache_budget_bytes = None
     if cache_resident:
         per_chunk = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
-        cache_budget_bytes = (len(manifest.chunks[SplitName.TRAIN.value]) + 2) * per_chunk
+        n_train = len(manifest.chunks[SplitName.TRAIN.value])
+        cache_budget_bytes = (n_train + 2) * per_chunk
+        if verbose:
+            gib = cache_budget_bytes / 1024**3
+            where = f"NVMe at {cache_dir}" if cache_dir else "RAM"
+            print(f"cache-resident: {n_train}-chunk train split (~{gib:.1f} GiB) held in {where}")
+            if cache_dir is None and gib > 8:
+                print(
+                    "  warning: large in-RAM cache -- pass --sample-range to subset, or "
+                    "--cache-dir to spill to NVMe"
+                )
+            if max_batches and num_epochs > 1:
+                print(
+                    "  note: --max-batches caps each epoch, so epoch 0 caches only those "
+                    "(reshuffled) chunks; drop it (full epochs) for the cache to pay off"
+                )
 
     ds = InSituDataset(
         store,
@@ -115,6 +155,7 @@ def run(
         prefetch_depth=prefetch_depth,
         max_inflight=max_inflight,
         cache_budget_bytes=cache_budget_bytes,
+        cache_dir=cache_dir,
         shuffle=shuffle,
         seed=seed,
         batch_transforms=[_crop(patch, seed)],
@@ -162,6 +203,11 @@ def _patch(s: str) -> tuple[int, int]:
     return (h, w)
 
 
+def _range(s: str) -> tuple[int, int]:
+    start, stop = (int(x) for x in s.split(","))
+    return (start, stop)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -177,6 +223,26 @@ def main() -> None:
     p.add_argument("--max-batches", type=int, default=20, help="cap batches per epoch (0 = all)")
     p.add_argument("--train-step-ms", type=float, default=0.0, help="simulated train step")
     p.add_argument("--no-shuffle", action="store_true")
+    p.add_argument(
+        "--max-inflight",
+        type=int,
+        default=None,
+        help="stored tiles in flight (the latency dial); raise it for a high-latency network",
+    )
+    p.add_argument(
+        "--sample-range",
+        type=_range,
+        default=None,
+        metavar="START,STOP",
+        help="train on a sample-axis (time) window -- subset this multi-decade store so a "
+        "cache fits (e.g. one year of 6-hourly steps is ~1460)",
+    )
+    p.add_argument(
+        "--cache-resident",
+        action="store_true",
+        help="hold the (subset) train split resident -> epoch 2+ is decode-once (no re-fetch)",
+    )
+    p.add_argument("--cache-dir", default=None, help="spill cached slots to this NVMe dir (mmap)")
     a = p.parse_args()
 
     store = open_arraylake_store(a.repo, branch=a.branch)
@@ -191,6 +257,10 @@ def main() -> None:
         max_batches=a.max_batches,
         train_step_ms=a.train_step_ms,
         shuffle=not a.no_shuffle,
+        max_inflight=a.max_inflight,
+        sample_range=a.sample_range,
+        cache_resident=a.cache_resident,
+        cache_dir=a.cache_dir,
     )
 
 

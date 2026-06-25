@@ -413,6 +413,22 @@ Perf track (the core thesis):
   `test_pool`/`test_scheduler` parity + bound tests. Supersedes the one-block
   look-ahead in `source.py`. exp_c fat-spatial acceptance passed (see the result
   table). Remaining: B2 (mmap/LRU pool backing).
+- **M-RA — bounded read-ahead (decouple prefetch depth from the cache budget).** Today the
+  scheduler's read-ahead depth is gated *only* by the pool's byte budget: admission
+  (`try_admit`) parks just when the budget is full. A large `cache_budget_bytes`
+  (decode-once retention, e.g. `--cache-resident`) removes that backpressure, so the driver
+  eagerly admits + fetches the *whole* resident set at once. On a high-latency /
+  bandwidth-limited network this starves the current block — the first batch competes with
+  the whole-subset prefetch, inflating cold TTFB (observed on the WeatherBench2 Arraylake
+  example: ~7 s without the cache → ~50 s with `--cache-resident`, since `max_inflight`
+  worth of fetches fan out across the entire split). As a stopgap the example uses a low
+  `--max-inflight` so it doubles as a read-ahead throttle, but that couples two dials.
+  **Fix:** a fetch-ahead cap — a semaphore released on the consumer's `unpin` — that bounds
+  how far ahead of the consumer the driver admits, *independent* of the retention budget.
+  Then the cache retains consumed chunks (fast warm epochs) without eager whole-split
+  fetching (fast cold TTFB), and `max_inflight` goes back to being purely the concurrency
+  dial. Applies to both the V2 main engine and the M-W branch (whose residency rework did
+  not add a read-ahead cap either).
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 
