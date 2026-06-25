@@ -1,18 +1,15 @@
 name: ci
 
-# Lint, type-check, and test on every push to main and every PR. The 3.12 job covers
-# the *full* suite -- every framework adapter (torch/JAX/TF) and the Icechunk handoff --
-# while 3.13 stays light (core + torch/bench), since the adapters are interpreter-
-# independent. A separate free-threaded job runs the core engine with the GIL disabled to
-# guard the scatter/gather concurrency.
+# Lint, type-check, and test on every push to main and every PR.
 #
-# torch, JAX and TF cannot share one interpreter: importing all three loads duplicate
-# OpenMP/XLA/protobuf runtimes and the process SIGSEGVs (exit 139). pytest imports every
-# collected test module up front, and `-m`/marker filtering runs *after* that import, so
-# the only way to keep a framework out of a process is to not collect its module. The 3.12
-# job therefore runs pytest three times -- torch+core, then JAX alone, then TF alone --
-# each a fresh process with at most one framework. (Forking is not an option: the parent
-# may hold a live obstore/tokio runtime, which a fork would corrupt.)
+# One framework per *environment*. torch, JAX and TensorFlow cannot coexist in one Python
+# process -- together they load duplicate OpenMP/XLA/protobuf runtimes and the process
+# crashes (SIGSEGV / abort). And it is not enough to run them in separate pytest processes
+# of one env: TF (via its bundled Keras 3) transitively imports JAX *when JAX is installed*,
+# so the two collide even when only the TF tests are selected. The fix is therefore to give
+# each framework its own job with only that framework installed; the others importorskip-skip.
+# A separate `lint` job installs every extra (so mypy sees the real framework types) but runs
+# no pytest -- mypy doesn't import the frameworks, so co-installation is harmless there.
 on:
   push:
     branches: [main]
@@ -27,6 +24,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Lint + types once, on 3.12 with every extra installed so mypy resolves the real
+  # torch/JAX/TF/icechunk types. No pytest here (that would co-import the frameworks).
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --python 3.12 --extra torch --extra bench --extra jax --extra tf --extra icechunk
+      - run: |
+          uv run ruff check src tests bench examples
+          uv run ruff format --check src tests bench examples
+          uv run mypy src bench examples
+
+  # One job per framework: each env installs a single DL framework, so nothing it (or its
+  # deps, e.g. Keras->JAX) imports can collide with another framework. Tests for absent
+  # frameworks importorskip-skip.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20  # a hang fails fast instead of burning the 6h default
@@ -34,12 +50,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 3.12: the full suite -- every framework (torch/JAX/TF) + Icechunk -- so the
-          # jax/tf/icechunk tests run instead of importorskip-skipping.
+          # torch + the cold-start bench deps + the Icechunk handoff (no jax/tf in this env).
           - python: "3.12"
-            extras: "--extra torch --extra bench --extra jax --extra tf --extra icechunk"
-          # 3.13: light (core + torch/bench); the adapters are interpreter-independent, so
-          # no need to pay the heavy JAX/TF/icechunk install twice.
+            extras: "--extra torch --extra bench --extra icechunk"
+          # JAX alone.
+          - python: "3.12"
+            extras: "--extra jax"
+          # TensorFlow alone (JAX absent, so Keras 3 stays on the TF backend).
+          - python: "3.12"
+            extras: "--extra tf"
+          # 3.13 re-confirms the torch adapter on the newer interpreter (adapters are
+          # interpreter-independent, so no need to pay the JAX/TF installs twice).
           - python: "3.13"
             extras: "--extra torch --extra bench"
     steps:
@@ -48,26 +69,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --python ${{ matrix.python }} ${{ matrix.extras }}
-      # Lint + types are interpreter-independent: run once (on 3.12, which has every extra
-      # so mypy sees the real framework types) to avoid 2x cost.
-      - if: matrix.python == '3.12'
-        run: |
-          uv run ruff check src tests bench examples
-          uv run ruff format --check src tests bench examples
-          uv run mypy src bench examples
-      # 3.12 has all three frameworks installed, so isolate each in its own process (see
-      # the header comment). --ignore keeps a module out of collection (and thus out of the
-      # process); --deselect drops the matching advection test whose import is lazy.
-      - if: matrix.python == '3.12'
-        run: |
-          uv run pytest -q --ignore=tests/test_jax.py --ignore=tests/test_tf.py \
-            --deselect tests/test_advection.py::test_jax_beats_persistence \
-            --deselect tests/test_advection.py::test_tf_beats_persistence
-          uv run pytest -q tests/test_jax.py tests/test_advection.py::test_jax_beats_persistence
-          uv run pytest -q tests/test_tf.py tests/test_advection.py::test_tf_beats_persistence
-      # 3.13 installs only torch/bench, so jax/tf importorskip-skip -- one process is fine.
-      - if: matrix.python != '3.12'
-        run: uv run --python ${{ matrix.python }} pytest -q
+      - run: uv run --python ${{ matrix.python }} pytest -q
 
   # Free-threaded 3.13t: the real test of the pool's lock-free disjoint scatter +
   # lock-published readiness. torch/bench have no free-threaded wheels yet, so this

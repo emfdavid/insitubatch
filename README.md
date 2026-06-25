@@ -91,22 +91,22 @@ uv run mypy src                               # types
 The torch-handoff tests skip unless torch is installed (`uv sync --extra torch`);
 the same is enforced in CI.
 
-> **One framework per interpreter.** torch, JAX and TensorFlow cannot be imported
-> into the same Python process — together they load duplicate OpenMP/XLA/protobuf
-> runtimes and the process hard-crashes (`SIGSEGV`, exit 139). So if you have more
-> than one adapter installed, run their tests in separate processes — pytest imports
-> every collected module up front, so `-m`/marker filtering is too late; only
-> `--ignore` keeps a framework out of the run:
+> **One framework per environment.** torch, JAX and TensorFlow cannot coexist in one
+> Python process — together they load duplicate OpenMP/XLA/protobuf runtimes and the
+> process crashes (`SIGSEGV` / abort). Separate pytest *processes* in one env are not
+> enough: TF (via its bundled Keras 3) transitively imports JAX whenever JAX is
+> *installed*, so the two collide even if only the TF tests are selected. So install
+> just one adapter at a time when running the framework tests:
 > ```bash
-> uv run pytest -q --ignore=tests/test_jax.py --ignore=tests/test_tf.py \
->   --deselect tests/test_advection.py::test_jax_beats_persistence \
->   --deselect tests/test_advection.py::test_tf_beats_persistence   # torch + core
-> uv run pytest -q tests/test_jax.py tests/test_advection.py::test_jax_beats_persistence  # JAX
-> uv run pytest -q tests/test_tf.py  tests/test_advection.py::test_tf_beats_persistence   # TF
+> uv sync --extra torch && uv run pytest -q   # torch adapter + core
+> uv sync --extra jax   && uv run pytest -q   # JAX adapter (others importorskip-skip)
+> uv sync --extra tf    && uv run pytest -q   # TF adapter
 > ```
-> CI does exactly this on the all-extras 3.12 job (the single-framework jobs run one
-> pass). This is a framework-coexistence limitation, not an insitubatch one — the
-> core engine and each adapter are independent.
+> CI does exactly this — one job per framework, each with a single adapter installed,
+> plus a separate lint/types job that installs every extra but runs no pytest (mypy
+> doesn't import the frameworks, so co-installation is harmless there). This is a
+> framework-coexistence limitation, not an insitubatch one — the core engine and each
+> adapter are independent.
 
 ### Free-threaded (3.13t)
 
