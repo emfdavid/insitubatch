@@ -5,6 +5,14 @@ name: ci
 # while 3.13 stays light (core + torch/bench), since the adapters are interpreter-
 # independent. A separate free-threaded job runs the core engine with the GIL disabled to
 # guard the scatter/gather concurrency.
+#
+# torch, JAX and TF cannot share one interpreter: importing all three loads duplicate
+# OpenMP/XLA/protobuf runtimes and the process SIGSEGVs (exit 139). pytest imports every
+# collected test module up front, and `-m`/marker filtering runs *after* that import, so
+# the only way to keep a framework out of a process is to not collect its module. The 3.12
+# job therefore runs pytest three times -- torch+core, then JAX alone, then TF alone --
+# each a fresh process with at most one framework. (Forking is not an option: the parent
+# may hold a live obstore/tokio runtime, which a fork would corrupt.)
 on:
   push:
     branches: [main]
@@ -47,7 +55,19 @@ jobs:
           uv run ruff check src tests bench examples
           uv run ruff format --check src tests bench examples
           uv run mypy src bench examples
-      - run: uv run --python ${{ matrix.python }} pytest -q
+      # 3.12 has all three frameworks installed, so isolate each in its own process (see
+      # the header comment). --ignore keeps a module out of collection (and thus out of the
+      # process); --deselect drops the matching advection test whose import is lazy.
+      - if: matrix.python == '3.12'
+        run: |
+          uv run pytest -q --ignore=tests/test_jax.py --ignore=tests/test_tf.py \
+            --deselect tests/test_advection.py::test_jax_beats_persistence \
+            --deselect tests/test_advection.py::test_tf_beats_persistence
+          uv run pytest -q tests/test_jax.py tests/test_advection.py::test_jax_beats_persistence
+          uv run pytest -q tests/test_tf.py tests/test_advection.py::test_tf_beats_persistence
+      # 3.13 installs only torch/bench, so jax/tf importorskip-skip -- one process is fine.
+      - if: matrix.python != '3.12'
+        run: uv run --python ${{ matrix.python }} pytest -q
 
   # Free-threaded 3.13t: the real test of the pool's lock-free disjoint scatter +
   # lock-published readiness. torch/bench have no free-threaded wheels yet, so this
