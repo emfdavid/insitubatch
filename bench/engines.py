@@ -280,7 +280,7 @@ def _run_workers(
     # _SampleReader is a map-style dataset (len/getitem) but isn't a torch Dataset
     # subclass -- it stays torch-free at module scope so it pickles to spawn workers.
     loader: DataLoader = DataLoader(
-        _SampleReader(cfg.url, cfg.var, idx, store_kwargs),
+        _SampleReader(cfg.url, cfg.var, idx, store_kwargs),  # type: ignore[arg-type]  # map-style, not a Dataset
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         shuffle=cfg.shuffle,

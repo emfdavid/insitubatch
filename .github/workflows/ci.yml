@@ -1,8 +1,10 @@
 name: ci
 
-# Lint, type-check, and test on every push to main and every PR. Standard builds
-# run the full extras (torch handoff + bench); a separate free-threaded job runs
-# the core engine with the GIL disabled to guard the scatter/gather concurrency.
+# Lint, type-check, and test on every push to main and every PR. The 3.12 job covers
+# the *full* suite -- every framework adapter (torch/JAX/TF) and the Icechunk handoff --
+# while 3.13 stays light (core + torch/bench), since the adapters are interpreter-
+# independent. A separate free-threaded job runs the core engine with the GIL disabled to
+# guard the scatter/gather concurrency.
 on:
   push:
     branches: [main]
@@ -19,23 +21,32 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # a hang fails fast instead of burning the 6h default
+    timeout-minutes: 20  # a hang fails fast instead of burning the 6h default
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.13"]
+        include:
+          # 3.12: the full suite -- every framework (torch/JAX/TF) + Icechunk -- so the
+          # jax/tf/icechunk tests run instead of importorskip-skipping.
+          - python: "3.12"
+            extras: "--extra torch --extra bench --extra jax --extra tf --extra icechunk"
+          # 3.13: light (core + torch/bench); the adapters are interpreter-independent, so
+          # no need to pay the heavy JAX/TF/icechunk install twice.
+          - python: "3.13"
+            extras: "--extra torch --extra bench"
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
-      - run: uv sync --python ${{ matrix.python }} --extra torch --extra bench
-      # Lint + types are interpreter-independent: run once (on 3.12) to avoid 2x cost.
+      - run: uv sync --python ${{ matrix.python }} ${{ matrix.extras }}
+      # Lint + types are interpreter-independent: run once (on 3.12, which has every extra
+      # so mypy sees the real framework types) to avoid 2x cost.
       - if: matrix.python == '3.12'
         run: |
           uv run ruff check src tests bench examples
           uv run ruff format --check src tests bench examples
-          uv run mypy src
+          uv run mypy src bench examples
       - run: uv run --python ${{ matrix.python }} pytest -q
 
   # Free-threaded 3.13t: the real test of the pool's lock-free disjoint scatter +
