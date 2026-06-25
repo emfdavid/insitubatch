@@ -46,7 +46,6 @@ def test_producer_runs_ahead_of_consumer(tmp_path) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=4,
         block_chunks=2,
         prefetch_depth=2,
@@ -54,7 +53,7 @@ def test_producer_runs_ahead_of_consumer(tmp_path) -> None:
     )
     ds.set_epoch(0)
 
-    it = iter(ds)
+    it = iter(ds.train)
     first = next(it)  # pulling one batch starts the producer, which runs ahead
     time.sleep(0.2)  # let the background producer fill the bounded queue
 
@@ -77,7 +76,6 @@ def test_prefetch_preserves_values_and_coverage(tmp_path) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=4,
         block_chunks=2,
         prefetch_depth=3,
@@ -85,7 +83,7 @@ def test_prefetch_preserves_values_and_coverage(tmp_path) -> None:
     ds.set_epoch(0)
 
     seen: list[np.ndarray] = []
-    for batch in ds:
+    for batch in ds.train:
         idx = batch.sample_indices
         np.testing.assert_array_equal(batch.arrays["t2m"], src[idx])
         seen.append(idx)
@@ -111,14 +109,13 @@ def test_partial_iteration_reaps_producer(tmp_path) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=4,
         block_chunks=2,
         prefetch_depth=2,
     )
 
     ds.set_epoch(0)
-    it = iter(ds)
+    it = iter(ds.train)
     for i, _ in enumerate(it):  # consume a couple, then stop short
         if i == 1:
             break
@@ -153,7 +150,6 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=4,
         block_chunks=2,
         prefetch_depth=2,
@@ -161,7 +157,7 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
 
     # epoch 0: pull one batch, let the producer read ahead (pinning), then abort.
     ds.set_epoch(0)
-    it = iter(ds)
+    it = iter(ds.train)
     next(it)
     time.sleep(0.3)  # let read-ahead pin a block or two before we tear down
     it.close()  # deterministic generator teardown (GeneratorExit -> __iter__ finally)
@@ -171,7 +167,7 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
     seen: list[np.ndarray] = []
 
     def drain() -> None:
-        for batch in ds:
+        for batch in ds.train:
             seen.append(batch.sample_indices)
         done.set()
 

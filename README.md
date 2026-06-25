@@ -123,24 +123,27 @@ on the GIL is the point (see [DESIGN.md](DESIGN.md)).
 
 ## Shape of the API
 
-The core `InSituDataset` is a **framework-neutral iterable of numpy `Batch` objects** —
-it inherits nothing framework-specific. Handoff to torch / JAX / TF is a thin, optional
-DLPack adapter layer in `insitubatch.frameworks`; the core imports no framework.
+The core `InSituDataset` is a **framework-neutral source of numpy `Batch` objects** — it
+inherits nothing framework-specific. You iterate its split *views* (`ds.train` shuffled,
+`ds.val` / `ds.test` / `ds.all` deterministic), which all share **one** pool, so a chunk
+two splits both read decodes once. Handoff to torch / JAX / TF is a thin, optional DLPack
+adapter layer in `insitubatch.frameworks`; the core imports no framework.
 
 ```python
-from insitubatch import open_geometries, split_by_chunk, SplitName
+from insitubatch import open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 
 url = "file:///data/era5.zarr"           # or "s3://bucket/era5.zarr" — same code
 geoms = open_geometries(url)             # {var: ArrayGeometry} from zarr metadata
 manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 
-ds = InSituDataset(url, manifest, split=SplitName.TRAIN,
-                   batch_size=32, block_chunks=16)
+ds = InSituDataset(url, manifest, batch_size=32, block_chunks=16)
 
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)
-    for batch in ds:                     # numpy Batch: {var: np.ndarray} + sample_indices
+    for batch in ds.train:               # numpy Batch: {var: np.ndarray} + sample_indices
+        ...
+    for batch in ds.val:                 # deterministic; shares the pool with train
         ...
 ```
 
@@ -152,12 +155,12 @@ from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset
 from torch.utils.data import DataLoader
 
 # torch: parallelism is in our event loop, so num_workers=0, batch_size=None
-loader = DataLoader(as_torch(ds), batch_size=None, num_workers=0)   # {var: torch.Tensor}
+loader = DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)  # {var: torch.Tensor}
 
-for batch in ds:            # JAX: iterate the dataset, convert each batch
+for batch in ds.train:      # JAX: iterate a view, convert each batch
     jbatch = to_jax(batch)  # {var: jax.Array}
 
-tfds = as_tf_dataset(ds)    # a tf.data.Dataset
+tfds = as_tf_dataset(ds.val)  # a tf.data.Dataset
 ```
 
 ## License

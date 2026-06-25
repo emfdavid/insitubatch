@@ -56,15 +56,15 @@ def _forecast(model: AdvectionCNN, batch: Batch) -> torch.Tensor:
     return d["t2m"][:, None] + model(x)  # (B, 1, H, W)
 
 
-def train(train_ds: InSituDataset, val_ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
+def train(ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
     """Train the CNN; return ``(model_rmse, persistence_rmse)`` -- 24 h forecast skill on val."""
     model = AdvectionCNN()
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     for epoch in range(epochs):
-        train_ds.set_epoch(epoch)
+        ds.set_epoch(epoch)
         model.train()
         last = 0.0
-        for batch in train_ds:
+        for batch in ds.train:
             target = to_torch(batch)["target"][:, None]
             loss = nn.functional.mse_loss(_forecast(model, batch), target)
             opt.zero_grad()
@@ -74,13 +74,13 @@ def train(train_ds: InSituDataset, val_ds: InSituDataset, *, epochs: int) -> tup
         print(f"epoch {epoch}  train mse {last:.4f}")
     model.eval()
     with torch.no_grad():
-        return evaluate(val_ds, lambda b: _forecast(model, b).detach().numpy())
+        return evaluate(ds.val, lambda b: _forecast(model, b).detach().numpy())
 
 
 def main() -> None:
     args = cli()
-    train_ds, val_ds = build_datasets(args)
-    model_rmse, persistence_rmse = train(train_ds, val_ds, epochs=args.epochs)
+    ds = build_datasets(args)
+    model_rmse, persistence_rmse = train(ds, epochs=args.epochs)
     print(
         f"\n24 h forecast RMSE on held-out data: model {model_rmse:.3f}  vs  "
         f"persistence {persistence_rmse:.3f}  ({persistence_rmse / model_rmse:.1f}x better)"

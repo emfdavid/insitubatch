@@ -156,7 +156,6 @@ def _run_insitu(
         cfg.url,
         manifest,
         geometries={cfg.var: geom},
-        split=SplitName.TRAIN,
         batch_size=cfg.batch_size,
         block_chunks=cfg.block_chunks,
         max_inflight=cfg.max_inflight,
@@ -171,7 +170,7 @@ def _run_insitu(
     for epoch in range(cfg.epochs):
         ds.set_epoch(epoch)
         sec, n, ttfb = _drive(
-            iter(ds), lambda b: b.arrays[cfg.var].shape[0], cfg.compute_ms, cfg.max_batches
+            iter(ds.train), lambda b: b.arrays[cfg.var].shape[0], cfg.compute_ms, cfg.max_batches
         )
         out.append(_result(cfg, geom, epoch, sec, n, ttfb))
     return out

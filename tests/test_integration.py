@@ -11,7 +11,6 @@ from __future__ import annotations
 import numpy as np
 
 from insitubatch import (
-    SplitName,
     StandardScaler,
     open_geometries,
     split_by_chunk,
@@ -30,7 +29,6 @@ def test_transforms_prefetch_reconstruct(write_zarr) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         shuffle=False,
         batch_size=6,
         block_chunks=3,
@@ -40,6 +38,6 @@ def test_transforms_prefetch_reconstruct(write_zarr) -> None:
 
     for _epoch in range(2):
         ds.set_epoch(_epoch)
-        normalized = np.concatenate([b.arrays["t2m"] for b in ds], axis=0)
+        normalized = np.concatenate([b.arrays["t2m"] for b in ds.train], axis=0)
         reconstructed = normalized * (std + 1e-8) + mean  # invert the scaler
         np.testing.assert_allclose(reconstructed, src, rtol=1e-4, atol=1e-4)

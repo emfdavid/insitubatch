@@ -29,7 +29,7 @@ def test_error_propagates_through_prefetch(write_zarr) -> None:
     ds = InSituDataset(url, manifest, chunk_transforms=[_boom])
     ds.set_epoch(0)
     with pytest.raises(ValueError, match="boom"):
-        list(ds)
+        list(ds.train)
 
 
 def test_bad_chunk_raises_by_default_then_nan_fills(write_zarr) -> None:
@@ -48,11 +48,11 @@ def test_bad_chunk_raises_by_default_then_nan_fills(write_zarr) -> None:
     ds = InSituDataset(url, manifest, shuffle=False, batch_size=8)
     ds.set_epoch(0)
     with pytest.raises(Exception):  # noqa: B017 - decode raises a codec-specific type
-        list(ds)
+        list(ds.train)
 
     ds = InSituDataset(url, manifest, shuffle=False, batch_size=8, on_bad_chunk="nan")
     ds.set_epoch(0)
-    batches = list(ds)
+    batches = list(ds.train)
     idx = np.concatenate([b.sample_indices for b in batches])
     out = np.concatenate([b.arrays["t2m"] for b in batches])[np.argsort(idx)]
 

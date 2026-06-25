@@ -72,13 +72,22 @@ def _partition_blocks(order: np.ndarray, block_chunks: int) -> list[tuple[int, i
 
 
 class InSituDataset:
-    """A framework-neutral iterable that streams shuffled numpy batches from Zarr.
+    """A framework-neutral source of shuffled numpy batches from Zarr, split-aware.
 
-    One epoch = permute the split's chunks -> walk shuffle-blocks -> for each
-    block, stream-fetch its stored chunks into the pool, gather coalesced batches,
-    evict the block. Iterating yields numpy :class:`Batch` objects; convert to a
-    framework with :mod:`insitubatch.frameworks` (``as_torch`` / ``to_jax`` /
-    ``as_tf_dataset``).
+    The dataset is *not* itself iterated -- you iterate one of its split views:
+    :attr:`train` (shuffled), :attr:`val`, :attr:`test`, :attr:`all` (deterministic).
+    All four share **one** :class:`ChunkPool`, so a chunk that two splits both read --
+    e.g. a windowed read spilling across a split boundary -- is decoded once::
+
+        ds = InSituDataset(store, manifest, geometries=geoms, batch_size=32)
+        for batch in ds.train: ...   # one epoch; ds.set_epoch(e) reshuffles
+        for batch in ds.val: ...
+
+    One epoch over a view = permute the split's chunks -> walk shuffle-blocks -> per
+    block, stream-fetch its stored chunks into the pool, gather coalesced batches, evict.
+    Batches are numpy :class:`Batch`; convert to a framework with
+    :mod:`insitubatch.frameworks` (``as_torch`` / ``to_jax`` / ``as_tf_dataset``). A
+    different per-split configuration (e.g. train-only augmentation) is a separate dataset.
     """
 
     def __init__(
@@ -86,7 +95,6 @@ class InSituDataset:
         store: StoreLike,
         manifest: SplitManifest,
         geometries: dict[str, ArrayGeometry] | None = None,
-        split: SplitName = SplitName.TRAIN,
         *,
         batch_size: int = 32,
         block_chunks: int = 16,
@@ -107,7 +115,6 @@ class InSituDataset:
             geometries if geometries is not None else open_geometries(store, **store_kwargs)
         )
         self.manifest = manifest
-        self.split = split
         self.variables = list(self.geometries)
 
         # Variables must share the sample axis (length + chunk size): the draw order
@@ -164,10 +171,10 @@ class InSituDataset:
             # owned by any other block: a chunk admitted early may be needed late. Until
             # bounded residency (re-fetch the spill) lands, hold the whole split resident
             # -- decode-once, the accepted memory cost of windows (spill to NVMe via
-            # cache_dir on large splits). Sequential (eval) windows spill only locally
-            # and keep the tight working set above.
-            n_split_chunks = len(self.manifest.chunks[self.split.value])
-            working_set = max(working_set, n_split_chunks * per_chunk_all_vars)
+            # cache_dir on large splits). Only `.train` shuffles (eval views are
+            # sequential and spill only locally), so size to the train split.
+            n_train_chunks = len(self.manifest.chunks[SplitName.TRAIN.value])
+            working_set = max(working_set, n_train_chunks * per_chunk_all_vars)
         self.cache_budget_bytes = max(int(cache_budget_bytes or 0), working_set)
         self._pool = ChunkPool(
             self.geometries,
@@ -187,13 +194,43 @@ class InSituDataset:
         """Call from the training loop so each epoch reshuffles deterministically."""
         self._epoch = epoch
 
+    # -- the splits, as iterables (one dataset, one shared pool) -------------
+
+    @property
+    def train(self) -> _SplitView:
+        """Iterable over the train split, shuffled per the dataset's ``shuffle`` flag."""
+        return _SplitView(self, SplitName.TRAIN, self.shuffle)
+
+    @property
+    def val(self) -> _SplitView:
+        """Iterable over the val split, in deterministic (sequential) order."""
+        return _SplitView(self, SplitName.VAL, False)
+
+    @property
+    def test(self) -> _SplitView:
+        """Iterable over the test split, in deterministic (sequential) order."""
+        return _SplitView(self, SplitName.TEST, False)
+
+    @property
+    def all(self) -> _SplitView:
+        """Iterable over every split's chunks (deterministic) -- e.g. full-archive inference."""
+        return _SplitView(self, None, False)
+
     _SENTINEL = object()
 
-    def _draw_order(self) -> np.ndarray:
+    def _chunk_ids(self, split: SplitName | None) -> np.ndarray:
+        """Sample-axis chunk indices for a split (``None`` = every split's chunks)."""
+        if split is None:
+            ids = sorted(set().union(*(set(self.manifest.chunks[s.value]) for s in SplitName)))
+        else:
+            ids = self.manifest.chunks[split.value]
+        return np.asarray(ids, dtype=np.int64)
+
+    def _draw_order(self, split: SplitName | None, shuffle: bool) -> np.ndarray:
         geom = self.geometries[self.variables[0]]
-        chunk_ids = np.asarray(self.manifest.chunks[self.split.value], dtype=np.int64)
+        chunk_ids = self._chunk_ids(split)
         spc = geom.sample_chunk_size
-        if self.shuffle:
+        if shuffle:
             order = block_shuffled_order(
                 chunk_ids,
                 spc,
@@ -229,22 +266,24 @@ class InSituDataset:
             keys.update((geom.path, int(c)) for c in np.unique(read_cid))
         return keys
 
-    def __iter__(self) -> Iterator[Batch]:
-        """Drain assembled batches from a background producer (prefetch).
+    def _iterate(self, split: SplitName | None, shuffle: bool) -> Iterator[Batch]:
+        """Drain assembled batches for one split from a background producer (prefetch).
 
-        A producer thread starts the scheduler over the epoch's chunks (in draw
-        order), then for each shuffle-block waits the block assembled, gathers its
-        batches, and unpins it; this consumer pops from a bounded queue (depth
-        ``prefetch_depth``) that provides backpressure and inter-batch overlap.
+        Called by the ``.train`` / ``.val`` / ``.test`` / ``.all`` views, all sharing the
+        one :class:`ChunkPool` -- so a chunk a windowed read pulls across a split boundary
+        is decoded once and reused by both splits.
 
-        The scheduler keeps ``max_inflight`` tiles continuously in flight and, while
-        the cache budget has room, fetches one block ahead, so block-boundary IO
-        overlaps the current block's per-batch compute instead of stalling. Chunks
-        skipped because the pool already holds them (cross-epoch hits) cost no fetch.
+        A producer thread starts the scheduler over the split's chunks (in draw order),
+        then for each shuffle-block waits the block assembled, gathers its batches, and
+        unpins it; this consumer pops from a bounded queue (depth ``prefetch_depth``) that
+        provides backpressure and inter-batch overlap. The scheduler keeps ``max_inflight``
+        tiles continuously in flight and fetches one block ahead, so block-boundary IO
+        overlaps the per-batch compute. Chunks the pool already holds (cross-epoch or
+        cross-split hits) cost no fetch.
         """
         geom = self.geometries[self.variables[0]]
         spc = geom.sample_chunk_size
-        order = self._draw_order()
+        order = self._draw_order(split, shuffle)
         blocks = _partition_blocks(order, self.block_chunks)
         ordered_chunks = [int(c) for _rstart, _rstop, cids in blocks for c in cids]
 
@@ -340,3 +379,24 @@ class InSituDataset:
     def __del__(self) -> None:
         with contextlib.suppress(Exception):  # best-effort on GC
             self._pool.close()
+
+
+class _SplitView:
+    """A lazy, re-iterable view of one split, returned by ``InSituDataset.train`` /
+    ``.val`` / ``.test`` / ``.all``. Iterating it streams that split's batches through the
+    dataset's *shared* pool, so a chunk two splits both read (a windowed read spilling
+    across a split boundary) is decoded once. Re-iterable: a fresh pass each ``iter()``.
+    ``geometries`` is exposed so the framework adapters can infer tensor shapes.
+    """
+
+    def __init__(self, dataset: InSituDataset, split: SplitName | None, shuffle: bool) -> None:
+        self._dataset = dataset
+        self._split = split
+        self._shuffle = shuffle
+
+    @property
+    def geometries(self) -> dict[str, ArrayGeometry]:
+        return self._dataset.geometries
+
+    def __iter__(self) -> Iterator[Batch]:
+        return self._dataset._iterate(self._split, self._shuffle)

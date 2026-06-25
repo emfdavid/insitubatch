@@ -18,7 +18,6 @@ from examples.advection.data import (
     make_advection_store,
     rmse,
 )
-from insitubatch import SplitName
 
 
 @pytest.fixture
@@ -29,16 +28,14 @@ def synth_store(tmp_path) -> str:
     return url
 
 
-def _datasets(url: str):
-    train = forecast_dataset(url, split=SplitName.TRAIN, batch_size=32)
-    val = forecast_dataset(url, split=SplitName.VAL, batch_size=32, shuffle=False)
-    return train, val
+def _dataset(url: str):
+    return forecast_dataset(url, batch_size=32)
 
 
 def test_forecast_dataset_is_windowed_and_multivariable(synth_store) -> None:
-    ds = forecast_dataset(synth_store, split=SplitName.TRAIN, batch_size=32, shuffle=False)
+    ds = forecast_dataset(synth_store, batch_size=32, shuffle=False)
     ds.set_epoch(0)
-    batch = next(iter(ds))
+    batch = next(iter(ds.train))
 
     assert set(batch.arrays) == {"t2m", "u10", "v10", "target"}
     # target is t2m read `horizon` steps ahead -- two views of one in-place array, no reshard
@@ -57,7 +54,7 @@ def test_torch_beats_persistence(synth_store) -> None:
     pytest.importorskip("torch")
     from examples.advection.train_torch import train
 
-    model_rmse, persistence_rmse = train(*_datasets(synth_store), epochs=8)
+    model_rmse, persistence_rmse = train(_dataset(synth_store), epochs=8)
     assert model_rmse < persistence_rmse
 
 
@@ -65,7 +62,7 @@ def test_jax_beats_persistence(synth_store) -> None:
     pytest.importorskip("flax")
     from examples.advection.train_jax import train
 
-    model_rmse, persistence_rmse = train(*_datasets(synth_store), epochs=8)
+    model_rmse, persistence_rmse = train(_dataset(synth_store), epochs=8)
     assert model_rmse < persistence_rmse
 
 
@@ -73,5 +70,5 @@ def test_tf_beats_persistence(synth_store) -> None:
     pytest.importorskip("tensorflow")
     from examples.advection.train_tf import train
 
-    model_rmse, persistence_rmse = train(*_datasets(synth_store), epochs=8)
+    model_rmse, persistence_rmse = train(_dataset(synth_store), epochs=8)
     assert model_rmse < persistence_rmse

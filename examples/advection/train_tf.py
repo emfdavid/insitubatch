@@ -65,14 +65,14 @@ def _channels(batch: Batch) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     return x, d["t2m"][..., None], d["target"][..., None]  # (B, H, W, 1) each
 
 
-def train(train_ds: InSituDataset, val_ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
+def train(ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
     """Train the CNN; return ``(model_rmse, persistence_rmse)`` -- 24 h forecast skill on val."""
     model = build_model()
     opt = keras.optimizers.Adam(1e-3)
     for epoch in range(epochs):
-        train_ds.set_epoch(epoch)
+        ds.set_epoch(epoch)
         last = 0.0
-        for batch in train_ds:
+        for batch in ds.train:
             x, persistence, target = _channels(batch)
             with tf.GradientTape() as tape:
                 loss = tf.reduce_mean((persistence + model(x, training=True) - target) ** 2)
@@ -85,13 +85,13 @@ def train(train_ds: InSituDataset, val_ds: InSituDataset, *, epochs: int) -> tup
         x, persistence, _ = _channels(batch)
         return (persistence + model(x)).numpy().transpose(0, 3, 1, 2)
 
-    return evaluate(val_ds, predict)
+    return evaluate(ds.val, predict)
 
 
 def main() -> None:
     args = cli()
-    train_ds, val_ds = build_datasets(args)
-    model_rmse, persistence_rmse = train(train_ds, val_ds, epochs=args.epochs)
+    ds = build_datasets(args)
+    model_rmse, persistence_rmse = train(ds, epochs=args.epochs)
     print(
         f"\n24 h forecast RMSE on held-out data: model {model_rmse:.3f}  vs  "
         f"persistence {persistence_rmse:.3f}  ({persistence_rmse / model_rmse:.1f}x better)"

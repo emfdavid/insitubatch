@@ -98,7 +98,7 @@ def test_windowed_forecast_target_leads_input(write_zarr, shuffle) -> None:
     ds, src = _forecast_dataset(write_zarr, n=40, spc=8, shuffle=shuffle, batch_size=7, seed=3)
     ds.set_epoch(0)
     seen = []
-    for batch in ds:
+    for batch in ds.train:
         anchor = batch.sample_indices
         np.testing.assert_array_equal(batch.arrays["x"], src[anchor])  # x = array[t]
         np.testing.assert_array_equal(batch.arrays["y"], src[anchor + 1])  # y = array[t+1]
@@ -115,7 +115,7 @@ def test_windowed_batch_carries_offsets(write_zarr) -> None:
     stacked window can be recovered downstream (the Phase 3 metadata + helpers)."""
     ds, src = _forecast_dataset(write_zarr, n=40, spc=8, shuffle=False, batch_size=7, seed=0)
     ds.set_epoch(0)
-    batch = list(ds)[0]
+    batch = list(ds.train)[0]
 
     assert batch.offsets == {"x": 0, "y": 1}
     np.testing.assert_array_equal(batch.read_indices("x"), batch.sample_indices)
@@ -137,7 +137,7 @@ def test_windowed_history_and_target(write_zarr) -> None:
     ds.set_epoch(0)
 
     anchors = []
-    for batch in ds:
+    for batch in ds.train:
         a = batch.sample_indices
         np.testing.assert_array_equal(batch.arrays["prev"], src[a - 1])
         np.testing.assert_array_equal(batch.arrays["now"], src[a])
@@ -164,7 +164,7 @@ def test_windowed_eviction_and_cross_epoch_reuse(write_zarr) -> None:
     for epoch in range(3):
         ds.set_epoch(epoch)
         anchors = []
-        for batch in ds:
+        for batch in ds.train:
             a = batch.sample_indices
             np.testing.assert_array_equal(batch.arrays["x"], src[a])
             np.testing.assert_array_equal(batch.arrays["y"], src[a + 1])
@@ -198,7 +198,7 @@ def test_windowed_partial_iteration_then_clean_epoch(write_zarr) -> None:
 
     # epoch 0: pull one batch, let the producer pin + read ahead (in-flight), then abort.
     ds.set_epoch(0)
-    it = iter(ds)
+    it = iter(ds.train)
     next(it)
     time.sleep(0.2)
     it.close()  # GeneratorExit -> teardown; leaves pins/partials in the persistent pool
@@ -206,7 +206,7 @@ def test_windowed_partial_iteration_then_clean_epoch(write_zarr) -> None:
     # epoch 1: full pass must be correct despite the leftovers.
     ds.set_epoch(1)
     anchors = []
-    for batch in ds:
+    for batch in ds.train:
         a = batch.sample_indices
         np.testing.assert_array_equal(batch.arrays["x"], src[a])
         np.testing.assert_array_equal(batch.arrays["y"], src[a + 1])
@@ -217,3 +217,24 @@ def test_windowed_partial_iteration_then_clean_epoch(write_zarr) -> None:
     assert ds._pool._pinned == {}
     assert all(slot.ready for slot in ds._pool._slots.values())
     ds.close()
+
+
+def test_windowed_val_correct_after_train_shared_pool(write_zarr) -> None:
+    """The shared pool across split views, with windowing: iterate train (which warms --
+    and via windowed spill *pollutes* -- the pool with chunks near the train/val boundary),
+    then val. Val's forecast pairs must still be exact (boundary chunks are reused, not
+    corrupted) -- the cross-split overlap the single shared pool is meant to exploit."""
+    url, srcs = write_zarr(n=120, spc=8)  # 15 chunks
+    src = srcs["t2m"]
+    geom = open_geometries(url)["t2m"]
+    geoms = {"x": geom, "y": geom.shift(1)}  # forecast: input x[t], target y[t]=x[t+1]
+    manifest = split_by_chunk(geom, fractions=(0.7, 0.3, 0.0))
+    ds = InSituDataset(url, manifest, geometries=geoms, batch_size=6, block_chunks=2)
+
+    ds.set_epoch(0)
+    for _ in ds.train:  # warm/pollute the shared pool (windowed reads spill across the split)
+        pass
+    for batch in ds.val:
+        a = batch.sample_indices
+        np.testing.assert_array_equal(batch.arrays["x"], src[a])
+        np.testing.assert_array_equal(batch.arrays["y"], src[a + 1])

@@ -64,13 +64,12 @@ def test_chunk_transform_normalizes_batches(tmp_path) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=10,
         block_chunks=4,
         chunk_transforms=[sc],
     )
     ds.set_epoch(0)
-    for batch in ds:
+    for batch in ds.train:
         idx = batch.sample_indices
         np.testing.assert_allclose(
             batch.arrays["t2m"], (src[idx] - m) / (s + 1e-8), rtol=1e-4, atol=1e-4
@@ -99,13 +98,12 @@ def test_cross_variable_windspeed_is_a_batch_transform(tmp_path) -> None:
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         batch_size=8,
         block_chunks=4,
         batch_transforms=[windspeed],
     )
     ds.set_epoch(0)
-    for batch in ds:
+    for batch in ds.train:
         idx = batch.sample_indices
         expected = np.sqrt(su[idx] ** 2 + sv[idx] ** 2)
         np.testing.assert_allclose(batch.arrays["wspd"], expected, rtol=1e-5)

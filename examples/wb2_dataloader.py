@@ -136,7 +136,6 @@ def run_demo(
         url,
         manifest,
         geometries={var: geom},
-        split=SplitName.TRAIN,
         batch_size=batch_size,
         block_chunks=block_chunks,
         prefetch_depth=prefetch_depth,
@@ -155,7 +154,7 @@ def run_demo(
     for epoch in range(num_epochs):
         ds.set_epoch(epoch)
         t_prev = time.perf_counter()
-        for i, batch in enumerate(ds):
+        for i, batch in enumerate(ds.train):
             now = time.perf_counter()
             waits.append(now - t_prev)
             a = batch.arrays[var]

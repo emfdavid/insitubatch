@@ -271,7 +271,7 @@ def fill_nan(chunk):                      # your policy: climatology, interpolat
     return chunk
 
 ds = InSituDataset(url, manifest, on_bad_chunk="nan", chunk_transforms=[fill_nan])
-for batch in ds:
+for batch in ds.train:
     ...
 print(ds.bad_chunks)   # the (array, chunk_index, inner_coord) reads that were bad this epoch
 ```

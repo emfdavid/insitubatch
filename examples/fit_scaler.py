@@ -34,7 +34,6 @@ import zarr
 
 from insitubatch import (
     Batch,
-    SplitName,
     ensure_local_dir,
     open_geometries,
     split_by_chunk,
@@ -73,7 +72,7 @@ def fit_over_loader(ds: InSituDataset) -> tuple[dict[str, StandardScaler], float
     scalers = {v: StandardScaler() for v in ds.variables}
     ds.set_epoch(0)
     n, t = 0, time.perf_counter()
-    for batch in ds:
+    for batch in ds.train:
         for v in ds.variables:
             scalers[v].partial_fit(batch.arrays[v].reshape(-1, 1))
         n += len(batch.sample_indices)
@@ -119,7 +118,6 @@ def run_demo(
         url,
         manifest,
         geometries=geoms,
-        split=SplitName.TRAIN,
         batch_size=16,
         block_chunks=4,
         shuffle=False,
@@ -144,7 +142,7 @@ def run_demo(
     ds.batch_transforms = (make_batch_scaler(scalers),)
     ds.set_epoch(1)
     means, stds, t = [], [], time.perf_counter()
-    for batch in ds:
+    for batch in ds.train:
         for v in ds.variables:
             means.append(float(batch.arrays[v].mean()))
             stds.append(float(batch.arrays[v].std()))

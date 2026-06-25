@@ -21,7 +21,6 @@ import pytest
 import zarr
 
 from insitubatch import (
-    SplitName,
     ensure_local_dir,
     open_geometries,
     split_by_chunk,
@@ -55,7 +54,6 @@ def test_iterates_store_v2_and_v3(
     ds = InSituDataset(
         url,
         manifest,
-        split=SplitName.TRAIN,
         shuffle=False,
         batch_size=8,
         block_chunks=2,
@@ -63,5 +61,5 @@ def test_iterates_store_v2_and_v3(
     ds.set_epoch(0)
 
     # Every chunk (and every inner tile) decoded + scattered into the right place.
-    recon = np.concatenate([b.arrays["t2m"] for b in ds], axis=0)
+    recon = np.concatenate([b.arrays["t2m"] for b in ds.train], axis=0)
     np.testing.assert_array_equal(recon, src)
