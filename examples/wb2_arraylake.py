@@ -79,6 +79,8 @@ def run(
     batch_size: int = 16,
     block_chunks: int = 8,
     prefetch_depth: int = 2,
+    max_inflight: int | None = None,
+    cache_resident: bool = False,
     train_step_ms: float = 0.0,
     num_epochs: int = 1,
     max_batches: int = 0,
@@ -86,10 +88,22 @@ def run(
     seed: int = 0,
     verbose: bool = True,
 ) -> dict:
-    """Stream patches from ``store`` and report time-to-first-batch + throughput."""
+    """Stream patches from ``store`` and report time-to-first-batch + throughput.
+
+    ``max_inflight`` is the latency dial: a high-latency store (streaming over the WAN)
+    needs many concurrent requests to keep the read-ahead fed, or block-boundary waits
+    show as a sawtooth (the next block isn't fetched while the current one drains). Raise
+    it well above the default 32 for a remote store. ``cache_resident`` sizes the pool to
+    the whole train split so epoch 2+ is served decode-once from the pool (no re-fetch).
+    """
     qual = f"{group}/{var}" if group else var
     geom = open_geometries(store, variables=[qual])[qual]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
+
+    cache_budget_bytes = None
+    if cache_resident:
+        per_chunk = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
+        cache_budget_bytes = (len(manifest.chunks[SplitName.TRAIN.value]) + 2) * per_chunk
 
     ds = InSituDataset(
         store,
@@ -99,6 +113,8 @@ def run(
         batch_size=batch_size,
         block_chunks=block_chunks,
         prefetch_depth=prefetch_depth,
+        max_inflight=max_inflight,
+        cache_budget_bytes=cache_budget_bytes,
         shuffle=shuffle,
         seed=seed,
         batch_transforms=[_crop(patch, seed)],
@@ -118,8 +134,10 @@ def run(
             total += int(a.shape[0])
             sample_shape = tuple(int(d) for d in a.shape[1:])
             if verbose:
-                print(f"  epoch {epoch} batch {i}: {tuple(a.shape)}  "
-                      f"wait {1e3 * (now - t_prev):.1f} ms")
+                print(
+                    f"  epoch {epoch} batch {i}: {tuple(a.shape)}  "
+                    f"wait {1e3 * (now - t_prev):.1f} ms"
+                )
             time.sleep(train_step_ms / 1000.0)
             t_prev = time.perf_counter()
             if max_batches and i + 1 >= max_batches:

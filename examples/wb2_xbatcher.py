@@ -159,7 +159,7 @@ def run_xbatcher_demo(
         # Fresh loader each epoch: this measures *cold start*, the inference-relevant
         # cost (the bench/ suite uses persistent workers to measure steady state).
         loader: DataLoader = DataLoader(
-            base,  # type: ignore[arg-type]  # _CenterCrop is map-style but not a torch Dataset
+            base,  # _CenterCrop is map-style (len/getitem); torch's DataLoader accepts it
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=shuffle,
