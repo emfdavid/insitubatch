@@ -1,14 +1,13 @@
 """Forecast t2m 24 h ahead with a tiny CNN, in **PyTorch**, on one insitu dataset.
 
-    python -m examples.advection.train_torch          # synthetic advected field (offline)
-    python -m examples.advection.train_torch --wb2    # WeatherBench2 (real ERA5, gs://)
+Only this file is torch: ``to_torch`` is a zero-copy DLPack hand-off and the train loop
+moves each batch to ``--device``. ``train_jax.py`` / ``train_tf.py`` train the *same* model
+on the *same* numpy ``Batch``. The model learns the **tendency** (the change on top of
+persistence), so beating persistence means it read the wind-driven advection.
 
-The data layer (``examples/advection/data.py``) is framework-neutral -- a numpy ``Batch``
-read in place from the store, inputs ``{t2m, u10, v10}@t`` and target ``t2m@(t+24h)`` as
-offset views of the same arrays, no reshard. Only this file is torch: ``to_torch`` is a
-zero-copy DLPack hand-off. ``train_jax.py`` / ``train_tf.py`` train the *same* model on
-the *same* dataset. The model learns the **tendency** (the change on top of persistence),
-so beating the persistence baseline means it learned the wind-driven advection.
+Sources (``--source``), the finite training window (``--sample-range``), GPU placement and
+the NVMe cache flags are documented in ``examples/README.md``; the framework-neutral data
+layer is ``examples/advection/data.py``.
 """
 
 from __future__ import annotations
@@ -49,24 +48,28 @@ class AdvectionCNN(nn.Module):
         return self.net(xn)
 
 
-def _forecast(model: AdvectionCNN, batch: Batch) -> torch.Tensor:
-    """t2m(t+24h) forecast for one batch: persistence + the model's predicted tendency."""
-    d = to_torch(batch)  # {label: (B, H, W) tensor}, zero-copy via DLPack
-    x = torch.stack([d["t2m"], d["u10"], d["v10"]], dim=1)  # (B, 3, H, W)
-    return d["t2m"][:, None] + model(x)  # (B, 1, H, W)
+def _forecast(model: AdvectionCNN, batch: Batch, device: torch.device) -> torch.Tensor:
+    """t2m(t+24h) forecast for one batch: persistence + the model's predicted tendency.
+
+    ``to_torch`` is a zero-copy DLPack hand-off on CPU; moving to ``device`` is the H2D
+    copy -- placement is the training loop's job, not the dataset's (it speaks numpy)."""
+    d = to_torch(batch)  # {label: (B, H, W) tensor}, CPU via DLPack
+    x = torch.stack([d["t2m"], d["u10"], d["v10"]], dim=1).to(device)  # (B, 3, H, W)
+    return d["t2m"][:, None].to(device) + model(x)  # (B, 1, H, W)
 
 
-def train(ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
+def train(ds: InSituDataset, *, epochs: int, device: str = "cpu") -> tuple[float, float]:
     """Train the CNN; return ``(model_rmse, persistence_rmse)`` -- 24 h forecast skill on val."""
-    model = AdvectionCNN()
+    dev = torch.device(device)
+    model = AdvectionCNN().to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     for epoch in range(epochs):
         ds.set_epoch(epoch)
         model.train()
         last = 0.0
         for batch in ds.train:
-            target = to_torch(batch)["target"][:, None]
-            loss = nn.functional.mse_loss(_forecast(model, batch), target)
+            target = to_torch(batch)["target"][:, None].to(dev)
+            loss = nn.functional.mse_loss(_forecast(model, batch, dev), target)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -74,13 +77,13 @@ def train(ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
         print(f"epoch {epoch}  train mse {last:.4f}")
     model.eval()
     with torch.no_grad():
-        return evaluate(ds.val, lambda b: _forecast(model, b).detach().numpy())
+        return evaluate(ds.val, lambda b: _forecast(model, b, dev).detach().cpu().numpy())
 
 
 def main() -> None:
     args = cli()
     ds = build_datasets(args)
-    model_rmse, persistence_rmse = train(ds, epochs=args.epochs)
+    model_rmse, persistence_rmse = train(ds, epochs=args.epochs, device=args.device)
     print(
         f"\n24 h forecast RMSE on held-out data: model {model_rmse:.3f}  vs  "
         f"persistence {persistence_rmse:.3f}  ({persistence_rmse / model_rmse:.1f}x better)"

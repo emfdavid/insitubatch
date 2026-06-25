@@ -311,6 +311,107 @@ The actual Express comparison datasets + probe commands live in the benchmark pl
 (`bench/benchmark_plan.md`).
 
 
+## 10. GPU box — advection examples on real ERA5 (G6 + NVMe, Arraylake)
+
+The advection examples (`examples/advection/train_{torch,jax,tf}.py`) train a tiny
+forecast CNN on real ERA5 read **in place** from the Arraylake/Icechunk
+`earthmover-public/weatherbench2` repo. `--source arraylake` + `--sample-range`
+gives a finite training window; `--device cuda` moves each batch to the GPU in the
+training loop (the dataset stays numpy — placement is the loop's job).
+
+**Instance.** A G6 (NVIDIA L4) is plenty for this CNN; the win is fast NVMe for the
+chunk cache, not FLOPs.
+
+```bash
+export AWS_REGION=us-east-1
+export KEY_NAME=emfdavid_ed25519
+export INSTANCE_TYPE=g6.2xlarge          # 1x L4 24 GB, 8 vCPU, ~450 GB NVMe instance store
+```
+
+**AMI — the Deep Learning *Base* GPU AMI (Ubuntu).** "Base" ships the NVIDIA driver
++ CUDA toolkit but *no* frameworks — exactly right, since we bring torch/jax/tf via
+`uv`. (The full DLAMI's preinstalled conda torch would just fight the uv env.)
+
+```bash
+AMI=$(aws ssm get-parameters --region "$AWS_REGION" \
+  --names /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id \
+  --query 'Parameters[0].Value' --output text)
+```
+
+Launch with the **same** key/SG/profile from sections 1–6 (drop the S3 bits if you
+only need Arraylake). Give the root EBS ~60 GB (the CUDA toolkit + driver are large):
+
+```bash
+IID=$(aws ec2 run-instances --region "$AWS_REGION" \
+  --image-id "$AMI" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
+  --security-group-ids "$SG" \
+  --instance-market-options 'MarketType=spot' \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=60,VolumeType=gp3}' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=insitubatch-gpu}]' \
+  --query 'Instances[0].InstanceId' --output text)
+aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$IID"
+IP=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+echo "ssh -A ubuntu@$IP"               # Ubuntu AMI -> user is 'ubuntu', not 'ec2-user'
+```
+
+**On the box — NVMe, install, GPU torch, run.**
+
+```bash
+nvidia-smi                              # confirm the driver sees the L4 before anything else
+
+# --- mount the instance-store NVMe for the chunk cache (ephemeral scratch) ---
+lsblk                                   # instance store is usually /dev/nvme1n1 (root = nvme0n1)
+sudo mkfs -t xfs /dev/nvme1n1
+sudo mkdir -p /mnt/nvme && sudo mount /dev/nvme1n1 /mnt/nvme && sudo chown "$USER" /mnt/nvme
+
+# --- install ---
+curl -LsSf https://astral.sh/uv/install.sh | sh && source "$HOME/.bashrc"
+git clone https://github.com/emfdavid/insitubatch.git && cd insitubatch
+git checkout multi-offset-sampling      # until merged to main
+
+# Pick your framework's extra (torch | jax | tf) + arraylake for the real store.
+uv sync --extra torch --extra arraylake
+
+# --- CUDA torch (the catch) -----------------------------------------------------
+# PyPI's `torch` is the CPU build; `uv sync` installed that. uv 0.11+ swaps it for the
+# matching CUDA wheel from the PyTorch index, auto-detecting the driver's CUDA:
+uv pip install torch --torch-backend=auto      # or pin: --torch-backend=cu124
+uv run python -c "import torch; print(torch.cuda.is_available())"   # -> True
+#
+# Why not bake CUDA torch into an extra? `[tool.uv.sources]` index pins are GLOBAL
+# per-package, so pinning torch -> the cu124 index would drag the CPU `torch` extra,
+# CI's Linux runners, AND the 3.13t free-threaded job (which the cu index has no
+# wheels for) onto CUDA. Keeping the lock CPU-clean and swapping at install time on
+# the box is the one-obvious-way. (jax: `uv pip install "jax[cuda12]"`; tf already
+# auto-uses the GPU once the driver is visible — `tensorflow[and-cuda]` if you need
+# the bundled CUDA libs.)
+
+# --- Arraylake auth (one of) ---
+uv run al auth login                    # opens a device-code flow
+# or non-interactive: export ARRAYLAKE_TOKEN=...
+
+# --- train on a finite window of real ERA5, on the GPU, cache on NVMe ---
+uv run python -m examples.advection.train_torch \
+  --source arraylake --sample-range 0,2920 \   # ~2 years at 6-hourly (4/day)
+  --device cuda --epochs 8 --batch-size 32 \
+  --cache-dir /mnt/nvme/cache
+```
+
+**Sizing caveats (learned the hard way):**
+
+- **`--sample-range` is not optional for the real store.** The Arraylake fields are
+  full-resolution; without a window the split spans the whole multi-decade archive
+  and the resident cache is hundreds of GB. Start small (a year or two) and grow.
+- **Run full epochs, not `--max-batches`.** The cross-epoch NVMe cache only pays off
+  when epoch *N+1* re-reads chunks epoch *N* already cached; a truncated, reshuffled
+  epoch keeps missing uncached chunks and never warms up.
+- **High cold TTFB over a high-latency network is expected** (first batch waits on
+  the first GET + decode with no warm cache). A large resident budget removes
+  read-ahead backpressure so the scheduler fetches eagerly and starves block 0 of
+  bandwidth — this is the bounded-read-ahead item (**M-RA**) on the roadmap, not a
+  bug. Keep `--max-inflight` modest if cold latency matters more than steady-state.
+
 ## External reproducers (a different AWS account)
 ```python
 from insitubatch import open_geometries, split_by_chunk
