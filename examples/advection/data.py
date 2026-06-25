@@ -27,6 +27,7 @@ import numpy as np
 import zarr
 
 from insitubatch import (
+    StoreLike,
     ensure_local_dir,
     open_geometries,
     split_by_chunk,
@@ -42,10 +43,22 @@ WB2_URL = (
 WB2_VARS = ("2m_temperature", "10m_u_component_of_wind", "10m_v_component_of_wind")
 WB2_HORIZON = 4  # 4 steps x 6 h = 24 h
 
+# The same data as an Arraylake/Icechunk repo (real ERA5; grouped by resolution).
+ARRAYLAKE_REPO = "earthmover-public/weatherbench2"
+ARRAYLAKE_GROUP = "era5/6h_240x121"
+
 SYNTH_VARS = ("t2m", "u10", "v10")
 SYNTH_HORIZON = 24  # 24 steps x 1 h = 24 h
 
 LABELS = ("t2m", "u10", "v10")  # canonical input labels (store-independent)
+
+
+def open_arraylake_store(repo: str, *, branch: str = "main") -> StoreLike:
+    """Read-only Icechunk session store for an Arraylake repo (needs ``--extra arraylake``
+    + ``al auth login`` / ``ARRAYLAKE_TOKEN``). Passed straight to ``InSituDataset``."""
+    from arraylake import Client
+
+    return Client().get_repo(repo).readonly_session(branch).store
 
 
 def _advect(field: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -125,32 +138,43 @@ def make_advection_store(url: str, *, n_steps: int = 768, size: int = 48, seed: 
 
 
 def forecast_dataset(
-    url: str,
+    store: StoreLike,
     *,
     variables: tuple[str, str, str] = SYNTH_VARS,
     horizon: int = SYNTH_HORIZON,
+    sample_range: tuple[int, int] | None = None,
     batch_size: int = 32,
     shuffle: bool = True,
+    cache_dir: str | None = None,
+    max_inflight: int | None = None,
     **store_kwargs: Any,
 ) -> InSituDataset:
     """One windowed dataset: inputs ``{t2m, u10, v10}@t`` + ``target = t2m@(t+horizon)``.
 
-    ``variables`` names the three input arrays in the store (synthetic short names or the
-    WeatherBench2 long names); the dataset's labels are always ``t2m, u10, v10, target`` so
-    the model code is store-agnostic. The target is the first variable shifted by
-    ``horizon`` -- two views of one array, no reshard. Iterate its ``.train`` / ``.val``
-    views; ``split_by_chunk`` partitions the time axis (contiguous, the time-series default).
+    ``store`` is a URL or a prebuilt zarr Store (e.g. an Arraylake/Icechunk session store).
+    ``variables`` names the three input arrays in the store (synthetic short names, the
+    WeatherBench2 long names, or group-qualified paths); the dataset's labels are always
+    ``t2m, u10, v10, target`` so the model code is store-agnostic. The target is the first
+    variable shifted by ``horizon`` -- two views of one array, no reshard. ``sample_range``
+    restricts the split to a finite time window (subset a multi-decade store).
+    ``cache_dir`` spills the decoded-chunk cache to NVMe (fast cross-epoch reuse over a
+    high-latency network); ``max_inflight`` throttles read-ahead. Iterate the returned
+    dataset's ``.train`` / ``.val`` views.
     """
-    opened = open_geometries(url, variables=list(variables), **store_kwargs)
+    opened = open_geometries(store, variables=list(variables), **store_kwargs)
     geoms = {label: opened[var] for label, var in zip(LABELS, variables, strict=True)}
     geoms["target"] = opened[variables[0]].shift(horizon)
-    manifest = split_by_chunk(opened[variables[0]], fractions=(0.8, 0.1, 0.1))
+    manifest = split_by_chunk(
+        opened[variables[0]], fractions=(0.8, 0.1, 0.1), sample_range=sample_range
+    )
     return InSituDataset(
-        url,
+        store,
         manifest,
         geometries=geoms,
         batch_size=batch_size,
         shuffle=shuffle,
+        cache_dir=cache_dir,
+        max_inflight=max_inflight,
         **store_kwargs,
     )
 
@@ -192,28 +216,76 @@ def evaluate(view: Iterable[Batch], predict: Callable[[Batch], np.ndarray]) -> t
     return rmse(pred, target), rmse(persistence, target)
 
 
+def _range(s: str) -> tuple[int, int]:
+    start, stop = (int(x) for x in s.split(","))
+    return (start, stop)
+
+
 def cli() -> argparse.Namespace:
     """Shared CLI for the three training files (only the model + loop differ)."""
     p = argparse.ArgumentParser(description="advected-field 24 h forecast")
-    p.add_argument("--wb2", action="store_true", help="read the public WeatherBench2 ARCO store")
+    p.add_argument(
+        "--source",
+        choices=("synthetic", "wb2", "arraylake"),
+        default="synthetic",
+        help="offline synthetic | WeatherBench2 gs:// | Arraylake/Icechunk (real ERA5)",
+    )
+    p.add_argument(
+        "--device",
+        default="cpu",
+        help="cpu or cuda -- the train loop moves tensors there",
+    )
+    p.add_argument(
+        "--sample-range",
+        type=_range,
+        default=None,
+        metavar="START,STOP",
+        help="finite training window on the time axis (subset a multi-decade real store)",
+    )
+    p.add_argument("--repo", default=ARRAYLAKE_REPO, help="Arraylake repo (--source arraylake)")
+    p.add_argument("--group", default=ARRAYLAKE_GROUP, help="resolution group (--source arraylake)")
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--n-steps", type=int, default=768, help="synthetic trajectory length (hours)")
     p.add_argument("--url", default=None, help="synthetic store path (default: a temp file)")
+    p.add_argument(
+        "--cache-dir",
+        default=None,
+        help="spill the decoded-chunk cache here (e.g. NVMe) for cross-epoch reuse",
+    )
+    p.add_argument(
+        "--max-inflight",
+        type=int,
+        default=None,
+        help="throttle read-ahead depth (lower = lower cold TTFB over a high-latency network)",
+    )
     return p.parse_args()
 
 
 def build_datasets(args: argparse.Namespace) -> InSituDataset:
-    """One forecast dataset from CLI args -- iterate ``ds.train`` / ``ds.val``. Synthetic by
-    default (written fresh -- deterministic, offline); ``--wb2`` reads the public
-    WeatherBench2 store (anonymous ``gs://``, real ERA5, 6-hourly so the 24 h horizon is 4
-    steps)."""
-    if args.wb2:
-        url, variables, horizon, kw = WB2_URL, WB2_VARS, WB2_HORIZON, {"skip_signature": True}
+    """One forecast dataset from CLI args -- iterate ``ds.train`` / ``ds.val``. ``--source``
+    picks offline synthetic (written fresh), the public WeatherBench2 ``gs://`` store, or the
+    Arraylake/Icechunk repo (real ERA5; pass ``--sample-range`` to subset the archive)."""
+    store: StoreLike
+    if args.source == "arraylake":
+        store = open_arraylake_store(args.repo)
+        a, b, c = WB2_VARS
+        variables = (f"{args.group}/{a}", f"{args.group}/{b}", f"{args.group}/{c}")
+        horizon, kw = WB2_HORIZON, {}
+    elif args.source == "wb2":
+        store, variables, horizon, kw = WB2_URL, WB2_VARS, WB2_HORIZON, {"skip_signature": True}
     else:
-        url = args.url or "file:///tmp/insitu_advection.zarr"
-        make_advection_store(url, n_steps=args.n_steps)
+        store = args.url or "file:///tmp/insitu_advection.zarr"
+        make_advection_store(store, n_steps=args.n_steps)
         variables, horizon, kw = SYNTH_VARS, SYNTH_HORIZON, {}
     return forecast_dataset(
-        url, variables=variables, horizon=horizon, batch_size=args.batch_size, shuffle=True, **kw
+        store,
+        variables=variables,
+        horizon=horizon,
+        sample_range=args.sample_range,
+        batch_size=args.batch_size,
+        shuffle=True,
+        cache_dir=args.cache_dir,
+        max_inflight=args.max_inflight,
+        **kw,
     )

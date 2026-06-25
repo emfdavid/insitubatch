@@ -1,12 +1,9 @@
 """Forecast t2m 24 h ahead with a tiny CNN, in **JAX** (flax + optax), on one insitu dataset.
 
-    python -m examples.advection.train_jax          # synthetic advected field (offline)
-    python -m examples.advection.train_jax --wb2    # WeatherBench2 (real ERA5, gs://)
-
-Same shared, framework-neutral data layer as ``train_torch.py`` / ``train_tf.py`` -- the
-numpy ``Batch`` is handed to JAX zero-copy via ``to_jax`` (DLPack). Only this file is JAX.
-The model learns the **tendency** (the change on persistence); beating persistence means it
-learned the wind-driven advection. JAX/TF use channels-last (``B, H, W, C``).
+Same shared, framework-neutral data layer as ``train_torch.py`` -- the numpy ``Batch`` is
+handed to JAX zero-copy via ``to_jax`` (DLPack). Only this file is JAX; JAX auto-places on
+the accelerator it finds (``--device cpu`` forces CPU). JAX/TF use channels-last
+(``B, H, W, C``). Usage, sources and flags: ``examples/README.md``.
 """
 
 from __future__ import annotations
@@ -47,8 +44,14 @@ def _channels(batch: Batch) -> tuple[jax.Array, jax.Array, jax.Array]:
     return x, d["t2m"][..., None], d["target"][..., None]  # (B, H, W, 1) each
 
 
-def train(ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
-    """Train the CNN; return ``(model_rmse, persistence_rmse)`` -- 24 h forecast skill on val."""
+def train(ds: InSituDataset, *, epochs: int, device: str = "cpu") -> tuple[float, float]:
+    """Train the CNN; return ``(model_rmse, persistence_rmse)`` -- 24 h forecast skill on val.
+
+    JAX auto-places on the accelerator it finds (install ``jax[cuda12]`` for GPU); ``device
+    == "cpu"`` forces CPU. Either way the dataset stays numpy and ``to_jax`` is a per-batch
+    DLPack hand-off."""
+    if device == "cpu":
+        jax.config.update("jax_platform_name", "cpu")
     model = AdvectionCNN()
     opt = optax.adam(1e-3)
     ds.set_epoch(0)
@@ -87,7 +90,7 @@ def train(ds: InSituDataset, *, epochs: int) -> tuple[float, float]:
 def main() -> None:
     args = cli()
     ds = build_datasets(args)
-    model_rmse, persistence_rmse = train(ds, epochs=args.epochs)
+    model_rmse, persistence_rmse = train(ds, epochs=args.epochs, device=args.device)
     print(
         f"\n24 h forecast RMSE on held-out data: model {model_rmse:.3f}  vs  "
         f"persistence {persistence_rmse:.3f}  ({persistence_rmse / model_rmse:.1f}x better)"

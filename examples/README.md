@@ -25,11 +25,36 @@ python -m examples.advection.train_tf      # TensorFlow (Keras)         [uv sync
 ```
 
 Each prints the 24-hour forecast skill on held-out data — the model (which *reads the wind*
-to predict the advection) vs the persistence baseline. The default is a fast offline
-**synthetic advected field**; `--wb2` runs the *same code* on the public **WeatherBench2**
-ERA5 store (`gs://`, anonymous — `uv sync --extra bench` for gcsfs) — real cloud data, no
-reshard. (On real ERA5 the claim is "same pipeline, real data", not SOTA skill: 24 h
-persistence of temperature is a strong baseline.)
+to predict the advection) vs the persistence baseline. All three share one CLI
+([`data.py`](advection/data.py)); the files differ only in framework calls.
+
+### Data sources (`--source`)
+
+| `--source` | store | extra | notes |
+| --- | --- | --- | --- |
+| `synthetic` *(default)* | a fast offline **advected field** written to a temp zarr | — | beats persistence by construction; `--n-steps` sets the trajectory length |
+| `wb2` | public **WeatherBench2** ERA5, `gs://` (anonymous) | `--extra bench` (gcsfs) | the *same code* on real cloud data, no reshard |
+| `arraylake` | the same ERA5 as an **Arraylake/Icechunk** repo | `--extra arraylake` | needs `al auth login` / `ARRAYLAKE_TOKEN`; `--repo` / `--group` select it |
+
+On real ERA5 the claim is "same pipeline, real data", **not** SOTA skill — 24 h persistence
+of temperature is a strong baseline.
+
+### Flags
+
+- `--device cpu|cuda` — where the **training loop** moves each batch. The dataset stays
+  numpy (placement is the loop's job, not the loader's); torch does an explicit `.to(device)`,
+  JAX/TF auto-place on the accelerator and `--device cpu` forces/hides it.
+- `--sample-range START,STOP` — a **finite training window** on the time axis, so you can
+  subset a multi-decade real store (e.g. `0,2920` ≈ 2 years at 6-hourly).
+- `--cache-dir DIR` — spill the decoded-chunk cache to fast local disk (NVMe) for
+  **cross-epoch reuse** over a high-latency network.
+- `--max-inflight N` — throttle read-ahead depth (lower ⇒ lower cold time-to-first-batch
+  when the network is the bottleneck).
+- `--epochs`, `--batch-size`, `--repo`, `--group`, `--url` round out the CLI (`--help`).
+
+Running the examples on a GPU box against real ERA5 (G6 + NVMe, the Deep Learning Base AMI,
+CUDA torch via `--torch-backend`, Arraylake auth) is documented in
+[`bench/ops_aws.md`](../bench/ops_aws.md) §10.
 
 **The pattern to take away:** point insitu at an existing cloud zarr, declare your inputs
 and a shifted target as `(label, path, offset)` views, and train in your framework — the
