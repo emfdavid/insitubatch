@@ -325,7 +325,7 @@ chunk cache, not FLOPs.
 ```bash
 export AWS_REGION=us-east-1
 export KEY_NAME=emfdavid_ed25519
-export INSTANCE_TYPE=g6.2xlarge          # 1x L4 24 GB, 8 vCPU, ~450 GB NVMe instance store
+export INSTANCE_TYPE=g6.8xlarge          # 1x L4 24 GB, 32 vCPU, 25gb/s, 2x450 GB NVMe instance store
 ```
 
 **AMI — the Deep Learning *Base* GPU AMI (Ubuntu).** "Base" ships the NVIDIA driver
@@ -339,14 +339,13 @@ AMI=$(aws ssm get-parameters --region "$AWS_REGION" \
 ```
 
 Launch with the **same** key/SG/profile from sections 1–6 (drop the S3 bits if you
-only need Arraylake). Give the root EBS ~60 GB (the CUDA toolkit + driver are large):
+only need Arraylake). Give the root EBS ~100 GB (the CUDA toolkit + driver are large):
 
 ```bash
 IID=$(aws ec2 run-instances --region "$AWS_REGION" \
   --image-id "$AMI" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
   --security-group-ids "$SG" \
-  --instance-market-options 'MarketType=spot' \
-  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=60,VolumeType=gp3}' \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3}' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=insitubatch-gpu}]' \
   --query 'Instances[0].InstanceId' --output text)
 aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$IID"
@@ -393,10 +392,12 @@ uv run al auth login                    # opens a device-code flow
 
 # --- train on a finite window of real ERA5, on the GPU, cache on NVMe ---
 uv run python -m examples.advection.train_torch \
-  --source arraylake --sample-range 0,2920 \   # ~2 years at 6-hourly (4/day)
+  --source arraylake --sample-range 0,2920 \
   --device cuda --epochs 8 --batch-size 32 \
   --cache-dir /mnt/nvme/cache
 ```
+Training set is ~2 years at 6-hourly (4/day)
+
 
 **Sizing caveats (learned the hard way):**
 

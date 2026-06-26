@@ -8,10 +8,10 @@
 **Train in place on n-dimensional cloud tensors.**
 
 `insitubatch` is the data-loader orchestration layer that sits on top of
-*already-solved* async cloud IO (obstore / zarr v3 / icechunk). It turns an
-existing Zarr archive into a shuffled, split-aware PyTorch source built to **keep
-the GPU fed** — **with no reshard** — and a Python hot path that scales with
-**chunks, not samples**.
+*already-solved* async cloud IO (obstore / zarr v3 / icechunk) for PyTorch,
+Jax and TensorFlow. It turns an existing Zarr archive into a shuffled,
+split-aware data source built to **keep the GPU fed** — **with no reshard**
+— and a Python hot path that scales with **chunks, not samples**.
 
 > The IO race is over (obstore/icechunk saturate the NIC). The *loader* race is
 > open. `insitubatch` builds the layer that projects like light-speed-io and
@@ -29,7 +29,7 @@ the pool doubles as the cache; torch runs `num_workers=0`.
 
 The payoff is being the **batteries-included** choice at both operating points: for
 **inference** it pays no worker-pool cold start (first batch in ~ms, not seconds — and a
-production service can't keep a hot pool alive); for **training** it uses far less memory
+production service hot pool is extremely challenging); for **training** it uses far less memory
 (one process, not 32), reads each chunk once, and caches across epochs, beating the
 tuned worker/xbatcher stacks across the chunk spectrum. The worker-process stacks are
 competitive only at the degenerate GRIB end (one sample per chunk) — a partial solution
@@ -37,7 +37,7 @@ that doesn't generalize. See [Benchmarks](https://emfdavid.github.io/insitubatch
 
 ## Status
 
-🚧 **Pre-alpha, but validated on real cloud IO.** On an in-region S3 run
+🚧 **alpha, but validated on real cloud IO.** On an in-region S3 run
 (`c6id.8xlarge`, ERA5-shaped `721×1440` fields, `sample_chunk=8`), insitubatch
 delivers **~8× the throughput** of a *tuned* `xbatcher`/worker `DataLoader`
 baseline (swept to 32 workers) and reaches its first batch **~10× sooner** — the

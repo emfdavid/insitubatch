@@ -3,10 +3,10 @@
 **Train in place on n-dimensional cloud tensors.**
 
 `insitubatch` is the data-loader orchestration layer that sits on top of
-*already-solved* async cloud IO (obstore / zarr v3 / icechunk). It turns an
-existing Zarr archive into a shuffled, split-aware PyTorch source built to **keep
-the GPU fed** — **with no reshard** — and a Python hot path that scales with
-**chunks, not samples**.
+*already-solved* async cloud IO (obstore / zarr v3 / icechunk) for PyTorch, Jax
+and TensorFlow. It turns an existing Zarr archive into a shuffled, split-aware
+data source built to **keep the GPU fed** — **with no reshard** — and a Python
+hot path that scales with **chunks, not samples**.
 
 !!! quote
     The IO race is over (obstore/icechunk saturate the NIC). The *loader* race is
@@ -76,6 +76,10 @@ loader = DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)  # torch
 jbatch = to_jax(next(iter(ds.train)))                                    # JAX:   {var: jax.Array}
 tfds = as_tf_dataset(ds.val)                                             # TF:    tf.data.Dataset
 ```
+
+See [`examples/advection`](https://github.com/emfdavid/insitubatch/blob/main/examples/advection) for
+working CNN forecast models using insituBatch implemented with Torch, Jax and Tensorflow with
+real ERA5 data.
 
 A runnable, network-free version of this — paralleling the Earthmover
 `dataloader-demo`, with a spatial subregion pulled out by a `batch_transform` —

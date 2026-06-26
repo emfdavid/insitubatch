@@ -17,16 +17,23 @@ target `t2m` 24 h later (`g.shift(horizon)`) — input and target are **offset v
 same in-place array**, the inputs are arrays gathered at the **same anchor**, and *nothing
 is resharded*. The same numpy `Batch` then trains the **same tiny CNN** in three frameworks
 via the zero-copy DLPack adapters — the files differ only in framework calls:
-
 ```bash
-python -m examples.advection.train_torch   # PyTorch   (torch.nn)
-python -m examples.advection.train_jax     # JAX       (flax + optax)   [uv sync --extra jax]
-python -m examples.advection.train_tf      # TensorFlow (Keras)         [uv sync --extra tf]
+uv sync --extra bench --extra torch               # PyTorch   (torch.nn)
+uv run python -m examples.advection.train_torch   #
+
+uv sync --extra bench --extra jax                 # JAX       (flax + optax)
+uv run python -m examples.advection.train_jax     #
+
+uv sync --extra bench --extra tf                  # TensorFlow (Keras)
+uv run python -m examples.advection.train_tf      #
 ```
 
 Each prints the 24-hour forecast skill on held-out data — the model (which *reads the wind*
 to predict the advection) vs the persistence baseline. All three share one CLI
 ([`data.py`](advection/data.py)); the files differ only in framework calls.
+
+Make sure only one ML toolkit is installed at a time when running the models. Having multiple
+present in the uv venv can cause segfaults.
 
 ### Data sources (`--source`)
 
