@@ -1,9 +1,9 @@
 """Forecast t2m 24 h ahead with a tiny CNN, in **TensorFlow** (Keras), on one insitu dataset.
 
 Same shared, framework-neutral data layer as ``train_torch.py`` -- the numpy ``Batch`` is
-handed to TF zero-copy via ``to_tf`` (DLPack). Only this file is TF; TF auto-uses a visible
-GPU (``--device cpu`` hides it). JAX/TF use channels-last (``B, H, W, C``). Usage, sources
-and flags: ``examples/README.md``.
+handed to TF via ``to_tf`` (a per-batch copy; TF's experimental DLPack is unreliable, see
+``to_tf``). Only this file is TF; TF auto-uses a visible GPU (``--device cpu`` hides it).
+JAX/TF use channels-last (``B, H, W, C``). Usage, sources and flags: ``examples/README.md``.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def build_model(hidden: int = 32) -> keras.Model:
 
 
 def _channels(batch: Batch) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """``(x, persistence, target)`` as channels-last TF tensors, zero-copy via DLPack."""
+    """``(x, persistence, target)`` as channels-last TF tensors (``to_tf`` copies per batch)."""
     d = to_tf(batch)  # {label: (B, H, W)}
     x = tf.stack([d["t2m"], d["u10"], d["v10"]], axis=-1)  # (B, H, W, 3)
     return x, d["t2m"][..., None], d["target"][..., None]  # (B, H, W, 1) each

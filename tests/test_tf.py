@@ -1,8 +1,8 @@
 """TensorFlow handoff: frameworks.to_tf + as_tf_dataset. Skips if tensorflow is absent.
 
 TF has no base class to inherit -- :func:`insitubatch.frameworks.as_tf_dataset` adapts
-the stream via ``tf.data.Dataset.from_generator``; :func:`to_tf` is the per-batch
-(zero-copy DLPack) path.
+the stream via ``tf.data.Dataset.from_generator``; :func:`to_tf` is the per-batch path
+(a copy -- TF's experimental DLPack mishandles buffer ownership; torch/JAX stay zero-copy).
 """
 
 from __future__ import annotations

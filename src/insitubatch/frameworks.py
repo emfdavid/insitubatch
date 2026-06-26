@@ -62,12 +62,21 @@ def to_jax(batch: Batch) -> dict[str, Any]:
 
 
 def to_tf(batch: Batch) -> dict[str, Any]:
-    """Convert a numpy ``Batch`` to a dict of ``tf.Tensor`` (DLPack; zero-copy on CPU)."""
+    """Convert a numpy ``Batch`` to a dict of ``tf.Tensor`` (one CPU copy per variable).
+
+    Unlike torch/JAX -- whose array-accepting ``from_dlpack`` manages the exported buffer's
+    lifetime correctly -- TensorFlow only exposes the *experimental* ``from_dlpack(capsule)``,
+    which mishandles ownership of the exported numpy buffer: under the concurrent allocation
+    of the prefetch decode threads it double-frees that buffer and aborts the process
+    (SIGABRT, no message). ``convert_to_tensor`` copies into a TF-owned tensor instead, so TF
+    never touches insitu-managed memory; the batch is already an owned array, so this is a
+    single CPU copy. (torch/JAX stay zero-copy; this is a TF-DLPack limitation, not ours.)
+    """
     try:
         import tensorflow as tf
     except ImportError as exc:  # pragma: no cover - tf-less installs
         raise _missing("TensorFlow", "tf") from exc
-    return {k: tf.experimental.dlpack.from_dlpack(v.__dlpack__()) for k, v in batch.arrays.items()}
+    return {k: tf.convert_to_tensor(v) for k, v in batch.arrays.items()}
 
 
 def as_torch(view: _SplitView) -> IterableDataset:
