@@ -69,14 +69,15 @@ Engines (`bench/engines.py`):
 - **workers** — map-style `Dataset` + `DataLoader(num_workers=N, prefetch_factor=k)`.
   The DIY pattern: `__getitem__` returns one sample, so the containing chunk is
   decoded once **per sample** with no shared cache. **Must be tuned** (sweep `N`,
-  report best) or the comparison isn't fair. This is *not* the Earthmover stack.
-- **xbatcher** — xbatcher + `DataLoader` (the **Earthmover** / domain-standard
-  stack). **Required before claiming a win.** Match *their* tuning, not our
+  report best) or the comparison isn't fair. This is *not* the xbatcher stack.
+- **xbatcher** — xbatcher + `DataLoader` (the **domain-standard** worker stack,
+  as showcased in [Earthmover's blog post](https://earthmover.io/blog/cloud-native-dataloader)).
+  **Required before claiming a win.** Match *their* tuning, not our
   defaults: the post used `num_workers=32`, `prefetch_factor=3` — so sweep
   `num_workers` and report the best. Our xbatcher feeds the **obstore** store
   (storage held constant vs insitu → a stronger, conservative baseline than their
-  gcsfs path). Their headline ~15× is **internal** (tuned vs untuned xbatcher),
-  not xbatcher-vs-another-loader — so "beating Earthmover" means insitu vs a
+  gcsfs path). The post's headline ~15× is **internal** (tuned vs untuned xbatcher),
+  not xbatcher-vs-another-loader — so beating that result means insitu vs a
   well-tuned xbatcher. We run it **without** xbatcher's opt-in batch cache
   (`BatchGenerator(cache=...)`); the story-3 warm-epoch numbers are therefore insitu's
   chunk cache vs the uncached path. A cache-vs-cache comparison (xbatcher's materialized
@@ -354,13 +355,13 @@ pool to spawn) **and** a bounded single-process footprint vs the 33-process fan-
 ### Cold-start on WeatherBench2 (the Earthmover demo, head-to-head)
 
 The bench engines run synthetic ERA5-shaped data; these two examples run the **public
-WeatherBench2 ARCO store** (gs://, anonymous) through the *actual* Earthmover stack and
+WeatherBench2 ARCO store** (gs://, anonymous) through the *actual* xbatcher worker stack and
 the insitu equivalent — a recognizable, reproducible cold-start comparison. This is the
 clean TTFB story the G5 probe's cross-engine column can't give. Needs the `bench` extra
 (xbatcher, gcsfs) + torch; drop `--wb2` for a network-free synthetic sanity run.
 
 ```bash
-# Earthmover stack (xbatcher + torch DataLoader): the worker-process model. --compare
+# xbatcher worker stack (xbatcher + torch DataLoader): the worker-process model. --compare
 # sweeps the worker start methods -- spawn re-imports per worker (slow), forkserver/preload
 # amortize it -- and prints the mp-mode TTFB table.
 uv run python -m examples.wb2_xbatcher --wb2 --compare --subregion 48,48 --max-batches 100 \

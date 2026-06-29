@@ -1,9 +1,9 @@
-"""Earthmover's ``dataloader-demo`` stack — xbatcher + torch DataLoader — with a
-focus on **cold-start latency** and how to cut it.
+"""The xbatcher + torch DataLoader worker stack — the pattern from Earthmover's
+``dataloader-demo`` — with a focus on **cold-start latency** and how to cut it.
 
-xbatcher (from the Earthmover / pangeo community) is the domain-standard way to *define*
-ndim batches; this runs their published demo as-is — ``xarray`` + ``xbatcher`` for the
-batch definition, fed to a torch ``DataLoader`` with ``num_workers`` worker processes
+xbatcher (an xarray-contrib community project) is the domain-standard way to *define*
+ndim batches; this runs Earthmover's published demo as-is — ``xarray`` + ``xbatcher`` for
+the batch definition, fed to a torch ``DataLoader`` with ``num_workers`` worker processes
 (https://github.com/earth-mover/dataloader-demo) — and uses it to study where the
 worker-process model spends startup time (useful whichever loader you ship). The
 companion ``examples/wb2_dataloader.py`` runs the *same task* on insitubatch's

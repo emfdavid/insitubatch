@@ -25,8 +25,8 @@ parallelism comparison.
         --batch-size 32 --train-step-ms 10 --request-payer
     uv run python -m examples.wb2_dataloader            # tiny synthetic data, no network
 
-The companion ``examples/wb2_xbatcher.py`` runs the same task on Earthmover's xbatcher +
-DataLoader stack (and shows how to cut its startup cost).
+The companion ``examples/wb2_xbatcher.py`` runs the same task on the xbatcher +
+DataLoader worker stack (and shows how to cut its startup cost).
 """
 
 from __future__ import annotations

@@ -68,15 +68,16 @@ and a shifted target as `(label, path, offset)` views, and train in your framewo
 windowing (`Batch.offsets`, `Batch.stack`, `Batch.read_indices`) and the no-reshard,
 chunk-once IO are the engine's job.
 
-## The WeatherBench2 cold-start pair (with Earthmover's xbatcher)
+## The WeatherBench2 cold-start pair (with xbatcher)
 
 The same task two ways — complementary engines for the same ndim-batch problem — so you
 can see the cold-start trade-off and pick what fits your workload:
 
 - [`wb2_dataloader.py`](wb2_dataloader.py) — the insitu single-event-loop loader.
-- [`wb2_xbatcher.py`](wb2_xbatcher.py) — Earthmover's `dataloader-demo` stack (xbatcher
-  defines the batches, torch `DataLoader` runs them), with a focus on cold-start latency
-  and how `forkserver-preload` cuts it (useful whichever loader you ship).
+- [`wb2_xbatcher.py`](wb2_xbatcher.py) — the xbatcher + torch `DataLoader` worker stack
+  (xbatcher defines the batches, the `DataLoader` runs them), the pattern from Earthmover's
+  `dataloader-demo`, with a focus on cold-start latency and how `forkserver-preload` cuts it
+  (useful whichever loader you ship).
 
 ## Transforms
 

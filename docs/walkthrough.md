@@ -1,15 +1,18 @@
 # WeatherBench2 walkthrough
 
 A **runnable, real-cloud** comparison — distinct from the controlled
-[benchmark suite](benchmarks.md) (G1–G7 on a synthetic chunk-size family). Here
-the same public dataset is fed through two stacks so the contrast is reproducible
+[benchmark suite](benchmarks.md), which sweeps synthetic chunk sizes. Here the same
+public dataset is fed through two stacks so the contrast is reproducible
 end-to-end:
 
 - [`examples/wb2_dataloader.py`](https://github.com/emfdavid/insitubatch/blob/main/examples/wb2_dataloader.py)
   — insitubatch (one async event loop, `num_workers=0`).
 - [`examples/wb2_xbatcher.py`](https://github.com/emfdavid/insitubatch/blob/main/examples/wb2_xbatcher.py)
-  — the Earthmover stack (xarray + xbatcher + torch `DataLoader` workers), with a
-  `--mp` knob to compare worker start regimes.
+  — a [xarray](https://xarray.dev) + [xbatcher](https://github.com/xarray-contrib/xbatcher)
+  + torch `DataLoader` worker stack, with a `--mp` knob to compare worker start
+  regimes. This is the worker-based pattern Earthmover wrote up in
+  [Build a cloud-native data loader for ML training](https://earthmover.io/blog/cloud-native-dataloader);
+  xbatcher itself is a community [xarray-contrib](https://github.com/xarray-contrib) project.
 
 Both crop a spatial subregion of `2m_temperature` from the public WeatherBench2
 ERA5 zarr (zarr v2 on GCS) and report time-to-first-batch and throughput.
@@ -45,13 +48,13 @@ network variance):
 | mean wait (ms) | 5.3 | 5.1 – 6.8 |
 
 This is the **zero-compute** case (`--train-step-ms 0`): the loader is purely
-IO-bound, so the mean per-batch wait (6.6 ms) is dominated by the per-shuffle-block
-refill — the **sawtooth** explained in
+IO-bound, so the mean per-batch wait (table above) is dominated by the
+per-shuffle-block refill — the **sawtooth** explained in
 [Architecture → Prefetch](architecture.md#prefetch) and
 [Startup latency](architecture.md#startup-latency-the-inference-angle). One-block
 read-ahead overlaps that refill with any real per-batch compute; add
-`--train-step-ms` to watch the boundary stalls disappear. Cold-start TTFB (~455 ms)
-is the single chunk read before the first batch.
+`--train-step-ms` to watch the boundary stalls disappear. The TTFB above is the
+single cold chunk read before the first batch.
 
 ## xbatcher (worker stack)
 

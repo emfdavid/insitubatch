@@ -42,7 +42,7 @@ with one async loop, so its edge grows with samples-per-chunk.
 | `insitu` | insitubatch: one async event loop, prefetch, shared cache | the system under test |
 | `naive` | sequential synchronous reads, one sample at a time | the floor |
 | `workers` | map-style `Dataset` + `DataLoader(num_workers=N)` | the realistic baseline |
-| `xbatcher` | `xbatcher.BatchGenerator` + `DataLoader` (the Earthmover stack) | the credibility bar |
+| `xbatcher` | `xbatcher.BatchGenerator` + `DataLoader` (the xbatcher worker stack) | the credibility bar |
 | `memory` | data preloaded into RAM, compute only | the in-memory ceiling |
 
 Each engine is reported at its **tuned** optimum (insitu over `block_chunks`, the
