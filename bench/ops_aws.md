@@ -1,11 +1,31 @@
-# Phase 1 ops — EC2 + S3 for the cloud benchmark
+# AWS ops — EC2 + S3 for the cloud benchmark
 
 Stand up a CPU EC2 box in **us-east-1** that reads ~200 GB of zarr from a
 **regional, public, Requester-Pays** S3 bucket, so anyone with an AWS account can
 reproduce the benchmark paying only their own egress.
 
 > You run these; nothing here is run for you. Commands are copy-paste with the
-> variables in the first block.
+> variables in the first block. The GCP equivalent is [`ops_gcp.md`](ops_gcp.md); the
+> dataset matrix and per-story run commands live in [`benchmark_plan.md`](benchmark_plan.md).
+
+## Contents
+
+- [Access model (Requester Pays)](#read-first--the-access-model)
+- [Variables](#variables)
+- [1. SSH key](#1-import-your-ssh-key-from-ssh-agent)
+- [2. S3 bucket](#2-s3-bucket--regional-public-read-requester-pays)
+- [3. IAM instance profile](#3-iam-instance-profile-box-readswrites-the-bucket-no-keys-on-disk)
+- [4. Security group + VPC](#4-security-group-ssh-from-your-ip-only--default-vpc-lookups)
+- [5. S3 gateway endpoint](#5-recommended-free-s3-gateway-endpoint--keeps-s3-traffic-on-aws-no-nategress)
+- [6. Launch the box](#6-launch-spot-latest-amazon-linux-2023-public-ip)
+- [7. On the box: install + bench](#7-on-the-box--mount-nvme-install-generate-bench)
+- [7b. Free-threaded (3.13t)](#7b-free-threaded-313t--tests--probe-acceptance-gil-off)
+- [7c. Perf re-confirmation](#7c-perf-re-confirmation--the-merge-gate-gil-build)
+- [8. Back to local](#8-back-to-local)
+- [9. S3 Express One Zone](#9-s3-express-one-zone--the-io-ceiling-stress-test)
+- [10. GPU box (G6)](#10-gpu-box--advection-examples-on-real-era5-g6--nvme-arraylake)
+- [External reproducers](#external-reproducers-a-different-aws-account)
+- [Teardown](#teardown) · [Cost](#cost-us-east-1-approximate) · [Notes](#notes)
 
 ## Read first — the access model
 - **Requester Pays is not anonymous-public.** Anonymous access is *denied* on a
@@ -28,7 +48,7 @@ export AWS_REGION=us-east-1
 export ACCT=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET="insitubatch-bench-${ACCT}"
 export KEY_NAME=emfdavid_ed25519
-export INSTANCE_TYPE=c6id.8xlarge      
+export INSTANCE_TYPE=c6id.8xlarge
 ```
 
 ## 1. Import your SSH key (from ssh-agent)
@@ -42,7 +62,8 @@ aws ec2 import-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME" \
 
 ## 2. S3 bucket — regional, public-read, Requester Pays
 ```bash
-aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"   # us-east-1 needs no LocationConstraint
+# us-east-1 needs no LocationConstraint
+aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
 
 # allow a public-read policy (disable Block Public Access on this bucket)
 aws s3api put-public-access-block --bucket "$BUCKET" \
@@ -120,7 +141,8 @@ AMI=$(aws ssm get-parameters --region "$AWS_REGION" \
 #   SUBNET=$(aws ec2 describe-subnets --region "$AWS_REGION" \
 #     --filters Name=vpc-id,Values=$VPC Name=availability-zone,Values=us-east-1a \
 #     --query 'Subnets[0].SubnetId' --output text)
-SUBNET=""   # empty => EC2 picks an AZ with capacity
+# empty => EC2 picks an AZ with capacity
+SUBNET=""
 
 IID=$(aws ec2 run-instances --region "$AWS_REGION" \
   --image-id "$AMI" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
@@ -140,11 +162,13 @@ echo "ssh -A ec2-user@$IP"
 
 ## 7. On the box — mount NVMe, install, generate, bench
 ```bash
-export AWS_REGION=us-east-1            # obstore/object_store needs the region
+# obstore/object_store needs the region
+export AWS_REGION=us-east-1
 export BUCKET=insitubatch-bench-808047988126
 
 # --- mount the instance-store NVMe (ephemeral scratch for the mmap cache) ---
-lsblk                                  # find the instance store (usually /dev/nvme1n1; root = nvme0n1)
+# find the instance store (usually /dev/nvme1n1; root = nvme0n1)
+lsblk
 sudo mkfs -t xfs /dev/nvme1n1
 sudo mkdir -p /mnt/nvme && sudo mount /dev/nvme1n1 /mnt/nvme && sudo chown "$USER" /mnt/nvme
 
@@ -153,7 +177,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh && source "$HOME/.bashrc"
 sudo yum install git
 git clone git@github.com:emfdavid/insitubatch.git && cd insitubatch
 uv sync --extra torch --extra bench
-uv run pytest -q                       # sanity-check the install before the long run
+# sanity-check the install before the long run
+uv run pytest -q
 
 # --- generate the chunk-size family (owner creds -> no request_payer needed) ---
 # (n, 721, 1440) f4 ~= 4.15 MB/sample; n=6000 ~= 25 GB per chunking, ~150 GB total.
@@ -185,12 +210,14 @@ GIL-safe), so we force it off with `PYTHON_GIL=0` and assert that it took.
 
 ```bash
 # --- toolchain for the numcodecs sdist build (the bit AL2023 lacks) ---
-sudo dnf install -y gcc gcc-c++          # or: sudo dnf groupinstall -y "Development Tools"
+# or: sudo dnf groupinstall -y "Development Tools"
+sudo dnf install -y gcc gcc-c++
 
 # --- a SEPARATE env so the 3.12 .venv stays intact. torch/bench have no FT wheels
 #     yet, so this is core-deps-only (the torch tests skip via importorskip). ---
 uv python install 3.13t
-export FT_ENV="$HOME/insitu-ft"          # survives stop/start (NVMe /mnt is wiped)
+# survives stop/start (NVMe /mnt is wiped)
+export FT_ENV="$HOME/insitu-ft"
 UV_PROJECT_ENVIRONMENT="$FT_ENV" uv sync --python 3.13t
 
 # --- prove the GIL is actually off (else everything below is a GIL-on no-op) ---
@@ -266,15 +293,17 @@ orchestration becomes the bound. **The VM must be in the same AZ as the bucket**
 ```bash
 T=$(curl -sX PUT http://169.254.169.254/latest/api/token \
   -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+# want us-east-1c
 curl -s -H "X-aws-ec2-metadata-token: $T" \
-  http://169.254.169.254/latest/meta-data/placement/availability-zone   # want us-east-1c
+  http://169.254.169.254/latest/meta-data/placement/availability-zone
 ```
 
 ```bash
 # 1) Resolve us-east-1c -> its AZ ID (the account-specific mapping)
 export AZID=$(aws ec2 describe-availability-zones --region us-east-1 \
   --query "AvailabilityZones[?ZoneName=='us-east-1c'].ZoneId" --output text)
-echo "us-east-1c -> $AZID"          # e.g. use1-az6
+# e.g. use1-az6
+echo "us-east-1c -> $AZID"
 
 # 2) Create the S3 Express One Zone directory bucket (name MUST end --<azid>--x-s3)
 export XBUCKET="insitubatch-bench--${AZID}--x-s3"
@@ -325,7 +354,8 @@ chunk cache, not FLOPs.
 ```bash
 export AWS_REGION=us-east-1
 export KEY_NAME=emfdavid_ed25519
-export INSTANCE_TYPE=g6.8xlarge          # 1x L4 24 GB, 32 vCPU, 25gb/s, 2x450 GB NVMe instance store
+# 1x L4 24 GB, 32 vCPU, 25gb/s, 2x450 GB NVMe instance store
+export INSTANCE_TYPE=g6.8xlarge
 ```
 
 **AMI — the Deep Learning *Base* GPU AMI (Ubuntu).** "Base" ships the NVIDIA driver
@@ -351,23 +381,25 @@ IID=$(aws ec2 run-instances --region "$AWS_REGION" \
 aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$IID"
 IP=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-echo "ssh -A ubuntu@$IP"               # Ubuntu AMI -> user is 'ubuntu', not 'ec2-user'
+# Ubuntu AMI -> user is 'ubuntu', not 'ec2-user'
+echo "ssh -A ubuntu@$IP"
 ```
 
 **On the box — NVMe, install, GPU torch, run.**
 
 ```bash
-nvidia-smi                              # confirm the driver sees the L4 before anything else
+# confirm the driver sees the L4 before anything else
+nvidia-smi
 
 # --- mount the instance-store NVMe for the chunk cache (ephemeral scratch) ---
-lsblk                                   # instance store is usually /dev/nvme1n1 (root = nvme0n1)
+# instance store is usually /dev/nvme1n1 (root = nvme0n1)
+lsblk
 sudo mkfs -t xfs /dev/nvme1n1
 sudo mkdir -p /mnt/nvme && sudo mount /dev/nvme1n1 /mnt/nvme && sudo chown "$USER" /mnt/nvme
 
 # --- install ---
 curl -LsSf https://astral.sh/uv/install.sh | sh && source "$HOME/.bashrc"
 git clone https://github.com/emfdavid/insitubatch.git && cd insitubatch
-git checkout multi-offset-sampling      # until merged to main
 
 # Pick your framework's extra (torch | jax | tf) + arraylake for the real store.
 uv sync --extra torch --extra arraylake
@@ -375,8 +407,9 @@ uv sync --extra torch --extra arraylake
 # --- CUDA torch (the catch) -----------------------------------------------------
 # PyPI's `torch` is the CPU build; `uv sync` installed that. uv 0.11+ swaps it for the
 # matching CUDA wheel from the PyTorch index, auto-detecting the driver's CUDA:
-uv pip install torch --torch-backend=auto      # or pin: --torch-backend=cu124
-uv run python -c "import torch; print(torch.cuda.is_available())"   # -> True
+# or pin: --torch-backend=cu124
+uv pip install torch --torch-backend=auto
+uv run python -c "import torch; print(torch.cuda.is_available())"  # expect True
 #
 # Why not bake CUDA torch into an extra? `[tool.uv.sources]` index pins are GLOBAL
 # per-package, so pinning torch -> the cu124 index would drag the CPU `torch` extra,
@@ -387,7 +420,8 @@ uv run python -c "import torch; print(torch.cuda.is_available())"   # -> True
 # the bundled CUDA libs.)
 
 # --- Arraylake auth (one of) ---
-uv run al auth login                    # opens a device-code flow
+# opens a device-code flow
+uv run al auth login
 # or non-interactive: export ARRAYLAKE_TOKEN=...
 
 # --- train on a finite window of real ERA5, on the GPU, cache on NVMe ---
@@ -419,9 +453,9 @@ from insitubatch import open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 
 url = "s3://insitubatch-bench-<ACCT>/era5_fat.zarr"
-geoms = open_geometries(url, request_payer=True)          # they pay their egress
+geoms = open_geometries(url, request_payer=True)  # they pay their egress
 manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
-ds = InSituDataset(url, manifest, request_payer=True)      # store kwargs pass through
+ds = InSituDataset(url, manifest, request_payer=True)  # store kwargs pass through
 ```
 
 ## Teardown
