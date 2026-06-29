@@ -458,34 +458,77 @@ shortcut: it is exactly what lets xbatcher's cache survive process exit today.
 | key | `(array, chunk_index)` | batch index → zarr store |
 | backing | heap or mmap'd `.npy` (reclaimable NVMe page cache) | zarr store (local dir or cloud) |
 | cross-epoch reuse | intrinsic (just don't evict) | yes |
-| cross-run persistence | **not yet** (see below) | **yes** — survives restarts |
+| cross-run persistence | **yes** — `persist=True` (see below) | **yes** — survives restarts |
 | shuffle | sits *before* shuffle: sample→batch membership re-drawn every epoch | batch composition frozen; only batch *order* reshuffles |
 | sweet spot | many samples per chunk, fat-chunk, multi-epoch, scoring reuse | one-sample-per-chunk, stable batch defs reused across runs |
 
-The two rows that decide it: insitu avoids the second copy and keeps a stronger
-per-epoch shuffle (the cache is upstream of shuffling), while xbatcher's batch cache
-**persists across runs** and insitu's does not — yet. Closing that one gap is the
-cross-run work below.
+Both persist across runs now; the distinction is the **unit**. insitu caches deduped
+decoded chunks (no second copy, `gather` views the slot in place) and keeps a stronger
+per-epoch shuffle because the cache is *upstream* of shuffling; xbatcher caches
+materialized batches with frozen composition. Pick by regime, not by a missing feature.
 
-### Cross-run persistence (planned)
+### Cross-run persistence
 
-Intra-run cross-epoch reuse is intrinsic (just don't evict). Surviving process exit
-is the one place the batch-cache model leads today, and it is the gap this closes — a
-deduped decoded-chunk tier on NVMe rather than a separate materialized batch copy:
+`persist=True` (with a `cache_dir`) turns the mmap tier into a cache that **survives
+process exit**: ready slot files are kept on `close`, a JSON manifest records the
+completed entries, and a fresh dataset over the same `cache_dir` revives them as ready
+hits on first touch — the fetch driver's existing hit path skips fetch *and* decode
+*and* transform, so a warm run re-decodes **zero** chunks. Without `persist`,
+`cache_dir` is ephemeral spill (files unlinked on close).
 
-- **A content key.** Within a run the key is `(array, chunk_index)` because one pool
-  == one fixed pipeline. A cross-run key must add a fingerprint of (a) source
-  identity (store URL + array + chunk version/etag) and (b) the chunk-transform
-  pipeline (stats + transform list), so changed data *or* transforms invalidate.
-  Require transforms to expose a stable `version` / config hash.
-- **Index rebuild on reopen.** The slot files persist; a dir scan on init (parse
-  `(array, chunk)` + size) recovers entries written by earlier runs.
-- **A raw-decoded tier** keyed by source identity only (decode being the expensive
-  cloud + decompress step), beneath the prepped tier, would let transform
-  experimentation reuse decoded chunks without a fingerprint.
-- **GDS synergy.** A persistent NVMe tier of prepped `.npy` chunks is the natural
-  feed for the kvikio/GDS NVMe→GPU path; cross-process reuse then needs atomic
-  writes / immutable files + light locking.
+```python
+ds = InSituDataset(store, manifest, cache_dir="/mnt/nvme/era5/v3",
+                   persist=True, cache_budget_bytes=...)
+```
+
+Two automatic guards keep a reopened cache honest, and **either mismatch is a miss
+(re-fetch + overwrite), never an error** — the cache is a transparent optimization:
+
+1. a **chunk-transform fingerprint** in the manifest — change your `chunk_transforms`
+   and the whole cache is discarded (cold start), never served stale; and
+2. a per-entry **shape/dtype check** on revive — a chunk whose stored geometry no
+   longer matches the current array is ignored.
+
+The fingerprint resolves each transform by, in order: an explicit `transform.cache_key`
+(authoritative), a `cloudpickle` hash (the optional `cache` extra — captures closures
+and referenced globals, so a changed closed-over constant invalidates), or a
+best-effort source hash (catches an edited body but not a changed closure/global — it
+warns once so the weaker guarantee is visible).
+
+**Observability.** `dataset.cache_hits` / `cache_misses` give per-epoch counts; a plain
+miss is silent, but `persist=True` serving **zero** hits while the cache was
+consulted-and-rejected emits one WARNING per epoch — a cache you configured but that
+isn't working is loud, not silent.
+
+**Invariants the engine guarantees:**
+
+- The cache key is `(array_path, global chunk_index)` — the *absolute* zarr chunk index,
+  not relative to a split or `sample_range`. So overlapping subsets/splits and a later
+  fuller run **share** entries: chunk 5 is always the same `.npy`.
+- A hit returns the **prepped** chunk (post-`chunk_transform`), no copy — `gather` views
+  the slot in place.
+- **Crash-safe:** the manifest lists only *completed* chunks (written atomically on
+  `close`), so a `.npy` left half-written by a crash is ignored on reopen.
+
+**What you must ensure (the guarantee boundary):**
+
+- **The `cache_dir` path is the dataset identity.** The **store URL is not in the key**
+  (an Icechunk/Arraylake session store has no round-trippable URL), so pointing one
+  `cache_dir` at two sources that share array paths + geometry would serve the wrong
+  chunks. Use a distinct dir per dataset and bury a version in the path (`…/era5/v3/`)
+  that you bump when the **source data** changes — content/etag drift is deliberately
+  not detected.
+- **`chunk_transforms` must be deterministic** (they are baked into the cached chunk).
+  If you rely on auto-invalidation when you edit one, install the `cache` extra
+  (cloudpickle) or set an explicit `transform.cache_key`; the source-only fallback can
+  miss closure/global changes.
+
+**Limitations (deferred).** A **reshaping** `chunk_transform` (e.g. `Regrid`) on the
+mmap tier still raises — the slot is sized at the source shape, so the persistent cache
+covers shape-preserving transforms today. A raw-decoded tier (keyed by source only, for
+transform experimentation), orphaned-file GC across version bumps, and the kvikio/GDS
+NVMe→GPU feed off the persistent `.npy` tier remain on the roadmap
+([DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md)).
 
 ## Earth2Studio integration
 

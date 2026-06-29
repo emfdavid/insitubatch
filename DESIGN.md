@@ -38,7 +38,7 @@ arrive DLPack-ready with no labeled-array machinery in the loop. (xarray is stil
 | Neighbor | Why insitubatch is different |
 |---|---|
 | **MosaicML Streaming / WebDataset** | They require **resharding** into a sample-oriented format (MDS/tar) — a full ETL copy, and a "sample" becomes an opaque blob. insitubatch trains **in place** on the existing ndim Zarr; splits/shuffle/batches live in **coordinate space**. |
-| **xbatcher + DataLoader (worker stack)** | xbatcher (an xarray-contrib community project) is the standard, elegant way to *define* ndim batches — **xarray-native**, yielding `xr.DataArray`. Its torch-worker engine (N **processes**) is strongest at the GRIB / one-sample-per-chunk end, and elsewhere pays worker cold start, memory ∝ workers, and per-sample decode on the uncached path. insitubatch keeps the same ndim batch semantics but stays at the **numpy/tensor** level on a *different engine* — one async loop — winning **cold start** (inference) and **memory** across the chunk spectrum (training). The caches differ in kind: insitu's in-place decoded-chunk pool (deduped, no second copy) vs xbatcher's opt-in **materialized-batch** zarr store — which *does* persist across runs, where insitu's does not yet. Complementary tools; pick by regime (and we tune xbatcher well before any comparison). |
+| **xbatcher + DataLoader (worker stack)** | xbatcher (an xarray-contrib community project) is the standard, elegant way to *define* ndim batches — **xarray-native**, yielding `xr.DataArray`. Its torch-worker engine (N **processes**) is strongest at the GRIB / one-sample-per-chunk end, and elsewhere pays worker cold start, memory ∝ workers, and per-sample decode on the uncached path. insitubatch keeps the same ndim batch semantics but stays at the **numpy/tensor** level on a *different engine* — one async loop — winning **cold start** (inference) and **memory** across the chunk spectrum (training). The caches differ in kind: insitu's in-place decoded-chunk pool (deduped, no second copy) vs xbatcher's opt-in **materialized-batch** zarr store; both now persist across runs (insitu via `persist=True`). Complementary tools; pick by regime (and we tune xbatcher well before any comparison). |
 | **Earth2Studio (NVIDIA)** | An **xarray-centric** inference framework: its `DataSource` yields `xr.DataArray`, and xarray is load-bearing down to `prep_data_array`. insitubatch doesn't build xarray — *inside* their loop the win is an obstore store-swap (an obstore contribution, not ours); *around* their models it feeds `(tensor, coords)` batches straight to `model.create_iterator`, where `coords` is a light metadata dict, not the xarray machinery. |
 | **DALI / kvikio / nvCOMP** | The GPU compute/decompress path — a *peer* we interop with (cupy→dlpack→torch, optional nvCOMP), not the orchestration. |
 | **anemoi-datasets** | Weather-locked, opinionated schema. We are general ndim arrays. |
@@ -207,9 +207,9 @@ parameterized by:
 Caveats: (1) **mmap isn't free for read-once** — scattering into mmap is NVMe write
 traffic even when never reused, so default the pool to **heap** for streaming and
 use mmap only to spill a working set past RAM or for cross-epoch reuse. (2)
-**cross-*run* persistence is still extra** — intra-run/cross-epoch reuse is
-intrinsic (just don't evict), but surviving process exit needs a stable content key
-+ index rebuild on reopen (the deferred cache item below).
+**cross-*run* persistence is now a flag** (`persist=True`, M-C2 ✅) — intra-run/
+cross-epoch reuse is intrinsic (just don't evict); surviving process exit adds a
+manifest of completed slots + a chunk-transform fingerprint, revived on reopen.
 
 Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
 `chunk_key_encoding.encode_chunk_key`, bytes via `store.get`, decode via
@@ -226,8 +226,9 @@ Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
   cross-epoch decode-once reuse (the scheduler skips fetch+decode+transform on a
   still-resident chunk). The pool is dataset-owned (persists across epochs); B1's
   `resident_cap` admission unified into the budget (consumer `unpin` replaces
-  `evict`, eviction is unpinned-LRU). Remaining: cross-*run* persistence (stable
-  content key + index rebuild on reopen).
+  `evict`, eviction is unpinned-LRU). **M-C2 ✅** later added cross-*run* persistence
+  (`persist=True`): a manifest of completed slots + a chunk-transform fingerprint
+  survive `close` and revive on reopen.
 
 Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurrency
 — v1 (concurrency = `block_chunks`) rises in both; V2 (`block_chunks` fixed small,
@@ -434,8 +435,9 @@ at `2*block_chunks`); the v1 shuffle-block buffer is retired. **Acceptance passe
 on fat-spatial S3: 1052 MB/s at `max_inflight=32` (beats the 930 v1 peak) with
 residency flat across the concurrency sweep. **B2 done** — the `ChunkPool` is now
 the cache too (byte budget + pin/unpin + LRU, heap or mmap backing; cross-epoch
-decode-once reuse via `cache_dir`/`cache_budget_bytes`). **Not yet built:** cross-*run*
-cache persistence, `Regrid` + the GPU/device transform stage (M2), bounded read-ahead (M-RA).
+decode-once reuse via `cache_dir`/`cache_budget_bytes`; cross-*run* persistence via
+`persist=True`, M-C2). **Not yet built:** `Regrid` + the GPU/device transform stage (M2),
+bounded read-ahead (M-RA).
 
 ## Roadmap / milestones
 
@@ -499,15 +501,24 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   intercept and the standalone cache classes were retired — caching is no longer a
   separate intercept, it became "don't evict." Deferred: an L1/L2 (RAM+NVMe) tier and
   cached cross-variable derived variables (cross-*run* persistence is M-C2).
-- **M-C2 — cross-run persistent cache.** The mmap'd `.npy` slots under `cache_dir`
-  already *survive* the process (they are files on NVMe), but nothing rebuilds the
-  index to reuse them — so each new run re-fetches + re-decodes from S3. Add a
-  **persisted slot index** (`(array, chunk_index) → file`, with shape/dtype and the
-  chunk-transform version) rebuilt on startup, gated by a **content fingerprint**
-  (store URL + zarr metadata + codec + chunk-transform identity) so stale slots are
-  invalidated when the data or pipeline changes. Then decode-once amortizes across
-  *runs*, not just epochs — a relaunched job, a hyperparameter sweep, or several
-  processes on one box read decoded chunks straight from NVMe (no S3, no decode).
+- **M-C2 — cross-run persistent cache ✅.** `persist=True` (with `cache_dir`) keeps the
+  mmap'd `.npy` slots past `close` and writes a JSON **manifest** of completed entries
+  (`(array, chunk_index) → file`); a new pool over the same dir **revives** them as ready
+  hits on first touch, so decode-once amortizes across *runs* — a relaunched job, a
+  hyperparameter sweep, or several processes on one box read decoded chunks straight from
+  NVMe (no S3, no decode). Invalidation has two automatic guards: a **chunk-transform
+  fingerprint** in the manifest header (explicit `transform.cache_key` → optional
+  cloudpickle hash of closures+globals → best-effort source hash that warns) and a
+  per-entry **shape/dtype** check on revive; either mismatch is a *miss* (re-fetch +
+  overwrite), never an error. Crash-safe (only completed chunks are listed; atomic write).
+  Observability: per-epoch `cache_hits`/`cache_misses` + one WARN when persistence was
+  asked for but served nothing. **Deliberately not in the key:** the store URL —
+  Icechunk/Arraylake session stores have no round-trippable URL, so the `cache_dir` path
+  *is* the dataset identity (bury a version in it); content/etag drift is the user's call.
+  The key's `chunk_index` is the *global* zarr index, so subsets/splits share entries.
+  *Still deferred:* a reshaping `chunk_transform` (`Regrid`) on the mmap tier (slot sized
+  at source shape), a raw-decoded tier keyed by source only, orphaned-file GC across
+  version bumps, and the kvikio/GDS NVMe→GPU feed off the persistent tier.
   Scope: a read-through cache keyed by fingerprint; a shared/networked cache tier and
   the L1/L2 split above are later.
 - **M-W — windowed / multi-offset sampling (sample geometry v2).** The forecasting
