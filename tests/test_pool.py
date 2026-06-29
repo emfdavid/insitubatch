@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -332,3 +333,84 @@ def test_pool_unpin_all_drops_abandoned_partial_keeps_ready(tiled_store):
     assert ("spatial", 0) not in pool._slots  # abandoned partial dropped
     assert pool.is_ready("spatial", 1)  # ready chunk retained (cross-epoch reuse)
     assert pool._bytes == bytes_ready  # the partial's bytes were reclaimed
+
+
+def test_pool_persist_requires_cache_dir(tiled_store):
+    """persist=True only makes sense with a backing dir to keep files in -- fail fast."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    with pytest.raises(ValueError, match="cache_dir|backing_dir"):
+        ChunkPool(geoms, persist=True)
+
+
+def _fill_chunk(pool, var, cid, geom, tiles):
+    pool.try_admit(var, cid)
+    for inner in geom.inner_coords():
+        pool.scatter(var, cid, inner, tiles[(cid, *inner)])
+    pool.wait_ready(var, cid)
+
+
+def test_pool_cross_run_persistence(tiled_store, tmp_path):
+    """A persistent cache survives process exit: a new pool over the same dir serves
+    each chunk as a ready hit (no re-scatter), reconstructing the source exactly."""
+    url, srcs = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    spc = geom.sample_chunk_size
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    # Run 1: populate + close. persist must KEEP the files and write a manifest.
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    for cid in range(geom.n_chunks):
+        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+    pool.close()
+    assert list(backing.glob("*.npy")), "persist=True must keep slot files after close()"
+    assert (backing / "insitu_cache.json").exists(), "persist must write a manifest"
+
+    # Run 2: same dir -> every chunk a ready hit, no fetch/scatter.
+    pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    for cid in range(geom.n_chunks):
+        assert pool2.pin_if_ready("single_inner", cid), "persisted chunk must be a hit"
+        n0 = len(geom.samples_in_chunk(cid))
+        rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
+        got = pool2.gather(rows, ["single_inner"], spc).arrays["single_inner"]
+        assert np.array_equal(got, srcs["single_inner"][cid * spc : cid * spc + n0])
+    pool2.close()
+
+
+def test_pool_persist_invalidates_on_geometry_mismatch(tiled_store, tmp_path):
+    """A persisted entry whose stored shape/dtype no longer matches the current
+    geometry is ignored (a miss), not served -- the structural fingerprint check.
+    The dataset/pipeline identity is the cache_dir path; the user versions that."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+
+    # Reopen with a structurally different dtype for the same array -> mismatch -> miss.
+    drifted = {"single_inner": replace(geom, dtype=np.dtype("f8"))}
+    pool2 = ChunkPool(drifted, backing_dir=backing, persist=True)
+    assert not pool2.pin_if_ready("single_inner", 0), "geometry drift must invalidate"
+    pool2.close()
+
+
+def test_pool_spill_unlinks_without_persist(tiled_store, tmp_path):
+    """Without persist, a backing dir is scratch: files are unlinked on close and no
+    manifest is written (the persistence machinery is persist-only)."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "spill"
+
+    pool = ChunkPool(geoms, backing_dir=backing)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+    assert not list(backing.glob("*.npy")), "spill must unlink slot files on close()"
+    assert not (backing / "insitu_cache.json").exists(), "no manifest without persist"

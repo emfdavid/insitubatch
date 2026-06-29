@@ -184,6 +184,57 @@ def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
     assert all(v == 1 for v in transformed.values()), dict(transformed)  # once, not twice
 
 
+def test_cache_persists_across_runs(write_zarr, tmp_path) -> None:
+    # persist=True keeps the mmap cache + manifest past close(); a fresh dataset over the
+    # same cache_dir serves every chunk from disk -- no re-decode (the chunk transform
+    # never runs in run 2) -- and yields byte-identical batches in the same draw order.
+    url, _ = write_zarr(n=160, spc=8)  # 20 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    cache = str(tmp_path / "cache")
+
+    decoded: collections.Counter[int] = collections.Counter()
+
+    def count(chunk):  # runs once per outer chunk, on the miss (decode) path only
+        decoded[chunk.read.chunk_index] += 1
+        return chunk
+
+    def make() -> InSituDataset:
+        return InSituDataset(
+            url,
+            manifest,
+            batch_size=4,
+            block_chunks=4,
+            shuffle=True,
+            seed=0,
+            chunk_transforms=[count],
+            cache_dir=cache,
+            persist=True,
+            cache_budget_bytes=10_000_000,  # >> the split -> nothing evicted
+        )
+
+    ds = make()
+    try:
+        ds.set_epoch(0)
+        run1 = [b.arrays["t2m"].copy() for b in ds.train]
+    finally:
+        ds.close()
+    assert set(decoded) == set(manifest.chunks[SplitName.TRAIN.value])  # all decoded in run 1
+
+    decoded.clear()
+    ds2 = make()  # fresh process-equivalent: new pool over the same persisted cache_dir
+    try:
+        ds2.set_epoch(0)
+        run2 = [b.arrays["t2m"].copy() for b in ds2.train]
+    finally:
+        ds2.close()
+
+    assert decoded == collections.Counter()  # nothing re-decoded: every chunk a cross-run hit
+    assert len(run1) == len(run2)
+    for a, b in zip(run1, run2, strict=True):
+        assert np.array_equal(a, b)
+
+
 def test_sample_range_subsets_what_the_dataset_reads(write_zarr) -> None:
     # sample_range restricts the manifest to the covering chunks; the dataset then
     # yields exactly those samples (chunk-aligned).
