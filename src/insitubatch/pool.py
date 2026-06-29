@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import threading
@@ -63,6 +64,8 @@ from pathlib import Path
 import numpy as np
 
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk
+
+logger = logging.getLogger(__name__)
 
 ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
 
@@ -128,6 +131,15 @@ class ChunkPool:
         self._dir = Path(backing_dir) if backing_dir is not None else None
         if self._dir is not None:
             self._dir.mkdir(parents=True, exist_ok=True)
+        # Observability. hits/misses (+ the revive failure breakdown) are per-epoch --
+        # reset by unpin_all at each epoch boundary -- so the driver can warn when a
+        # configured persist cache served nothing. manifest_entries is load-time (how
+        # many entries a prior run left us) and does NOT reset.
+        self.hits = 0
+        self.misses = 0
+        self.revive_mismatch = 0  # persisted entry whose stored shape/dtype no longer matches
+        self.revive_missing = 0  # persisted entry whose .npy was unreadable/gone
+        self.manifest_entries = 0
         # Cross-run persistence: keep slot files past close, write a manifest of completed
         # entries, and revive them on reopen. Requires a dir to keep the files in. The dir
         # path is the dataset+pipeline identity (the user buries a version in it); we only
@@ -193,6 +205,7 @@ class ChunkPool:
                 return True
             if not self._make_room(nbytes):
                 return False
+            self.misses += 1  # a fresh slot allocated to fetch -> a cache miss
             self._slots[key] = _Slot(
                 data=self._alloc(array, chunk_index, geom.slot_shape(chunk_index), geom.dtype),
                 remaining=geom.n_inner_chunks(chunk_index),
@@ -228,6 +241,7 @@ class ChunkPool:
                 if not self._revive(key):
                     return False
                 slot = self._slots[key]
+            self.hits += 1  # resident (cross-epoch) or revived (cross-run) -> no fetch
             self._pin(key)
             slot.claimed = True  # publish the claim so a waiter may now proceed
             self._cv.notify_all()
@@ -253,10 +267,21 @@ class ChunkPool:
         assert self._dir is not None
         try:
             data = np.lib.format.open_memmap(self._dir / fname, mode="r")
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            self.revive_missing += 1
+            logger.debug("cache: persisted %s unreadable (%s); refetching", key, exc)
             self._persisted.pop(key, None)
             return False
         if geom is None or data.shape != geom.slot_shape(chunk_index) or data.dtype != geom.dtype:
+            self.revive_mismatch += 1
+            logger.debug(
+                "cache: persisted %s shape/dtype %s/%s != current %s/%s; refetching",
+                key,
+                data.shape,
+                data.dtype,
+                None if geom is None else geom.slot_shape(chunk_index),
+                None if geom is None else geom.dtype,
+            )
             del data  # drop the mmap ref; structural fingerprint mismatch -> a miss
             self._persisted.pop(key, None)
             return False
@@ -313,6 +338,10 @@ class ChunkPool:
                 self._drop(key)
             for slot in self._slots.values():
                 slot.claimed = False  # a retained chunk must be re-claimed next epoch
+            # Per-epoch observability resets here (the epoch boundary); manifest_entries
+            # is load-time and persists.
+            self.hits = self.misses = 0
+            self.revive_mismatch = self.revive_missing = 0
             self._cv.notify_all()
 
     def _pin(self, key: tuple[str, int]) -> None:  # call under the lock
@@ -521,22 +550,33 @@ class ChunkPool:
     def _load_manifest(self) -> None:
         """Populate the persisted-entry registry from a prior run's manifest, if any.
 
-        An unreadable manifest, a format mismatch, or a missing file is just a cold start
-        (no entries loaded) -- never an error. Per-entry shape/dtype validation is deferred
-        to :meth:`_revive`, which reads it straight from the ``.npy`` header.
+        No manifest is a cold start (silent -- the expected first run). An unreadable
+        manifest or a format mismatch is a cold start too, but WARNed: persistence was
+        asked for and a prior cache could not be honored. Per-entry validation
+        (existence, shape, dtype) is deferred to :meth:`_revive`, which reads it from the
+        ``.npy`` header -- so a stale/missing file shows up as a per-epoch revive failure
+        the driver can warn on, not a silent drop here.
         """
         assert self._dir is not None
         path = self._dir / self._MANIFEST_NAME
+        if not path.exists():
+            return  # cold start: no prior cache (the expected first run)
         try:
             doc = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("persist: cache manifest %s unreadable (%s); starting cold", path, exc)
             return
         if doc.get("format_version") != self._MANIFEST_FORMAT:
+            logger.warning(
+                "persist: cache manifest %s format %r != %d; starting cold",
+                path,
+                doc.get("format_version"),
+                self._MANIFEST_FORMAT,
+            )
             return
         for entry in doc.get("entries", []):
-            fname = entry["file"]
-            if (self._dir / fname).exists():
-                self._persisted[(entry["array"], int(entry["chunk_index"]))] = fname
+            self._persisted[(entry["array"], int(entry["chunk_index"]))] = entry["file"]
+        self.manifest_entries = len(self._persisted)
 
     def _write_manifest(self) -> None:  # call under the lock
         """Atomically write the registry of completed cache entries (persist mode)."""

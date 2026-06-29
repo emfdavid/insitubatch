@@ -364,18 +364,21 @@ def test_pool_cross_run_persistence(tiled_store, tmp_path):
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
     for cid in range(geom.n_chunks):
         _fill_chunk(pool, "single_inner", cid, geom, tiles)
+    assert pool.misses == geom.n_chunks and pool.hits == 0  # cold: every chunk a miss
     pool.close()
     assert list(backing.glob("*.npy")), "persist=True must keep slot files after close()"
     assert (backing / "insitu_cache.json").exists(), "persist must write a manifest"
 
     # Run 2: same dir -> every chunk a ready hit, no fetch/scatter.
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    assert pool2.manifest_entries == geom.n_chunks
     for cid in range(geom.n_chunks):
         assert pool2.pin_if_ready("single_inner", cid), "persisted chunk must be a hit"
         n0 = len(geom.samples_in_chunk(cid))
         rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
         got = pool2.gather(rows, ["single_inner"], spc).arrays["single_inner"]
         assert np.array_equal(got, srcs["single_inner"][cid * spc : cid * spc + n0])
+    assert pool2.hits == geom.n_chunks and pool2.misses == 0  # warm: every chunk a hit
     pool2.close()
 
 
@@ -397,6 +400,7 @@ def test_pool_persist_invalidates_on_geometry_mismatch(tiled_store, tmp_path):
     drifted = {"single_inner": replace(geom, dtype=np.dtype("f8"))}
     pool2 = ChunkPool(drifted, backing_dir=backing, persist=True)
     assert not pool2.pin_if_ready("single_inner", 0), "geometry drift must invalidate"
+    assert pool2.revive_mismatch == 1 and pool2.hits == 0  # the mismatch is counted
     pool2.close()
 
 

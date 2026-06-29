@@ -27,6 +27,7 @@ residency budget are independent dials. See [docs/architecture.md] for the pipel
 from __future__ import annotations
 
 import contextlib
+import logging
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -40,6 +41,8 @@ from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
 from .store import StoreLike, open_geometries
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRead
+
+logger = logging.getLogger(__name__)
 
 # Default for the single concurrency dial when the caller does not pin it.
 # max_inflight is independent of the shuffle window -- sized to saturate the
@@ -149,7 +152,10 @@ class InSituDataset:
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
         self._epoch = 0
+        self._persist = persist
         self.resident_peak = 0  # peak resident outer chunks (observability)
+        self.cache_hits = 0  # chunks served without a fetch this epoch (cross-epoch/run)
+        self.cache_misses = 0  # chunks fetched + decoded this epoch
         # Stored tiles NaN-filled in the last epoch (when on_bad_chunk="nan") -- which
         # (array, chunk_index, inner_coord) reads were corrupt/truncated. len() is the
         # count. Inspect after iterating to log/quarantine bad chunks.
@@ -384,8 +390,25 @@ class InSituDataset:
                     with contextlib.suppress(queue.Empty):
                         out_q.get(timeout=0.05)
                 producer.join(timeout=10)
-                self.resident_peak = sched.pool.max_resident  # peak residency this epoch
+                pool = sched.pool
+                self.resident_peak = pool.max_resident  # peak residency this epoch
+                self.cache_hits = pool.hits
+                self.cache_misses = pool.misses
                 self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
+                # Persistence was asked for but served nothing, and the cache *was*
+                # consulted (entries existed and every revive failed) -> almost certainly
+                # a stale cache_dir or changed data/transforms. Loud once per epoch; a
+                # plain miss (no persisted entry for a chunk) is silent (normal).
+                failed_revives = pool.revive_mismatch + pool.revive_missing
+                if self._persist and pool.hits == 0 and failed_revives:
+                    logger.warning(
+                        "persist=True but 0 of %d persisted chunks were served this epoch "
+                        "(%d shape/dtype mismatches, %d missing/unreadable) -- stale cache_dir "
+                        "or changed data/transforms?",
+                        pool.manifest_entries,
+                        pool.revive_mismatch,
+                        pool.revive_missing,
+                    )
 
     def close(self) -> None:
         """Release the cache pool's backing (mmap handles, cached chunks).

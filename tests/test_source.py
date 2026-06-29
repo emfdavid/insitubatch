@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import logging
 
 import numpy as np
 import pytest
@@ -213,6 +214,7 @@ def test_cache_persists_across_runs(write_zarr, tmp_path) -> None:
             cache_budget_bytes=10_000_000,  # >> the split -> nothing evicted
         )
 
+    n_train = len(manifest.chunks[SplitName.TRAIN.value])
     ds = make()
     try:
         ds.set_epoch(0)
@@ -220,6 +222,7 @@ def test_cache_persists_across_runs(write_zarr, tmp_path) -> None:
     finally:
         ds.close()
     assert set(decoded) == set(manifest.chunks[SplitName.TRAIN.value])  # all decoded in run 1
+    assert ds.cache_misses == n_train and ds.cache_hits == 0  # cold run: all misses
 
     decoded.clear()
     ds2 = make()  # fresh process-equivalent: new pool over the same persisted cache_dir
@@ -230,9 +233,47 @@ def test_cache_persists_across_runs(write_zarr, tmp_path) -> None:
         ds2.close()
 
     assert decoded == collections.Counter()  # nothing re-decoded: every chunk a cross-run hit
+    assert ds2.cache_hits == n_train and ds2.cache_misses == 0  # warm run: all hits
     assert len(run1) == len(run2)
     for a, b in zip(run1, run2, strict=True):
         assert np.array_equal(a, b)
+
+
+def test_persist_warns_when_cache_unusable(write_zarr, tmp_path, caplog) -> None:
+    # persist=True but the cache is consulted and serves nothing (here: the .npy files
+    # were deleted under a surviving manifest) -> one loud WARNING per epoch, and the
+    # chunks are still re-fetched correctly (a miss, never a raise).
+    url, _ = write_zarr(n=80, spc=8)  # 10 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    cache = tmp_path / "cache"
+
+    def make() -> InSituDataset:
+        return InSituDataset(
+            url, manifest, batch_size=4, block_chunks=4, shuffle=False,
+            cache_dir=str(cache), persist=True, cache_budget_bytes=10_000_000,
+        )
+
+    ds = make()
+    try:
+        ds.set_epoch(0)
+        want = np.concatenate([b.arrays["t2m"] for b in ds.train])
+    finally:
+        ds.close()
+
+    # Break the cache: keep the manifest, delete the data files it points at.
+    for f in cache.glob("*.npy"):
+        f.unlink()
+
+    ds2 = make()
+    ds2.set_epoch(0)
+    with caplog.at_level(logging.WARNING, logger="insitubatch.source"):
+        got = np.concatenate([b.arrays["t2m"] for b in ds2.train])
+    ds2.close()
+
+    assert ds2.cache_hits == 0  # nothing served from the (broken) cache
+    assert np.array_equal(got, want)  # but the data is correct -- re-fetched, not raised
+    assert any("persist=True but 0" in r.message for r in caplog.records), caplog.text
 
 
 def test_sample_range_subsets_what_the_dataset_reads(write_zarr) -> None:
