@@ -77,7 +77,10 @@ Engines (`bench/engines.py`):
   (storage held constant vs insitu → a stronger, conservative baseline than their
   gcsfs path). Their headline ~15× is **internal** (tuned vs untuned xbatcher),
   not xbatcher-vs-another-loader — so "beating Earthmover" means insitu vs a
-  well-tuned xbatcher.
+  well-tuned xbatcher. We run it **without** xbatcher's opt-in batch cache
+  (`BatchGenerator(cache=...)`); the story-3 warm-epoch numbers are therefore insitu's
+  chunk cache vs the uncached path. A cache-vs-cache comparison (xbatcher's materialized
+  batch store, which persists across runs, vs insitu's in-process chunk cache) is future work.
 - **insitu** — the engine under test.
 - **memory** — whole dataset preloaded into RAM, then iterate with the same compute
   step. The **compute-bound ceiling** (zero IO), drawn as a reference line, not a

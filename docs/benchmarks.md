@@ -13,17 +13,18 @@ insitubatch is the **batteries-included** choice across two operating points:
   the worker stacks' 1–15 s — and a production inference service can't keep a hot 32-worker
   pool alive anyway. insitu wins cold-start at **every** chunk size measured.
 - **Training (across the chunk spectrum).** It uses **8–25× less memory** (one process, not
-  32), reads each chunk **once** (vs the baselines' per-sample re-decode), and brings a
-  **cross-epoch cache** (warm epochs at ~4 GB/s) the worker stacks don't have. Throughput
-  beats the best-tuned baseline from `c2` up — to **~25×** at fat chunks.
+  32), reads each chunk **once** (vs the baselines' per-sample re-decode), and keeps a
+  **cross-epoch chunk cache** in the pool (warm epochs at ~4 GB/s). Throughput beats the
+  best-tuned baseline from `c2` up — to **~25×** at fat chunks.
 
 The honest exception is the **GRIB end (`c1`, one sample per chunk)**: there xbatcher is
 ~30% faster on *single-pass* throughput, because with nothing to amortize per chunk insitu's
-read-once advantage doesn't apply. The trade-offs are memory (~25×) and cold start (~6×
-TTFB), and since the worker stacks re-read every epoch, multi-epoch training flips back to
-insitu via the cross-epoch cache (~9× warm). xbatcher is a well-established *batch
-definition* on a worker-process *engine*; insitu keeps the same ndim batch semantics with
-one async loop, so its edge grows with samples-per-chunk.
+read-once advantage doesn't apply. insitu still wins memory (~25×) and cold start (~6× TTFB),
+and its cross-epoch cache makes warm epochs ~9× faster than its own cold pass — though that is
+measured against xbatcher **without** its (opt-in) cache enabled; see the
+[cache caveat](#story-3-the-cache-decode-once-across-epochs). xbatcher is a well-established
+*batch definition* on a worker-process *engine*; insitu keeps the same ndim batch semantics
+with one async loop, so its edge grows with samples-per-chunk.
 
 !!! note "Real run"
     Numbers below are from a **real S3 run** on a
@@ -113,9 +114,20 @@ come from the pool — no S3, no decode — so warm ≫ cold:
 | c8 | 777 | 4526 | 5.8× |
 | c32 | 750 | 4557 | 6.1× |
 
-The cross-epoch probe on `fat_g16` confirms it independently (1006 → 4509, 4.5×). The
-worker stacks have **no shared cross-epoch cache** — they re-read S3 every epoch — so this
-is the result that flips the GRIB end back to insitu for *multi-epoch training*.
+The cross-epoch probe on `fat_g16` confirms it independently (1006 → 4509, 4.5×).
+
+!!! warning "What this does — and doesn't — compare"
+    This is insitu **with** its cache against the worker stacks reading S3 each epoch — i.e.
+    xbatcher **without** caching (the bench engine builds `BatchGenerator` with no `cache=`).
+    xbatcher *does* have an opt-in cache
+    ([docs](https://xbatcher.readthedocs.io/en/latest/user-guide/caching.html)): it serializes
+    **assembled batches** to a zarr store that persists across epochs *and across runs* —
+    insitu's chunk cache is in-process and cross-run persistence isn't built yet, so on that
+    axis xbatcher is ahead. The designs differ in kind: insitu caches **decoded chunks** in
+    the pool (no second copy, deduped across samples/splits, reusable under any shuffle order
+    or batch transform); xbatcher caches **materialized batches** (a separate copy in batch
+    layout with a fixed shuffle/augmentation baked in). A fair cache-vs-cache run (xbatcher
+    `cache=` enabled) is future work; read the table as insitu's cache vs the uncached default.
 
 <iframe src="../figures/g4_cache_epochs.html" width="100%" height="420" frameborder="0"></iframe>
 

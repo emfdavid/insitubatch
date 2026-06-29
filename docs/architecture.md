@@ -446,7 +446,9 @@ reused across metrics, lead times, models); datasets that fit in RAM/NVMe
 ### Cross-run persistence (deferred)
 
 Intra-run cross-epoch reuse is intrinsic (just don't evict). Surviving process exit
-needs more:
+needs more (xbatcher's batch cache, by contrast, *does* persist across runs — it writes
+assembled batches to a zarr store; the trade-off is a separate materialized copy in batch
+layout rather than a deduped decoded-chunk cache):
 
 - **A content key.** Within a run the key is `(array, chunk_index)` because one pool
   == one fixed pipeline. A cross-run key must add a fingerprint of (a) source
