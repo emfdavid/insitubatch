@@ -59,6 +59,13 @@ gpu = [
 virtual = [
     "virtualizarr>=1.2",
 ]
+# Stronger cross-run cache invalidation: cloudpickle fingerprints a chunk_transform
+# (closures + referenced globals), so editing one invalidates the persisted cache
+# automatically. Optional -- without it the fingerprint falls back to a best-effort
+# source hash (and warns); an explicit `transform.cache_key` is always honored.
+cache = [
+    "cloudpickle>=3",
+]
 # Benchmark suite extras: the xbatcher baseline (B2), plotting, and the py-spy
 # sampling profiler (probe_decode --profile). (pandas comes in transitively via
 # xarray.)
