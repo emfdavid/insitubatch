@@ -121,9 +121,10 @@ The cross-epoch probe on `fat_g16` confirms it independently (1006 → 4509, 4.5
     xbatcher **without** caching (the bench engine builds `BatchGenerator` with no `cache=`).
     xbatcher *does* have an opt-in cache
     ([docs](https://xbatcher.readthedocs.io/en/latest/user-guide/caching.html)): it serializes
-    **assembled batches** to a zarr store that persists across epochs *and across runs* —
-    insitu's chunk cache is in-process and cross-run persistence isn't built yet, so on that
-    axis xbatcher is ahead. The designs differ in kind: insitu caches **decoded chunks** in
+    **assembled batches** to a zarr store that persists across epochs *and across runs*. insitu
+    now persists across runs too (`persist=True`), but **this figure uses neither** persistent
+    cache — it measures insitu's in-process cross-epoch cache against the uncached worker stacks.
+    The designs differ in kind: insitu caches **decoded chunks** in
     the pool (no second copy, deduped across samples/splits, reusable under any shuffle order
     or batch transform); xbatcher caches **materialized batches** (a separate copy in batch
     layout with a fixed shuffle/augmentation baked in). A fair cache-vs-cache run (xbatcher

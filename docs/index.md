@@ -93,11 +93,11 @@ uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 
 **Alpha — validated on real cloud IO.** Built: planner + chunk-aligned splits, async
 obstore reads, the decoupled fetch **`Scheduler`** + **`ChunkPool`** (assembly buffer
-*and* cross-epoch cache — byte budget + pin/LRU, heap or mmap-on-NVMe), approximate
-(shuffle-block) shuffle, chunk/batch **transforms** (incl. a fitted `StandardScaler`),
-**prefetch**, and the **torch / JAX / TF** surfaces. Not yet built: `Regrid` + the
-**GPU/device** transform stage, multi-timestep windows that cross chunk boundaries, and
-cross-*run* cache persistence.
+*and* cache — byte budget + pin/LRU, heap or mmap-on-NVMe, with **cross-run
+persistence** via `persist=True`), approximate (shuffle-block) shuffle, chunk/batch
+**transforms** (incl. a fitted `StandardScaler`), **prefetch**, and the **torch / JAX /
+TF** surfaces. Not yet built: `Regrid` + the **GPU/device** transform stage, and
+multi-timestep windows that cross chunk boundaries.
 
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) is the single
 source of truth for status, the roadmap, and the scope limits.

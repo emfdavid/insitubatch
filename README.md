@@ -52,11 +52,11 @@ tiles scatter into a **`ChunkPool`** that is the assembly buffer *and* the cache
 (byte budget + pin/LRU, heap or mmap-on-NVMe). **Read concurrency and
 residency/shuffle span are independent dials** — the decoupling reaches ~1 GB/s at
 flat, low memory (validated on S3; see below). Built: planner + chunk-aligned
-splits, async obstore reads, the scheduler + pool (with **cross-epoch decode-once
-caching**), chunk/batch **transforms** (incl. a fitted `StandardScaler`),
-**prefetch**, the torch / JAX / TF surfaces, and runnable [examples](examples/);
-validated free-threading-correct on 3.13t. Not yet built: `Regrid` + the **GPU/device**
-transform stage, and cross-*run* cache persistence — see the roadmap in [DESIGN.md](DESIGN.md).
+splits, async obstore reads, the scheduler + pool (with **decode-once caching**,
+cross-epoch and **cross-run** via `persist=True`), chunk/batch **transforms** (incl. a
+fitted `StandardScaler`), **prefetch**, the torch / JAX / TF surfaces, and runnable
+[examples](examples/); validated free-threading-correct on 3.13t. Not yet built:
+`Regrid` + the **GPU/device** transform stage — see the roadmap in [DESIGN.md](DESIGN.md).
 
 📖 **Docs:** <https://emfdavid.github.io/insitubatch/>
 (see [Tuning](https://emfdavid.github.io/insitubatch/tuning/) for the
