@@ -250,8 +250,14 @@ def test_persist_warns_when_cache_unusable(write_zarr, tmp_path, caplog) -> None
 
     def make() -> InSituDataset:
         return InSituDataset(
-            url, manifest, batch_size=4, block_chunks=4, shuffle=False,
-            cache_dir=str(cache), persist=True, cache_budget_bytes=10_000_000,
+            url,
+            manifest,
+            batch_size=4,
+            block_chunks=4,
+            shuffle=False,
+            cache_dir=str(cache),
+            persist=True,
+            cache_budget_bytes=10_000_000,
         )
 
     ds = make()
