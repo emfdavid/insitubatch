@@ -18,6 +18,14 @@ Buffer and cache differ only in budget + backing, so they are the same code:
   the scatter writing straight into the slot either way; mmap keeps the working set
   as reclaimable page cache rather than anon heap.
 
+With ``persist=True`` (requires a ``backing_dir``) the mmap tier becomes a **cross-run
+cache**: slot files survive ``close`` (only budget eviction removes them), a JSON
+manifest records the completed entries, and a new pool over the same dir revives them
+as ready hits -- no fetch/decode. The ``backing_dir`` path *is* the dataset+pipeline
+identity (bury a version in it); the only automatic guard is a structural shape/dtype
+check on revive, and a mismatch is treated as a miss (recompute + overwrite), not an
+error. Without ``persist`` a ``backing_dir`` is ephemeral spill (unlinked on close).
+
 See [docs/architecture.md] for where this sits in the pipeline.
 
 Thread-safety / free-threading (the load-bearing invariant)
@@ -43,6 +51,7 @@ So the GIL build is just the serialized (slower) case; free threading is upside.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import threading
@@ -93,6 +102,9 @@ class ChunkPool:
     the *assembled* array, so a hit reflects decode + transform.
     """
 
+    _MANIFEST_NAME = "insitu_cache.json"
+    _MANIFEST_FORMAT = 1
+
     def __init__(
         self,
         geometries: dict[str, ArrayGeometry],
@@ -100,6 +112,7 @@ class ChunkPool:
         chunk_transforms: Sequence[ChunkTransform] = (),
         backing_dir: str | Path | None = None,
         budget_bytes: int | None = None,
+        persist: bool = False,
     ) -> None:
         self._geom = geometries  # label -> geometry (a label is one (array, offset) view)
         # Slots are keyed by the underlying array *path*, not the variable label, so two
@@ -115,6 +128,17 @@ class ChunkPool:
         self._dir = Path(backing_dir) if backing_dir is not None else None
         if self._dir is not None:
             self._dir.mkdir(parents=True, exist_ok=True)
+        # Cross-run persistence: keep slot files past close, write a manifest of completed
+        # entries, and revive them on reopen. Requires a dir to keep the files in. The dir
+        # path is the dataset+pipeline identity (the user buries a version in it); we only
+        # auto-check shape/dtype on revive (a mismatch is a miss, not an error).
+        self._persistent = persist
+        if persist and self._dir is None:
+            raise ValueError("persist=True requires cache_dir (a backing_dir) to keep files in")
+        # key -> on-disk filename for completed entries known to survive a run.
+        self._persisted: dict[tuple[str, int], str] = {}
+        if persist:
+            self._load_manifest()
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
         self._bytes = 0
         # OrderedDict in recency order (LRU front -> MRU back). Eviction targets only
@@ -189,21 +213,61 @@ class ChunkPool:
     def pin_if_ready(self, array: str, chunk_index: int) -> bool:
         """Incref + return ``True`` iff the chunk is resident, ready, and not failed.
 
-        A cross-epoch cache hit the driver can skip fetching -- but it must still be
-        referenced so it stays resident through the consumer's use (released at last
-        use like an admitted chunk), else it could be evicted before the waiter gathers
-        it and, since the driver fetches each chunk once, deadlock. One lock so the
-        check and the incref cannot race an eviction in between.
+        A cross-epoch (or, with ``persist``, cross-*run*) cache hit the driver can skip
+        fetching -- but it must still be referenced so it stays resident through the
+        consumer's use (released at last use like an admitted chunk), else it could be
+        evicted before the waiter gathers it and, since the driver fetches each chunk
+        once, deadlock. One lock so the check and the incref cannot race an eviction in
+        between. A persisted-on-disk chunk is revived here on first touch (see
+        :meth:`_revive`), so a cross-run hit costs no fetch.
         """
         with self._cv:
             key = (array, chunk_index)
             slot = self._slots.get(key)
-            if slot is not None and slot.ready and slot.error is None:
-                self._pin(key)
-                slot.claimed = True  # publish the claim so a waiter may now proceed
-                self._cv.notify_all()
-                return True
+            if not (slot is not None and slot.ready and slot.error is None):
+                if not self._revive(key):
+                    return False
+                slot = self._slots[key]
+            self._pin(key)
+            slot.claimed = True  # publish the claim so a waiter may now proceed
+            self._cv.notify_all()
+            return True
+
+    def _revive(self, key: tuple[str, int]) -> bool:  # call under the lock
+        """Bring a persisted on-disk chunk back as a ready slot (a cross-run hit).
+
+        Returns ``True`` iff the slot is now resident + ready. Validates the stored
+        ``.npy`` shape/dtype against the current geometry; a mismatch (or an unreadable
+        file) is a **miss** -- the entry is dropped from the registry and the stale file
+        is overwritten when the chunk is next fetched. Charges the slot to the budget,
+        evicting unpinned-LRU for room; if none can be freed it stays a miss (the driver
+        re-fetches -- correct, just uncached this once).
+        """
+        if not self._persistent or key in self._slots:
             return False
+        fname = self._persisted.get(key)
+        if fname is None:
+            return False
+        array, chunk_index = key
+        geom = self._by_path.get(array)
+        assert self._dir is not None
+        try:
+            data = np.lib.format.open_memmap(self._dir / fname, mode="r")
+        except (OSError, ValueError):
+            self._persisted.pop(key, None)
+            return False
+        if geom is None or data.shape != geom.slot_shape(chunk_index) or data.dtype != geom.dtype:
+            del data  # drop the mmap ref; structural fingerprint mismatch -> a miss
+            self._persisted.pop(key, None)
+            return False
+        nbytes = int(data.nbytes)
+        if not self._make_room(nbytes):
+            del data
+            return False
+        self._slots[key] = _Slot(data=data, remaining=0, nbytes=nbytes, ready=True)
+        self._bytes += nbytes
+        self.max_resident = max(self.max_resident, len(self._positions()))
+        return True
 
     def pin_keys(self, keys: set[tuple[str, int]]) -> None:
         """Reference (incref) a set of ``(path, chunk_index)`` slots for a live block.
@@ -281,7 +345,13 @@ class ChunkPool:
         slot = self._slots.pop(key)
         self._pinned.pop(key, None)  # no stale refcount if dropping a (rare) pinned partial
         self._bytes -= slot.nbytes
-        self._free(slot)
+        # In persist mode a *ready* eviction is a cache demotion, not a deletion: keep the
+        # .npy on disk and register it so a later epoch/run can revive it. A not-ready
+        # partial is garbage either way -> unlink it.
+        keep = self._persistent and slot.ready
+        if keep:
+            self._register_persisted(key, slot)
+        self._free(slot, keep_file=keep)
 
     def _alloc(
         self, array: str, chunk_index: int, shape: tuple[int, ...], dtype: np.dtype
@@ -428,24 +498,69 @@ class ChunkPool:
         offsets = {var: self._geom[var].offset for var in variables}
         return Batch(arrays=arrays, sample_indices=anchor, offsets=offsets)
 
-    def _free(self, slot: _Slot) -> None:
-        """Release a slot's backing: a no-op for heap, flush+close+unlink for mmap.
+    def _free(self, slot: _Slot, *, keep_file: bool) -> None:
+        """Release a slot's backing: a no-op for heap, close (and maybe unlink) for mmap.
 
-        Dropping a slot drops its cached bytes (intra-run); cross-*run* persistence
-        (keep the file + a content-keyed index) is the deferred follow-up.
+        ``keep_file`` leaves the ``.npy`` on disk (a persisted cache entry); otherwise the
+        file is unlinked (heap/spill teardown or a discarded partial).
         """
         mmap = getattr(slot.data, "_mmap", None)
         if mmap is not None:
             fname = getattr(slot.data, "filename", None)
             mmap.close()
-            if fname:
+            if fname and not keep_file:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(fname)
 
+    def _register_persisted(self, key: tuple[str, int], slot: _Slot) -> None:  # under the lock
+        """Record a ready mmap slot's file as a surviving cache entry (persist mode)."""
+        fname = getattr(slot.data, "filename", None)
+        if fname is not None:
+            self._persisted[key] = Path(fname).name
+
+    def _load_manifest(self) -> None:
+        """Populate the persisted-entry registry from a prior run's manifest, if any.
+
+        An unreadable manifest, a format mismatch, or a missing file is just a cold start
+        (no entries loaded) -- never an error. Per-entry shape/dtype validation is deferred
+        to :meth:`_revive`, which reads it straight from the ``.npy`` header.
+        """
+        assert self._dir is not None
+        path = self._dir / self._MANIFEST_NAME
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if doc.get("format_version") != self._MANIFEST_FORMAT:
+            return
+        for entry in doc.get("entries", []):
+            fname = entry["file"]
+            if (self._dir / fname).exists():
+                self._persisted[(entry["array"], int(entry["chunk_index"]))] = fname
+
+    def _write_manifest(self) -> None:  # call under the lock
+        """Atomically write the registry of completed cache entries (persist mode)."""
+        assert self._dir is not None
+        entries = [
+            {"array": array, "chunk_index": cid, "file": fname}
+            for (array, cid), fname in sorted(self._persisted.items())
+        ]
+        doc = {"format_version": self._MANIFEST_FORMAT, "entries": entries}
+        tmp = self._dir / (self._MANIFEST_NAME + ".tmp")
+        tmp.write_text(json.dumps(doc))
+        os.replace(tmp, self._dir / self._MANIFEST_NAME)
+
     def close(self) -> None:
-        """Free every remaining slot (mmap files included) -- e.g. on teardown."""
+        """Free every remaining slot. Persist mode keeps ready cache files + a manifest;
+        otherwise (heap/spill) mmap files are unlinked -- e.g. on teardown."""
         with self._cv:
+            if self._persistent:
+                for key, slot in self._slots.items():
+                    if slot.ready:
+                        self._register_persisted(key, slot)
+                self._write_manifest()
             for k in list(self._slots):
-                self._free(self._slots.pop(k))
+                slot = self._slots.pop(k)
+                self._free(slot, keep_file=self._persistent and slot.ready)
             self._bytes = 0
             self._pinned.clear()

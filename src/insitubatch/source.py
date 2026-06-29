@@ -116,6 +116,7 @@ class InSituDataset:
         prefetch_depth: int = 2,
         cache_dir: str | None = None,
         cache_budget_bytes: int | None = None,
+        persist: bool = False,
         on_bad_chunk: str = "raise",
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
@@ -188,11 +189,17 @@ class InSituDataset:
             n_train_chunks = len(self.manifest.chunks[SplitName.TRAIN.value])
             working_set = max(working_set, n_train_chunks * per_chunk_all_vars)
         self.cache_budget_bytes = max(int(cache_budget_bytes or 0), working_set)
+        # persist turns the cache_dir mmap tier into a cross-run cache (files + manifest
+        # survive close; reopen revives them as hits). It needs a dir to keep files in;
+        # the dir path is the dataset+pipeline identity (bury a version in it).
+        if persist and cache_dir is None:
+            raise ValueError("persist=True requires cache_dir to keep the cache files in")
         self._pool = ChunkPool(
             self.geometries,
             chunk_transforms=self.chunk_transforms,
             backing_dir=cache_dir,
             budget_bytes=self.cache_budget_bytes,
+            persist=persist,
         )
 
         # One concurrency dial (max_inflight, network), independent of the shuffle
@@ -381,10 +388,12 @@ class InSituDataset:
                 self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
 
     def close(self) -> None:
-        """Release the cache pool's backing (mmap files, cached chunks).
+        """Release the cache pool's backing (mmap handles, cached chunks).
 
         The pool persists across epochs, so close it when done training -- not per
-        epoch. Idempotent; also called on GC.
+        epoch. With ``persist=True`` the cache files + manifest are kept on disk for a
+        future run (only the in-memory handles are released); otherwise the mmap spill
+        files are unlinked. Idempotent; also called on GC.
         """
         self._pool.close()
 
