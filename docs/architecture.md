@@ -249,6 +249,11 @@ work for every reused sample — we refuse that by default.
 transforms need **not** be picklable — stateful normalizers, closures, GPU objects
 all work. torch's DataLoader forces picklable transforms across `fork`.
 
+Runnable side-by-side example:
+[`examples/transforms.py`](https://github.com/emfdavid/insitubatch/blob/main/examples/transforms.py)
+— a Kelvin→Celsius `chunk_transform` (one variable, cached) and a cross-variable windspeed
+`batch_transform` (needs the assembled batch, uncached).
+
 ### Standard scaler — pre-fit GLOBAL stats (not per-chunk)
 
 ```python

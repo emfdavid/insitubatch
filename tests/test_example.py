@@ -40,6 +40,18 @@ def test_wb2_xbatcher_example_spawns(tmp_path) -> None:
     assert summary["ttfb_ms"] > 0.0
 
 
+def test_transforms_example_runs_both_stages(tmp_path) -> None:
+    from examples.transforms import run_demo
+
+    summary = run_demo(url=None, verbose=False)  # synthetic, no network
+    # the cross-variable derived field proves the batch_transform ran
+    assert summary["variables"] == ["t2m", "u10", "v10", "windspeed"]
+    assert -50.0 < summary["t2m_mean_c"] < 50.0  # chunk_transform converted K -> C
+    assert summary["windspeed_mean"] > 0.0
+    assert summary["windspeed_nonneg"]
+    assert summary["samples"] > 0
+
+
 def test_fit_scaler_example_partial_fit(tmp_path) -> None:
     pytest.importorskip("sklearn")  # bench extra
     from examples.fit_scaler import run_demo
