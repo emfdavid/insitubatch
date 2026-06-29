@@ -8,6 +8,29 @@ makes the whole result dismissible — so the baselines below are load-bearing.
 > **B2 (xbatcher + DataLoader)** is in the comparison and tuned. The naive/worker
 > baselines are enough to develop against; B2 is the credibility bar for a claim.
 
+The published results live on the [benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/);
+the boxes to run this on are in [`ops_aws.md`](ops_aws.md) / [`ops_gcp.md`](ops_gcp.md).
+
+## Contents
+
+- [The four stories](#the-four-stories)
+- [Comparison set](#comparison-set)
+- [Axes and metrics](#axes-and-metrics)
+- [Full run — datasets + commands](#full-run--datasets--commands)
+    - [Make the datasets](#make-the-datasets)
+    - [Story 1 — chunks, not samples](#story-1--chunks-not-samples-the-suite-vs-baselines)
+    - [Story 2 — concurrency/residency](#story-2--the-v2-decoupling-max_inflight-sweep--sawtooth)
+    - [Story 3 — the cache](#story-3--the-cache-decode-once-across-epochs)
+    - [Story 4 — efficiency vs the ceiling](#story-4--efficiency-vs-the-raw-get-ceiling)
+    - [Memory by engine](#memory-by-engine-the-g5-rebuild)
+    - [Cold-start on WeatherBench2](#cold-start-on-weatherbench2-the-earthmover-demo-head-to-head)
+    - [Free-threading readiness](#free-threading-readiness-panels)
+    - [Windowed-sampling overhead](#windowed-sampling-overhead-m-w-refcount-no-regression)
+    - [S3 Express One Zone stress](#s3-express-one-zone-stress-story-4-on-a-directory-bucket)
+- [Graphs (deliverables)](#graphs-deliverables)
+- [Rigor](#rigor-what-makes-it-convincing)
+- [Phasing](#phasing)
+
 ## The four stories
 
 The post-V2 architecture tells four clean results. Everything below maps to one
@@ -46,7 +69,7 @@ Engines (`bench/engines.py`):
 - **workers** — map-style `Dataset` + `DataLoader(num_workers=N, prefetch_factor=k)`.
   The DIY pattern: `__getitem__` returns one sample, so the containing chunk is
   decoded once **per sample** with no shared cache. **Must be tuned** (sweep `N`,
-  report best) or it's a strawman. This is *not* the Earthmover stack.
+  report best) or the comparison isn't fair. This is *not* the Earthmover stack.
 - **xbatcher** — xbatcher + `DataLoader` (the **Earthmover** / domain-standard
   stack). **Required before claiming a win.** Match *their* tuning, not our
   defaults: the post used `num_workers=32`, `prefetch_factor=3` — so sweep
@@ -89,8 +112,10 @@ engine). Provenance in every row: instance type, region, vCPU, codec, date.
 Run from the bench VM (see [ops_aws.md](ops_aws.md)). Set once:
 
 ```bash
-export BUCKET=insitubatch-bench                       # regular S3, same region as the VM
-export XBUCKET=insitubatch-bench--use1-az4--x-s3      # S3 Express directory bucket, AZ-matched
+# regular S3, same region as the VM
+export BUCKET=insitubatch-bench
+# S3 Express directory bucket, AZ-matched
+export XBUCKET=insitubatch-bench--use1-az4--x-s3
 export AWS_REGION=us-east-1
 ```
 
@@ -265,7 +290,8 @@ the picture is time in **Rust IO + C decode + numpy**, with only a thin Python s
 Run it on the regular env (py-spy is in `--extra bench`) at one steady-state concurrency:
 
 ```bash
-sudo sysctl -w kernel.yama.ptrace_scope=0   # once; py-spy --native needs ptrace
+# once; py-spy --native needs ptrace
+sudo sysctl -w kernel.yama.ptrace_scope=0
 uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fat_g16.zarr \
   --max-inflight 64 --max-chunks 256 --repeats 3 --no-decode-sweep --no-raw \
   --profile bench/results/profile_fat_g16.svg
@@ -331,7 +357,7 @@ clean TTFB story the G5 probe's cross-engine column can't give. Needs the `bench
 (xbatcher, gcsfs) + torch; drop `--wb2` for a network-free synthetic sanity run.
 
 ```bash
-# Earthmover stack (xbatcher + torch DataLoader): worker-process brute force. --compare
+# Earthmover stack (xbatcher + torch DataLoader): the worker-process model. --compare
 # sweeps the worker start methods -- spawn re-imports per worker (slow), forkserver/preload
 # amortize it -- and prints the mp-mode TTFB table.
 uv run python -m examples.wb2_xbatcher --wb2 --compare --subregion 48,48 --max-batches 100 \
@@ -348,8 +374,8 @@ samples/s** at **~1.9–3.3 s** to first batch (`forkserver-preload` lowest TTFB
 designed), while insitu runs **~2250 samples/s** at **~320 ms** — **~40× the throughput**,
 because WB2's fat time-chunks make the per-sample decode brutal for the worker stack and
 insitu reads each chunk once. That is the framing — xbatcher is the domain-standard
-*batch definition*, but its **engine is worker-process brute force** (many procs, heavy
-memory, slow cold start); insitu keeps the ndim batch semantics with one async loop,
+*batch definition*, but its **engine is worker-process based** (many procs, heavier
+memory, slower cold start); insitu keeps the ndim batch semantics with one async loop,
 **batteries-included across the chunk spectrum** — its edge grows with samples-per-chunk
 and needs enough chunks in flight to saturate IO (it only gives ground in the pathological
 few-giant-single-inner-chunk case, which spatial chunking fixes).
