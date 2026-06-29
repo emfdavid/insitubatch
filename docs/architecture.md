@@ -443,12 +443,35 @@ fat-chunk regime (one chunk → many batches); scoring/verification (reference c
 reused across metrics, lead times, models); datasets that fit in RAM/NVMe
 (effectively in-memory at GPU-fed speed after the first pass).
 
-### Cross-run persistence (deferred)
+### Two cache models: chunks vs batches
+
+insitubatch and xbatcher both cache — they cache *different things*, and each choice
+buys something real. [xbatcher](https://github.com/xarray-contrib/xbatcher) serializes
+**assembled batches** to a zarr store; insitubatch retains **decoded, chunk-transformed
+chunks** in the pool. Caching whole batches is a deliberate design choice, not a
+shortcut: it is exactly what lets xbatcher's cache survive process exit today.
+
+| dimension | insitubatch — chunk pool | xbatcher — batch cache |
+|---|---|---|
+| unit cached | decoded + chunk-transformed **chunk** (deduped) | **assembled batch**, in batch layout |
+| extra copy | none — `gather` views the slot in place | a separate materialized copy |
+| key | `(array, chunk_index)` | batch index → zarr store |
+| backing | heap or mmap'd `.npy` (reclaimable NVMe page cache) | zarr store (local dir or cloud) |
+| cross-epoch reuse | intrinsic (just don't evict) | yes |
+| cross-run persistence | **not yet** (see below) | **yes** — survives restarts |
+| shuffle | sits *before* shuffle: sample→batch membership re-drawn every epoch | batch composition frozen; only batch *order* reshuffles |
+| sweet spot | many samples per chunk, fat-chunk, multi-epoch, scoring reuse | one-sample-per-chunk, stable batch defs reused across runs |
+
+The two rows that decide it: insitu avoids the second copy and keeps a stronger
+per-epoch shuffle (the cache is upstream of shuffling), while xbatcher's batch cache
+**persists across runs** and insitu's does not — yet. Closing that one gap is the
+cross-run work below.
+
+### Cross-run persistence (planned)
 
 Intra-run cross-epoch reuse is intrinsic (just don't evict). Surviving process exit
-needs more (xbatcher's batch cache, by contrast, *does* persist across runs — it writes
-assembled batches to a zarr store; the trade-off is a separate materialized copy in batch
-layout rather than a deduped decoded-chunk cache):
+is the one place the batch-cache model leads today, and it is the gap this closes — a
+deduped decoded-chunk tier on NVMe rather than a separate materialized batch copy:
 
 - **A content key.** Within a run the key is `(array, chunk_index)` because one pool
   == one fixed pipeline. A cross-run key must add a fingerprint of (a) source
