@@ -276,6 +276,27 @@ uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
   --repeats 3 --cache-dir /mnt/nvme/insitu-cache --plot
 ```
 
+#### Cache-vs-cache (xbatcher `cache=` enabled) — future work, not yet wired
+
+The story-3 run above is insitu's chunk cache vs xbatcher's *uncached* path: the
+xbatcher engine (`bench/engines.py:_run_xbatcher`) builds
+`BatchGenerator(da, input_dims=...)` with **no `cache=`**. A fair cache-vs-cache
+comparison needs two changes first:
+
+1. **Wire xbatcher's batch cache** into `_run_xbatcher`: pass
+   `BatchGenerator(..., cache=zarr.storage.DirectoryStore("/mnt/nvme/xb-cache"))`
+   behind a new `--caches` value (e.g. `xb-disk`) so the harness can select it.
+2. **Match shuffle semantics.** xbatcher's cache freezes batch composition (only
+   batch *order* reshuffles via the DataLoader); insitu re-draws membership each
+   epoch. Either disable shuffle on both for the throughput number, or report the
+   shuffle asymmetry alongside it — don't quietly compare a frozen-composition warm
+   read against insitu's full reshuffle. See the caching-continuum table in
+   [architecture.md](../docs/architecture.md).
+
+Run it on the **`c6id.8xlarge`** bench box (32 vCPU + NVMe), not a small instance —
+both caches want the instance-store NVMe and enough cores to keep the warm path
+loader-bound, not CPU-bound.
+
 ### Story 4 — efficiency vs the raw-GET ceiling
 
 The probe's sec-2 raw-GET section (on by default) reads the same bytes with no
