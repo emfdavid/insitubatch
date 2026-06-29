@@ -21,10 +21,14 @@ Buffer and cache differ only in budget + backing, so they are the same code:
 With ``persist=True`` (requires a ``backing_dir``) the mmap tier becomes a **cross-run
 cache**: slot files survive ``close`` (only budget eviction removes them), a JSON
 manifest records the completed entries, and a new pool over the same dir revives them
-as ready hits -- no fetch/decode. The ``backing_dir`` path *is* the dataset+pipeline
-identity (bury a version in it); the only automatic guard is a structural shape/dtype
-check on revive, and a mismatch is treated as a miss (recompute + overwrite), not an
-error. Without ``persist`` a ``backing_dir`` is ephemeral spill (unlinked on close).
+as ready hits -- no fetch/decode. The ``backing_dir`` path *is* the dataset identity
+(bury a version in it; the store URL is not in the key). Two automatic guards: the
+manifest carries a **chunk_transform fingerprint** (changed transforms -> whole cache
+discarded) and revive does a **shape/dtype** check per entry; either mismatch is a miss
+(recompute + overwrite), never an error. The fingerprint uses cloudpickle when present
+(``--extra cache``; captures closures/globals), else a best-effort source hash (warned),
+and always honors an explicit ``transform.cache_key``. Without ``persist`` a
+``backing_dir`` is ephemeral spill (unlinked on close).
 
 See [docs/architecture.md] for where this sits in the pipeline.
 
@@ -51,6 +55,8 @@ So the GIL build is just the serialized (slower) case; free threading is upside.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import inspect
 import json
 import logging
 import os
@@ -65,6 +71,11 @@ import numpy as np
 
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk
 
+try:  # optional: stronger transform fingerprint (closures + globals). `--extra cache`.
+    import cloudpickle
+except ImportError:  # pragma: no cover - exercised by the no-cloudpickle fallback path
+    cloudpickle = None
+
 logger = logging.getLogger(__name__)
 
 ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
@@ -72,6 +83,35 @@ ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
 
 def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def _transform_token(fn: ChunkTransform) -> str:
+    """A stable identity for one chunk_transform, for the cross-run cache fingerprint.
+
+    Precedence: an explicit ``fn.cache_key`` (user-owned, strongest) -> a cloudpickle
+    hash if available (captures closure cells + referenced globals) -> a best-effort
+    source/qualname hash (catches an edited body, but NOT a changed closed-over constant
+    or a called helper -- the same blind spot joblib has). The method is encoded in the
+    token, so toggling cloudpickle on/off changes the fingerprint (honest re-compute
+    rather than a false match).
+    """
+    key = getattr(fn, "cache_key", None)
+    if key is not None:
+        return f"key:{key}"
+    if cloudpickle is not None:
+        with contextlib.suppress(Exception):  # unpicklable -> fall through to source
+            return "pickle:" + hashlib.sha256(cloudpickle.dumps(fn)).hexdigest()
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        src = ""  # C funcs / REPL: no source -> lean on the qualname alone
+    name = getattr(fn, "__qualname__", repr(fn))
+    return "src:" + hashlib.sha256(f"{name}\n{src}".encode()).hexdigest()
+
+
+def _has_weak_token(transforms: Sequence[ChunkTransform]) -> bool:
+    """True if any transform falls back to the source hash (no cache_key, no cloudpickle)."""
+    return cloudpickle is None and any(getattr(t, "cache_key", None) is None for t in transforms)
 
 
 @dataclass(slots=True)
@@ -149,7 +189,23 @@ class ChunkPool:
             raise ValueError("persist=True requires cache_dir (a backing_dir) to keep files in")
         # key -> on-disk filename for completed entries known to survive a run.
         self._persisted: dict[tuple[str, int], str] = {}
+        # Fingerprint of the chunk_transform pipeline (only chunk_transforms are baked into
+        # cached chunks; batch_transforms run post-cache). A run whose fingerprint differs
+        # from the manifest's discards the cache (changed transforms -> stale). batch
+        # transforms and the store identity are out of scope (the cache_dir path is the
+        # dataset identity -- see the class docstring).
+        self._pipeline_fp = ""
         if persist:
+            self._pipeline_fp = hashlib.sha256(
+                "\n".join(_transform_token(t) for t in self._chunk_transforms).encode()
+            ).hexdigest()
+            if _has_weak_token(self._chunk_transforms):
+                logger.warning(
+                    "persist: cloudpickle not installed and a chunk_transform has no "
+                    "cache_key -> cache invalidation on transform changes is best-effort "
+                    "(source only; closure/global changes may not invalidate). Install "
+                    "`insitubatch[cache]` or set a `cache_key` attribute for a stronger guarantee."
+                )
             self._load_manifest()
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
         self._bytes = 0
@@ -574,6 +630,13 @@ class ChunkPool:
                 self._MANIFEST_FORMAT,
             )
             return
+        if doc.get("pipeline_hash") != self._pipeline_fp:
+            logger.warning(
+                "persist: chunk_transform fingerprint changed since %s was written; "
+                "ignoring the stale cache (starting cold)",
+                path,
+            )
+            return
         for entry in doc.get("entries", []):
             self._persisted[(entry["array"], int(entry["chunk_index"]))] = entry["file"]
         self.manifest_entries = len(self._persisted)
@@ -585,7 +648,11 @@ class ChunkPool:
             {"array": array, "chunk_index": cid, "file": fname}
             for (array, cid), fname in sorted(self._persisted.items())
         ]
-        doc = {"format_version": self._MANIFEST_FORMAT, "entries": entries}
+        doc = {
+            "format_version": self._MANIFEST_FORMAT,
+            "pipeline_hash": self._pipeline_fp,
+            "entries": entries,
+        }
         tmp = self._dir / (self._MANIFEST_NAME + ".tmp")
         tmp.write_text(json.dumps(doc))
         os.replace(tmp, self._dir / self._MANIFEST_NAME)

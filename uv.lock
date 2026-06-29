@@ -1271,6 +1271,9 @@ bench = [
     { name = "scikit-learn" },
     { name = "xbatcher" },
 ]
+cache = [
+    { name = "cloudpickle" },
+]
 docs = [
     { name = "mkdocs-material" },
     { name = "mkdocstrings", extra = ["python"] },
@@ -1310,6 +1313,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "arraylake", marker = "extra == 'arraylake'", specifier = ">=0.14" },
+    { name = "cloudpickle", marker = "extra == 'cache'", specifier = ">=3" },
     { name = "cupy-cuda12x", marker = "extra == 'gpu'", specifier = ">=13.0" },
     { name = "flax", marker = "extra == 'jax'", specifier = ">=0.8" },
     { name = "gcsfs", marker = "extra == 'bench'", specifier = ">=2024.6" },
@@ -1333,7 +1337,7 @@ requires-dist = [
     { name = "xbatcher", marker = "extra == 'bench'", specifier = ">=0.3" },
     { name = "zarr", specifier = ">=3.0" },
 ]
-provides-extras = ["torch", "jax", "tf", "gpu", "virtual", "bench", "docs", "icechunk", "arraylake"]
+provides-extras = ["torch", "jax", "tf", "gpu", "virtual", "cache", "bench", "docs", "icechunk", "arraylake"]
 
 [package.metadata.requires-dev]
 dev = [

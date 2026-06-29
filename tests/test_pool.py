@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
@@ -402,6 +403,123 @@ def test_pool_persist_invalidates_on_geometry_mismatch(tiled_store, tmp_path):
     assert not pool2.pin_if_ready("single_inner", 0), "geometry drift must invalidate"
     assert pool2.revive_mismatch == 1 and pool2.hits == 0  # the mismatch is counted
     pool2.close()
+
+
+def test_pool_persist_invalidates_on_transform_change(tiled_store, tmp_path):
+    """The manifest carries a chunk_transform fingerprint: the same transform reopens as
+    a hit; a changed transform discards the whole cache (cold start), not a false hit."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    def scale_a(chunk):
+        chunk.data = chunk.data * 2.0
+        return chunk
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_a])
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+
+    same = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_a])
+    assert same.manifest_entries == 1 and same.pin_if_ready("single_inner", 0)  # same fp -> hit
+    same.close()
+
+    def scale_b(chunk):  # different body -> different fingerprint
+        chunk.data = chunk.data * 3.0
+        return chunk
+
+    changed = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_b])
+    assert changed.manifest_entries == 0  # stale cache discarded, not loaded
+    assert not changed.pin_if_ready("single_inner", 0)
+    changed.close()
+
+
+def test_pool_persist_cache_key_overrides_fingerprint(tiled_store, tmp_path):
+    """An explicit transform.cache_key is authoritative: distinct function objects sharing
+    a key reopen as a hit; bumping the key invalidates."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    def t1(chunk):
+        return chunk
+
+    t1.cache_key = "v1"  # type: ignore[attr-defined]
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t1])
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+
+    def t2(chunk):  # a different object/body, same declared key -> treated as identical
+        return chunk
+
+    t2.cache_key = "v1"  # type: ignore[attr-defined]
+    same = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t2])
+    assert same.pin_if_ready("single_inner", 0)
+    same.close()
+
+    t2.cache_key = "v2"  # type: ignore[attr-defined]  # bump the key -> invalidate
+    changed = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t2])
+    assert changed.manifest_entries == 0
+    changed.close()
+
+
+def test_pool_persist_cloudpickle_catches_closure_change(tiled_store, tmp_path):
+    """cloudpickle's stronger guarantee: two closures with identical source but a different
+    closed-over constant get different fingerprints (a source hash would falsely match)."""
+    pytest.importorskip("cloudpickle")
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    def make_scaler(factor):  # identical source text; only the closure cell differs
+        def scale(chunk):
+            chunk.data = chunk.data * factor
+            return chunk
+
+        return scale
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[make_scaler(2.0)])
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+
+    changed = ChunkPool(
+        geoms, backing_dir=backing, persist=True, chunk_transforms=[make_scaler(3.0)]
+    )
+    assert changed.manifest_entries == 0  # closure-value change caught -> cache discarded
+    changed.close()
+
+
+def test_pool_persist_without_cloudpickle_warns_and_falls_back(
+    tiled_store, tmp_path, monkeypatch, caplog
+):
+    """No cloudpickle + no cache_key -> a best-effort source fingerprint, with a one-time
+    warning. The source hash still reopens an unchanged transform as a hit."""
+    monkeypatch.setattr("insitubatch.pool.cloudpickle", None)
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    def scale(chunk):
+        chunk.data = chunk.data * 2.0
+        return chunk
+
+    with caplog.at_level(logging.WARNING, logger="insitubatch.pool"):
+        pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale])
+    assert any("best-effort" in r.message for r in caplog.records), caplog.text
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+
+    same = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale])
+    assert same.pin_if_ready("single_inner", 0)  # source hash matches -> hit
+    same.close()
 
 
 def test_pool_spill_unlinks_without_persist(tiled_store, tmp_path):
