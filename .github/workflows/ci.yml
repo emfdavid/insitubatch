@@ -51,8 +51,10 @@ jobs:
       matrix:
         include:
           # torch + the cold-start bench deps + the Icechunk handoff (no jax/tf in this env).
+          # cache pulls cloudpickle so the cross-run cache fingerprint exercises its
+          # cloudpickle path here rather than importorskip-skipping it.
           - python: "3.12"
-            extras: "--extra torch --extra bench --extra icechunk"
+            extras: "--extra torch --extra bench --extra icechunk --extra cache"
           # JAX alone.
           - python: "3.12"
             extras: "--extra jax"
