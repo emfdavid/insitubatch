@@ -88,6 +88,18 @@ class InSituDataset:
     Batches are numpy :class:`Batch`; convert to a framework with
     :mod:`insitubatch.frameworks` (``as_torch`` / ``to_jax`` / ``as_tf_dataset``). A
     different per-split configuration (e.g. train-only augmentation) is a separate dataset.
+
+    Two preprocessing hooks, placed by cost (full model in the docs, "Transforms"):
+
+    - ``chunk_transforms`` -- ``(DecodedChunk) -> DecodedChunk``, run per chunk *before*
+      shuffle, seeing **one variable**. The cacheable home for elementwise, per-variable,
+      deterministic work (scaling, unit conversion, dtype cast); amortized over every sample
+      in the chunk and reused across epochs.
+    - ``batch_transforms`` -- ``(Batch) -> Batch``, run per assembled batch, seeing **all
+      variables** aligned on the sample axis. For cross-variable derived fields and
+      per-sample random augmentation; runs after the cache, so it is **never cached**.
+
+    Runnable side-by-side example: ``examples/transforms.py``.
     """
 
     def __init__(

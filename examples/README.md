@@ -78,6 +78,14 @@ can see the cold-start trade-off and pick what fits your workload:
   defines the batches, torch `DataLoader` runs them), with a focus on cold-start latency
   and how `forkserver-preload` cuts it (useful whichever loader you ship).
 
+## Transforms
+
+- [`transforms.py`](transforms.py) — the two user transform stages side by side on a tiny
+  offline store: a Kelvin→Celsius `chunk_transform` (per chunk, one variable, cached) and a
+  cross-variable windspeed `batch_transform` (needs the assembled batch, uncached). The
+  clearest illustration of *why there are two*; see docs/architecture.md "Transforms" for
+  the placement model. Runs with no network: `uv run python -m examples.transforms`.
+
 ## Normalization
 
 - [`fit_scaler.py`](fit_scaler.py) — fit a `StandardScaler` over the loader with sklearn
