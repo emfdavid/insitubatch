@@ -151,17 +151,19 @@ adapter layer in `insitubatch.frameworks`; the core imports no framework.
 from insitubatch import open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 
-url = "file:///data/era5.zarr"           # or "s3://bucket/era5.zarr" — same code
-geoms = open_geometries(url)             # {var: ArrayGeometry} from zarr metadata
+url = "file:///data/era5.zarr"  # or "s3://bucket/era5.zarr" — same code
+geoms = open_geometries(url)  # {var: ArrayGeometry} from zarr metadata
+# contiguous chunk blocks by default (no time-series leakage);
+# pass contiguous=False for exchangeable samples (independent scenes)
 manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 
 ds = InSituDataset(url, manifest, batch_size=32, block_chunks=16)
 
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)
-    for batch in ds.train:               # numpy Batch: {var: np.ndarray} + sample_indices
+    for batch in ds.train:  # numpy Batch: {var: np.ndarray} + sample_indices
         ...
-    for batch in ds.val:                 # deterministic; shares the pool with train
+    for batch in ds.val:  # deterministic; shares the pool with train
         ...
 ```
 

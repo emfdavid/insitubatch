@@ -334,7 +334,41 @@ NaN-containing *samples* is deliberately not automatic (it would break the fixed
 vectorized gather); exclude known-bad chunks at the split/manifest level instead
 (`ds.bad_chunks` gives you the list to quarantine).
 
-## Subsetting the sample (time) axis — define it with xarray
+## Splits — chunk-aligned and leakage-safe
+
+Train/val/test are partitioned **ahead of time, at chunk granularity** along the sample
+axis — `split_by_chunk` assigns whole chunks to each split, never individual samples. Two
+reasons:
+
+- **No leakage.** A sample never straddles a split boundary, and the temporally adjacent,
+  autocorrelated samples inside a chunk can't land on opposite sides of train/val.
+- **Reads stay chunk-aligned.** Every read serves exactly one split — no half-chunk waste,
+  no sample shared between two splits.
+
+The result is a `SplitManifest` (which chunk indices belong to each split), persisted as JSON
+for reproducibility; the dataset's views (`ds.train` / `ds.val` / `ds.test`) read from it.
+
+**`contiguous` is the decision to get right.** By default (`contiguous=True`) each split is a
+*contiguous block* of chunks — the safe choice for time series, where a randomly interleaved
+split still leaks through autocorrelation across chunk boundaries (a val chunk wedged between
+two train chunks shares its neighbours' weather). Set `contiguous=False` only when samples are
+**exchangeable** (independent scenes); it shuffles chunks before partitioning.
+
+```python
+from insitubatch import open_geometries, split_by_chunk
+
+geom = open_geometries(url)[var]
+# time series (default): contiguous blocks, no cross-boundary leakage
+manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
+# independent scenes: shuffle chunks before splitting
+manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1), contiguous=False)
+```
+
+`fractions` are fractions of *chunks*, not samples (for many chunks the two converge). See
+`split_by_chunk` in the [API reference](api.md) and "Splits" in
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) for the rationale.
+
+### Subsetting to a window — define it with xarray
 
 The `SplitManifest` records *which sample-axis chunks* belong to each split, so to
 train on a window of a long archive you just restrict the manifest. `split_by_chunk`
@@ -348,15 +382,17 @@ import xarray as xr
 from insitubatch import open_geometries, split_by_chunk, store_from_url
 from insitubatch.source import InSituDataset
 
+# define the window in xarray
 xds = xr.open_zarr(store_from_url(url))
-sel = xds.sel(time=slice("2020-01-01", "2021-01-01"))      # define it in xarray
+sel = xds.sel(time=slice("2020-01-01", "2021-01-01"))
 times = xds.indexes["time"]
 i0 = times.get_loc(sel.time.values[0])
-i1 = times.get_loc(sel.time.values[-1]) + 1                # half-open
+i1 = times.get_loc(sel.time.values[-1]) + 1  # half-open
 
+# pure zarr/numpy from here
 geom = open_geometries(url)[var]
 manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1), sample_range=(i0, i1))
-ds = InSituDataset(url, manifest, ...)                     # pure zarr/numpy from here
+ds = InSituDataset(url, manifest, ...)
 ```
 
 **Limitation — chunk-aligned and contiguous.** The selection snaps *outward* to chunk
