@@ -165,6 +165,56 @@ flowchart LR
 Same shape as `torchdata.nodes.Prefetcher`, but async-native. This is what turns a
 throughput win into a *GPU-fed* win.
 
+## Trade-offs: chunk size, shuffle window, concurrency, batch size
+
+Four dials shape throughput and memory, and the engine keeps them as independent as possible
+so you can move one without paying on the others. This is the model behind them; for the
+values to actually set, see [Tuning](tuning.md).
+
+| dial | what it trades | bounded by |
+|---|---|---|
+| **stored-chunk size** (`inner_chunks`, write time) | fetch granularity ↔ per-request overhead | a tile of ~10–50 MB |
+| **read concurrency** (`max_inflight`) | network saturation ↔ in-flight memory | the store's raw-GET knee |
+| **shuffle window** (`block_chunks`) | shuffle quality ↔ resident memory | RAM / cache budget |
+| **batch size** (`batch_size`) | the model's step size | the window's sample pool |
+
+**Chunk size is the amortization lever.** insitu reads each stored chunk once and gathers
+every sample inside it, so the work saved versus a per-sample `__getitem__` grows with
+samples-per-chunk. Fat chunks amortize more; the one-sample-per-chunk (GRIB) end has nothing
+to amortize. Chunk size also sets the memory *unit* — residency is counted in whole outer
+chunks.
+
+**Stored-chunk size decouples concurrency cost from chunk size.** When a chunk is split into
+an inner grid of tiles, a read fetches a *tile*, not the whole chunk, so raising
+`max_inflight` costs tile-sized memory, not chunk-sized. That is why "fat, spatial" is the
+sweet spot and "fat, single inner" is not: with one tile per chunk the two collapse and
+concurrency costs full chunks. The [decoupled scheduler](#insitubatch-async-driven-pipeline)
+is what makes read concurrency and residency independent dials in the first place.
+
+**Batch size is largely orthogonal to IO.** A batch is a vectorized gather from the resident
+window, so batch size sets the step the model sees, not the read pattern — as long as the
+window's pool (`block_chunks × samples-per-chunk`) stays well above it.
+
+### Why the block-local shuffle is enough
+
+The shuffle is **approximate, not global**: chunks are permuted each epoch, and within a
+window of `block_chunks` chunks all samples are shuffled together (the [scope
+boundary](#what-this-does-not-do-scope-boundaries) on exact shuffle explains why a global
+shuffle is incompatible with chunk-aligned, low-copy reads). Two things make that converge to
+a full shuffle in practice:
+
+1. **Within an epoch**, each batch is a uniform draw from the window's pool of
+   `block_chunks × samples-per-chunk` samples. Keep that pool well above `batch_size` and a
+   single batch is already well-mixed locally.
+2. **Across epochs**, the per-epoch chunk permutation re-randomizes *which* chunks share a
+   window, so any two samples' chunks eventually co-occur. Over a run the set of samples a
+   given sample is ever batched with approaches the whole dataset.
+
+So even a modest window asymptotes quickly toward a global shuffle over the many epochs
+training actually runs — at memory cost `O(block_chunks)`, not `O(dataset)`.
+[`shuffle_quality`](api.md) scores an emitted order against a perfect global shuffle if you
+want to see it on your own data.
+
 ## Transforms — three stages, placed by cost
 
 Models need preprocessing (at minimum scaling; often regridding). The interesting
@@ -432,7 +482,7 @@ public seam is the `xr.DataArray` DataSource.
 (Tell: `fetch_data(legacy=False)` already returns a **cupy-backed** `xr.DataArray`
 for CUDA — NVIDIA themselves reaching for GPU-resident arrays. A fully
 tensor-native fast path in E2S is conceivable later, but it is a larger change to
-their framework, not v1.)
+their framework, and out of scope today.)
 
 ### Positioning vs NVIDIA MSC and GDS
 
@@ -449,7 +499,7 @@ their framework, not v1.)
 
 ## What this does NOT do (scope boundaries)
 
-These are deliberate v1 boundaries — the design is honest about them rather than
+These are deliberate current boundaries — the design is honest about them rather than
 pretending to be a general compute graph.
 
 - **`chunk_transform` sees ONE variable and ONE chunk.** It cannot combine
@@ -460,9 +510,9 @@ pretending to be a general compute graph.
     *after* the cache, so a derived field is recomputed per batch/draw, not
     cached. A cached cross-variable **derived variable** (compute once from
     co-scheduled input chunks, store as a pseudo-chunk keyed like any other) is a
-    deliberate **future** feature, not v1.
+    deliberate **future** feature.
 - **No cross-chunk / cross-sample-boundary ops.** A sample is a slice of the outer
-  (sample) axis that does **not span a chunk boundary** (the v1 contract). So
+  (sample) axis that does **not span a chunk boundary** (the current contract). So
   temporal stencils or windows that straddle two time-chunks (e.g. finite
   differences across the seam, or a 6-step window crossing chunk edges) are not
   supported. Windows spanning *n* chunks are a future opt-in that trades away
@@ -481,4 +531,4 @@ pretending to be a general compute graph.
 
 Rule of thumb: **per-variable, per-chunk, deterministic → chunk stage (cacheable).
 Cross-variable or per-sample-random → batch stage (not cached). Cross-chunk →
-not v1.**
+not supported.**
