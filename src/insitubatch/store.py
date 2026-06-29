@@ -37,6 +37,8 @@ from .types import ArrayGeometry
 # interface, so any backend works -- Icechunk session stores in particular have
 # no URL that round-trips to them, so they must be passed as objects.
 StoreLike = str | Store
+"""A store argument: either a URL string (resolved by :func:`as_store` /
+:func:`store_from_url`) or an already-constructed obstore ``Store``."""
 
 
 def store_from_url(url: str, *, read_only: bool = True, **kwargs: Any) -> zarr.storage.ObjectStore:

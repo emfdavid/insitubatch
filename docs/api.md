@@ -1,37 +1,27 @@
 # API reference
 
 The public surface is everything re-exported from the top-level `insitubatch`
-package, plus `InSituDataset` (the torch source) from `insitubatch.source`.
+package (its `__all__`), plus the framework-neutral `InSituDataset` source from
+`insitubatch.source` and the optional DLPack adapters in `insitubatch.frameworks`.
 
 ## `insitubatch`
 
 ::: insitubatch
     options:
       show_root_heading: false
-      members:
-        - open_geometries
-        - store_from_url
-        - ensure_local_dir
-        - split_by_chunk
-        - SplitManifest
-        - SplitName
-        - ArrayGeometry
-        - Batch
-        - ChunkRead
-        - DecodedChunk
-        - StoredChunkRead
-        - build_stored_chunk_reads
-        - block_shuffled_order
-        - sequential_order
-        - chunk_permutation
-        - shuffle_quality
-        - Scheduler
-        - SchedulerConfig
-        - ChunkPool
-        - StandardScaler
-        - ChunkTransform
-        - BatchTransform
 
 ## `insitubatch.source`
 
 ::: insitubatch.source.InSituDataset
+
+## `insitubatch.frameworks`
+
+::: insitubatch.frameworks
+    options:
+      show_root_heading: false
+      members:
+        - to_torch
+        - as_torch
+        - to_jax
+        - to_tf
+        - as_tf_dataset

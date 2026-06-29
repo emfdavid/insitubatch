@@ -26,15 +26,6 @@ memory, not *outer-chunk*-sized — but only if your data is inner (spatially)
 chunked.** If each outer chunk is a single stored chunk, the two terms collapse and
 concurrency gets expensive (see the fat-single-inner row below).
 
-!!! note "v1 vs v2"
-    In v1, read concurrency follows `block_chunks` (a block fetches its chunks), so
-    these terms aren't yet fully independent — to get more concurrency you raise
-    `block_chunks` and pay residency for it. The [V2 decoupled fetch
-    scheduler](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) makes
-    `max_inflight` an independent budget. The guidance below is written for the V2
-    model; under v1, read `max_inflight` as "set `block_chunks` to your desired
-    concurrency, memory permitting."
-
 ## The recipe
 
 1. **Pick `inner_chunks` (at write time)** so a stored chunk is ~10–50 MB — small

@@ -71,7 +71,7 @@ for epoch in range(n_epochs):
     for batch in ds.val:                 # deterministic; shares the pool with train
         ...
 
-# Framework handoff (zero-copy on CPU via DLPack):
+# Framework handoff (DLPack, zero-copy on CPU for torch/JAX; TF copies once):
 loader = DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)  # torch
 jbatch = to_jax(next(iter(ds.train)))                                    # JAX:   {var: jax.Array}
 tfds = as_tf_dataset(ds.val)                                             # TF:    tf.data.Dataset
@@ -105,13 +105,13 @@ uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 
 ## Status
 
-🚧 **Pre-alpha.** Real obstore-backed zarr v3 async reads work end-to-end;
-chunk-aligned splits, approximate (shuffle-block) shuffle, a bounded buffer,
-chunk/batch **transforms** (incl. a fitted `StandardScaler`), **prefetch**, and a
-pluggable **chunk cache** (in-memory or mmap-on-NVMe, byte-LRU) are implemented
-and tested.
+**Alpha — validated on real cloud IO.** Built: planner + chunk-aligned splits, async
+obstore reads, the decoupled fetch **`Scheduler`** + **`ChunkPool`** (assembly buffer
+*and* cross-epoch cache — byte budget + pin/LRU, heap or mmap-on-NVMe), approximate
+(shuffle-block) shuffle, chunk/batch **transforms** (incl. a fitted `StandardScaler`),
+**prefetch**, and the **torch / JAX / TF** surfaces. Not yet built: `Regrid` + the
+**GPU/device** transform stage, multi-timestep windows that cross chunk boundaries, and
+cross-*run* cache persistence.
 
-Not yet built: `Regrid` and the **GPU/device** transform stage; multi-timestep
-windows that cross chunk boundaries; JAX/TF surfaces. See the roadmap and scope
-limits in the
-[design rationale](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md).
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) is the single
+source of truth for status, the roadmap, and the scope limits.

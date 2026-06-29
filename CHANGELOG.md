@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.0.3 — 2026-06-29
+
+First **Alpha** release. Headline: the V2 decoupled fetch scheduler + the `ChunkPool`
+cache are now the engine, the **torch / JAX / TF** surfaces ship with runnable
+three-framework [examples](examples/), and the first real-cloud benchmark round is
+published. The pre-1.0 API changes below (the v1 reader/buffer/cache stack removed in
+favor of `Scheduler` + `ChunkPool`) are also called out in the GitHub release notes.
 
 The V2 decoupled fetch scheduler (M1.6, B1) is now the training engine; the v1
 shuffle-block path is retired. **Acceptance passed** on S3 (c6id.8xlarge,
