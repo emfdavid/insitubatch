@@ -13,39 +13,25 @@ hot path that scales with **chunks, not samples**.
     open. `insitubatch` builds the layer that projects like light-speed-io and
     hypergrib stopped one step short of.
 
-## The problem
+## The problem, and the inversion
 
-The classic PyTorch `DataLoader` spreads work across worker **processes**, each
-running a *synchronous* `__getitem__`. Against cloud Zarr that means:
+The classic PyTorch `DataLoader` puts parallelism in worker **processes**, each running a
+*synchronous* `__getitem__`. Against cloud Zarr that fights itself: no shared chunk cache
+(every worker re-reads the same chunk), no way to drive async obstore, and dask thread
+pools nested inside forked workers. The usual escape — **resharding** to one-sample-per-file
+— is a second copy of the dataset that throws away the chunk locality the store already has.
 
-- **No shared chunk cache** — every worker re-reads (and re-decodes) the same
-  chunk, because a sample is a slice of a chunk and neighbouring samples land in
-  the same chunk.
-- **No way to drive async obstore** — a synchronous `__getitem__` can't fan out
-  concurrent range requests, so the NIC sits idle between blocking reads.
-- **Dask thread pools nested inside forked workers** — the usual xarray path
-  fights itself for cores.
+`insitubatch` keeps the data in place and **inverts the loader**:
 
-The fix people reach for is to **reshard**: rewrite the archive into
-one-sample-per-file shards. That is a second copy of the dataset, a pipeline to
-maintain, and it throws away the chunk locality the store already has.
+> Classic `DataLoader`: parallelism lives in **`num_workers` OS processes**, each running a
+> synchronous `__getitem__`. insitubatch: parallelism lives in **one async event loop**;
+> batch assembly is the consumer.
 
-## The inversion
-
-`insitubatch` keeps the data where it is and **inverts the loader**:
-
-> Classic `DataLoader`: parallelism lives in **`num_workers` OS processes**, each
-> running a synchronous `__getitem__`. insitubatch: parallelism lives in **one
-> async event loop**; batch assembly is the consumer.
-
-That single move is what unlocks async obstore, a **shared chunk cache**, bounded
-memory, and **prefetch overlap** with the training step. Torch runs with
-`num_workers=0` — the concurrency is ours, not the worker pool's.
-
-See [Architecture](architecture.md) for the loader/prefetch diagrams and the
-read-plan abstraction, and the
-[design rationale](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md)
-for the why.
+That single move unlocks async obstore, a **shared chunk cache**, bounded memory, and
+**prefetch overlap** with the training step; torch runs `num_workers=0`.
+[Architecture](architecture.md) has the full frictions breakdown, the loader/prefetch
+diagrams, and the read-plan abstraction;
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) has the why.
 
 ## Shape of the API
 

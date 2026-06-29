@@ -17,11 +17,13 @@ insitubatch is the **batteries-included** choice across two operating points:
   **cross-epoch cache** (warm epochs at ~4 GB/s) the worker stacks don't have. Throughput
   beats the best-tuned baseline from `c2` up — to **~25×** at fat chunks.
 
-The honest exception: at the degenerate **GRIB end (`c1`, one sample per chunk)**, xbatcher
-is ~30% faster on *single-pass* throughput — but at **25× the memory** and **6× the TTFB**,
-and a re-read every epoch (so multi-epoch training flips back to insitu via the cache, 9×
-warm). xbatcher is a fine *batch definition* with a worker-process *engine* competitive
-only at that one extreme; insitubatch keeps the ndim batch semantics and generalizes.
+The honest exception is the **GRIB end (`c1`, one sample per chunk)**: there xbatcher is
+~30% faster on *single-pass* throughput, because with nothing to amortize per chunk insitu's
+read-once advantage doesn't apply. The trade-offs are memory (~25×) and cold start (~6×
+TTFB), and since the worker stacks re-read every epoch, multi-epoch training flips back to
+insitu via the cross-epoch cache (~9× warm). xbatcher is a well-established *batch
+definition* on a worker-process *engine*; insitu keeps the same ndim batch semantics with
+one async loop, so its edge grows with samples-per-chunk.
 
 !!! note "Real run"
     Numbers below are from a **real S3 run** on a
@@ -29,8 +31,8 @@ only at that one extreme; insitubatch keeps the ndim batch semantics and general
     (32 vCPU, in-region S3 + S3 Express), not a laptop: coarsened ERA5 `361×720`
     fields, the `era5_c{1..32}` chunk-size family plus fat-spatial grids, ≥3 repeats
     with a warm-up burst to clear S3 cold-start. Both baselines are **tuned**
-    (`num_workers` swept to 32 = vCPUs); insitu is swept over `block_chunks` — not a
-    strawman.
+    (`num_workers` swept to 32 = vCPUs); insitu is swept over `block_chunks` — so neither
+    side is under-tuned.
 
 ## The comparison set
 

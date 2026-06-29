@@ -27,13 +27,14 @@ obstore, and dask thread pools nested inside forked workers. `insitubatch`
 concurrency budget and scatters them into a bounded pool that assembles batches —
 the pool doubles as the cache; torch runs `num_workers=0`.
 
-The payoff is being the **batteries-included** choice at both operating points: for
-**inference** it pays no worker-pool cold start (first batch in ~ms, not seconds — and a
-production service hot pool is extremely challenging); for **training** it uses far less memory
-(one process, not 32), reads each chunk once, and caches across epochs, beating the
-tuned worker/xbatcher stacks across the chunk spectrum. The worker-process stacks are
-competitive only at the degenerate GRIB end (one sample per chunk) — a partial solution
-that doesn't generalize. See [Benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/).
+The payoff is being a **batteries-included** choice at both operating points: for
+**inference** it pays no worker-pool cold start (first batch in ~ms, not seconds — keeping a
+production hot pool alive is its own challenge); for **training** it uses far less memory
+(one process, not 32), reads each chunk once, and caches across epochs. Across the chunk
+spectrum it leads a *tuned* worker/xbatcher baseline; xbatcher stays ahead on single-pass
+throughput at the GRIB end (one sample per chunk, where there is nothing to amortize), and
+there the cross-epoch cache flips multi-epoch training back to insitu. Full comparison:
+[Benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/).
 
 ## Status
 
