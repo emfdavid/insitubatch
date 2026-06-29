@@ -195,7 +195,7 @@ runs at the **same speed** as the GIL build.
 
 So free-threading here is **correctness + future-proofing, not a speedup** — and *not
 depending* on the GIL is a stronger position than needing it. The
-[flamegraph](https://github.com/emfdavid/insitubatch/blob/main/bench/results/profile_fat_g16.svg)
+[flamegraph](figures/profile_fat_g16.svg)
 (`py-spy --native`) makes it visual: time is in Rust IO + C decode + numpy, with only a
 thin Python sliver.
 
