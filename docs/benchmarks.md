@@ -85,13 +85,12 @@ insitu at `c8` is ~0.7 GB/s — the gap is IO, not loader overhead (see story 4)
 
 ---
 
-## Story 2 — the V2 decoupling
+## Story 2 — decoupling concurrency from residency
 
 Read concurrency (`max_inflight`) is decoupled from residency/shuffle (`block_chunks`):
 throughput climbs to the network knee and **stays flat**, while residency is **pinned**,
-as `max_inflight` rises. V1's nested caps produced a sawtooth; V2's single semaphore
-smooths it — so the result is a clean rise-to-plateau, the same on every spatial grid
-(`era5_fat_g4/g16/g36`):
+as `max_inflight` rises. The result is a clean rise-to-plateau, the same on every spatial
+grid (`era5_fat_g4/g16/g36`):
 
 | max_inflight | 1 | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|

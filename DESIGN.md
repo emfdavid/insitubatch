@@ -28,10 +28,18 @@ zarr v3 async store and builds the layer those projects stopped one step short o
 
 ## What it is, by contrast
 
+**A throughline:** the xarray-centric stacks below (xbatcher, Earth2Studio) deliver
+**labeled arrays** (`xr.DataArray`) and carry coordinates through the hot path. insitubatch
+makes a different bet on purpose — stay at the **zarr → numpy → tensor** level, with
+labels/coords as *off-hot-path planning* metadata, never the delivery format — so batches
+arrive DLPack-ready with no labeled-array machinery in the loop. (xarray is still welcome for
+*defining* a window; see "Subsetting the sample axis" in the architecture doc.)
+
 | Neighbor | Why insitubatch is different |
 |---|---|
 | **MosaicML Streaming / WebDataset** | They require **resharding** into a sample-oriented format (MDS/tar) — a full ETL copy, and a "sample" becomes an opaque blob. insitubatch trains **in place** on the existing ndim Zarr; splits/shuffle/batches live in **coordinate space**. |
-| **xbatcher + DataLoader (Earthmover stack)** | xbatcher (Earthmover / pangeo) is the standard, elegant way to *define* ndim batches; its torch-worker engine (N **processes**) is strongest at the GRIB / one-sample-per-chunk end, and elsewhere pays worker cold start, memory ∝ workers, no shared cache, and per-sample decode. insitubatch keeps those same ndim batch semantics and offers a *different engine* — one async loop — that wins **cold start** (inference) and **memory + cache + ops** across the chunk spectrum (training). Complementary tools; pick by regime (and we tune xbatcher well before any comparison). |
+| **xbatcher + DataLoader (Earthmover stack)** | xbatcher (Earthmover / pangeo) is the standard, elegant way to *define* ndim batches — **xarray-native**, yielding `xr.DataArray`. Its torch-worker engine (N **processes**) is strongest at the GRIB / one-sample-per-chunk end, and elsewhere pays worker cold start, memory ∝ workers, no shared cache, and per-sample decode. insitubatch keeps the same ndim batch semantics but stays at the **numpy/tensor** level on a *different engine* — one async loop — winning **cold start** (inference) and **memory + cache + ops** across the chunk spectrum (training). Complementary tools; pick by regime (and we tune xbatcher well before any comparison). |
+| **Earth2Studio (NVIDIA)** | An **xarray-centric** inference framework: its `DataSource` yields `xr.DataArray`, and xarray is load-bearing down to `prep_data_array`. insitubatch doesn't build xarray — *inside* their loop the win is an obstore store-swap (an obstore contribution, not ours); *around* their models it feeds `(tensor, coords)` batches straight to `model.create_iterator`, where `coords` is a light metadata dict, not the xarray machinery. |
 | **DALI / kvikio / nvCOMP** | The GPU compute/decompress path — a *peer* we interop with (cupy→dlpack→torch, optional nvCOMP), not the orchestration. |
 | **anemoi-datasets** | Weather-locked, opinionated schema. We are general ndim arrays. |
 | **dask / Ray Data** | General compute schedulers. We deliberately keep dask **off the hot path** (its nested thread pools inside forked workers are the problem). |
@@ -314,6 +322,43 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
 | `source.py` | `InSituDataset` — framework-neutral iterable of numpy `Batch`; prefetch producer over the scheduler+pool, block-granular eviction (inherits nothing) |
 | `frameworks.py` | thin optional DLPack adapters over the numpy `Batch`: `as_torch` (DataLoader subclass), `to_jax`, `to_tf` / `as_tf_dataset` (from_generator) |
 | `transforms.py` | chunk/batch transform hooks, `StandardScaler` (chunk-stage applier; fit over the loader — see `examples/fit_scaler.py`) |
+
+## Design evolution & alternatives
+
+The shape above wasn't the first cut. The pivots that got here, and the roads not taken:
+
+- **v1 reader+buffer → v2 Scheduler+ChunkPool.** The first engine paired an
+  `AsyncChunkReader` with a `ShuffleBlockBuffer`, and nested inner/outer concurrency caps
+  meant read concurrency rode on the shuffle window (you bought concurrency with memory, and
+  got a throughput sawtooth). The diagnosis that forced the rewrite: the wall was *read
+  concurrency*, not decode or bandwidth. v2 flattens reads to stored-chunk granularity under
+  one `max_inflight` budget and makes residency a separate byte budget — see the V2 section
+  above. The two are now independent dials.
+- **The pool *is* the cache.** There was once a separate `ChunkCache` (memory/disk tiers). It
+  collapsed into the `ChunkPool`: one byte-budgeted object that is the assembly buffer when
+  small and the cache when large ("don't evict"). One machinery, and no copy between a buffer
+  and a cache.
+- **Transforms staged by cost, not per-sample.** torch's per-`__getitem__` transform redoes
+  work for every reused sample. We split preprocessing into a per-chunk `chunk_transform`
+  (deterministic, per-variable, applied *before* shuffle so it is cached), a per-batch
+  `batch_transform` (cross-variable / per-sample-random, after gather, never cached), and a
+  GPU `device_transform` (M2) — each placed at the cheapest stage that can see what it needs.
+  The cache boundary *is* the chunk-transform boundary. See `docs/architecture.md` and the
+  runnable `examples/transforms.py`.
+- **No dask on the hot path.** The xarray/dask route nests worker thread pools inside forked
+  DataLoader workers and oversubscribes cores; we route around it with a single async loop.
+  Lazy dask-style graphs are out by design, not by omission.
+- **No reshard.** The usual fix — rewrite the archive to one-sample-per-file — is a second
+  copy that discards the chunk locality the store already has. We train in place and pay for
+  it with an *approximate* shuffle instead.
+- **Approximate shuffle over exact global.** Exact global shuffle wants a random chunk per
+  sample, which is incompatible with chunk-aligned low-copy reads. The two-level block
+  shuffle (see "Shuffle" above) converges toward global over epochs at `O(block_chunks)`
+  memory — the compromise we chose deliberately.
+- **Earth2Studio: store-swap vs tensor batches.** We don't build `xr.DataArray`. Inside
+  their inference loop the win is an obstore store-swap (an obstore contribution, not ours);
+  *around* their models, insitu delivers tensor batches directly. The two philosophies are
+  laid out in `docs/architecture.md`.
 
 ## Open questions / spikes
 
