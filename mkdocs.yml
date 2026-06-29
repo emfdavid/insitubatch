@@ -38,6 +38,7 @@ nav:
   - Design rationale: https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md
   - Benchmark plan: https://github.com/emfdavid/insitubatch/blob/main/bench/benchmark_plan.md
   - AWS ops runbook: https://github.com/emfdavid/insitubatch/blob/main/bench/ops_aws.md
+  - GCP ops runbook: https://github.com/emfdavid/insitubatch/blob/main/bench/ops_gcp.md
 
 plugins:
   - search
