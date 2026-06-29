@@ -115,10 +115,6 @@ budget with pin/unpin + LRU, backed by heap or an mmap'd `.npy` on NVMe. Before
 fetching, the scheduler asks the pool whether it already holds a chunk — a hit
 (cross-epoch, since the pool persists) skips fetch + decode + transform entirely.
 
-*Built today:* planner, the scheduler + ChunkPool (cache included), chunk/batch
-transforms, prefetch overlap, the torch surface. *Planned:* `Regrid` +
-`device_transform`.
-
 Properties: parallelism in the loop (not processes); each stored chunk read once
 and amortized across every sample that touches it; **read concurrency
 (`max_inflight`) and residency (the pool's byte budget) are independent dials**;

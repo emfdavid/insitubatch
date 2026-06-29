@@ -53,9 +53,9 @@ residency/shuffle span are independent dials** — the decoupling reaches ~1 GB/
 flat, low memory (validated on S3; see below). Built: planner + chunk-aligned
 splits, async obstore reads, the scheduler + pool (with **cross-epoch decode-once
 caching**), chunk/batch **transforms** (incl. a fitted `StandardScaler`),
-**prefetch**, the torch surface, and runnable [examples](examples/); validated
-free-threading-correct on 3.13t. Not yet built: `Regrid` + the **GPU/device**
-transform stage; JAX/TF surfaces — see the roadmap in [DESIGN.md](DESIGN.md).
+**prefetch**, the torch / JAX / TF surfaces, and runnable [examples](examples/);
+validated free-threading-correct on 3.13t. Not yet built: `Regrid` + the **GPU/device**
+transform stage, and cross-*run* cache persistence — see the roadmap in [DESIGN.md](DESIGN.md).
 
 📖 **Docs:** <https://emfdavid.github.io/insitubatch/>
 (see [Tuning](https://emfdavid.github.io/insitubatch/tuning/) for the
@@ -164,8 +164,10 @@ for epoch in range(n_epochs):
         ...
 ```
 
-Hand off to a framework (zero-copy on CPU via DLPack). The ecosystems differ — torch
-needs a `Dataset` subclass, JAX iterates directly, TF wraps via `from_generator`:
+Hand off to a framework — **zero-copy on CPU via DLPack for torch and JAX**; TF takes one
+CPU copy (its experimental DLPack is unreliable — see `frameworks.to_tf`). The ecosystems
+differ — torch needs a `Dataset` subclass, JAX iterates directly, TF wraps via
+`from_generator`:
 
 ```python
 from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset

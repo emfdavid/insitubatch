@@ -360,6 +360,9 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
 
 ## Status
 
+**Maturity: Alpha** — validated on real cloud IO; API is pre-1.0 (breaking changes
+allowed). This section is the single source of truth for status; other pages link here.
+
 **Phase 1 (real S3) validated.** Run on a `c6id.8xlarge` against in-region S3
 (ERA5-shaped `721×1440` fields, `sample_chunk=8`, warm), insitubatch delivers
 **~8× the throughput** of a tuned `xbatcher`/worker `DataLoader` baseline (swept to
@@ -376,7 +379,9 @@ inner-chunk support, and one-block read-ahead so block-boundary IO overlaps comp
 store.
 
 Built so far: planner, chunk-aligned splits, async obstore reads + bounded decode
-pool, coalesced gather, torch surface, **chunk/batch transforms + `StandardScaler`
+pool, coalesced gather, the **torch / JAX / TF framework surfaces (M3)** — DLPack
+`to_jax` / `to_tf` / `as_tf_dataset` over the numpy `Batch`, exercised by the
+three-framework advection examples — **chunk/batch transforms + `StandardScaler`
 (M-T)**, **prefetch (M1.5)**, runnable examples + a published docs site, and the
 **V2 decoupled fetch scheduler (M1.6, B1)** — `Scheduler` + `ChunkPool` are now the
 training engine (one `max_inflight` budget over stored chunks, residency decoupled
@@ -385,7 +390,7 @@ on fat-spatial S3: 1052 MB/s at `max_inflight=32` (beats the 930 v1 peak) with
 residency flat across the concurrency sweep. **B2 done** — the `ChunkPool` is now
 the cache too (byte budget + pin/unpin + LRU, heap or mmap backing; cross-epoch
 decode-once reuse via `cache_dir`/`cache_budget_bytes`). **Not yet built:** cross-*run*
-persistence, `Regrid` + the GPU/device stage (M2), JAX/TF surfaces (M3).
+cache persistence, `Regrid` + the GPU/device transform stage (M2), bounded read-ahead (M-RA).
 
 ## Roadmap / milestones
 

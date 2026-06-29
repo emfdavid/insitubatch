@@ -106,8 +106,10 @@ def as_tf_dataset(view: _SplitView, *, prefetch: int = 2) -> tf.data.Dataset:
 
     ``output_signature`` is inferred from the view's geometries: each variable is
     ``(None, *inner)`` (None = the variable last-batch size) with the variable's dtype.
-    Note ``from_generator`` *copies* into the TF runtime; for a zero-copy handoff call
-    :func:`to_tf` on the raw stream instead.
+    Both ``from_generator`` here and :func:`to_tf` copy into the TF runtime -- TF has no
+    reliable zero-copy path from insitu's buffers (its experimental DLPack mishandles buffer
+    ownership; see :func:`to_tf`). Call :func:`to_tf` on the raw stream when you want plain
+    ``dict[str, tf.Tensor]`` batches instead of a ``tf.data.Dataset``.
     """
     try:
         import tensorflow as tf
