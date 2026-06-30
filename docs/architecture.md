@@ -302,11 +302,37 @@ class Regrid:
     def __call__(self, chunk: DecodedChunk) -> DecodedChunk:
         chunk.data = _apply_weights(chunk.data, self._idx, self._w)
         return chunk
+    def output_inner(self, geom: ArrayGeometry) -> tuple[tuple[int, ...], np.dtype]:
+        return (len(self.dst_lat), len(self.dst_lon)), geom.dtype  # new inner shape
 ```
+
+A **reshaping** `chunk_transform` declares `output_inner` so the cache can size its slot at
+the post-transform shape (see [the caching section](#the-caching-continuum)); a
+shape/dtype-preserving one (scaling) omits it. Only the inner dims and dtype may change — the
+sample axis is the engine's to keep.
 
 - **Fat chunks** → `chunk_transform` (amortized over the chunk's samples).
 - **ARCO `chunk-1`** → reuse the same weights as a sparse tensor in a
   `device_transform` (batched on GPU), since per-chunk == per-sample there.
+
+### Developing a transform — `check_transform`
+
+Both transform contracts (vectorized/GIL-releasing, and a correct `output_inner`) are easy to
+get wrong and otherwise only surface at training time. Run the bundled CLI against **one chunk
+of your real store** while you write the transform:
+
+```bash
+python -m insitubatch.check_transform s3://bucket/era5.zarr --var t2m \
+    --transform ./prep.py:Regrid      # or  module.path:attr  (a class is instantiated)
+# also installed as:  insitubatch-check-transform ...
+```
+
+It prints the chunk geometry (the decoded MB the cache will hold), runs the transform on real
+data, **validates the declared `output_inner` against the actual output** (catching the
+mismatch `ChunkPool._persist` would later raise), and runs a thread-scaling probe that flags a
+transform holding the GIL — a pure-Python per-element transform that would serialize the decode
+pool. Non-zero exit on a failed check, so it can gate a pre-commit hook. `--no-gil-probe` does
+the geometry + cacheability checks only (fast, deterministic).
 
 ## Bad / corrupt chunks
 

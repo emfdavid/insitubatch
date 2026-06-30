@@ -24,6 +24,11 @@ dependencies = [
     "obstore>=0.3",
 ]
 
+[project.scripts]
+# A development tool (not on the training hot path): probe one chunk of a real store to
+# check a chunk_transform's geometry, declared output_inner, and GIL-release behavior.
+insitubatch-check-transform = "insitubatch.check_transform:main"
+
 [project.urls]
 Documentation = "https://emfdavid.github.io/insitubatch/"
 Homepage = "https://emfdavid.github.io/insitubatch/"
