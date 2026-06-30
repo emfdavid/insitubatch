@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from .pool import ChunkPool
+from .pool import ChunkPool, output_geometry
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
@@ -151,6 +151,11 @@ class InSituDataset:
         self.prefetch_depth = max(int(prefetch_depth), 1)
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
+        # Geometry each variable presents *after* the chunk_transform pipeline (regrid / dtype
+        # recast). What the consumer and the framework adapters see, and what sizes the cache.
+        self._out_geometries = {
+            label: output_geometry(g, self.chunk_transforms) for label, g in self.geometries.items()
+        }
         self._epoch = 0
         self._persist = persist
         self.resident_peak = 0  # peak resident outer chunks (observability)
@@ -178,10 +183,14 @@ class InSituDataset:
         span = max(offsets) - min(offsets)
         windowed = any(o != 0 for o in offsets)
         window_factor = 2 + (-(-span // spc0)) if windowed else 1  # 2 + ceil(span/spc)
+        # Size from the OUTPUT geometry: the pool caches post-transform chunks, so a regrid
+        # that grows (or shrinks) the data changes the resident footprint the budget must hold.
         per_chunk_all_vars = int(
             sum(
-                g.sample_chunk_size * int(np.prod(g.inner_shape)) * g.dtype.itemsize
-                for g in self.geometries.values()
+                g.sample_chunk_size * int(np.prod(o.inner_shape)) * o.dtype.itemsize
+                for g, o in zip(
+                    self.geometries.values(), self._out_geometries.values(), strict=True
+                )
             )
         )
         working_set = 2 * block_chunks * window_factor * per_chunk_all_vars
@@ -440,7 +449,9 @@ class _SplitView:
 
     @property
     def geometries(self) -> dict[str, ArrayGeometry]:
-        return self._dataset.geometries
+        # Post-transform geometry: the adapters infer *output* tensor shapes/dtypes from
+        # this, which a reshaping chunk_transform (regrid / dtype recast) changes.
+        return self._dataset._out_geometries
 
     def __iter__(self) -> Iterator[Batch]:
         return self._dataset._iterate(self._split, self._shuffle)

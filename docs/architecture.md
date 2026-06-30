@@ -523,11 +523,18 @@ isn't working is loud, not silent.
   (cloudpickle) or set an explicit `transform.cache_key`; the source-only fallback can
   miss closure/global changes.
 
-**Limitations (deferred).** A **reshaping** `chunk_transform` (e.g. `Regrid`) on the
-mmap tier still raises — the slot is sized at the source shape, so the persistent cache
-covers shape-preserving transforms today. A raw-decoded tier (keyed by source only, for
-transform experimentation), orphaned-file GC across version bumps, and the kvikio/GDS
-NVMe→GPU feed off the persistent `.npy` tier remain on the roadmap
+**Reshaping transforms.** A **reshaping** `chunk_transform` (e.g. `Regrid`, or a dtype
+recast) is a first-class cacheable stage on every backing including the persistent mmap
+tier. The transform declares its post-transform *inner* geometry via
+`output_inner(geom) -> (inner_shape, dtype)`; the engine sizes the cache slot at that
+**output** shape and assembles decoded tiles into a transient **source**-shaped scratch
+buffer, then writes the transformed result into the slot (the sample axis is spliced back
+from the source, so a chunk_transform can never move it). Shape/dtype-preserving transforms
+omit `output_inner` and keep the zero-copy fast path (the slot is buffer and cache in one).
+
+**Limitations (deferred).** A raw-decoded tier (keyed by source only, for transform
+experimentation), orphaned-file GC across version bumps, and the kvikio/GDS NVMe→GPU feed
+off the persistent `.npy` tier remain on the roadmap
 ([DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md)).
 
 ## Earth2Studio integration

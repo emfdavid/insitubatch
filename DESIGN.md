@@ -516,9 +516,12 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   Icechunk/Arraylake session stores have no round-trippable URL, so the `cache_dir` path
   *is* the dataset identity (bury a version in it); content/etag drift is the user's call.
   The key's `chunk_index` is the *global* zarr index, so subsets/splits share entries.
-  *Still deferred:* a reshaping `chunk_transform` (`Regrid`) on the mmap tier (slot sized
-  at source shape), a raw-decoded tier keyed by source only, orphaned-file GC across
-  version bumps, and the kvikio/GDS NVMe→GPU feed off the persistent tier.
+  A **reshaping** `chunk_transform` (`Regrid` / dtype recast) is supported on every tier
+  including persistent mmap: it declares `output_inner -> (inner_shape, dtype)`, the cache
+  slot is sized at the output shape, and tiles assemble in a transient source-shaped scratch
+  buffer (the sample axis is invariant). *Still deferred:* a raw-decoded tier keyed by source
+  only, orphaned-file GC across version bumps, and the kvikio/GDS NVMe→GPU feed off the
+  persistent tier.
   Scope: a read-through cache keyed by fingerprint; a shared/networked cache tier and
   the L1/L2 split above are later.
 - **M-W — windowed / multi-offset sampling (sample geometry v2).** The forecasting

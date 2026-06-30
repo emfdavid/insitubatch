@@ -22,7 +22,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from .types import Batch, DecodedChunk
+from .types import ArrayGeometry, Batch, DecodedChunk
 
 
 @runtime_checkable
@@ -30,6 +30,30 @@ class ChunkTransform(Protocol):
     """Per-chunk transform applied before shuffle/gather (cacheable)."""
 
     def __call__(self, chunk: DecodedChunk) -> DecodedChunk: ...
+
+
+@runtime_checkable
+class ReshapingChunkTransform(ChunkTransform, Protocol):
+    """A chunk_transform that changes a chunk's *inner* geometry (shape and/or dtype).
+
+    The canonical case is regrid; a dtype recast (e.g. decode ``f2`` storage, cache ``f4``)
+    qualifies too. Declaring the output lets the engine size the cache slot and the gather
+    buffer at the post-transform geometry, so a reshaping transform is a first-class,
+    cacheable chunk stage rather than a heap-only special case.
+
+    ``output_inner`` returns only the **inner** geometry (everything past the sample axis):
+    a chunk_transform must never cross or reshape axis 0 (the sample-geometry invariant), so
+    it has no business naming axis 0, and the engine splices the source's sample axis back on.
+    Shape/dtype-preserving transforms (e.g. :class:`StandardScaler`) simply do **not** define
+    ``output_inner`` -- the engine treats their output geometry as identical to the source.
+    """
+
+    def output_inner(self, geom: ArrayGeometry) -> tuple[tuple[int, ...], np.dtype]:
+        """``(inner_shape, dtype)`` of this transform's output, given its input ``geom``.
+
+        Composes across a pipeline: the engine feeds each transform the geometry produced
+        by the ones before it. The sample axis (``geom.shape[0]``) is unchanged."""
+        ...
 
 
 @runtime_checkable

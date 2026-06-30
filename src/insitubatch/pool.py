@@ -64,7 +64,7 @@ import re
 import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +83,30 @@ ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
 
 def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def output_geometry(geom: ArrayGeometry, transforms: Sequence[ChunkTransform]) -> ArrayGeometry:
+    """The geometry a chunk has *after* the chunk_transform pipeline.
+
+    A reshaping transform (regrid / dtype recast) declares ``output_inner(geom) ->
+    (inner_shape, dtype)``; the pipeline folds them so each transform sees the geometry
+    produced by the ones before it. Only the *inner* dims and dtype may change -- the
+    sample axis (``shape[0]`` / ``chunks[0]``) is spliced straight back from the source, so
+    a transform can neither move nor reshape it (the sample-geometry invariant). A transform
+    without ``output_inner`` is identity; with none reshaping, the source geometry returns
+    unchanged. Output ``chunks`` are set to the inner shape (the cache slot is one assembled
+    buffer, never inner-tiled), keeping the geometry self-consistent."""
+    inner, dt = geom.inner_shape, geom.dtype
+    for t in transforms:
+        declare = getattr(t, "output_inner", None)
+        if declare is None:
+            continue
+        current = replace(
+            geom, shape=(geom.shape[0], *inner), chunks=(geom.chunks[0], *inner), dtype=dt
+        )
+        inner, dt = declare(current)
+        inner, dt = tuple(int(s) for s in inner), np.dtype(dt)
+    return replace(geom, shape=(geom.shape[0], *inner), chunks=(geom.chunks[0], *inner), dtype=dt)
 
 
 def _transform_token(fn: ChunkTransform) -> str:
@@ -116,7 +140,14 @@ def _has_weak_token(transforms: Sequence[ChunkTransform]) -> bool:
 
 @dataclass(slots=True)
 class _Slot:
-    """One outer chunk's assembly buffer plus its completion bookkeeping."""
+    """One outer chunk's cache slot plus its completion bookkeeping.
+
+    ``data`` is the cache slot, sized at the transform's *output* geometry. ``scratch`` is
+    a transient *source*-shaped assembly buffer, present only when a reshaping transform
+    means the slot cannot also be the assembly target; tiles scatter into it and the
+    transformed result lands in ``data`` (then ``scratch`` is dropped). With no reshaping
+    transform ``scratch`` is ``None`` and tiles scatter straight into ``data`` -- the slot
+    is buffer and cache in one, no extra copy (the common path)."""
 
     data: np.ndarray
     remaining: int  # inner tiles not yet scattered; 0 => fully assembled
@@ -124,6 +155,7 @@ class _Slot:
     ready: bool = False
     error: BaseException | None = None
     claimed: bool = False  # the driver has referenced it *this epoch* (see wait_ready)
+    scratch: np.ndarray | None = None  # source-shaped assembly buffer (reshaping path only)
 
 
 class ChunkPool:
@@ -163,6 +195,22 @@ class ChunkPool:
         # representative geometry per path suffices for slot sizing (aliases share shape).
         self._by_path = {g.path: g for g in geometries.values()}
         self._chunk_transforms = tuple(chunk_transforms)
+        # Output geometry after the chunk_transform pipeline. A reshaping transform (regrid /
+        # dtype recast) makes the cached chunk differ from the source, so everything
+        # *downstream of assembly* -- slot sizing, the cache budget, gather, the revive
+        # structural check -- is sized at the OUTPUT geometry, while tile assembly stays at
+        # the SOURCE geometry (in scratch). With no reshaping transform out == source.
+        self._out_geom = {
+            label: output_geometry(g, self._chunk_transforms) for label, g in geometries.items()
+        }
+        self._out_by_path = {g.path: self._out_geom[label] for label, g in geometries.items()}
+        self._reshapes = {
+            p: (
+                out.inner_shape != self._by_path[p].inner_shape
+                or out.dtype != self._by_path[p].dtype
+            )
+            for p, out in self._out_by_path.items()
+        }
         # backing: heap (np.empty) or mmap'd .npy under backing_dir (point at NVMe).
         # The scatter writes straight into the slot either way; mmap keeps the working
         # set as reclaimable page cache rather than anon heap. Default heap: scattering
@@ -251,8 +299,11 @@ class ChunkPool:
         the budget is full of in-flight or referenced slots -- the caller awaits a release.
         """
         key = (array, chunk_index)
-        geom = self._by_path[array]
-        nbytes = int(np.prod(geom.slot_shape(chunk_index), dtype=np.int64)) * geom.dtype.itemsize
+        src, out = self._by_path[array], self._out_by_path[array]
+        # The cache slot is the OUTPUT geometry (what a reshaping transform produces and what
+        # gather reads); the budget is charged for it. Assembly tiles are SOURCE-shaped, so a
+        # reshaping path also needs a transient source-shaped scratch buffer (not cached).
+        nbytes = int(np.prod(out.slot_shape(chunk_index), dtype=np.int64)) * out.dtype.itemsize
         with self._cv:
             if key in self._slots:
                 self._pin(key)  # already resident (in-flight or ready hit) -> incref, reuse
@@ -262,11 +313,17 @@ class ChunkPool:
             if not self._make_room(nbytes):
                 return False
             self.misses += 1  # a fresh slot allocated to fetch -> a cache miss
+            scratch = (
+                np.empty(src.slot_shape(chunk_index), dtype=src.dtype)
+                if self._reshapes[array]
+                else None
+            )
             self._slots[key] = _Slot(
-                data=self._alloc(array, chunk_index, geom.slot_shape(chunk_index), geom.dtype),
-                remaining=geom.n_inner_chunks(chunk_index),
+                data=self._alloc(array, chunk_index, out.slot_shape(chunk_index), out.dtype),
+                remaining=src.n_inner_chunks(chunk_index),
                 nbytes=nbytes,
                 claimed=True,
+                scratch=scratch,
             )
             self._bytes += nbytes
             self._pin(key)
@@ -319,7 +376,7 @@ class ChunkPool:
         if fname is None:
             return False
         array, chunk_index = key
-        geom = self._by_path.get(array)
+        geom = self._out_by_path.get(array)  # the persisted .npy holds the post-transform chunk
         assert self._dir is not None
         try:
             data = np.lib.format.open_memmap(self._dir / fname, mode="r")
@@ -459,7 +516,10 @@ class ChunkPool:
         key = (array, chunk_index)
         slot = self._slots[key]  # allocated by the scheduler before any scatter
         dst, src = self._by_path[array].tile_placement(chunk_index, inner_coord)
-        slot.data[dst] = tile[src]  # disjoint, fixed-shape: lock-free (rule 1)
+        # Tiles assemble at the SOURCE shape: into scratch on a reshaping path, else straight
+        # into the slot (which is then both buffer and cache). Disjoint, fixed-shape, lock-free.
+        buffer = slot.data if slot.scratch is None else slot.scratch
+        buffer[dst] = tile[src]  # disjoint, fixed-shape: lock-free (rule 1)
 
         with self._cv:
             slot.remaining -= 1
@@ -467,29 +527,34 @@ class ChunkPool:
         if not last:
             return
 
-        # Sole owner now: assemble-stage transforms on the whole outer chunk.
-        prepped = self._apply_transforms(array, chunk_index, slot.data)
+        # Sole owner now: assemble-stage transforms on the whole (source-shaped) outer chunk,
+        # then land the (possibly reshaped) result in the output-sized slot.
+        prepped = self._apply_transforms(array, chunk_index, buffer)
         with self._cv:
             slot.data = self._persist(slot.data, prepped)
+            slot.scratch = None  # assembly done -- drop the transient source-shaped buffer
             slot.ready = True
             self._cv.notify_all()
 
     def _persist(self, current: np.ndarray, prepped: np.ndarray) -> np.ndarray:
-        """Land the prepped (post-transform) array in the slot's backing.
+        """Land the prepped (post-transform) array in the slot's (output-sized) backing.
 
-        No transform (``prepped is current``) is a no-op -- the scatter already
-        wrote the slot. With a transform, heap just holds the new array; mmap writes
-        it back into the slot's file so the cached chunk stays on NVMe (a shape-
-        changing transform like regrid would need a re-sized memmap -- deferred).
+        No transform (``prepped is current``) is a no-op -- the scatter already wrote the
+        slot. Otherwise heap just holds the new array; mmap writes it back into the slot's
+        file so the cached chunk stays on NVMe. The slot is sized at the transform's *output*
+        geometry (see :func:`output_geometry`), so a reshaping transform lands here exactly
+        like a shape-preserving one -- ``prepped.shape`` matches the slot by construction. A
+        mismatch means ``__call__`` disagreed with its declared ``output_inner``: a bug, raised.
         """
         if prepped is current or self._dir is None:
             return prepped
         if prepped.shape != current.shape:
-            raise NotImplementedError(
-                "mmap backing with a reshaping chunk_transform (e.g. regrid) is not "
-                "supported yet; use heap backing for that path."
+            raise ValueError(
+                f"chunk_transform produced shape {prepped.shape} but the cache slot is sized "
+                f"{current.shape} from the declared output geometry; a reshaping transform's "
+                "output_inner must agree with what __call__ returns."
             )
-        current[:] = prepped  # write the transformed result into the memmap
+        current[:] = prepped  # write the transformed result into the memmap (casts to slot dtype)
         return current
 
     def fail(self, array: str, chunk_index: int, error: BaseException) -> None:
@@ -571,11 +636,12 @@ class ChunkPool:
 
         arrays: dict[str, np.ndarray] = {}
         for var in variables:
-            geom = self._geom[var]
+            geom = self._geom[var]  # source: drives the read math (offset, path, chunking)
+            out_geom = self._out_geom[var]  # post-transform: shape/dtype the consumer sees
             sample = anchor + geom.offset  # this view reads array[anchor + offset]
             read_cid = sample // spc
             within = sample % spc
-            out = np.empty((n, *geom.inner_shape), dtype=geom.dtype)
+            out = np.empty((n, *out_geom.inner_shape), dtype=out_geom.dtype)
             for cid in np.unique(read_cid):
                 mask = read_cid == cid  # rows that read this chunk -> one coalesced index
                 out[mask] = self._slots[(geom.path, int(cid))].data[within[mask]]
