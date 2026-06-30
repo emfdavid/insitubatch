@@ -232,6 +232,130 @@ def test_pool_mmap_backing_with_transform(tiled_store, tmp_path):
     np.testing.assert_allclose(got, srcs["single_inner"][:spc] * 2.0)
 
 
+class MeanLastAxis:
+    """A *reshaping* chunk_transform: mean over the last inner axis (and an optional
+    dtype recast). Declares its output inner geometry via ``output_inner`` so the engine
+    can size the cache slot and gather buffer at the post-transform shape."""
+
+    def __init__(self, out_dtype: str | np.dtype = "f4") -> None:
+        self.out_dtype = np.dtype(out_dtype)
+
+    def __call__(self, chunk):
+        chunk.data = chunk.data.mean(axis=-1).astype(self.out_dtype)  # (n,9,7) -> (n,9)
+        return chunk
+
+    def output_inner(self, geom: ArrayGeometry) -> tuple[tuple[int, ...], np.dtype]:
+        return geom.inner_shape[:-1], self.out_dtype
+
+
+def _gather_chunk(pool, var, cid, geom, spc):
+    n0 = len(geom.samples_in_chunk(cid))
+    rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
+    return pool.gather(rows, [var], spc).arrays[var]
+
+
+def test_pool_reshaping_transform_heap_gather(tiled_store):
+    """A reshaping chunk_transform's output shape flows through gather on heap backing.
+
+    Today gather allocates at the *source* inner_shape and assigns from the post-transform
+    slot (output shape) -> broadcast error. The output geometry must drive gather."""
+    url, srcs = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    spc = geom.sample_chunk_size
+
+    pool = ChunkPool(geoms, chunk_transforms=[MeanLastAxis()])
+    for cid in range(geom.n_chunks):
+        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+        got = _gather_chunk(pool, "single_inner", cid, geom, spc)
+        n0 = len(geom.samples_in_chunk(cid))
+        expected = srcs["single_inner"][cid * spc : cid * spc + n0].mean(axis=-1)
+        assert got.shape == (n0, geom.inner_shape[0])  # (n, 9), reshaped from (n, 9, 7)
+        np.testing.assert_allclose(got, expected, rtol=1e-6)
+
+
+def test_pool_reshaping_transform_dtype_recast(tiled_store):
+    """A dtype-changing transform (f4 -> f8) propagates its dtype through gather."""
+    url, srcs = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    spc = geom.sample_chunk_size
+
+    pool = ChunkPool(geoms, chunk_transforms=[MeanLastAxis(out_dtype="f8")])
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    got = _gather_chunk(pool, "single_inner", 0, geom, spc)
+    assert got.dtype == np.dtype("f8")
+    np.testing.assert_allclose(got, srcs["single_inner"][:spc].mean(axis=-1), rtol=1e-12)
+
+
+def test_pool_reshaping_transform_mmap_persist_roundtrip(tiled_store, tmp_path):
+    """The fenced path: a reshaping transform on mmap backing with persist must write the
+    output-shaped result into the (output-sized) slot, survive close(), and revive as a
+    ready hit on reopen -- re-decoding zero chunks -- reconstructing the regridded data."""
+    url, srcs = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    spc = geom.sample_chunk_size
+    backing = tmp_path / "cache"
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[MeanLastAxis()])
+    for cid in range(geom.n_chunks):
+        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+    assert pool.misses == geom.n_chunks and pool.hits == 0
+    pool.close()
+    assert list(backing.glob("*.npy")) and (backing / "insitu_cache.json").exists()
+
+    pool2 = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[MeanLastAxis()])
+    assert pool2.manifest_entries == geom.n_chunks
+    for cid in range(geom.n_chunks):
+        assert pool2.pin_if_ready("single_inner", cid), "regridded chunk must revive as a hit"
+        n0 = len(geom.samples_in_chunk(cid))
+        got = _gather_chunk(pool2, "single_inner", cid, geom, spc)
+        expected = srcs["single_inner"][cid * spc : cid * spc + n0].mean(axis=-1)
+        assert got.shape == (n0, geom.inner_shape[0])
+        np.testing.assert_allclose(got, expected, rtol=1e-6)
+    assert pool2.hits == geom.n_chunks and pool2.misses == 0
+    pool2.close()
+
+
+def test_pool_reshaping_transform_structural_mismatch_is_miss(tiled_store, tmp_path):
+    """A persisted output-shaped entry whose *output* geometry no longer matches (the
+    transform now yields a different inner shape) is invalidated structurally -- a miss."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    class MeanBothAxes(MeanLastAxis):  # output inner () vs (9,) -> structural drift
+        def __call__(self, chunk):
+            chunk.data = chunk.data.mean(axis=(-2, -1)).astype(self.out_dtype)
+            return chunk
+
+        def output_inner(self, geom):
+            return (), self.out_dtype
+
+    # Share a cache_key so the transform *fingerprint* matches across the two runs; only
+    # the declared output inner shape differs ((9,) -> ()). That isolates the structural
+    # backstop: the persisted .npy header no longer matches the current output geometry.
+    t_old = MeanLastAxis()
+    t_old.cache_key = "k"  # type: ignore[attr-defined]
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t_old])
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+
+    t_new = MeanBothAxes()
+    t_new.cache_key = "k"  # type: ignore[attr-defined]
+    pool2 = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t_new])
+    assert pool2.manifest_entries == 1, "same fingerprint -> entry is consulted"
+    assert not pool2.pin_if_ready("single_inner", 0), "output-geometry drift must invalidate"
+    assert pool2.revive_mismatch == 1 and pool2.hits == 0
+    pool2.close()
+
+
 def test_pool_wait_ready_raises_on_failure(tiled_store):
     """A poisoned tile surfaces on the waiting consumer (fail-fast), not a hang."""
     url, _ = tiled_store

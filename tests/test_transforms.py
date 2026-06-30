@@ -76,6 +76,31 @@ def test_chunk_transform_normalizes_batches(tmp_path) -> None:
         )
 
 
+def test_reshaping_chunk_transform_through_dataset(tmp_path) -> None:
+    """A reshaping chunk_transform (mean over the last inner axis, (3,4)->(3,)) flows
+    end-to-end through InSituDataset: every batch carries the post-transform geometry."""
+    url, src = _write(tmp_path, inner=(3, 4))
+    geoms = open_geometries(url)
+    manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
+
+    class MeanLastAxis:
+        def __call__(self, chunk):
+            chunk.data = chunk.data.mean(axis=-1)  # (n,3,4) -> (n,3)
+            return chunk
+
+        def output_inner(self, geom):
+            return geom.inner_shape[:-1], geom.dtype
+
+    ds = InSituDataset(
+        url, manifest, batch_size=10, block_chunks=4, chunk_transforms=[MeanLastAxis()]
+    )
+    ds.set_epoch(0)
+    for batch in ds.train:
+        idx = batch.sample_indices
+        assert batch.arrays["t2m"].shape == (len(idx), 3)  # reshaped inner
+        np.testing.assert_allclose(batch.arrays["t2m"], src[idx].mean(axis=-1), rtol=1e-5)
+
+
 def test_cross_variable_windspeed_is_a_batch_transform(tmp_path) -> None:
     # Validates the documented capability: U10,V10 -> windspeed lives at the BATCH
     # stage (the chunk stage sees one variable at a time).
