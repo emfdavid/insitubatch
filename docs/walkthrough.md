@@ -20,17 +20,21 @@ ERA5 zarr (zarr v2 on GCS) and report time-to-first-batch and throughput.
 ## Environment
 
 Run on the EC2 box from the [AWS ops runbook](https://github.com/emfdavid/insitubatch/blob/main/bench/ops_aws.md)
-(`c6id.8xlarge`, us-east-1). Note this reads **GCS from AWS** — cross-cloud, so
-the network ceiling is lower than an in-region S3 store would give; treat the
+(`c6id.16xlarge`, us-east-1, 25 Gb/s). Note this reads **GCS from AWS** — cross-cloud,
+so the network ceiling is lower than an in-region S3 store would give; treat the
 absolute throughput as a floor, and the *shape* of the comparison as the point.
+
+Both stacks are measured on **identical 48×32 samples** (16,000 each, same store),
+each preceded by a discarded warmup run to absorb the GCS per-prefix ramp; xbatcher
+is reported at its best worker count (swept 16/32/64).
 
 !!! warning "Compare MB/s, not samples/s, against full-resolution runs"
     WeatherBench2 `128x64` is a **downsampled** ERA5: each field is `128·64·4` ≈
     **32 KB**, about **130× smaller** than a full-resolution `721×1440` field
     (~4.15 MB). So the `samples/s` here look fast mainly because the samples are
-    tiny — in **bytes/s** this run is ~96 MB/s, the same ~100 MB/s ceiling the
-    [benchmark suite](benchmarks.md) sees on full-resolution data. Don't read the
-    walkthrough's `samples/s` as comparable to the suite's; convert to MB/s.
+    tiny — in **bytes/s** insitubatch's run below is only ~140 MB/s. Don't read the
+    walkthrough's `samples/s` as comparable to the [benchmark suite](benchmarks.md)'s
+    full-resolution numbers; convert to MB/s first.
 
 ## insitubatch
 
@@ -38,14 +42,14 @@ absolute throughput as a floor, and the *shape* of the comparison as the point.
 uv run python -m examples.wb2_dataloader --wb2 --subregion 48,32 --max-batches 1000
 ```
 
-Median of 5 runs (16,000 samples each; cross-cloud GCS→AWS, so the spread is mostly
-network variance):
+Median of 5 timed runs (a discarded warmup precedes them; 16,000 samples each;
+cross-cloud GCS→AWS, so the spread is mostly network variance):
 
 | metric | median | range (n=5) |
 |---|---:|---:|
-| samples/s | 2915 | 2247 – 2985 |
-| TTFB (ms) | 338 | 291 – 546 |
-| mean wait (ms) | 5.3 | 5.1 – 6.8 |
+| samples/s | 4447 | 4014 – 4922 |
+| TTFB (ms) | 317 | 295 – 335 |
+| mean wait (ms) | 3.3 | 3.2 – 3.9 |
 
 This is the **zero-compute** case (`--train-step-ms 0`): the loader is purely
 IO-bound, so the mean per-batch wait (table above) is dominated by the
@@ -59,43 +63,52 @@ single cold chunk read before the first batch.
 ## xbatcher (worker stack)
 
 ```bash
-uv run python -m examples.wb2_xbatcher --wb2 --compare --max-batches 500 --num-workers 16
+uv run python -m examples.wb2_xbatcher --wb2 --subregion 48,32 --compare --max-batches 500 --num-workers 16
 ```
 
+Median of 3 runs at 16 workers (xbatcher's best — see below):
+
 ```
-regime                       workers   ttfb_ms   samples/s   wall_s
-xbatcher spawn                    16     913.5         210    76.07
-xbatcher forkserver               16    1510.6         238    67.21
-xbatcher forkserver-preload       16     811.3         280    57.06
+regime                       workers   ttfb_ms   samples/s
+xbatcher spawn                    16       874         230
+xbatcher forkserver               16       818         249
+xbatcher forkserver-preload       16       883         289
 ```
 
-**Why is plain `forkserver` worse than `spawn` on TTFB?** Without
-`set_forkserver_preload` the fork-server process starts nearly empty, so each
-forked worker still re-imports torch/xarray/xbatcher itself — you pay spawn's
-per-worker import cost **plus** the one-time fork-server bootstrap on the critical
-path to the first batch. `spawn` skips that server step. forkserver only pays off
-once you **preload** the heavy modules into the server: the fork is then cheap and
-import-free, which is why `forkserver-preload` has the lowest TTFB and the best
-throughput. (Throughput is much closer across the three — at 500 batches startup is
-amortized and they converge toward the worker stack's steady rate; the spread is
-mostly TTFB.)
+**16 workers is xbatcher's best here, and adding workers *hurts*.** Each worker
+reads and decodes the full 40-timestep chunk *once per sample*, so more workers
+multiply that redundant decode rather than adding useful concurrency: throughput
+falls to ≈186 samples/s at 32 workers and ≈110 at 64. This is the **inverse** of
+the GRIB / one-sample-per-chunk regime (see [benchmarks](benchmarks.md)), where the
+chunk holds a single sample and more worker processes *do* add useful read
+concurrency — there xbatcher scales up to 64 workers. The right worker count is a
+property of the chunk layout, not a constant.
+
+**On worker start regimes (`--mp`):** at this scale the three are within run-to-run
+noise on TTFB (~820–880 ms on a 64-core box with warm GCS); `forkserver-preload`
+keeps a modest *throughput* edge. The structural cost is that *every* regime pays
+~850 ms of worker-stack startup before the first batch — versus insitubatch's
+317 ms — see
+[the fork-safety tax and inference-startup note](architecture.md#startup-latency-the-inference-angle).
 
 ## Side by side
 
 | Stack | regime | TTFB (ms) | samples/s |
 |---|---|---:|---:|
-| **insitubatch** | event loop (`num_workers=0`) | 338 | **2915** |
-| xbatcher | spawn (16 workers) | 913 | 210 |
-| xbatcher | forkserver (16 workers) | 1511 | 238 |
-| xbatcher | forkserver-preload (16 workers) | 811 | **280** |
+| **insitubatch** | event loop (`num_workers=0`) | **317** | **4447** |
+| xbatcher | spawn (16 workers) | 874 | 230 |
+| xbatcher | forkserver (16 workers) | 818 | 249 |
+| xbatcher | forkserver-preload (16 workers) | 883 | **289** |
 
-Both stacks deliver the same 16,000 samples from the same WeatherBench2 store; the
-configs differ in the ways each is run idiomatically (insitubatch: `num_workers=0`,
-parallelism in the event loop, median of 5 runs; xbatcher: tuned to 16 workers,
-single run). The ~10× throughput gap is the structural one: the xbatcher map-style
-dataset reads + decodes a 40-timestep chunk **once per sample**, while insitubatch
-reads each chunk **once** and slices every sample from it
-([the read plan](architecture.md#prefetch)). The worker stack's *other* cost is
-cold-start latency (TTFB) — see
+Both stacks deliver the **same 16,000 samples at the same 48×32 shape** from the
+same WeatherBench2 store; the configs differ only in the ways each is run
+idiomatically (insitubatch: `num_workers=0`, parallelism in the event loop;
+xbatcher: tuned to its best worker count). The ~15× throughput gap is the
+structural one: the xbatcher map-style dataset reads + decodes a 40-timestep chunk
+**once per sample**, while insitubatch reads each chunk **once** and slices every
+sample from it ([the read plan](architecture.md#prefetch)). The worker stack's
+*other* cost is cold-start latency (TTFB, ~2.7× here) — see
 [the fork-safety tax and inference-startup note](architecture.md#startup-latency-the-inference-angle)
-for why `forkserver-preload` is its best case and why insitubatch pays none of it.
+for why insitubatch pays none of it. This is the **fat-chunk** regime, which favors
+insitubatch most; at the GRIB / one-sample-per-chunk end the gap narrows and the
+worker fan-out's warm throughput can lead — see [benchmarks](benchmarks.md).

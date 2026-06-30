@@ -146,7 +146,46 @@ How much of the NIC do we keep? insitu's decoded MB/s as a **% of the raw-GET ce
 
 So ~80% of the network ceiling survives decode + gather. S3 Express saturates the ceiling
 at **concurrency 16** (single-digit-ms GETs) where regular S3 needs 32–64, and it rescues
-the GRIB end: insitu `c1` runs **820 MB/s on Express vs 283 on S3 (2.9×)**.
+the GRIB end: insitu `c1` runs **820 MB/s on Express vs 283 on S3 (2.9×)**. On a 25 Gb/s box
+this ceiling roughly doubles and Express separates further from standard — see
+[Scaling](#scaling-the-same-workload-on-faster-hardware).
+
+---
+
+## Scaling — the same workload on faster hardware
+
+Re-running on a **`c6id.16xlarge`** (64 vCPU, **25 Gb/s** — double the `c6id.8xlarge`'s NIC)
+isolates what was network-bound. These are additional real-hardware data points, not design
+changes.
+
+Raw-GET ceiling and insitu decoded throughput (`fat_g16`, MB/s, median of 5):
+
+| `fat_g16` | 12.5 Gb/s (8xlarge) | 25 Gb/s (16xlarge) |
+|---|--:|--:|
+| raw GET — S3 standard | 1467 | 2548 |
+| raw GET — S3 Express | 1501 | 2868 |
+| insitu decoded — S3 standard | 1187 | 1591 |
+| insitu decoded — S3 Express | 1261 | 1904 |
+
+Two things the bigger pipe reveals:
+
+1. **The 12.5 Gb/s box was NIC-bound.** Both buckets capped at ~1.5 GB/s (≈12 Gbit/s);
+   doubling the NIC nearly doubles raw GET (standard +74%, Express +91%), and decode keeps
+   pace (insitu +34% / +51%). Express now reaches ~23 of 25 Gbit/s.
+2. **S3 Express separates from standard only once you're off the cap.** At 12.5 Gb/s the two
+   were a statistical tie (both pipe-limited); at 25 Gb/s Express hits its ceiling at
+   concurrency 32 where standard needs 128, and is far steadier run-to-run (single-AZ). On
+   the **latency-bound GRIB end (`c1`)** the gap is largest — Express beats standard **2–9×
+   per engine** (e.g. xbatcher 883 → 1939 samples/s, workers 327 → 2546).
+
+**Worker count is a property of the chunk layout.** The `c1` suite on the fast box also
+sharpens the engine trade-off. At the GRIB end (one tiny GET per sample, request-rate-bound)
+the worker fan-out's *warm* throughput leads and **more workers help** (xbatcher best at 64).
+At **fat chunks** the opposite holds — each worker re-decodes the whole chunk per sample, so
+adding workers multiplies decode and throughput *falls* (the
+[WeatherBench2 walkthrough](walkthrough.md) measures xbatcher dropping 289 → 110 samples/s
+from 16 → 64 workers). insitu keeps the cold-start/TTFB and consistency edge in both regimes;
+the worker stack's warm-throughput win is specific to the `c1` extreme.
 
 ---
 
@@ -176,10 +215,10 @@ working set), so it's apples-to-apples:
 → **~8× memory, ~19× throughput, ~22× TTFB.** insitu's footprint is one Python+obstore
 process (paid once); the baselines pay the interpreter floor **32×** plus a 208 MB field
 re-decoded per sample at fat chunks. The independent **WeatherBench2** run on the real
-public store (`examples/wb2_xbatcher.py` vs `wb2_dataloader.py`, 8 workers) makes it
-concrete: xbatcher manages **~40–60 samples/s** at **~2–3 s** to first batch, insitu
-**~2250 samples/s** at **~320 ms** — **~40×** throughput, because WB2's fat time-chunks
-punish the per-sample decode while insitu reads each chunk once.
+public store ([walkthrough](walkthrough.md), identical 48×32 samples, xbatcher at its best
+worker count) makes it concrete: xbatcher manages **~290 samples/s** at **~850 ms** to first
+batch, insitu **~4450 samples/s** at **~320 ms** — **~15×** throughput and ~2.7× TTFB,
+because WB2's fat time-chunks punish the per-sample decode while insitu reads each chunk once.
 
 ---
 
