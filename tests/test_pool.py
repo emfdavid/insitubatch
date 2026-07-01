@@ -604,6 +604,23 @@ def test_pool_persist_log_dedups_across_epochs_and_runs(tiled_store, tmp_path):
     assert len(logpath.read_text().splitlines()) == 3, "reopen must not duplicate lines"
 
 
+def test_pool_close_is_idempotent(tiled_store, tmp_path):
+    """close() must be safe to call twice: InSituDataset.close() and its __del__ both call it,
+    and ChunkPool.__del__ is a third best-effort call. The second call releases nothing (the log
+    handle is already None, the slots already freed) and must not raise."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+    assert pool._log is None  # handle released
+    pool.close()  # idempotent -- no double-close error on the file handle or slots
+
+
 def test_pool_persist_missing_file_is_miss_not_raise(tiled_store, tmp_path):
     """A log entry whose ``.npy`` is gone from disk (external deletion / disk cleanup -- NOT
     eviction, which keeps the file) is a **miss**: revive fails to open it, drops the entry, and

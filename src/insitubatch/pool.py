@@ -843,9 +843,9 @@ class ChunkPool:
         logger.info("persist: stale cache at %s (%s changed) reset; rebuilding.", self._dir, why)
 
     def close(self) -> None:
-        """Free every remaining slot. Persist keeps ready cache files (each already recorded in
-        the log at completion, so there is nothing to rewrite -- just flush + close the handle);
-        heap/spill mmap files are unlinked."""
+        """Free every remaining slot and release the log handle. Persist keeps ready cache files
+        (each already recorded in the log at completion, so there is nothing to rewrite -- just
+        flush + close the handle); heap/spill mmap files are unlinked. Idempotent."""
         with self._cv:
             if self._log is not None:
                 self._log.flush()
@@ -856,3 +856,11 @@ class ChunkPool:
                 self._free(slot, keep_file=self._persistent and slot.ready)
             self._bytes = 0
             self._pinned.clear()
+
+    def __del__(self) -> None:
+        # Safety net for a pool dropped without an explicit close() -- release the open log
+        # handle (persist mode holds one for its lifetime) and the mmap backings. Best-effort:
+        # __del__ runs at GC / interpreter shutdown where exceptions are unraisable. In normal
+        # use InSituDataset.close()/__del__ closes the pool; this covers a bare ChunkPool.
+        with contextlib.suppress(Exception):
+            self.close()
