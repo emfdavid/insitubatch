@@ -15,6 +15,12 @@ for the thesis and [docs/architecture.md](docs/architecture.md) for the pipeline
   recovered — let them propagate with context. Validate at boundaries and raise
   early. Use explicit exceptions for runtime contracts; reserve `assert` for
   internal dev invariants (it is stripped under `-O`).
+- **Copy-paste-safe command blocks.** Interactive zsh (macOS default) has
+  `interactive_comments` off, so a pasted `#` line runs as a command
+  (`zsh: command not found: #`); bash honors in-block comments by default. Docs/runbooks
+  that keep `#` comments inside fenced blocks (`bench/ops_*.md`) must carry a
+  `setopt interactive_comments` note near the top so zsh readers enable it once. Prefer
+  that one escape-hatch note over sprinkling the caveat per block.
 
 ## Interaction style
 

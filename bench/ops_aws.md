@@ -7,6 +7,10 @@ reproduce the benchmark paying only their own egress.
 > You run these; nothing here is run for you. Commands are copy-paste with the
 > variables in the first block. The GCP equivalent is [`ops_gcp.md`](ops_gcp.md); the
 > dataset matrix and per-story run commands live in [`benchmark_plan.md`](benchmark_plan.md).
+>
+> **zsh (macOS default):** run `setopt interactive_comments` once before pasting — the
+> blocks contain `#` comments, and interactive zsh otherwise runs `#` as a command
+> (`zsh: command not found: #`). bash honors in-block comments by default.
 
 ## Contents
 
@@ -159,6 +163,26 @@ IP=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$IID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 echo "ssh -A ec2-user@$IP"
 ```
+
+### (Optional) Elastic IP — stable address across stop/start
+
+A Spot box that stops/starts gets a **new** auto-assigned public IP each time; an Elastic
+IP (EIP) pins it so you reconnect to the same address and `known_hosts` stays put. Allocate
+one and associate it with the running instance:
+
+```bash
+# allocate a VPC Elastic IP and bind it to the instance
+ALLOC=$(aws ec2 allocate-address --region "$AWS_REGION" --domain vpc \
+  --query AllocationId --output text)
+aws ec2 associate-address --region "$AWS_REGION" \
+  --instance-id "$IID" --allocation-id "$ALLOC"
+EIP=$(aws ec2 describe-addresses --region "$AWS_REGION" \
+  --allocation-ids "$ALLOC" --query 'Addresses[0].PublicIp' --output text)
+echo "ssh -A ec2-user@$EIP"
+```
+
+AWS bills every public IPv4 at ~$0.005/hr whether the EIP is in use or idle — a few cents a
+day. Release it at [teardown](#teardown) rather than leaving it allocated.
 
 ## 7. On the box — mount NVMe, install, generate, bench
 ```bash
@@ -465,6 +489,9 @@ aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$IID"
 aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$IID"
 
 aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$IID"
+# if you allocated an Elastic IP, release it after terminate (terminate auto-disassociates
+# it; an unreleased EIP keeps billing):
+#   aws ec2 release-address --region "$AWS_REGION" --allocation-id "$ALLOC"
 # keep the bucket for reproducers; to remove later:
 #   aws s3 rb "s3://$BUCKET" --force
 # and tear down the IAM/SG if done:
@@ -480,6 +507,8 @@ aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$IID"
   (Instance-store NVMe is included and ephemeral — wiped on stop/terminate.)
 - S3 storage: ~$0.023/GB-mo → ~150 GB ≈ **$3.5/mo** (owner pays storage only).
 - Requester Pays: reproducers pay their own GET + egress; owner pays $0 for reads.
+- Elastic IP (if used): ~$0.005/hr (~$0.12/day) for the IPv4, billed whether attached or
+  idle — release at teardown.
 - Optional: an AWS Budgets alarm to cap surprises.
 
 ## Notes

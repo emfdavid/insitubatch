@@ -27,17 +27,29 @@ it runs against S3. The dataset matrix and per-story run commands live in
 
 ## Read first — the access model
 
-- **Public read = anonymous.** Unlike S3 Requester-Pays, the simplest public GCS pattern is
-  an anonymous-readable bucket (`allUsers` → `roles/storage.objectViewer`); obstore reads it
+Two mutually exclusive read models; **anonymous-public is the only one that works
+end-to-end today** — see the Requester Pays blocker below.
+
+- **Anonymous public read (tested).** The simplest public GCS pattern is an
+  anonymous-readable bucket (`allUsers` → `roles/storage.objectViewer`); obstore reads it
   with `skip_signature=True` (the same flag the WeatherBench2 example uses for `gs://`). The
   owner pays egress, so keep readers in-region.
-- **Requester Pays exists** on GCS too (`--requester-pays`), but obstore's billing-project
-  pass-through for GCS is **VERIFY** — confirm before relying on it. For the public benchmark,
-  anonymous read is the tested path.
+- **Requester Pays (bucket side works, client side BLOCKED).** GCS supports
+  `--requester-pays`, but unlike S3 there is **no owner exemption**: *every* non-exempt
+  request — yours from the GCE box included — must carry a billing project
+  (`x-goog-user-project`). obstore 0.10.1's `GCSConfig` exposes **no** user-project / billing
+  knob (just auth options like `skip_signature`, `service_account`, `token`), so obstore cannot send it and
+  both owner and reproducer reads 400. This is why S3's `request_payer=True` has no GCS
+  equivalent here. Do not enable Requester Pays on the bench bucket until that upstream knob
+  lands — see [§2](#2-gcs-bucket--regional-public-read).
 - **Co-locate** bucket and instance in one region (and one **zone** for local SSD and Rapid
   Storage). Cross-region egress is slow and billed.
 
 ## Variables
+
+> **zsh (macOS default):** run `setopt interactive_comments` once before pasting — the
+> blocks below contain `#` comments, and interactive zsh otherwise runs `#` as a command
+> (`zsh: command not found: #`). bash honors in-block comments by default.
 
 ```bash
 export PROJECT=$(gcloud config get-value project)
@@ -65,6 +77,26 @@ gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
   --member=allUsers --role=roles/storage.objectViewer
 ```
 
+### Requester Pays — the AWS analogue (currently BLOCKED on obstore)
+
+The GCS counterpart to [`ops_aws.md` §2](ops_aws.md#2-s3-bucket--regional-public-read-requester-pays).
+The bucket-side setup is a two-liner — any authenticated Google account may read, and the
+reader's own project is billed for egress:
+
+```bash
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
+  --member=allAuthenticatedUsers --role=roles/storage.objectViewer
+gcloud storage buckets update "gs://$BUCKET" --requester-pays
+```
+
+> **Do not run this on the bench bucket yet.** obstore 0.10.1 has no GCS billing-project
+> config (verified: `GCSConfig` carries auth options like `skip_signature` / `service_account`
+> but no `user_project`), and GCS — unlike S3 — grants the owner **no** Requester-Pays exemption.
+> So enabling it breaks *your own* GCE bench reads too, not just external reproducers, with
+> `... is a requester pays bucket but no user project provided`. There is no `request_payer`
+> equivalent to pass through `store_from_url` for `gs://`. Until obstore gains a GCS
+> user-project knob, anonymous-public (above) is the one working path.
+
 ## 3. Service account + bucket access
 
 The GCE instance reads/writes the bucket via its attached service account — no keys on disk,
@@ -91,6 +123,24 @@ gcloud compute firewall-rules create insitubatch-ssh \
 `n2-standard-32` ≈ the `c6id.8xlarge` (32 vCPU); one local SSD gives ephemeral NVMe for the
 mmap cache spill. **VERIFY** the machine family supports the local-SSD count you ask for.
 
+### Reuse an existing SSH key (skip gcloud's auto-keygen)
+
+GCE has no importable key-pair object like EC2's `import-key-pair`; left to itself
+`gcloud compute ssh` generates and manages a dedicated `~/.ssh/google_compute_engine` pair.
+To connect with an existing key instead — the analogue of
+[`ops_aws.md` §1](ops_aws.md#1-import-your-ssh-key-from-ssh-agent) — inject its **public**
+half as instance metadata at launch. The metadata format is `USERNAME:KEY`, and `USERNAME`
+becomes your login user on the box:
+
+```bash
+export SSH_USER="$USER"
+printf '%s:%s\n' "$SSH_USER" "$(ssh-add -L | grep emfdavid_ed25519)" \
+  > /tmp/gce-ssh-keys.txt
+```
+
+Then launch with the key wired in via `--metadata-from-file`, and connect with plain
+`ssh -A` (the AWS-style flow), not `gcloud compute ssh`:
+
 ```bash
 gcloud compute instances create "$INSTANCE" \
   --zone="$ZONE" \
@@ -98,10 +148,59 @@ gcloud compute instances create "$INSTANCE" \
   --image-family=ubuntu-2204-lts --image-project=ubuntu-os-cloud \
   --local-ssd=interface=NVME \
   --scopes=cloud-platform \
-  --provisioning-model=SPOT --instance-termination-action=STOP
+  --provisioning-model=SPOT --instance-termination-action=STOP \
+  --metadata-from-file=ssh-keys=/tmp/gce-ssh-keys.txt
 
-gcloud compute ssh "$INSTANCE" --zone="$ZONE"
+IP=$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" \
+  --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+ssh -A "$SSH_USER@$IP"
 ```
+
+The key comes from your **ssh-agent** (as in the AWS flow) — no `-i` and no on-disk key
+file needed. First connect to a fresh box prompts to accept the host key; if instead you get
+`Host key verification failed`, GCP has likely recycled the external IP and a stale
+`known_hosts` entry is colliding — clear it and retry:
+
+```bash
+ssh-keygen -R "$IP"
+ssh -A "$SSH_USER@$IP" -o StrictHostKeyChecking=accept-new
+```
+
+> **OS Login caveat.** If OS Login is enabled (project/instance metadata
+> `enable-oslogin=TRUE`), metadata `ssh-keys` are *ignored* — register the key with
+> `gcloud compute os-login ssh-keys add --key-file="$HOME/.ssh/emfdavid_ed25519.pub"`
+> instead. It is off by default; check with
+> `gcloud compute project-info describe --format='value(commonInstanceMetadata.items)' | grep -i oslogin`.
+
+### (Optional) Static external IP — stable address across stop/start
+
+The GCE counterpart to the AWS Elastic IP
+([`ops_aws.md` §6](ops_aws.md#optional-elastic-ip--stable-address-across-stopstart)): an
+ephemeral external IP is released on stop and a new one assigned on start, so reserve a
+**static external IP** to keep the box's address fixed. Reserve a regional address and swap
+the instance's external interface onto it:
+
+```bash
+# reserve a regional static IP
+gcloud compute addresses create "${INSTANCE}-ip" --region="$REGION"
+STATIC_IP=$(gcloud compute addresses describe "${INSTANCE}-ip" \
+  --region="$REGION" --format='get(address)')
+
+# swap the instance's ephemeral access-config for the reserved IP (look up the existing
+# access-config name first; the default created at launch is "External NAT")
+CONFIG=$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" \
+  --format='get(networkInterfaces[0].accessConfigs[0].name)')
+gcloud compute instances delete-access-config "$INSTANCE" --zone="$ZONE" \
+  --access-config-name="$CONFIG"
+gcloud compute instances add-access-config "$INSTANCE" --zone="$ZONE" \
+  --access-config-name="external-nat" --address="$STATIC_IP"
+echo "ssh -A $SSH_USER@$STATIC_IP"
+```
+
+To assign it at launch instead, reserve the address first and add `--address="$STATIC_IP"`
+to the §5 `instances create`. A static IP on a running VM is a few cents a day; a
+**reserved-but-unused** one is billed at a higher rate — delete it at
+[teardown](#teardown) rather than leaving it reserved.
 
 ## 6. On the box — mount NVMe, install, generate, bench
 
@@ -241,6 +340,8 @@ TTFB over a high-latency network is expected.
 
 ```bash
 gcloud compute instances delete "$INSTANCE" --zone="$ZONE"
+# if you reserved a static IP, delete it (a reserved-but-unused address keeps billing):
+#   gcloud compute addresses delete "${INSTANCE}-ip" --region="$REGION"
 # keep the bucket for reproducers; to remove later:
 #   gcloud storage rm --recursive "gs://$BUCKET"
 #   gcloud compute firewall-rules delete insitubatch-ssh
@@ -252,6 +353,8 @@ gcloud compute instances delete "$INSTANCE" --zone="$ZONE"
 - `g2-standard-8` (1x L4): Spot ~$0.2–0.3/hr, on-demand ~$0.7–0.9/hr (**VERIFY** current
   pricing). Local SSD is billed while the instance exists and wiped on stop.
 - GCS storage: ~$0.02/GB-mo (standard, regional). Rapid Storage is priced higher — **VERIFY**.
+- Static external IP (if used): a few cents a day while attached to a running VM; a
+  reserved-but-unused address is billed at a higher rate — delete it at teardown.
 
 ## Notes
 
