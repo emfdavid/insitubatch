@@ -120,6 +120,7 @@ class InSituDataset:
         cache_dir: str | None = None,
         cache_budget_bytes: int | None = None,
         persist: bool = False,
+        reset_stale_cache: bool = False,
         on_bad_chunk: str = "raise",
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
@@ -215,6 +216,7 @@ class InSituDataset:
             backing_dir=cache_dir,
             budget_bytes=self.cache_budget_bytes,
             persist=persist,
+            reset_stale_cache=reset_stale_cache,
         )
 
         # One concurrency dial (max_inflight, network), independent of the shuffle

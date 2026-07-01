@@ -19,15 +19,17 @@ Buffer and cache differ only in budget + backing, so they are the same code:
   as reclaimable page cache rather than anon heap.
 
 With ``persist=True`` (requires a ``backing_dir``) the mmap tier becomes a **cross-run
-cache**: slot files survive ``close`` (only budget eviction removes them), a JSON
-manifest records the completed entries, and a new pool over the same dir revives them
-as ready hits -- no fetch/decode. The ``backing_dir`` path *is* the dataset identity
-(bury a version in it; the store URL is not in the key). Two automatic guards: the
-manifest carries a **chunk_transform fingerprint** (changed transforms -> whole cache
-discarded) and revive does a **shape/dtype** check per entry; either mismatch is a miss
-(recompute + overwrite), never an error. The fingerprint uses cloudpickle when present
-(``--extra cache``; captures closures/globals), else a best-effort source hash (warned),
-and always honors an explicit ``transform.cache_key``. Without ``persist`` a
+cache**: slot files survive ``close`` (only budget eviction removes them), an append-only
+``insitu_cache.jsonl`` log records each completed entry *as it lands* (so a killed process
+still leaves a usable cache -- crash recovery, no re-decode of what finished), and a new
+pool over the same dir revives them as ready hits -- no fetch/decode. The ``backing_dir``
+path *is* the dataset identity (bury a version in it; the store URL is not in the key).
+The log header carries a **chunk_transform fingerprint**: a changed transform (or a format
+bump) is a **stale cache**, which by default *raises* (``reset_stale_cache=True`` deletes
+and rebuilds it). Revive additionally does a **shape/dtype** check per entry; that mismatch
+is a miss (recompute + overwrite), never an error. The fingerprint uses cloudpickle when
+present (``--extra cache``; captures closures/globals), else a best-effort source hash
+(warned), and always honors an explicit ``transform.cache_key``. Without ``persist`` a
 ``backing_dir`` is ephemeral spill (unlinked on close).
 
 See [docs/architecture.md] for where this sits in the pipeline.
@@ -66,6 +68,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TextIO
 
 import numpy as np
 
@@ -192,8 +195,8 @@ class ChunkPool:
     the *assembled* array, so a hit reflects decode + transform.
     """
 
-    _MANIFEST_NAME = "insitu_cache.json"
-    _MANIFEST_FORMAT = 1
+    _MANIFEST_NAME = "insitu_cache.jsonl"
+    _MANIFEST_FORMAT = 2
 
     def __init__(
         self,
@@ -203,6 +206,7 @@ class ChunkPool:
         backing_dir: str | Path | None = None,
         budget_bytes: int | None = None,
         persist: bool = False,
+        reset_stale_cache: bool = False,
     ) -> None:
         self._geom = geometries  # label -> geometry (a label is one (array, offset) view)
         # Slots are keyed by the underlying array *path*, not the variable label, so two
@@ -248,10 +252,21 @@ class ChunkPool:
         # path is the dataset+pipeline identity (the user buries a version in it); we only
         # auto-check shape/dtype on revive (a mismatch is a miss, not an error).
         self._persistent = persist
+        # When the on-disk cache is *stale* (its chunk_transform fingerprint or the log format
+        # differs from this run's), the default is to fail fast -- a stale cache is almost never
+        # what the user intended. Setting this opts into deleting the stale files and rebuilding.
+        self._reset_stale_cache = reset_stale_cache
         if persist and self._dir is None:
             raise ValueError("persist=True requires cache_dir (a backing_dir) to keep files in")
         # key -> on-disk filename for completed entries known to survive a run.
         self._persisted: dict[tuple[str, int], str] = {}
+        # Keys already written to the on-disk log this pool's lifetime (loaded entries + entries
+        # appended on completion). Gates the append so re-completing a chunk across epochs/runs
+        # never duplicates a line -- the log is self-deduplicating and bounded to O(#chunks).
+        self._recorded: set[tuple[str, int]] = set()
+        # The append-only manifest handle (persist mode), held open for the pool's lifetime so a
+        # completion is one write()+flush() -- no per-chunk open(). None in heap/spill mode.
+        self._log: TextIO | None = None
         # Fingerprint of the chunk_transform pipeline (only chunk_transforms are baked into
         # cached chunks; batch_transforms run post-cache). A run whose fingerprint differs
         # from the manifest's discards the cache (changed transforms -> stale). batch
@@ -269,7 +284,8 @@ class ChunkPool:
                     "(source only; closure/global changes may not invalidate). Install "
                     "`insitubatch[cache]` or set a `cache_key` attribute for a stronger guarantee."
                 )
-            self._load_manifest()
+            self._load_log()
+            self._open_log()
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
         self._bytes = 0
         # OrderedDict in recency order (LRU front -> MRU back). Eviction targets only
@@ -503,11 +519,10 @@ class ChunkPool:
         self._pinned.pop(key, None)  # no stale refcount if dropping a (rare) pinned partial
         self._bytes -= slot.nbytes
         # In persist mode a *ready* eviction is a cache demotion, not a deletion: keep the
-        # .npy on disk and register it so a later epoch/run can revive it. A not-ready
-        # partial is garbage either way -> unlink it.
+        # .npy on disk so a later epoch/run can revive it. It was already recorded in the log at
+        # completion (see scatter -> _record_completed), so eviction touches only the backing.
+        # A not-ready partial is garbage either way -> unlink it.
         keep = self._persistent and slot.ready
-        if keep:
-            self._register_persisted(key, slot)
         self._free(slot, keep_file=keep)
 
     def _alloc(
@@ -549,6 +564,10 @@ class ChunkPool:
             slot.data = self._persist(slot.data, prepped)
             slot.scratch = None  # assembly done -- drop the transient source-shaped buffer
             slot.ready = True
+            # Record the completed entry *now* (not at eviction/close) so a crash still leaves a
+            # usable cache. Appending here, under the lock, serializes writes across decode
+            # threads and orders them after the slot's data is durable in its .npy.
+            self._record_completed(key, slot)
             self._cv.notify_all()
 
     def _persist(self, current: np.ndarray, prepped: np.ndarray) -> np.ndarray:
@@ -678,111 +697,160 @@ class ChunkPool:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(fname)
 
-    def _register_persisted(self, key: tuple[str, int], slot: _Slot) -> None:  # under the lock
-        """Record a ready mmap slot's file as a surviving cache entry (persist mode)."""
+    @staticmethod
+    def _is_bare_filename(fname: object) -> bool:
+        """True iff ``fname`` is a bare basename safe to resolve inside the cache dir.
+
+        An absolute path, a ``..`` component, or any separator would escape via
+        ``self._dir / fname`` in :meth:`_revive`. ``Path('..').name`` is ``'..'`` and a
+        Windows-style separator is an ordinary char to posix ``basename``, so check the
+        separators explicitly rather than trusting ``Path.name``.
+        """
+        return (
+            isinstance(fname, str)
+            and fname not in ("", ".", "..")
+            and "/" not in fname
+            and "\\" not in fname
+        )
+
+    def _record_completed(self, key: tuple[str, int], slot: _Slot) -> None:  # under the lock
+        """Register a freshly completed slot's ``.npy`` as a surviving cache entry and append
+        it to the log -- exactly once per key.
+
+        Recording at *completion* (not at eviction/close) is what makes the cache crash-safe: a
+        killed process still leaves every finished chunk in the log. Idempotent per key -- a
+        re-completion in a later epoch (after eviction + refetch) refreshes ``_persisted`` but
+        the ``_recorded`` gate skips the duplicate log line, so the log stays bounded.
+        """
+        if not self._persistent:
+            return
         fname = getattr(slot.data, "filename", None)
-        if fname is not None:
-            self._persisted[key] = Path(fname).name
+        if fname is None:
+            return  # heap backing -- nothing on disk to record
+        fname = Path(fname).name
+        self._persisted[key] = fname
+        if self._log is not None and key not in self._recorded:
+            array, chunk_index = key
+            self._append_entry(array, chunk_index, fname)
+            self._recorded.add(key)
 
-    def _load_manifest(self) -> None:
-        """Populate the persisted-entry registry from a prior run's manifest, if any.
+    def _append_entry(self, array: str, chunk_index: int, fname: str) -> None:  # under the lock
+        """Append one completed-entry line to the open log and flush it to the page cache.
 
-        No manifest is a cold start (silent -- the expected first run). The *expected* stale
-        states degrade to a cold start with a WARN: an unreadable manifest, a format-version
-        bump, and a chunk_transform fingerprint change. Per-entry data validation (file
-        existence, shape, dtype) is deferred to :meth:`_revive`, which reads it from the
-        ``.npy`` header -- so a stale/missing file shows up as a per-epoch revive failure.
+        ``flush`` (not ``fsync``) makes the entry durable against *process death* -- the target
+        failure mode (spot preemption / OOM / SIGTERM); the kernel flushes the page cache. Power
+        loss (which would need ``fsync`` per chunk) is out of scope.
+        """
+        assert self._log is not None
+        self._log.write(json.dumps({"array": array, "chunk_index": chunk_index, "file": fname}))
+        self._log.write("\n")
+        self._log.flush()
 
-        A manifest that clears those gates but is then *structurally* corrupt -- an entry with
-        a missing field, a non-integer chunk index, or a ``file`` that is not a bare filename
-        (an absolute or ``..`` path would let :meth:`_revive` ``open_memmap`` escape the cache
-        dir) -- is **not** an expected stale cache; it is corruption or tampering. We fail fast
-        and raise rather than silently start cold (which would hide the problem and re-decode
-        everything). Delete the cache dir to reset.
+    def _open_log(self) -> None:
+        """Open the append-only manifest for the pool's lifetime; write the header on a cold
+        start (or after a stale-cache reset removed the file). A warm reopen appends after the
+        existing entries -- the ``_recorded`` gate (populated by :meth:`_load_log`) keeps those
+        from being re-appended."""
+        assert self._dir is not None
+        path = self._dir / self._MANIFEST_NAME
+        fresh = not path.exists()
+        self._log = path.open("a")
+        if fresh:
+            header = {"format_version": self._MANIFEST_FORMAT, "pipeline_hash": self._pipeline_fp}
+            self._log.write(json.dumps(header))
+            self._log.write("\n")
+            self._log.flush()
+
+    def _load_log(self) -> None:
+        """Populate the persisted-entry registry from a prior run's append-only log, if any.
+
+        No log is a cold start (silent -- the expected first run). A log whose header ``format``
+        or ``pipeline_hash`` differs from this run is a **stale** cache: by default that *raises*
+        (a stale cache is almost never what the user intended), or -- with ``reset_stale_cache``
+        -- it deletes the listed files + the log and rebuilds (see :meth:`_reset_stale`).
+
+        Corruption always raises, regardless of the flag: an unreadable header, a malformed
+        *interior* entry, or a ``file`` that is not a bare filename (an absolute or ``..`` path
+        would let :meth:`_revive` ``open_memmap`` escape the cache dir -- path-traversal
+        tampering). A torn *final* line (a crash mid-append) is expected and dropped silently.
         """
         assert self._dir is not None
         path = self._dir / self._MANIFEST_NAME
         if not path.exists():
             return  # cold start: no prior cache (the expected first run)
+        lines = path.read_text().splitlines()
+        if not lines:
+            return  # header not yet flushed (a crash before the first write) -- treat as cold
         try:
-            doc = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("persist: cache manifest %s unreadable (%s); starting cold", path, exc)
-            return
-        if doc.get("format_version") != self._MANIFEST_FORMAT:
-            logger.warning(
-                "persist: cache manifest %s format %r != %d; starting cold",
-                path,
-                doc.get("format_version"),
-                self._MANIFEST_FORMAT,
-            )
-            return
-        if doc.get("pipeline_hash") != self._pipeline_fp:
-            logger.warning(
-                "persist: chunk_transform fingerprint changed since %s was written; "
-                "ignoring the stale cache (starting cold)",
-                path,
-            )
-            return
-        entries = doc.get("entries", [])
-        if not isinstance(entries, list):
+            header = json.loads(lines[0])
+            fmt, fp = header["format_version"], header["pipeline_hash"]
+        except (json.JSONDecodeError, TypeError, KeyError) as exc:
             raise ValueError(
-                f"persist: cache manifest {path} is corrupt ('entries' is not a list); "
-                f"delete {self._dir} to reset the cache."
-            )
-        for entry in entries:
+                f"persist: cache log {path} has an unreadable header ({exc}); this is corruption "
+                f"or tampering, not a stale cache -- delete {self._dir} to reset."
+            ) from exc
+        entry_lines = lines[1:]
+        if fmt != self._MANIFEST_FORMAT or fp != self._pipeline_fp:
+            why = "log format" if fmt != self._MANIFEST_FORMAT else "chunk_transform fingerprint"
+            self._reset_stale(path, entry_lines, why)
+            return
+        for i, line in enumerate(entry_lines):
             try:
-                array, chunk_index, fname = entry["array"], int(entry["chunk_index"]), entry["file"]
-            except (TypeError, KeyError, ValueError) as exc:
+                rec = json.loads(line)
+                array, chunk_index, fname = rec["array"], int(rec["chunk_index"]), rec["file"]
+            except (json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:
+                if i == len(entry_lines) - 1:
+                    break  # torn tail: the crash landed mid-append on the last line -- drop it
                 raise ValueError(
-                    f"persist: cache manifest {path} has a malformed entry {entry!r} ({exc}); "
+                    f"persist: cache log {path} has a malformed entry on line {i + 2} ({exc}); "
                     f"this is corruption or tampering, not a stale cache -- delete {self._dir} "
                     "to reset."
                 ) from exc
-            # The file must be a bare name resolved inside the cache dir. An absolute path, a
-            # ``..`` component, or any separator would escape via ``self._dir / fname`` in
-            # _revive; a manifest only ever stores basenames (see _register_persisted). Check
-            # separators explicitly -- ``Path('..').name`` is ``'..'``, and a Windows-style
-            # separator is an ordinary char to posix ``basename`` -- so neither alone suffices.
-            unsafe = (
-                not isinstance(fname, str)
-                or fname in ("", ".", "..")
-                or "/" in fname
-                or "\\" in fname
-            )
-            if unsafe:
+            if not self._is_bare_filename(fname):
                 raise ValueError(
-                    f"persist: cache manifest {path} entry file {fname!r} is not a bare filename "
+                    f"persist: cache log {path} entry file {fname!r} is not a bare filename "
                     f"(possible path-traversal tampering); delete {self._dir} to reset."
                 )
-            self._persisted[(array, chunk_index)] = fname
+            key = (array, chunk_index)
+            self._persisted[key] = fname
+            self._recorded.add(key)
         self.manifest_entries = len(self._persisted)
 
-    def _write_manifest(self) -> None:  # call under the lock
-        """Atomically write the registry of completed cache entries (persist mode)."""
+    def _reset_stale(self, path: Path, entry_lines: list[str], why: str) -> None:
+        """A stale cache: raise by default, or (``reset_stale_cache``) GC + rebuild.
+
+        The GC deletes exactly the ``.npy`` files this stale log named -- each re-checked as a
+        bare filename before ``unlink`` (a tampered path is never removed) -- then the log
+        itself. Precise: only files we recorded writing; crash-orphans are already in the log.
+        """
         assert self._dir is not None
-        entries = [
-            {"array": array, "chunk_index": cid, "file": fname}
-            for (array, cid), fname in sorted(self._persisted.items())
-        ]
-        doc = {
-            "format_version": self._MANIFEST_FORMAT,
-            "pipeline_hash": self._pipeline_fp,
-            "entries": entries,
-        }
-        tmp = self._dir / (self._MANIFEST_NAME + ".tmp")
-        tmp.write_text(json.dumps(doc))
-        os.replace(tmp, self._dir / self._MANIFEST_NAME)
+        if not self._reset_stale_cache:
+            raise ValueError(
+                f"persist: cache at {self._dir} is stale ({why} changed since it was written). "
+                "This is not corruption -- pass reset_stale_cache=True to delete and rebuild it, "
+                f"or remove {self._dir} yourself."
+            )
+        for line in entry_lines:
+            try:
+                fname = json.loads(line)["file"]
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue  # a garbage/torn line in a log we're discarding anyway -- skip
+            if self._is_bare_filename(fname):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self._dir / fname)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        logger.info("persist: stale cache at %s (%s changed) reset; rebuilding.", self._dir, why)
 
     def close(self) -> None:
-        """Free every remaining slot. Persist mode keeps ready cache files + a manifest;
-        otherwise (heap/spill) mmap files are unlinked -- e.g. on teardown."""
+        """Free every remaining slot. Persist keeps ready cache files (each already recorded in
+        the log at completion, so there is nothing to rewrite -- just flush + close the handle);
+        heap/spill mmap files are unlinked."""
         with self._cv:
-            if self._persistent:
-                for key, slot in self._slots.items():
-                    if slot.ready:
-                        self._register_persisted(key, slot)
-                self._write_manifest()
+            if self._log is not None:
+                self._log.flush()
+                self._log.close()
+                self._log = None
             for k in list(self._slots):
                 slot = self._slots.pop(k)
                 self._free(slot, keep_file=self._persistent and slot.ready)

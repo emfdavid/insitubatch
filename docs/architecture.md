@@ -501,24 +501,33 @@ materialized batches with frozen composition. Pick by regime, not by a missing f
 ### Cross-run persistence
 
 `persist=True` (with a `cache_dir`) turns the mmap tier into a cache that **survives
-process exit**: ready slot files are kept on `close`, a JSON manifest records the
-completed entries, and a fresh dataset over the same `cache_dir` revives them as ready
-hits on first touch — the fetch driver's existing hit path skips fetch *and* decode
-*and* transform, so a warm run re-decodes **zero** chunks. Without `persist`,
-`cache_dir` is ephemeral spill (files unlinked on close).
+process exit**: ready slot files are kept on `close`, an append-only
+`insitu_cache.jsonl` log records each completed entry *the moment it lands*, and a fresh
+dataset over the same `cache_dir` revives them as ready hits on first touch — the fetch
+driver's existing hit path skips fetch *and* decode *and* transform, so a warm run
+re-decodes **zero** chunks. Because the log is written incrementally (not at `close`), a
+killed process — spot preemption, OOM, SIGTERM — still leaves a usable cache: the next
+run re-decodes only the chunks that hadn't finished. Without `persist`, `cache_dir` is
+ephemeral spill (files unlinked on close).
 
 ```python
 ds = InSituDataset(store, manifest, cache_dir="/mnt/nvme/era5/v3",
                    persist=True, cache_budget_bytes=...)
 ```
 
-Two automatic guards keep a reopened cache honest, and **either mismatch is a miss
-(re-fetch + overwrite), never an error** — the cache is a transparent optimization:
+Two guards keep a reopened cache honest:
 
-1. a **chunk-transform fingerprint** in the manifest — change your `chunk_transforms`
-   and the whole cache is discarded (cold start), never served stale; and
+1. a **chunk-transform fingerprint** in the log header — change your `chunk_transforms`
+   (or bump the log format) and the cache is **stale**. A stale cache is almost never
+   what you intended, so by default it **raises** at construction rather than silently
+   rebuilding or serving stale data. Pass `reset_stale_cache=True` to opt into deleting
+   the old files and rebuilding cold (or delete the `cache_dir` yourself); and
 2. a per-entry **shape/dtype check** on revive — a chunk whose stored geometry no
-   longer matches the current array is ignored.
+   longer matches the current array is a **miss** (re-fetch + overwrite), never an error.
+
+(Corruption or tampering — an unreadable header, a malformed interior entry, or a `file`
+that isn't a bare basename — always raises, regardless of `reset_stale_cache`; that flag
+governs an *expected* stale cache, not a damaged one.)
 
 The fingerprint resolves each transform by, in order: an explicit `transform.cache_key`
 (authoritative), a `cloudpickle` hash (the optional `cache` extra — captures closures
@@ -538,8 +547,11 @@ isn't working is loud, not silent.
   fuller run **share** entries: chunk 5 is always the same `.npy`.
 - A hit returns the **prepped** chunk (post-`chunk_transform`), no copy — `gather` views
   the slot in place.
-- **Crash-safe:** the manifest lists only *completed* chunks (written atomically on
-  `close`), so a `.npy` left half-written by a crash is ignored on reopen.
+- **Crash-safe:** each *completed* chunk is appended to the log as it finishes (flushed to
+  the OS page cache, which survives process death), so a killed run keeps everything it
+  decoded. The log is self-deduplicating (a re-completed chunk across epochs/runs is not
+  re-appended) and bounded to one line per cached chunk — no compaction needed. A `.npy`
+  left half-written by a crash was never logged, so it's simply overwritten on re-decode.
 
 **What you must ensure (the guarantee boundary):**
 
@@ -550,9 +562,11 @@ isn't working is loud, not silent.
   that you bump when the **source data** changes — content/etag drift is deliberately
   not detected.
 - **`chunk_transforms` must be deterministic** (they are baked into the cached chunk).
-  If you rely on auto-invalidation when you edit one, install the `cache` extra
-  (cloudpickle) or set an explicit `transform.cache_key`; the source-only fallback can
-  miss closure/global changes.
+  When you edit one, its fingerprint changes and the cache goes stale — construction then
+  **raises** until you pass `reset_stale_cache=True` (wipe + rebuild) or delete the dir.
+  For the fingerprint to *notice* a change, install the `cache` extra (cloudpickle) or set
+  an explicit `transform.cache_key`; the source-only fallback can miss closure/global
+  changes (and would then wrongly serve the old cache as a hit).
 
 **Reshaping transforms.** A **reshaping** `chunk_transform` (e.g. `Regrid`, or a dtype
 recast) is a first-class cacheable stage on every backing including the persistent mmap
@@ -564,8 +578,8 @@ from the source, so a chunk_transform can never move it). Shape/dtype-preserving
 omit `output_inner` and keep the zero-copy fast path (the slot is buffer and cache in one).
 
 **Limitations (deferred).** A raw-decoded tier (keyed by source only, for transform
-experimentation), orphaned-file GC across version bumps, and the kvikio/GDS NVMe→GPU feed
-off the persistent `.npy` tier remain on the roadmap
+experimentation) and the kvikio/GDS NVMe→GPU feed off the persistent `.npy` tier remain
+on the roadmap
 ([DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md)).
 
 ## Earth2Studio integration
