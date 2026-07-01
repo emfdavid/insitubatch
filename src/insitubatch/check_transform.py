@@ -60,6 +60,9 @@ def load_transform(target: str) -> ChunkTransform:
         if spec is None or spec.loader is None:
             raise ImportError(f"could not load a module from {path}")
         module = importlib.util.module_from_spec(spec)
+        # Register before exec: a dataclass (or anything resolving sys.modules[__module__],
+        # e.g. typing.get_type_hints) in the loaded file needs its module discoverable.
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
     else:
         module = importlib.import_module(mod_part)
@@ -80,12 +83,14 @@ def load_transform(target: str) -> ChunkTransform:
     return fn
 
 
-def read_chunk(url: str, var: str, chunk_index: int, geom: ArrayGeometry) -> DecodedChunk:
+def read_chunk(
+    url: str, var: str, chunk_index: int, geom: ArrayGeometry, **store_kwargs: bool
+) -> DecodedChunk:
     """Decode exactly one outer chunk of ``var`` into a :class:`DecodedChunk`.
 
     Uses a plain zarr slice -- this is a one-off development read, not the training hot path
     (the no-getitem stance is about throughput), so zarr stitching the inner grid is fine."""
-    group = zarr.open_group(store=as_store(url), mode="r")
+    group = zarr.open_group(store=as_store(url, **store_kwargs), mode="r")
     arr = group[var]
     samples = geom.samples_in_chunk(chunk_index)
     data = np.asarray(arr[samples.start : samples.stop])  # type: ignore[index]
@@ -100,12 +105,19 @@ def _fresh(base: DecodedChunk) -> DecodedChunk:
 def _run_iters(
     fn: ChunkTransform, pristine: np.ndarray, read: ChunkRead, offset: int, iters: int
 ) -> None:
-    """Run ``fn`` ``iters`` times, each on a fresh source-shaped copy of ``pristine``.
+    """Run ``fn`` ``iters`` times, resetting the input to ``pristine`` before each call.
 
-    A fresh copy per call is required for correctness: transforms may mutate ``chunk.data``
-    in place, and a reshaping transform cannot be re-run on its own (changed-shape) output."""
+    The input is reset because transforms may mutate ``chunk.data`` in place, and a reshaping
+    transform cannot be re-run on its own (changed-shape) output. The reset writes into a
+    *preallocated* per-worker buffer (``np.copyto``) rather than allocating a fresh copy each
+    iteration: a per-iter allocation would thrash the allocator across the probe's worker
+    threads and mask the transform's own GIL behavior (a per-worker malloc lock, not the GIL)."""
+    buffer = pristine.copy()
+    chunk = DecodedChunk(read=read, data=buffer, sample_offset=offset)
     for _ in range(iters):
-        fn(DecodedChunk(read=read, data=pristine.copy(), sample_offset=offset))
+        np.copyto(buffer, pristine)  # reset the input (a GIL-releasing memcpy, no allocation)
+        chunk.data = buffer
+        fn(chunk)
 
 
 def gil_probe(
@@ -180,9 +192,22 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the GIL/vectorization probe "
         "(geometry + output_inner checks only -- fast, deterministic)",
     )
+    p.add_argument(
+        "--skip-signature",
+        action="store_true",
+        help="anonymous read of a public bucket (e.g. gs://weatherbench2/...)",
+    )
+    p.add_argument("--request-payer", action="store_true", help="Requester-Pays S3 bucket")
     a = p.parse_args(argv)
 
     threads = a.threads or min(4, os.cpu_count() or 1)
+    # Same store-auth surface as the loader (see examples/wb2_dataloader.py) so check_transform
+    # reaches the same public / requester-pays stores. Typed bool so the **kwargs stays mypy-clean.
+    store_kwargs: dict[str, bool] = {}
+    if a.skip_signature:
+        store_kwargs["skip_signature"] = True
+    if a.request_payer:
+        store_kwargs["request_payer"] = True
 
     try:
         fn = load_transform(a.transform)
@@ -190,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: could not load --transform {a.transform!r}: {exc}", file=sys.stderr)
         return 2
 
-    geoms = open_geometries(a.url, variables=[a.var])
+    geoms = open_geometries(a.url, variables=[a.var], **store_kwargs)
     geom = geoms[a.var]
     if not 0 <= a.chunk < geom.n_chunks:
         print(f"error: --chunk {a.chunk} out of range [0, {geom.n_chunks})", file=sys.stderr)
@@ -210,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{geom.slot_shape(a.chunk)} = {src_mb:.1f} MB decoded"
     )
 
-    base = read_chunk(a.url, a.var, a.chunk, geom)
+    base = read_chunk(a.url, a.var, a.chunk, geom, **store_kwargs)
     in_shape, in_dtype = base.data.shape, base.data.dtype
     out = fn(_fresh(base))
     out_data = out.data

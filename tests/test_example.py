@@ -50,6 +50,9 @@ def test_transforms_example_runs_both_stages(tmp_path) -> None:
     assert summary["windspeed_mean"] > 0.0
     assert summary["windspeed_nonneg"]
     assert summary["samples"] > 0
+    # the reshaping chunk_transform (Coarsen factor=2) halved the spatial grid
+    src_lat, src_lon = summary["source_inner"]
+    assert summary["sample_shape"] == (src_lat // 2, src_lon // 2)
 
 
 def test_fit_scaler_example_partial_fit(tmp_path) -> None:

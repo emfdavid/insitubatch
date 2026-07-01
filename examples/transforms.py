@@ -15,10 +15,12 @@ needs to see* (the full model is in docs/architecture.md, "Transforms"):
   output is **recomputed every draw** (never cached).
 
 The rule of thumb: per-variable + per-chunk + deterministic -> chunk stage (cacheable);
-cross-variable or per-sample-random -> batch stage. This example makes the split concrete:
-a Kelvin->Celsius conversion is a chunk_transform (one variable, elementwise), while
-windspeed = sqrt(u10^2 + v10^2) *must* be a batch_transform -- a chunk_transform cannot see
-``u10`` and ``v10`` at once.
+cross-variable or per-sample-random -> batch stage. This example makes the split concrete with
+three transforms: :func:`kelvin_to_celsius` (a shape-preserving chunk stage) and :class:`Coarsen`
+(a *reshaping* chunk stage -- a chunk-local regrid that halves the grid and declares its output
+geometry so the cache can size the slot), then ``windspeed = sqrt(u10^2 + v10^2)`` at the batch
+stage -- which *must* be a batch_transform, since a chunk_transform cannot see ``u10`` and
+``v10`` at once. Validate any of them against a real store with ``insitubatch-check-transform``.
 
     uv run python -m examples.transforms
 """
@@ -27,13 +29,14 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from dataclasses import dataclass
 
 import numpy as np
 import zarr
 
 from insitubatch import ensure_local_dir, open_geometries, split_by_chunk, store_from_url
 from insitubatch.source import InSituDataset
-from insitubatch.types import Batch, DecodedChunk
+from insitubatch.types import ArrayGeometry, Batch, DecodedChunk
 
 VARIABLES = ("t2m", "u10", "v10")
 
@@ -61,15 +64,60 @@ def build_store(tmp: str, *, n: int = 64, lat: int = 16, lon: int = 32, spc: int
     return url
 
 
+# Temperature fields this K->C transform understands: the synthetic ``t2m`` here and the public
+# WeatherBench2 ERA5 name (``2m_temperature``), so the same callable works against real cloud data.
+TEMPERATURE_VARS = ("t2m", "2m_temperature")
+
+
 def kelvin_to_celsius(chunk: DecodedChunk) -> DecodedChunk:
-    """A chunk_transform: convert temperature to Celsius in place.
+    """A chunk_transform: convert 2 m temperature from Kelvin to Celsius, vectorized.
 
     Gated on the variable name, because a chunk_transform is called once per (variable,
-    chunk) and should only touch the field it understands. Leaves u10/v10 untouched.
+    chunk) and should only touch the field it understands (leaves u10/v10 untouched). It is
+    per-variable, per-chunk, deterministic and elementwise -- the textbook cacheable chunk
+    stage -- and pure vectorized numpy, so it releases the GIL on the decode pool.
+
+    Check it against one chunk of your real store before training (geometry, cacheability, and
+    an empirical GIL-release verdict)::
+
+        insitubatch-check-transform <URL> --var 2m_temperature \\
+            --transform examples/transforms.py:kelvin_to_celsius --skip-signature
     """
-    if chunk.read.array == "t2m":
+    if chunk.read.array in TEMPERATURE_VARS:
         chunk.data = chunk.data - 273.15
     return chunk
+
+
+@dataclass
+class Coarsen:
+    """A *reshaping* chunk_transform: block-mean the spatial grid by ``factor`` (a local regrid).
+
+    ``(n, lat, lon) -> (n, lat//factor, lon//factor)`` -- the canonical geometry-changing chunk
+    stage. Because the output shape differs from the source, it declares ``output_inner`` so the
+    cache can size its slot at the coarsened shape (a reshaping transform that *forgot* to declare
+    it is rejected -- try deleting the method and running ``check-transform``). Pure vectorized
+    numpy (a strided reshape + mean), so it releases the GIL on the decode pool. Assumes a 2-D
+    ``(lat, lon)`` inner grid; a ragged edge (not divisible by ``factor``) is trimmed.
+
+    Check the reshaping path against real data (validates the declared vs actual output shape)::
+
+        insitubatch-check-transform <URL> --var 2m_temperature \\
+            --transform examples/transforms.py:Coarsen --skip-signature
+    """
+
+    factor: int = 2
+
+    def __call__(self, chunk: DecodedChunk) -> DecodedChunk:
+        n, lat, lon = chunk.data.shape
+        f = self.factor
+        lat2, lon2 = (lat // f) * f, (lon // f) * f  # trim the ragged edge to a multiple of f
+        blocks = chunk.data[:, :lat2, :lon2].reshape(n, lat2 // f, f, lon2 // f, f)
+        chunk.data = blocks.mean(axis=(2, 4)).astype(chunk.data.dtype)  # (n, lat//f, lon//f)
+        return chunk
+
+    def output_inner(self, geom: ArrayGeometry) -> tuple[tuple[int, ...], np.dtype]:
+        lat, lon = geom.inner_shape
+        return (lat // self.factor, lon // self.factor), geom.dtype
 
 
 def add_windspeed(batch: Batch) -> Batch:
@@ -93,7 +141,10 @@ def run_demo(
     try:
         geoms = open_geometries(url, variables=list(VARIABLES))
         manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
+        source_inner = geoms["t2m"].inner_shape
 
+        # Two chunk stages: K->C (shape-preserving) then a reshaping Coarsen (halves the grid).
+        # The cache slot is sized at the *coarsened* shape via Coarsen.output_inner.
         ds = InSituDataset(
             url,
             manifest,
@@ -101,7 +152,7 @@ def run_demo(
             batch_size=batch_size,
             block_chunks=block_chunks,
             shuffle=False,
-            chunk_transforms=[kelvin_to_celsius],
+            chunk_transforms=[kelvin_to_celsius, Coarsen(factor=2)],
             batch_transforms=[add_windspeed],
         )
 
@@ -113,13 +164,16 @@ def run_demo(
             "windspeed_mean": float(wind.mean()),
             "windspeed_nonneg": bool((wind >= 0.0).all()),
             "samples": int(t2m.shape[0]),
-            "sample_shape": tuple(t2m.shape[1:]),
+            "source_inner": tuple(source_inner),
+            "sample_shape": tuple(t2m.shape[1:]),  # coarsened by the reshaping chunk_transform
         }
         if verbose:
+            src, out = summary["source_inner"], summary["sample_shape"]
             print(f"batch variables: {summary['variables']}")
             print(f"t2m  (chunk_transform K->C): mean {summary['t2m_mean_c']:+.2f} C")
+            print(f"grid (chunk_transform Coarsen): {src} -> {out}")
             print(f"windspeed (batch_transform): mean {summary['windspeed_mean']:.2f} m/s")
-            print("both transform stages ran.")
+            print("all three stages ran: K->C + reshaping Coarsen (chunk), windspeed (batch).")
         return summary
     finally:
         if tmp is not None:
