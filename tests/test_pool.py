@@ -290,10 +290,21 @@ def test_pool_reshaping_transform_dtype_recast(tiled_store):
     np.testing.assert_allclose(got, srcs["single_inner"][:spc].mean(axis=-1), rtol=1e-12)
 
 
-def test_pool_reshaping_transform_mmap_persist_roundtrip(tiled_store, tmp_path):
+@pytest.mark.parametrize("no_cloudpickle", [False, True], ids=["cloudpickle", "source-hash"])
+def test_pool_reshaping_transform_mmap_persist_roundtrip(
+    tiled_store, tmp_path, monkeypatch, no_cloudpickle
+):
     """The fenced path: a reshaping transform on mmap backing with persist must write the
     output-shaped result into the (output-sized) slot, survive close(), and revive as a
-    ready hit on reopen -- re-decoding zero chunks -- reconstructing the regridded data."""
+    ready hit on reopen -- re-decoding zero chunks -- reconstructing the regridded data.
+
+    Parametrized over the transform-fingerprint path: with cloudpickle (the torch CI job) and
+    on the source-hash fallback (the tf/jax/freethreaded jobs, no ``cache`` extra). The latter
+    is a regression guard -- a class-based transform (``MeanLastAxis``) must fingerprint stably
+    without cloudpickle; hashing ``repr(instance)`` embedded the object address and discarded
+    the cache on every reopen (``manifest_entries == 0``)."""
+    if no_cloudpickle:
+        monkeypatch.setattr("insitubatch.pool.cloudpickle", None)
     url, srcs = tiled_store
     geoms = open_geometries(url, variables=["single_inner"])
     geom = geoms["single_inner"]

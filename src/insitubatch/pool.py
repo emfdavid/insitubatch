@@ -118,6 +118,13 @@ def _transform_token(fn: ChunkTransform) -> str:
     or a called helper -- the same blind spot joblib has). The method is encoded in the
     token, so toggling cloudpickle on/off changes the fingerprint (honest re-compute
     rather than a false match).
+
+    On the source path a *class-based* transform (a callable instance, e.g. a dataclass
+    like :class:`StandardScaler`) is hashed by its **class** source + qualname, not the
+    instance: ``inspect.getsource(instance)`` raises and the default ``object`` repr embeds
+    the object's memory address, so the token would be unstable across runs (a spurious
+    cache miss on every reopen). A stable, non-default ``__repr__`` (dataclasses, partials)
+    is folded in so instance config still affects the token; the address-bearing default is not.
     """
     key = getattr(fn, "cache_key", None)
     if key is not None:
@@ -125,12 +132,20 @@ def _transform_token(fn: ChunkTransform) -> str:
     if cloudpickle is not None:
         with contextlib.suppress(Exception):  # unpicklable -> fall through to source
             return "pickle:" + hashlib.sha256(cloudpickle.dumps(fn)).hexdigest()
+    # Hash the routine itself, or the class of a callable instance (never the instance --
+    # its default repr carries an unstable address).
+    target = fn if inspect.isroutine(fn) else type(fn)
     try:
-        src = inspect.getsource(fn)
+        src = inspect.getsource(target)
     except (OSError, TypeError):
         src = ""  # C funcs / REPL: no source -> lean on the qualname alone
-    name = getattr(fn, "__qualname__", repr(fn))
-    return "src:" + hashlib.sha256(f"{name}\n{src}".encode()).hexdigest()
+    name = getattr(target, "__qualname__", repr(target))
+    # A class-defined repr (dataclass/partial) is stable and captures config; skip the
+    # default object repr, which would reintroduce the address.
+    config = (
+        repr(fn) if not inspect.isroutine(fn) and type(fn).__repr__ is not object.__repr__ else ""
+    )
+    return "src:" + hashlib.sha256(f"{name}\n{src}\n{config}".encode()).hexdigest()
 
 
 def _has_weak_token(transforms: Sequence[ChunkTransform]) -> bool:
