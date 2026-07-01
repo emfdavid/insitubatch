@@ -318,7 +318,7 @@ def test_pool_reshaping_transform_mmap_persist_roundtrip(
         _fill_chunk(pool, "single_inner", cid, geom, tiles)
     assert pool.misses == geom.n_chunks and pool.hits == 0
     pool.close()
-    assert list(backing.glob("*.npy")) and (backing / "insitu_cache.json").exists()
+    assert list(backing.glob("*.npy")) and (backing / "insitu_cache.jsonl").exists()
 
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[MeanLastAxis()])
     assert pool2.manifest_entries == geom.n_chunks
@@ -504,7 +504,7 @@ def test_pool_cross_run_persistence(tiled_store, tmp_path):
     assert pool.misses == geom.n_chunks and pool.hits == 0  # cold: every chunk a miss
     pool.close()
     assert list(backing.glob("*.npy")), "persist=True must keep slot files after close()"
-    assert (backing / "insitu_cache.json").exists(), "persist must write a manifest"
+    assert (backing / "insitu_cache.jsonl").exists(), "persist must write a manifest"
 
     # Run 2: same dir -> every chunk a ready hit, no fetch/scatter.
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
@@ -517,6 +517,141 @@ def test_pool_cross_run_persistence(tiled_store, tmp_path):
         assert np.array_equal(got, srcs["single_inner"][cid * spc : cid * spc + n0])
     assert pool2.hits == geom.n_chunks and pool2.misses == 0  # warm: every chunk a hit
     pool2.close()
+
+
+def test_pool_persist_crash_recovery_without_close(tiled_store, tmp_path):
+    """The headline crash-recovery contract: a process that dies WITHOUT calling close() (spot
+    preempt / OOM / SIGTERM) still leaves every completed chunk in the append-only log, so a new
+    pool over the same dir revives them all as hits -- re-decoding ZERO. The close-only manifest
+    could not do this: it wrote nothing on a crash."""
+    url, srcs = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    spc = geom.sample_chunk_size
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    # Run 1: populate every chunk but NEVER close() -- simulate a killed process. The log must
+    # already carry every completed entry (flushed on completion, not at close).
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    for cid in range(geom.n_chunks):
+        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+    log = (backing / "insitu_cache.jsonl").read_text().splitlines()
+    assert len(log) == geom.n_chunks + 1  # header + one entry per completed chunk
+
+    # Run 2: same dir, fresh pool -> every chunk a ready hit despite the missing close().
+    pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    assert pool2.manifest_entries == geom.n_chunks
+    for cid in range(geom.n_chunks):
+        assert pool2.pin_if_ready("single_inner", cid), "crashed-run chunk must revive as a hit"
+        n0 = len(geom.samples_in_chunk(cid))
+        rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
+        got = pool2.gather(rows, ["single_inner"], spc).arrays["single_inner"]
+        assert np.array_equal(got, srcs["single_inner"][cid * spc : cid * spc + n0])
+    assert pool2.hits == geom.n_chunks and pool2.misses == 0
+    pool2.close()
+
+
+def test_pool_persist_partial_iteration_recovers_completed_subset(tiled_store, tmp_path):
+    """A crash partway through the first epoch: only the chunks that *completed* are logged, so
+    a reopen revives exactly that subset -- the rest are misses (re-decoded), not false hits."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)  # only chunk 0 completes before the "crash"
+    # no close()
+
+    pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    assert pool2.manifest_entries == 1
+    assert pool2.pin_if_ready("single_inner", 0), "the completed chunk revives"
+    assert not pool2.pin_if_ready("single_inner", 1), "an un-reached chunk is a miss, not a hit"
+    pool2.close()
+
+
+def test_pool_persist_log_dedups_across_epochs_and_runs(tiled_store, tmp_path):
+    """The log is self-deduplicating and bounded: re-completing a chunk (after an eviction +
+    refetch, and across a close+reopen) never appends a duplicate line -- the count stays equal
+    to the number of distinct cached chunks."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+    logpath = backing / "insitu_cache.jsonl"
+
+    # A tiny budget so admitting a second chunk evicts (demotes) the first -> then refetch it,
+    # re-completing the same key. The _recorded gate must prevent a duplicate log line.
+    one_slot = int(np.prod(geom.slot_shape(0)) * geom.dtype.itemsize)
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, budget_bytes=one_slot)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.unpin_all()  # drop the pin so chunk 0 is evictable
+    _fill_chunk(pool, "single_inner", 1, geom, tiles)  # evicts (demotes) chunk 0
+    pool.unpin_all()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)  # refetch + re-complete chunk 0
+    pool.close()
+
+    header_plus_entries = logpath.read_text().splitlines()
+    assert len(header_plus_entries) == 1 + 2, "one line per distinct key, no duplicates"
+
+    # Reopen and re-complete an already-logged chunk: still no new line.
+    pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    assert pool2.manifest_entries == 2
+    pool2.close()
+    assert len(logpath.read_text().splitlines()) == 3, "reopen must not duplicate lines"
+
+
+def test_pool_persist_missing_file_is_miss_not_raise(tiled_store, tmp_path):
+    """A log entry whose ``.npy`` is gone from disk (external deletion / disk cleanup -- NOT
+    eviction, which keeps the file) is a **miss**: revive fails to open it, drops the entry, and
+    the chunk is re-fetched. Never a raise -- the cache is a transparent optimization."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+
+    # Delete the data file but leave the log referencing it (a torn cache, not eviction).
+    for f in backing.glob("*.npy"):
+        f.unlink()
+
+    pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    assert pool2.manifest_entries == 1  # the log still lists the (now-missing) entry
+    assert not pool2.pin_if_ready("single_inner", 0), "a missing .npy is a miss, not a hit"
+    assert pool2.revive_missing == 1 and pool2.hits == 0
+    assert ("single_inner", 0) not in pool2._persisted  # the dangling entry is dropped
+    pool2.close()
+
+
+def test_pool_persist_evicted_chunk_revives_from_kept_file(tiled_store, tmp_path):
+    """Eviction in persist mode is a *demotion*, not a delete: a ready chunk pushed out under
+    budget pressure keeps its ``.npy`` on disk, so touching it again revives it as a HIT from
+    NVMe -- no re-fetch. (This is why a missing file is never expected from eviction.)"""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    one_slot = int(np.prod(geom.slot_shape(0)) * geom.dtype.itemsize)
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, budget_bytes=one_slot)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.unpin_all()  # make chunk 0 evictable
+    _fill_chunk(pool, "single_inner", 1, geom, tiles)  # admits 1 -> demotes 0 (file KEPT)
+    pool.unpin_all()  # make chunk 1 evictable so reviving 0 can free room
+
+    assert ("single_inner", 0) not in pool._slots  # 0 was evicted from memory
+    assert (backing / pool._persisted[("single_inner", 0)]).exists()  # but its file survives
+    assert pool.pin_if_ready("single_inner", 0), "the demoted chunk revives from its kept file"
+    assert pool.revive_missing == 0  # nothing was lost by the eviction
+    pool.close()
 
 
 def test_pool_persist_invalidates_on_geometry_mismatch(tiled_store, tmp_path):
@@ -542,8 +677,9 @@ def test_pool_persist_invalidates_on_geometry_mismatch(tiled_store, tmp_path):
 
 
 def test_pool_persist_invalidates_on_transform_change(tiled_store, tmp_path):
-    """The manifest carries a chunk_transform fingerprint: the same transform reopens as
-    a hit; a changed transform discards the whole cache (cold start), not a false hit."""
+    """The log header carries a chunk_transform fingerprint: the same transform reopens as a
+    hit; a changed transform is a *stale* cache, which RAISES by default (not a false hit, and
+    not a silent cold-start -- a stale cache is almost never what the user intended)."""
     url, _ = tiled_store
     geoms = open_geometries(url, variables=["single_inner"])
     geom = geoms["single_inner"]
@@ -566,10 +702,40 @@ def test_pool_persist_invalidates_on_transform_change(tiled_store, tmp_path):
         chunk.data = chunk.data * 3.0
         return chunk
 
-    changed = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_b])
-    assert changed.manifest_entries == 0  # stale cache discarded, not loaded
-    assert not changed.pin_if_ready("single_inner", 0)
-    changed.close()
+    with pytest.raises(ValueError, match="stale|reset_stale_cache"):
+        ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_b])
+
+
+def test_pool_persist_reset_stale_cache_gcs_and_rebuilds(tiled_store, tmp_path):
+    """reset_stale_cache=True opts into wiping a stale cache: the old .npy files and log are
+    deleted and the cache rebuilds cold (no raise, no false hit)."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    def scale_a(chunk):
+        chunk.data = chunk.data * 2.0
+        return chunk
+
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_a])
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+    stale_file = pool._persisted[("single_inner", 0)]
+    assert (backing / stale_file).exists()
+
+    def scale_b(chunk):
+        chunk.data = chunk.data * 3.0
+        return chunk
+
+    reset = ChunkPool(
+        geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_b], reset_stale_cache=True
+    )
+    assert reset.manifest_entries == 0  # stale cache wiped -> cold start
+    assert not (backing / stale_file).exists(), "the stale .npy must be GC'd"
+    assert not reset.pin_if_ready("single_inner", 0)  # nothing to revive -> a miss
+    reset.close()
 
 
 def test_pool_persist_cache_key_overrides_fingerprint(tiled_store, tmp_path):
@@ -597,10 +763,9 @@ def test_pool_persist_cache_key_overrides_fingerprint(tiled_store, tmp_path):
     assert same.pin_if_ready("single_inner", 0)
     same.close()
 
-    t2.cache_key = "v2"  # type: ignore[attr-defined]  # bump the key -> invalidate
-    changed = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t2])
-    assert changed.manifest_entries == 0
-    changed.close()
+    t2.cache_key = "v2"  # type: ignore[attr-defined]  # bump the key -> invalidate (stale -> raise)
+    with pytest.raises(ValueError, match="stale|reset_stale_cache"):
+        ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t2])
 
 
 def test_pool_persist_cloudpickle_catches_closure_change(tiled_store, tmp_path):
@@ -624,11 +789,8 @@ def test_pool_persist_cloudpickle_catches_closure_change(tiled_store, tmp_path):
     _fill_chunk(pool, "single_inner", 0, geom, tiles)
     pool.close()
 
-    changed = ChunkPool(
-        geoms, backing_dir=backing, persist=True, chunk_transforms=[make_scaler(3.0)]
-    )
-    assert changed.manifest_entries == 0  # closure-value change caught -> cache discarded
-    changed.close()
+    with pytest.raises(ValueError, match="stale|reset_stale_cache"):  # closure change -> stale
+        ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[make_scaler(3.0)])
 
 
 def test_pool_persist_without_cloudpickle_warns_and_falls_back(
@@ -658,28 +820,46 @@ def test_pool_persist_without_cloudpickle_warns_and_falls_back(
     same.close()
 
 
-def _persist_one(tiled_store, backing):
-    """Write a one-entry persistent cache and return (geoms, manifest_path)."""
+def _persist_two(tiled_store, backing):
+    """Write a two-entry persistent cache and return (geoms, log_path). Two entries so a
+    tampered/malformed entry can be an *interior* (non-tail) line -- a corrupt tail is treated
+    as a crash artifact and dropped, an interior one is corruption and raises."""
     url, _ = tiled_store
     geoms = open_geometries(url, variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    for cid in (0, 1):
+        _fill_chunk(pool, "single_inner", cid, geom, tiles)
     pool.close()
-    return geoms, backing / "insitu_cache.json"
+    return geoms, backing / "insitu_cache.jsonl"
+
+
+def _read_log(path):
+    lines = path.read_text().splitlines()
+    return json.loads(lines[0]), [json.loads(line) for line in lines[1:]]
+
+
+def _write_log(path, header, entries):
+    """Serialize a header + entry list back to JSONL. An entry given as a ``str`` is written
+    raw (to inject an unparseable / non-mapping line); a dict is json-encoded."""
+    with path.open("w") as f:
+        f.write(json.dumps(header) + "\n")
+        for e in entries:
+            f.write((e if isinstance(e, str) else json.dumps(e)) + "\n")
 
 
 @pytest.mark.parametrize("bad_file", ["/etc/passwd", "../../etc/passwd", "sub/dir.npy", "..", ""])
 def test_pool_manifest_rejects_non_basename_file(tiled_store, tmp_path, bad_file):
-    """A tampered manifest whose entry ``file`` is not a bare basename is rejected fail-fast
-    (not silently skipped): ``_revive`` would otherwise ``open_memmap`` a path escaping the
-    cache dir (``self._dir / fname``). Absolute paths and ``..`` both escape."""
+    """A tampered log whose entry ``file`` is not a bare basename is rejected fail-fast (not
+    silently skipped): ``_revive`` would otherwise ``open_memmap`` a path escaping the cache dir
+    (``self._dir / fname``). Absolute paths and ``..`` both escape. Mutating the *first* (of two)
+    entries keeps it an interior line so it can't be mistaken for a torn tail."""
     backing = tmp_path / "cache"
-    geoms, mpath = _persist_one(tiled_store, backing)
-    doc = json.loads(mpath.read_text())
-    doc["entries"][0]["file"] = bad_file
-    mpath.write_text(json.dumps(doc))
+    geoms, mpath = _persist_two(tiled_store, backing)
+    header, entries = _read_log(mpath)
+    entries[0]["file"] = bad_file
+    _write_log(mpath, header, entries)
     with pytest.raises(ValueError, match="bare filename|path-traversal"):
         ChunkPool(geoms, backing_dir=backing, persist=True)
 
@@ -687,22 +867,50 @@ def test_pool_manifest_rejects_non_basename_file(tiled_store, tmp_path, bad_file
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda d: d["entries"][0].pop("file"),  # missing field
-        lambda d: d["entries"][0].update(chunk_index="NaN"),  # non-int index
-        lambda d: d.update(entries="not-a-list"),  # wrong container type
-        lambda d: d.update(entries=["a-bare-string"]),  # entry not a mapping
+        lambda entries: entries[0].pop("file"),  # missing field
+        lambda entries: entries[0].update(chunk_index="NaN"),  # non-int index
+        lambda entries: entries.__setitem__(0, "a-bare-string"),  # entry not a mapping
+        lambda entries: entries.__setitem__(0, "{not-json"),  # unparseable interior line
     ],
 )
 def test_pool_manifest_rejects_malformed_entry(tiled_store, tmp_path, mutate):
-    """A manifest that clears the format/fingerprint gates but is structurally corrupt raises
-    -- corruption/tampering is not an expected stale cache (those degrade to a cold start)."""
+    """A log that clears the format/fingerprint gates but has a structurally corrupt *interior*
+    entry raises -- corruption/tampering is not an expected stale cache. (A corrupt *tail* line
+    is a crash artifact, tested separately.)"""
     backing = tmp_path / "cache"
-    geoms, mpath = _persist_one(tiled_store, backing)
-    doc = json.loads(mpath.read_text())
-    mutate(doc)
-    mpath.write_text(json.dumps(doc))
+    geoms, mpath = _persist_two(tiled_store, backing)
+    header, entries = _read_log(mpath)
+    mutate(entries)
+    _write_log(mpath, header, entries)
     with pytest.raises(ValueError, match="malformed entry|corrupt|bare filename"):
         ChunkPool(geoms, backing_dir=backing, persist=True)
+
+
+def test_pool_manifest_tolerates_torn_tail(tiled_store, tmp_path):
+    """A crash mid-append leaves a partial final line: it is dropped (not a raise), and every
+    complete entry before it still revives -- the crash-recovery contract."""
+    backing = tmp_path / "cache"
+    geoms, mpath = _persist_two(tiled_store, backing)
+    with mpath.open("a") as f:
+        f.write('{"array": "single_inner", "chunk_ind')  # torn tail, no newline
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    assert pool.manifest_entries == 2  # both complete entries survived; the torn tail dropped
+    assert pool.pin_if_ready("single_inner", 0) and pool.pin_if_ready("single_inner", 1)
+    pool.close()
+
+
+def test_pool_manifest_rejects_unreadable_header(tiled_store, tmp_path):
+    """An unparseable header (line 0) is corruption -- we cannot validate the fingerprint -- so
+    it raises regardless of reset_stale_cache; the flag governs a *stale* cache, not a torn one."""
+    backing = tmp_path / "cache"
+    geoms, mpath = _persist_two(tiled_store, backing)
+    _, entries = _read_log(mpath)
+    with mpath.open("w") as f:
+        f.write("{not-json\n")
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    with pytest.raises(ValueError, match="header|corrupt"):
+        ChunkPool(geoms, backing_dir=backing, persist=True, reset_stale_cache=True)
 
 
 def test_pool_spill_unlinks_without_persist(tiled_store, tmp_path):
@@ -718,4 +926,4 @@ def test_pool_spill_unlinks_without_persist(tiled_store, tmp_path):
     _fill_chunk(pool, "single_inner", 0, geom, tiles)
     pool.close()
     assert not list(backing.glob("*.npy")), "spill must unlink slot files on close()"
-    assert not (backing / "insitu_cache.json").exists(), "no manifest without persist"
+    assert not (backing / "insitu_cache.jsonl").exists(), "no manifest without persist"

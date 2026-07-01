@@ -239,6 +239,57 @@ def test_cache_persists_across_runs(write_zarr, tmp_path) -> None:
         assert np.array_equal(a, b)
 
 
+def test_persist_stale_transform_raises_then_rebuilds_with_flag(write_zarr, tmp_path) -> None:
+    # A changed chunk_transform makes the cache stale. Default: constructing the dataset RAISES
+    # (a stale cache is almost never intended). reset_stale_cache=True instead wipes it and
+    # rebuilds cold -- yielding correct batches again.
+    url, _ = write_zarr(n=80, spc=8)  # 10 chunks
+    geom = open_geometries(url)["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    cache = str(tmp_path / "cache")
+
+    def scale_a(chunk):
+        chunk.data = chunk.data * 2.0
+        return chunk
+
+    def scale_b(chunk):
+        chunk.data = chunk.data * 3.0
+        return chunk
+
+    def make(transform, reset=False) -> InSituDataset:
+        return InSituDataset(
+            url,
+            manifest,
+            batch_size=4,
+            block_chunks=4,
+            shuffle=False,
+            chunk_transforms=[transform],
+            cache_dir=cache,
+            persist=True,
+            reset_stale_cache=reset,
+            cache_budget_bytes=10_000_000,
+        )
+
+    ds = make(scale_a)
+    ds.set_epoch(0)
+    _ = [b for b in ds.train]
+    ds.close()
+
+    # Default: a different transform -> stale -> raise at construction (fail fast).
+    with pytest.raises(ValueError, match="stale|reset_stale_cache"):
+        make(scale_b)
+
+    # Opt in: wipe + rebuild, batches correct against the new transform.
+    ds2 = make(scale_b, reset=True)
+    try:
+        ds2.set_epoch(0)
+        got = np.concatenate([b.arrays["t2m"] for b in ds2.train])
+    finally:
+        ds2.close()
+    assert ds2.cache_misses > 0 and ds2.cache_hits == 0  # rebuilt cold, no false hits
+    assert np.isfinite(got).all()
+
+
 def test_persist_warns_when_cache_unusable(write_zarr, tmp_path, caplog) -> None:
     # persist=True but the cache is consulted and serves nothing (here: the .npy files
     # were deleted under a surviving manifest) -> one loud WARNING per epoch, and the

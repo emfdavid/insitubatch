@@ -208,8 +208,9 @@ Caveats: (1) **mmap isn't free for read-once** — scattering into mmap is NVMe 
 traffic even when never reused, so default the pool to **heap** for streaming and
 use mmap only to spill a working set past RAM or for cross-epoch reuse. (2)
 **cross-*run* persistence is now a flag** (`persist=True`, M-C2 ✅) — intra-run/
-cross-epoch reuse is intrinsic (just don't evict); surviving process exit adds a
-manifest of completed slots + a chunk-transform fingerprint, revived on reopen.
+cross-epoch reuse is intrinsic (just don't evict); surviving process exit adds an
+append-only log of completed slots (written incrementally, so a crash mid-run still
+recovers) + a chunk-transform fingerprint, revived on reopen.
 
 Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
 `chunk_key_encoding.encode_chunk_key`, bytes via `store.get`, decode via
@@ -227,8 +228,8 @@ Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
   still-resident chunk). The pool is dataset-owned (persists across epochs); B1's
   `resident_cap` admission unified into the budget (consumer `unpin` replaces
   `evict`, eviction is unpinned-LRU). **M-C2 ✅** later added cross-*run* persistence
-  (`persist=True`): a manifest of completed slots + a chunk-transform fingerprint
-  survive `close` and revive on reopen.
+  (`persist=True`): an append-only log of completed slots + a chunk-transform fingerprint
+  survive `close` (and a crash), revived on reopen.
 
 Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurrency
 — v1 (concurrency = `block_chunks`) rises in both; V2 (`block_chunks` fixed small,
@@ -502,26 +503,32 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   separate intercept, it became "don't evict." Deferred: an L1/L2 (RAM+NVMe) tier and
   cached cross-variable derived variables (cross-*run* persistence is M-C2).
 - **M-C2 — cross-run persistent cache ✅.** `persist=True` (with `cache_dir`) keeps the
-  mmap'd `.npy` slots past `close` and writes a JSON **manifest** of completed entries
-  (`(array, chunk_index) → file`); a new pool over the same dir **revives** them as ready
-  hits on first touch, so decode-once amortizes across *runs* — a relaunched job, a
-  hyperparameter sweep, or several processes on one box read decoded chunks straight from
-  NVMe (no S3, no decode). Invalidation has two automatic guards: a **chunk-transform
-  fingerprint** in the manifest header (explicit `transform.cache_key` → optional
-  cloudpickle hash of closures+globals → best-effort source hash that warns) and a
-  per-entry **shape/dtype** check on revive; either mismatch is a *miss* (re-fetch +
-  overwrite), never an error. Crash-safe (only completed chunks are listed; atomic write).
-  Observability: per-epoch `cache_hits`/`cache_misses` + one WARN when persistence was
-  asked for but served nothing. **Deliberately not in the key:** the store URL —
-  Icechunk/Arraylake session stores have no round-trippable URL, so the `cache_dir` path
-  *is* the dataset identity (bury a version in it); content/etag drift is the user's call.
-  The key's `chunk_index` is the *global* zarr index, so subsets/splits share entries.
-  A **reshaping** `chunk_transform` (`Regrid` / dtype recast) is supported on every tier
-  including persistent mmap: it declares `output_inner -> (inner_shape, dtype)`, the cache
-  slot is sized at the output shape, and tiles assemble in a transient source-shaped scratch
-  buffer (the sample axis is invariant). *Still deferred:* a raw-decoded tier keyed by source
-  only, orphaned-file GC across version bumps, and the kvikio/GDS NVMe→GPU feed off the
-  persistent tier.
+  mmap'd `.npy` slots past `close` and records completed entries (`(array, chunk_index) →
+  file`) in an **append-only `insitu_cache.jsonl` log**, written *incrementally as each
+  chunk lands* — so a killed process (spot preempt / OOM / SIGTERM) leaves a usable cache
+  and the next run re-decodes only what hadn't finished (**crash recovery**, backlog #4).
+  A new pool over the same dir **revives** entries as ready hits on first touch, so
+  decode-once amortizes across *runs* — a relaunched job, a hyperparameter sweep, or
+  several processes on one box read decoded chunks straight from NVMe (no S3, no decode).
+  Invalidation: a **chunk-transform fingerprint** in the log header (explicit
+  `transform.cache_key` → optional cloudpickle hash of closures+globals → best-effort
+  source hash that warns). A fingerprint/format mismatch is a **stale** cache, which
+  **raises by default** (almost never intended); `reset_stale_cache=True` opts into GC'ing
+  the stale files + rebuilding (backlog #3). A per-entry **shape/dtype** check on revive is
+  a *miss* (re-fetch + overwrite), never an error; corruption/tampering (unreadable header,
+  malformed interior entry, non-bare filename) always raises. The log is self-deduplicating
+  and bounded to one line per cached chunk (the `_recorded` gate) — no compaction. Durability
+  is `flush` (process-death), not `fsync` (power-loss out of scope). Observability: per-epoch
+  `cache_hits`/`cache_misses` + one WARN when persistence was asked for but served nothing.
+  **Deliberately not in the key:** the store URL — Icechunk/Arraylake session stores have no
+  round-trippable URL, so the `cache_dir` path *is* the dataset identity (bury a version in
+  it); content/etag drift is the user's call. The key's `chunk_index` is the *global* zarr
+  index, so subsets/splits share entries. A **reshaping** `chunk_transform` (`Regrid` / dtype
+  recast) is supported on every tier including persistent mmap: it declares `output_inner ->
+  (inner_shape, dtype)`, the cache slot is sized at the output shape, and tiles assemble in a
+  transient source-shaped scratch buffer (the sample axis is invariant). *Still deferred:* a
+  raw-decoded tier keyed by source only, and the kvikio/GDS NVMe→GPU feed off the persistent
+  tier.
   Scope: a read-through cache keyed by fingerprint; a shared/networked cache tier and
   the L1/L2 split above are later.
 - **M-W — windowed / multi-offset sampling (sample geometry v2).** The forecasting
