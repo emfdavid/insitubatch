@@ -531,6 +531,19 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
   tier.
   Scope: a read-through cache keyed by fingerprint; a shared/networked cache tier and
   the L1/L2 split above are later.
+  - **TODO — per-variable transform fingerprint (scope invalidation per array).** Today
+    `chunk_transforms` is one list applied to every variable (each transform self-gates by
+    name and no-ops on the rest), and the cache fingerprint hashes the **whole list once** →
+    a single `pipeline_hash` on every array's entries. So editing a transform that only
+    affects `t2m` invalidates the *whole* cache (`u10`/`v10` too, whose chunks are
+    byte-identical) — with the raise-on-stale default the user must `reset_stale_cache` and
+    re-decode everything. Fix: let transforms be assigned per variable (or derive, per array,
+    the subset of transforms that actually touch it) and compute the fingerprint **per array**,
+    so a temperature-only edit invalidates only the temperature arrays — and each array runs
+    only through its own transforms (drops the wasted no-op passes). Design question: how a
+    transform declares which variables it applies to (explicit mapping vs the current
+    name-gating convention). Documented as a limitation in docs/architecture.md (cache
+    invalidation section).
 - **M-W — windowed / multi-offset sampling (sample geometry v2).** The forecasting
   unlock, and a prerequisite for the canonical WeatherBench examples and the M4
   "around their models" play. Today a batch draws **one shared time index for all
