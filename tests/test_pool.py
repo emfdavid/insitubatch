@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -655,6 +656,53 @@ def test_pool_persist_without_cloudpickle_warns_and_falls_back(
     same = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale])
     assert same.pin_if_ready("single_inner", 0)  # source hash matches -> hit
     same.close()
+
+
+def _persist_one(tiled_store, backing):
+    """Write a one-entry persistent cache and return (geoms, manifest_path)."""
+    url, _ = tiled_store
+    geoms = open_geometries(url, variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    pool.close()
+    return geoms, backing / "insitu_cache.json"
+
+
+@pytest.mark.parametrize("bad_file", ["/etc/passwd", "../../etc/passwd", "sub/dir.npy", "..", ""])
+def test_pool_manifest_rejects_non_basename_file(tiled_store, tmp_path, bad_file):
+    """A tampered manifest whose entry ``file`` is not a bare basename is rejected fail-fast
+    (not silently skipped): ``_revive`` would otherwise ``open_memmap`` a path escaping the
+    cache dir (``self._dir / fname``). Absolute paths and ``..`` both escape."""
+    backing = tmp_path / "cache"
+    geoms, mpath = _persist_one(tiled_store, backing)
+    doc = json.loads(mpath.read_text())
+    doc["entries"][0]["file"] = bad_file
+    mpath.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="bare filename|path-traversal"):
+        ChunkPool(geoms, backing_dir=backing, persist=True)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d["entries"][0].pop("file"),  # missing field
+        lambda d: d["entries"][0].update(chunk_index="NaN"),  # non-int index
+        lambda d: d.update(entries="not-a-list"),  # wrong container type
+        lambda d: d.update(entries=["a-bare-string"]),  # entry not a mapping
+    ],
+)
+def test_pool_manifest_rejects_malformed_entry(tiled_store, tmp_path, mutate):
+    """A manifest that clears the format/fingerprint gates but is structurally corrupt raises
+    -- corruption/tampering is not an expected stale cache (those degrade to a cold start)."""
+    backing = tmp_path / "cache"
+    geoms, mpath = _persist_one(tiled_store, backing)
+    doc = json.loads(mpath.read_text())
+    mutate(doc)
+    mpath.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="malformed entry|corrupt|bare filename"):
+        ChunkPool(geoms, backing_dir=backing, persist=True)
 
 
 def test_pool_spill_unlinks_without_persist(tiled_store, tmp_path):
