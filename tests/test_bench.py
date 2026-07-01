@@ -40,6 +40,7 @@ def test_suite_smoke(tmp_path) -> None:
 
 def test_xbatcher_engine(tmp_path) -> None:
     pytest.importorskip("xbatcher")  # the B2 baseline (bench extra)
+    pytest.importorskip("torch")  # _run_xbatcher wraps in a torch DataLoader
     url = f"file://{tmp_path}/x.zarr"
     make_dataset(url, n_samples=40, inner=(3, 3), sample_chunk=8, variables=["t2m"])
     cfg = Cfg(
