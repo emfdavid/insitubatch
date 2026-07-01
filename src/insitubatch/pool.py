@@ -687,12 +687,18 @@ class ChunkPool:
     def _load_manifest(self) -> None:
         """Populate the persisted-entry registry from a prior run's manifest, if any.
 
-        No manifest is a cold start (silent -- the expected first run). An unreadable
-        manifest or a format mismatch is a cold start too, but WARNed: persistence was
-        asked for and a prior cache could not be honored. Per-entry validation
-        (existence, shape, dtype) is deferred to :meth:`_revive`, which reads it from the
-        ``.npy`` header -- so a stale/missing file shows up as a per-epoch revive failure
-        the driver can warn on, not a silent drop here.
+        No manifest is a cold start (silent -- the expected first run). The *expected* stale
+        states degrade to a cold start with a WARN: an unreadable manifest, a format-version
+        bump, and a chunk_transform fingerprint change. Per-entry data validation (file
+        existence, shape, dtype) is deferred to :meth:`_revive`, which reads it from the
+        ``.npy`` header -- so a stale/missing file shows up as a per-epoch revive failure.
+
+        A manifest that clears those gates but is then *structurally* corrupt -- an entry with
+        a missing field, a non-integer chunk index, or a ``file`` that is not a bare filename
+        (an absolute or ``..`` path would let :meth:`_revive` ``open_memmap`` escape the cache
+        dir) -- is **not** an expected stale cache; it is corruption or tampering. We fail fast
+        and raise rather than silently start cold (which would hide the problem and re-decode
+        everything). Delete the cache dir to reset.
         """
         assert self._dir is not None
         path = self._dir / self._MANIFEST_NAME
@@ -718,8 +724,38 @@ class ChunkPool:
                 path,
             )
             return
-        for entry in doc.get("entries", []):
-            self._persisted[(entry["array"], int(entry["chunk_index"]))] = entry["file"]
+        entries = doc.get("entries", [])
+        if not isinstance(entries, list):
+            raise ValueError(
+                f"persist: cache manifest {path} is corrupt ('entries' is not a list); "
+                f"delete {self._dir} to reset the cache."
+            )
+        for entry in entries:
+            try:
+                array, chunk_index, fname = entry["array"], int(entry["chunk_index"]), entry["file"]
+            except (TypeError, KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"persist: cache manifest {path} has a malformed entry {entry!r} ({exc}); "
+                    f"this is corruption or tampering, not a stale cache -- delete {self._dir} "
+                    "to reset."
+                ) from exc
+            # The file must be a bare name resolved inside the cache dir. An absolute path, a
+            # ``..`` component, or any separator would escape via ``self._dir / fname`` in
+            # _revive; a manifest only ever stores basenames (see _register_persisted). Check
+            # separators explicitly -- ``Path('..').name`` is ``'..'``, and a Windows-style
+            # separator is an ordinary char to posix ``basename`` -- so neither alone suffices.
+            unsafe = (
+                not isinstance(fname, str)
+                or fname in ("", ".", "..")
+                or "/" in fname
+                or "\\" in fname
+            )
+            if unsafe:
+                raise ValueError(
+                    f"persist: cache manifest {path} entry file {fname!r} is not a bare filename "
+                    f"(possible path-traversal tampering); delete {self._dir} to reset."
+                )
+            self._persisted[(array, chunk_index)] = fname
         self.manifest_entries = len(self._persisted)
 
     def _write_manifest(self) -> None:  # call under the lock
