@@ -185,6 +185,43 @@ for batch in ds.train:      # JAX: iterate a view, convert each batch
 tfds = as_tf_dataset(ds.val)  # a tf.data.Dataset
 ```
 
+## Transforms — and checking one before you train
+
+Two hooks, placed by cost: a **`chunk_transform`** `(DecodedChunk) -> DecodedChunk` runs per
+decoded chunk (one variable), before the cache boundary, so its output is **cached** — the home
+for scaling, unit conversion, dtype cast, regrid; and a **`batch_transform`** `(Batch) -> Batch`
+runs per assembled batch (all variables aligned), **uncached** — for cross-variable derived
+fields and per-sample random augmentation. Both are pure numpy; see
+[`examples/transforms.py`](examples/transforms.py) (K→C chunk stage + windspeed batch stage).
+
+A `chunk_transform` must be **vectorized numpy that releases the GIL** (a per-element Python
+loop serializes the decode pool), and a **reshaping** one (regrid) must declare
+`output_inner(geom) -> (inner_shape, dtype)` so the cache can size its slot. Check both against
+**one chunk of your real store** before training:
+
+```console
+$ insitubatch-check-transform \
+    gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr \
+    --var 2m_temperature --transform examples/transforms.py:kelvin_to_celsius --skip-signature
+
+  sample axis : 92040 samples, 40/chunk, 2301 chunks
+  chunk 0    : 40 samples -> source shape (40, 128, 64) = 1.3 MB decoded
+transform output:
+  (40, 128, 64) float32  ->  (40, 128, 64) float32   shape- and dtype-preserving
+cacheability: shape/dtype-preserving, no output_inner needed -> cacheable as-is.
+GIL-release probe (thread-scaling, 4 threads):
+  speedup 3.50x (>= 2.40) -> releases the GIL (vectorized).
+PASS: chunk_transform checks all passed.
+```
+
+The target is `module:attr` or `path/to/file.py:attr` (a transform class is instantiated).
+It reports the chunk geometry, validates a declared `output_inner` against the real output
+(catching the mismatch the cache would later reject), and gives a GIL-release verdict — a
+non-zero exit gates a pre-commit hook. Pass `--no-gil-probe` for a fast structural-only check;
+the GIL probe needs a realistically-sized chunk (a toy array is dominated by call overhead). For
+the **reshaping** path, try `--transform examples/transforms.py:Coarsen` — a chunk-local regrid
+that halves the grid and declares `output_inner`, so the report shows the validated shape change.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

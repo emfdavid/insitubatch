@@ -322,17 +322,22 @@ get wrong and otherwise only surface at training time. Run the bundled CLI again
 of your real store** while you write the transform:
 
 ```bash
-python -m insitubatch.check_transform s3://bucket/era5.zarr --var t2m \
-    --transform ./prep.py:Regrid      # or  module.path:attr  (a class is instantiated)
-# also installed as:  insitubatch-check-transform ...
+# a runnable example against the public WeatherBench2 ERA5, checking the bundled K->C transform:
+insitubatch-check-transform \
+    gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr \
+    --var 2m_temperature --transform examples/transforms.py:kelvin_to_celsius --skip-signature
+# your own:  insitubatch-check-transform s3://bucket/era5.zarr --var t2m --transform ./prep.py:Regrid
+#            (target is module:attr or path.py:attr; a transform class is instantiated)
 ```
 
 It prints the chunk geometry (the decoded MB the cache will hold), runs the transform on real
-data, **validates the declared `output_inner` against the actual output** (catching the
-mismatch `ChunkPool._persist` would later raise), and runs a thread-scaling probe that flags a
-transform holding the GIL — a pure-Python per-element transform that would serialize the decode
-pool. Non-zero exit on a failed check, so it can gate a pre-commit hook. `--no-gil-probe` does
-the geometry + cacheability checks only (fast, deterministic).
+data, **validates a declared `output_inner` against the actual output** (catching the mismatch
+`ChunkPool._persist` would later raise, or a reshape that forgot to declare one), and runs a
+thread-scaling probe that flags a transform holding the GIL — a pure-Python per-element transform
+that would serialize the decode pool. Non-zero exit on a failed check, so it can gate a
+pre-commit hook. `--no-gil-probe` does the geometry + cacheability checks only (fast,
+deterministic); the GIL probe wants a realistically-sized chunk (a toy array is dominated by
+per-call overhead). `--skip-signature` / `--request-payer` read public / Requester-Pays stores.
 
 ## Bad / corrupt chunks
 

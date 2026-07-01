@@ -21,7 +21,19 @@ from insitubatch.types import ChunkRead, DecodedChunk
 FAST = ["--no-gil-probe"]
 
 TRANSFORMS_SRC = """
+from dataclasses import dataclass
+
 import numpy as np
+
+@dataclass
+class Coarsen:  # a dataclass reshaping transform: needs its module registered in sys.modules
+    factor: int = 2
+    def __call__(self, chunk):
+        chunk.data = chunk.data[:, :: self.factor, :: self.factor]
+        return chunk
+    def output_inner(self, geom):
+        lat, lon = geom.inner_shape
+        return (-(-lat // self.factor), -(-lon // self.factor)), geom.dtype
 
 class MeanLastAxis:
     def __call__(self, chunk):
@@ -84,6 +96,15 @@ def test_load_transform_instantiates_zero_arg_class(transforms_file):
     fn = load_transform(f"{transforms_file}:MeanLastAxis")
     assert not isinstance(fn, type) and callable(fn)  # an instance, not the class
     assert hasattr(fn, "output_inner")
+
+
+def test_load_transform_dataclass_from_file(transforms_file):
+    """A @dataclass transform loaded from a file needs its module registered in sys.modules
+    (dataclasses resolves annotations via sys.modules[__module__]); regression for that."""
+    fn = load_transform(f"{transforms_file}:Coarsen")
+    assert callable(fn) and hasattr(fn, "output_inner")
+    chunk = DecodedChunk(read=ChunkRead("v", 0), data=np.ones((2, 6, 8)), sample_offset=0)
+    assert fn(chunk).data.shape == (2, 3, 4)  # strided by factor=2
 
 
 def test_load_transform_from_module(transforms_file, monkeypatch):
@@ -155,6 +176,24 @@ def test_main_bad_transform_returns_2(store, capsys):
     rc = main([store, "--var", "t2m", "--transform", "nope_no_colon", *FAST])
     assert rc == 2
     assert "could not load --transform" in capsys.readouterr().err
+
+
+def test_main_store_auth_flags_pass_through(store, transforms_file, capsys):
+    """--skip-signature / --request-payer thread into the store open (so check_transform
+    reaches the same public / Requester-Pays stores the loader does)."""
+    rc = main(
+        [
+            store,
+            "--var",
+            "t2m",
+            "--transform",
+            f"{transforms_file}:vectorized_scale",
+            "--skip-signature",
+            "--request-payer",
+            *FAST,
+        ]
+    )
+    assert rc == 0
 
 
 def test_main_chunk_out_of_range(store, transforms_file, capsys):
