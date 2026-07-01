@@ -535,6 +535,20 @@ and referenced globals, so a changed closed-over constant invalidates), or a
 best-effort source hash (catches an edited body but not a changed closure/global — it
 warns once so the weaker guarantee is visible).
 
+> **Limitation — the fingerprint is per-*pipeline*, not per-variable (invalidation is
+> all-or-nothing).** `chunk_transforms` is a single ordered list applied to **every**
+> variable; a transform that only concerns one field self-gates by name and no-ops on the
+> rest (e.g. `kelvin_to_celsius` acts on `t2m`, returns `u10`/`v10` untouched). But the
+> fingerprint hashes the **whole list once** and stamps that single `pipeline_hash` on
+> every array's cache entries. So editing a transform that logically affects only `t2m`
+> marks the **entire** cache stale — `u10`/`v10` included — even though their cached chunks
+> are byte-identical (the edited transform no-oped on them); with the default you must then
+> `reset_stale_cache=True` and re-decode everything. The engine also runs every transform
+> on every chunk (the no-op passes are wasted work, though cheap for a name-gated early
+> return). A per-variable transform assignment + per-array fingerprint would scope
+> invalidation (and application) to just the affected arrays — see the roadmap in
+> [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md).
+
 **Observability.** `dataset.cache_hits` / `cache_misses` give per-epoch counts; a plain
 miss is silent, but `persist=True` serving **zero** hits while the cache was
 consulted-and-rejected emits one WARNING per epoch — a cache you configured but that
