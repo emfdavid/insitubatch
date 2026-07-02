@@ -20,7 +20,7 @@ from typing import Literal
 import numpy as np
 import zarr
 
-from insitubatch.store import ensure_local_dir, obstore_store
+from insitubatch.store import ensure_local_dir, fsspec_store, obstore_store
 
 
 def make_dataset(
@@ -36,6 +36,7 @@ def make_dataset(
     write_batch_mb: int = 1024,
     write_concurrency: int = 32,
     s3_express: bool = False,
+    backend: str = "obstore",
 ) -> None:
     """Write a ``(n_samples, *inner)`` array per variable, chunked along axis 0.
 
@@ -56,10 +57,14 @@ def make_dataset(
     if len(inner_chunks) != len(inner):
         raise ValueError(f"inner_chunks {inner_chunks} must match inner dims {inner}")
     ensure_local_dir(url)
-    # S3 Express One Zone (directory buckets, --x-s3): obstore needs s3_express=True;
-    # it is NOT inferred from the bucket name. (env equivalent: AWS_S3_EXPRESS=true)
-    store_kwargs = {"s3_express": True} if s3_express else {}
-    store = obstore_store(url, read_only=False, **store_kwargs)
+    # fsspec/gcsfs is the only writer that reaches GCS Rapid/zonal (gRPC); obstore is the
+    # default and the S3 writer. (arraylake sessions are read-only, so it can't write here.)
+    if backend == "fsspec":
+        store = fsspec_store(url, read_only=False)
+    else:
+        # S3 Express One Zone (directory buckets, --x-s3): obstore needs s3_express=True;
+        # it is NOT inferred from the bucket name. (env equivalent: AWS_S3_EXPRESS=true)
+        store = obstore_store(url, read_only=False, **({"s3_express": True} if s3_express else {}))
     group = zarr.open_group(store=store, mode="w")
     rng = np.random.default_rng(seed)
     chunks = (sample_chunk, *inner_chunks)
@@ -155,6 +160,12 @@ def main() -> None:
     p.add_argument(
         "--s3-express", action="store_true", help="target an S3 Express One Zone directory bucket"
     )
+    p.add_argument(
+        "--backend",
+        default="obstore",
+        choices=["obstore", "fsspec"],
+        help="write store: obstore (default, S3/standard-GCS) or fsspec/gcsfs (GCS Rapid/zonal)",
+    )
     a = p.parse_args()
 
     sample_chunk = (
@@ -172,6 +183,7 @@ def main() -> None:
         write_batch_mb=a.write_batch_mb,
         write_concurrency=a.write_concurrency,
         s3_express=a.s3_express,
+        backend=a.backend,
     )
 
 
