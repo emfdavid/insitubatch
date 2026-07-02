@@ -92,20 +92,20 @@ def _insitu(
     churn) and under free-threading. MB/s counts the anchor-input bytes either way, so
     the windowing machinery's overhead shows as a drop at equal anchor rate.
     """
-    geom = open_geometries(obstore_store(url), variables=[var], **kw)[var]
+    store = obstore_store(url, **kw)
+    geom = open_geometries(store, variables=[var])[var]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     geoms = {var: geom}
     for k in range(1, window + 1):
         geoms[f"{var}_t{k}"] = geom.shift(k)
     ds = InSituDataset(
-        obstore_store(url),
+        store,
         manifest,
         geometries=geoms,
         batch_size=16,
         block_chunks=block_chunks,
         max_inflight=max_inflight,
         shuffle=False,
-        **kw,
     )
     ds.scheduler_config.decode_threads = decode_threads  # read by the scheduler at iteration time
     bps = int(np.prod(geom.inner_shape)) * 4
@@ -141,7 +141,8 @@ def _insitu_cache(
     then served entirely from the cache (no S3, no decode). ``cache_dir`` spills the
     slots to NVMe (mmap); pass it to keep heap bounded on fat data.
     """
-    geom = open_geometries(obstore_store(url), variables=[var], **kw)[var]
+    store = obstore_store(url, **kw)
+    geom = open_geometries(store, variables=[var])[var]
     full = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     train = full.chunks[SplitName.TRAIN.value][:max_chunks]
     manifest = SplitManifest(
@@ -154,7 +155,7 @@ def _insitu_cache(
     outer_nbytes = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
     budget = (len(train) + 2) * outer_nbytes  # hold every probed chunk + a margin
     ds = InSituDataset(
-        obstore_store(url),
+        store,
         manifest,
         geometries={var: geom},
         batch_size=16,
@@ -162,7 +163,6 @@ def _insitu_cache(
         shuffle=False,
         cache_dir=cache_dir,
         cache_budget_bytes=budget,
-        **kw,
     )
     bps = int(np.prod(geom.inner_shape)) * 4
 

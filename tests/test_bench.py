@@ -95,3 +95,15 @@ def test_workers_engine_spawns(tmp_path) -> None:
     )
     rows = run(cfg)
     assert rows and rows[0].n_samples > 0
+
+
+def test_run_forwards_store_kwargs(tmp_path) -> None:
+    # Regression: engines build the store from store_kwargs and hand a Store to
+    # open_geometries/InSituDataset -- the kwargs must NOT be splatted into those (the
+    # Store-only migration break). The suite smoke tests use empty store_kwargs, so only
+    # a non-empty dict exercises the path (obstore ignores skip_signature on file://).
+    url = f"file://{tmp_path}/k.zarr"
+    make_dataset(url, n_samples=40, inner=(3, 3), sample_chunk=8, variables=["t2m"])
+    cfg = Cfg(engine="insitu", url=url, storage="file", sample_chunk=8, batch_size=8, epochs=1)
+    rows = run(cfg, store_kwargs={"skip_signature": True})
+    assert rows and rows[0].n_samples > 0
