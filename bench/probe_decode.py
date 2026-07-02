@@ -25,6 +25,7 @@ it's the network/endpoint (more/bigger parallel streams, in-region S3, the gatew
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import contextlib
 import itertools
@@ -42,7 +43,7 @@ import numpy as np
 import obstore
 import zarr
 
-from insitubatch import SplitManifest, SplitName, open_geometries, split_by_chunk
+from insitubatch import SplitManifest, SplitName, close_store, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 
 from ._profile import record_pyspy
@@ -69,6 +70,21 @@ def _store_kwargs(
     if s3_express:  # S3 Express One Zone directory bucket (--x-s3); not inferred from the name
         kw["s3_express"] = True
     return kw
+
+
+def _close_fsspec_session(fs: Any) -> None:
+    """Close a gcsfs aiohttp session on the loop it lives on, so gcsfs's finalizer --
+    which captures ``self.loop`` (None here) and otherwise closes on the wrong loop at
+    GC -- becomes a no-op. Silences the "Task was destroyed / different loop" teardown
+    traceback. Best-effort: guarded for non-gcsfs backends and already-closed sessions.
+    """
+    sess = getattr(fs, "_session", None)
+    loop = getattr(sess, "_loop", None)
+    if sess is None or loop is None or sess.closed or not loop.is_running():
+        return
+    with contextlib.suppress(Exception):
+        asyncio.run_coroutine_threadsafe(sess.close(), loop).result(timeout=5)
+        fs._session = None
 
 
 def _stats(fn: Callable[[], float], repeats: int) -> tuple[float, float, float]:
@@ -209,7 +225,8 @@ def _raw_get_mb_s(
     it's correct for spatially-chunked arrays. max_chunks bounds the number of OUTER
     chunks; every inner chunk under them is fetched, concurrency threads at a time.
     """
-    arr = zarr.open_array(store=build_store(backend, url, **kw), path=var, mode="r")  # for chunks
+    meta_store = build_store(backend, url, **kw)
+    arr = zarr.open_array(store=meta_store, path=var, mode="r")  # for the chunk grid
     n_outer = min(max_chunks, math.ceil(arr.shape[0] / arr.chunks[0]))
     inner_ranges = [
         range(math.ceil(s / c)) for s, c in zip(arr.shape[1:], arr.chunks[1:], strict=True)
@@ -241,7 +258,11 @@ def _raw_get_mb_s(
     t = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         total = sum(ex.map(fetch, keys))
-    return total / 1e6 / (time.perf_counter() - t)
+    mb = total / 1e6 / (time.perf_counter() - t)
+    if backend == "fsspec":
+        _close_fsspec_session(raw_fs)  # the bare raw-fetch fs (no Store wrapper)
+        close_store(meta_store)  # the async grid-metadata store's session
+    return mb
 
 
 def main() -> None:
