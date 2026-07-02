@@ -36,10 +36,10 @@ reproduce the benchmark paying only their own egress.
   Requester-Pays bucket. "Public" here means **any authenticated AWS account** can
   read, and **the reader pays** their own GET + egress; the bucket owner pays
   storage only. Reproducers need an AWS account (which they need for EC2 anyway).
-- **obstore supports it.** External readers pass `request_payer=True`, which flows
-  through `store_from_url(...)` / `InSituDataset(..., request_payer=True)`. The
-  bucket **owner** is *not* charged and does not need the flag for their own
-  reads/writes on their own bucket.
+- **obstore supports it.** External readers pass `request_payer=True` to the store
+  constructor: `obstore_store("s3://…", request_payer=True)`, then hand the store to
+  `InSituDataset(store, ...)`. The bucket **owner** is *not* charged and does not need
+  the flag for their own reads/writes on their own bucket.
 - **Co-locate** bucket and instance in `us-east-1`. Cross-region egress is slow
   and billed.
 

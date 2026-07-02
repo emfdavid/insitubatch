@@ -39,16 +39,18 @@ The core `InSituDataset` is a framework-neutral iterable of numpy `Batch` object
 torch / JAX / TF handoff is a thin optional DLPack adapter in `insitubatch.frameworks`.
 
 ```python
-from insitubatch import open_geometries, split_by_chunk
+from insitubatch import obstore_store, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset
 from torch.utils.data import DataLoader
 
-url = "file:///data/era5.zarr"           # or "s3://bucket/era5.zarr" — same code
-geoms = open_geometries(url)             # {var: ArrayGeometry} from zarr metadata
+# The engine reads a zarr Store; obstore_store builds one for file://, s3://, gs://.
+# (fsspec_store for GCS Rapid/requester-pays; arraylake_store for Icechunk sessions.)
+store = obstore_store("file:///data/era5.zarr")  # or "s3://bucket/era5.zarr"
+geoms = open_geometries(store)           # {var: ArrayGeometry} from zarr metadata
 manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 
-ds = InSituDataset(url, manifest, batch_size=32, block_chunks=16)
+ds = InSituDataset(store, manifest, batch_size=32, block_chunks=16)
 
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)
