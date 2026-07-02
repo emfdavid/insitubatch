@@ -106,16 +106,18 @@ def run_demo(
     if url.startswith("gs://"):
         store_kwargs["skip_signature"] = True  # public bucket, anonymous read
 
+    store = obstore_store(url, **store_kwargs)  # one Store, reused throughout
+
     # A real store (WeatherBench2) has many variables on *different* sample axes (coords,
     # pressure levels); InSituDataset requires one shared sample axis, so select a
     # compatible set. None = every variable (fine for the synthetic two-var store).
-    geoms = open_geometries(obstore_store(url), variables=variables, **store_kwargs)
+    geoms = open_geometries(store, variables=variables)
     var0 = next(iter(geoms))
     manifest = split_by_chunk(geoms[var0], fractions=(1.0, 0.0, 0.0))
 
     # A cache big enough to hold the split: the fit pass warms it, training reuses it.
     ds = InSituDataset(
-        obstore_store(url),
+        store,
         manifest,
         geometries=geoms,
         batch_size=16,
@@ -123,14 +125,13 @@ def run_demo(
         shuffle=False,
         cache_dir=cache_dir or (f"{tmp}/cache" if tmp else None),
         cache_budget_bytes=4 << 30,
-        **store_kwargs,
     )
 
     # 1) fit over the loader (cold: decode + cache) -----------------------------------
     scalers, fit_s, n = fit_over_loader(ds)
 
     # verify the streamed partial_fit matches the true global mean/std
-    grp = zarr.open_group(store=obstore_store(url, **store_kwargs), mode="r")
+    grp = zarr.open_group(store=store, mode="r")
     max_err = 0.0
     for v, s in scalers.items():
         arr = grp[v]

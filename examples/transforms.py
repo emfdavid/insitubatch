@@ -139,14 +139,15 @@ def run_demo(
         tmp = tempfile.mkdtemp(prefix="insitu-transforms-")
         url = build_store(tmp)
     try:
-        geoms = open_geometries(obstore_store(url), variables=list(VARIABLES))
+        store = obstore_store(url)
+        geoms = open_geometries(store, variables=list(VARIABLES))
         manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
         source_inner = geoms["t2m"].inner_shape
 
         # Two chunk stages: K->C (shape-preserving) then a reshaping Coarsen (halves the grid).
         # The cache slot is sized at the *coarsened* shape via Coarsen.output_inner.
         ds = InSituDataset(
-            obstore_store(url),
+            store,
             manifest,
             geometries=geoms,
             batch_size=batch_size,

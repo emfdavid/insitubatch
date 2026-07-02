@@ -4,8 +4,11 @@ Mirrors https://github.com/earth-mover/dataloader-demo: load an ERA5-style zarr
 from the cloud, feed a simulated training loop, and report per-batch wait time.
 What differs:
 
-- **Storage is obstore.** Pass any zarr ``--url`` (e.g. an S3 ERA5 store); reads
-  go through ``obstore_store`` (so ``--request-payer`` works for Requester-Pays).
+- **Storage is a zarr Store, obstore by default.** Pass any zarr ``--url`` (e.g. an
+  S3 ERA5 store); reads go through ``obstore_store`` (so ``--request-payer`` works for
+  Requester-Pays). ``--backend fsspec`` reads the same URL through ``fsspec_store``
+  (gcsfs) instead — the path to GCS Rapid/zonal + Requester-Pays, and the A/B for
+  whether fsspec matches obstore on GCS (DESIGN.md M-GCS).
 - **Parallelism is in the event loop, not workers.** There is no ``num_workers``
   knob — insitubatch fans out IO on its async loop and prefetches; a different
   parallelism model for the same batches.
@@ -36,6 +39,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import zarr
@@ -43,6 +47,7 @@ import zarr
 from insitubatch import (
     SplitName,
     ensure_local_dir,
+    fsspec_store,
     obstore_store,
     open_geometries,
     split_by_chunk,
@@ -109,6 +114,7 @@ def run_demo(
     shuffle: bool = True,
     seed: int = 0,
     request_payer: bool = False,
+    backend: str = "obstore",
     verbose: bool = True,
 ) -> dict:
     tmp = None
@@ -116,13 +122,22 @@ def run_demo(
         tmp = tempfile.mkdtemp(prefix="wb2-demo-")
         url, var = _synthetic(tmp)
 
-    store_kwargs: dict = {}
-    if url.startswith("gs://"):
-        store_kwargs["skip_signature"] = True  # public bucket, anonymous read
-    if request_payer:
-        store_kwargs["request_payer"] = True
-
-    geom = open_geometries(obstore_store(url), variables=[var], **store_kwargs)[var]
+    # obstore (default, pure-Rust) vs fsspec/gcsfs (the GCS Rapid/requester-pays path) over
+    # the *same* engine -- the A/B for "does fsspec earn a co-equal fast path" (DESIGN M-GCS).
+    anon = url.startswith("gs://")  # the public WeatherBench2 bucket needs no credentials
+    if backend == "fsspec":
+        fs_kwargs: dict[str, Any] = {"token": "anon"} if anon else {}  # gcsfs anonymous read
+        if request_payer:
+            fs_kwargs["requester_pays"] = True
+        store = fsspec_store(url, **fs_kwargs)
+    else:
+        obs_kwargs: dict = {}
+        if anon:
+            obs_kwargs["skip_signature"] = True
+        if request_payer:
+            obs_kwargs["request_payer"] = True
+        store = obstore_store(url, **obs_kwargs)
+    geom = open_geometries(store, variables=[var])[var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
     # Caching is the pool's policy (V2: "don't evict"). --cache-resident sizes the budget
     # to hold the whole train split, so epoch 2+ is served from the pool (decode-once);
@@ -133,7 +148,7 @@ def run_demo(
         cache_budget_bytes = (len(manifest.chunks[SplitName.TRAIN.value]) + 2) * per_chunk
 
     ds = InSituDataset(
-        obstore_store(url),
+        store,
         manifest,
         geometries={var: geom},
         batch_size=batch_size,
@@ -144,7 +159,6 @@ def run_demo(
         shuffle=shuffle,
         seed=seed,
         batch_transforms=[_subregion_crop(var, subregion, seed)],
-        **store_kwargs,
     )
 
     waits: list[float] = []
@@ -218,6 +232,12 @@ def main() -> None:
     p.add_argument("--max-batches", type=int, default=0, help="cap batches per epoch (0 = all)")
     p.add_argument("--no-shuffle", action="store_true")
     p.add_argument("--request-payer", action="store_true")
+    p.add_argument(
+        "--backend",
+        choices=("obstore", "fsspec"),
+        default="obstore",
+        help="store backend: obstore (default, Rust) or fsspec/gcsfs (GCS Rapid/requester-pays)",
+    )
     a = p.parse_args()
     url, var = (WB2_URL, WB2_VAR) if a.wb2 else (a.url, a.var)
     run_demo(
@@ -234,6 +254,7 @@ def main() -> None:
         max_batches=a.max_batches,
         shuffle=not a.no_shuffle,
         request_payer=a.request_payer,
+        backend=a.backend,
     )
 
 
