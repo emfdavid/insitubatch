@@ -18,6 +18,7 @@ import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .engines import Cfg, run
 from .make_dataset import make_family
@@ -32,7 +33,6 @@ def run_suite(
     out: str | Path = DEFAULT_OUT,
     data_dir: str | Path | None = None,
     url_prefix: str | None = None,
-    storage: str = "file",
     backend: str = "obstore",
     chunk_sizes: Sequence[int] = (1, 8),
     engines: Sequence[str] = ("naive", "workers", "xbatcher", "insitu", "memory"),
@@ -73,6 +73,9 @@ def run_suite(
         urls = make_family(
             f"file://{ddir}/era5", tuple(chunk_sizes), n_samples=n_samples, inner=inner
         )
+    # The JSONL row's storage label is just the URL scheme (file | s3 | gs) -- no need
+    # for a separate flag to restate what the prefix already says.
+    storage = urlparse(next(iter(urls.values()))).scheme or "file"
 
     scratch = (
         Path(cache_dir) if cache_dir else Path(tempfile.mkdtemp(prefix="insitubatch-bench-cache-"))
@@ -194,7 +197,6 @@ def main() -> None:
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--data-dir", default=None, help="where to write local datasets (default: temp)")
     p.add_argument("--url-prefix", default=None, help="pre-generated data: <prefix>_c<spc>.zarr")
-    p.add_argument("--storage", default="file", choices=["file", "s3", "gs"])
     p.add_argument(
         "--backend",
         default="obstore",
@@ -231,7 +233,6 @@ def main() -> None:
         out=a.out,
         data_dir=a.data_dir,
         url_prefix=a.url_prefix,
-        storage=a.storage,
         backend=a.backend,
         epochs=a.epochs,
         repeats=a.repeats,
