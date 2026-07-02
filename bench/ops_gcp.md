@@ -89,13 +89,15 @@ gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
 gcloud storage buckets update "gs://$BUCKET" --requester-pays
 ```
 
-> **Do not run this on the bench bucket yet.** obstore 0.10.1 has no GCS billing-project
-> config (verified: `GCSConfig` carries auth options like `skip_signature` / `service_account`
-> but no `user_project`), and GCS — unlike S3 — grants the owner **no** Requester-Pays exemption.
-> So enabling it breaks *your own* GCE bench reads too, not just external reproducers, with
-> `... is a requester pays bucket but no user project provided`. There is no `request_payer`
-> equivalent to pass through `store_from_url` for `gs://`. Until obstore gains a GCS
-> user-project knob, anonymous-public (above) is the one working path.
+> **obstore cannot read Requester-Pays GCS; use `fsspec_store` instead.** obstore 0.10.1 has
+> no GCS billing-project config (verified: `GCSConfig` carries auth options like
+> `skip_signature` / `service_account` but no `user_project`), and GCS — unlike S3 — grants
+> the owner **no** Requester-Pays exemption, so enabling it breaks *your own* GCE bench reads
+> too (`... is a requester pays bucket but no user project provided`). The path is
+> `insitubatch.fsspec_store` (gcsfs), which forwards a billing project via `storage_options`:
+> `fsspec_store("gs://bucket/ds.zarr", project="my-billing-project", requester_pays=True)`.
+> obstore stays the default for non-Requester-Pays reads; anonymous-public (above) needs no
+> billing project on either backend.
 
 ## 3. Service account + bucket access
 
@@ -234,31 +236,38 @@ uv run python -m bench --full --url-prefix "gs://$BUCKET/era5" \
   --cache-dir /mnt/nvme/cache
 ```
 
-obstore reads `gs://` through the same `store_from_url` shim; credentials come from the
-instance service account (Application Default Credentials) automatically. A public reader on
-another account passes `skip_signature=True` instead — **VERIFY** the kwarg name flows
-through `make_dataset`/`open_geometries` for `gs://` as it does for the WB2 example.
+obstore reads `gs://` through `obstore_store`; credentials come from the instance service
+account (Application Default Credentials) automatically. A public reader on another account
+passes `skip_signature=True` instead — **VERIFY** the kwarg name flows through
+`make_dataset`/`open_geometries` for `gs://` as it does for the WB2 example. For Rapid/zonal or
+Requester-Pays buckets, build the store with `fsspec_store` (gcsfs) instead — see §7 and §2.
 
-## 7. Rapid Storage (gRPC) — the obstore high-performance experiment
+## 7. Rapid Storage (gRPC) — the fsspec/gcsfs high-performance experiment
 
-**Goal:** test obstore against **Google Cloud Rapid Storage** — a *zonal* GCS bucket served
-over the high-throughput **gRPC** Cloud Storage API (the GCS analogue of S3 Express One Zone).
-The open question is whether obstore (via Rust `object_store`) can drive the gRPC endpoint at
-all, and if so how close it gets to the raw-GET ceiling — exactly the story-4 efficiency
-measurement, on a faster floor.
+**Goal:** test **Google Cloud Rapid Storage** — a *zonal* GCS bucket served over the
+high-throughput **gRPC** Cloud Storage API (the GCS analogue of S3 Express One Zone) — as an
+insitubatch read path. The measurement is the story-4 raw-GET-vs-decoded efficiency, on a
+faster floor.
 
-> **All of this section is UNVERIFIED.** Rapid Storage is new and the exact `gcloud` flags,
-> the gRPC endpoint wiring, and obstore's gRPC support all need checking before the numbers
-> mean anything. Treat it as an experiment plan, not a runbook.
+> **Backend: gcsfs, not obstore.** Rust `object_store` (obstore) speaks GCS over HTTPS/JSON
+> only — it has no gRPC path — so it cannot drive the Rapid endpoint. gcsfs *does* (it has
+> dedicated Rapid/zonal support: True Appends over gRPC BidiWriteObject, streaming I/O). The
+> read path is therefore `insitubatch.fsspec_store("gs://…", …)` (zarr `FsspecStore` over
+> gcsfs), which is exactly why fsspec_store exists. The headline experiment is **fsspec-over-
+> gcsfs on Rapid vs obstore-over-HTTP on standard GCS** — does zonal gRPC beat the raw-GET
+> ceiling enough to justify fsspec as a co-equal fast path (see DESIGN.md M-GCS)?
+
+> **Still UNVERIFIED end-to-end.** Rapid Storage is new; the exact `gcloud` flags, the gcsfs
+> Rapid `storage_options`, and the measured numbers all need checking on the live box before
+> they mean anything. Treat provisioning below as an experiment plan, not a settled runbook.
 
 Open questions to resolve first:
 
-- **Does obstore/`object_store` speak the GCS gRPC API?** The S3-Express win came for free
-  because it is still the S3 HTTP API; GCS gRPC is a *different protocol*. If `object_store`
-  is HTTPS/JSON-only for GCS, this needs an obstore feature or a different client — confirm
-  before provisioning.
-- **Endpoint selection.** How obstore is told to use the gRPC endpoint (a URL scheme, a store
-  kwarg, or an env var) is **VERIFY** — there may be no hook yet.
+- **gcsfs Rapid `storage_options`.** How gcsfs is told to use the zonal gRPC endpoint (an
+  endpoint override, a bucket-type flag, or automatic on a Rapid bucket) is **VERIFY** —
+  confirm against the gcsfs Rapid docs, then thread it through `fsspec_store(...)`.
+- **Write path.** `bench/make_dataset.py` writes via `obstore_store` (HTTP); confirm whether it
+  must switch to gcsfs to *populate* a Rapid bucket, or whether HTTP writes + gRPC reads work.
 
 Provisioning sketch (**VERIFY** every flag against current docs — Rapid Storage requires a
 zonal location and hierarchical namespace):

@@ -316,7 +316,7 @@ multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
 |---|---|
 | `types.py` | `ArrayGeometry`, `ChunkRead`, `DecodedChunk`, `Batch` |
 | `split.py` | chunk-aligned `SplitManifest`, `split_by_chunk` (+ `sample_range` subsetting) |
-| `store.py` | `store_from_url` shim (local↔S3 via obstore) + geometry introspection |
+| `store.py` | per-backend `Store` constructors (`obstore_store`, `fsspec_store`, `arraylake_store`) + geometry introspection |
 | `shuffle.py` | chunk permutation + shuffle-block / sequential order + quality metric |
 | `plan.py` | `build_stored_chunk_reads` — a draw order's chunks → deduped stored-chunk (tile) reads for the scheduler |
 | `scheduler.py` | `Scheduler` — one `max_inflight` budget over stored-chunk reads; fetch→decode→scatter; residency admission |
@@ -482,6 +482,15 @@ Perf track (the core thesis):
   fetching (fast cold TTFB), and `max_inflight` goes back to being purely the concurrency
   dial. Applies to both the V2 main engine and the M-W branch (whose residency rework did
   not add a read-ahead cap either).
+- **M-GCS — fsspec/gcsfs store backend (in progress).** The engine now takes a zarr
+  `Store`, built per backend: `obstore_store` (default, pure-Rust URL path),
+  `fsspec_store` (`FsspecStore.from_url`, reaches what obstore can't — GCS Rapid/zonal
+  over gRPC, requester-pays — via `insitubatch[gcsfs]`), and `arraylake_store`
+  (Icechunk sessions). The str-vs-Store / `**store_kwargs` dispatch is gone. **Open
+  question under evaluation on the GCP bench box:** whether fsspec-over-gcsfs on Rapid
+  storage matches or beats obstore's raw-read path — if so, fsspec earns a spot as a
+  core dep and a co-equal fast path (today it is an optional extra). Pending: validate a
+  real Rapid bucket end-to-end, then drop the `ops_gcp.md` VERIFY markers.
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 
