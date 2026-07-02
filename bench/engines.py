@@ -27,9 +27,9 @@ import zarr
 from insitubatch import (
     SplitManifest,
     SplitName,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry
@@ -118,7 +118,7 @@ def run(
     cfg: Cfg, *, cache_dir: str | None = None, store_kwargs: dict | None = None
 ) -> list[Result]:
     store_kwargs = store_kwargs or {}
-    geom = open_geometries(cfg.url, **store_kwargs)[cfg.var]
+    geom = open_geometries(obstore_store(cfg.url, **store_kwargs))[cfg.var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
     engines = {
         "insitu": _run_insitu,
@@ -153,7 +153,7 @@ def _run_insitu(
         budget = (n_train + 2) * per_chunk  # hold every train chunk + a margin
         cdir = cache_dir
     ds = InSituDataset(
-        cfg.url,
+        obstore_store(cfg.url, **store_kwargs),
         manifest,
         geometries={cfg.var: geom},
         batch_size=cfg.batch_size,
@@ -164,7 +164,6 @@ def _run_insitu(
         seed=cfg.seed,
         cache_dir=cdir,
         cache_budget_bytes=budget,
-        **store_kwargs,
     )
     out = []
     for epoch in range(cfg.epochs):
@@ -183,7 +182,7 @@ def _run_naive(
     cache_dir: str | None,
     store_kwargs: dict,
 ) -> list[Result]:
-    arr = zarr.open_array(store=store_from_url(cfg.url, **store_kwargs), path=cfg.var, mode="r")
+    arr = zarr.open_array(store=obstore_store(cfg.url, **store_kwargs), path=cfg.var, mode="r")
     spc = geom.sample_chunk_size
 
     def batches() -> Iterator[np.ndarray]:
@@ -205,7 +204,7 @@ def _run_memory(
     cache_dir: str | None,
     store_kwargs: dict,
 ) -> list[Result]:
-    arr = zarr.open_array(store=store_from_url(cfg.url, **store_kwargs), path=cfg.var, mode="r")
+    arr = zarr.open_array(store=obstore_store(cfg.url, **store_kwargs), path=cfg.var, mode="r")
     full = np.asarray(arr[:])
     idx0 = manifest.sample_indices(SplitName.TRAIN, geom)
     out = []
@@ -241,7 +240,7 @@ class _SampleReader:
     def __getitem__(self, i: int) -> np.ndarray:
         if self._arr is None:
             self._arr = zarr.open_array(
-                store=store_from_url(self.url, **self.store_kwargs), path=self.var, mode="r"
+                store=obstore_store(self.url, **self.store_kwargs), path=self.var, mode="r"
             )
         return np.asarray(self._arr[int(self.idx[i])])
 
@@ -310,7 +309,7 @@ def _run_xbatcher(
     from torch.utils.data import DataLoader
     from xbatcher.loaders.torch import MapDataset
 
-    da = xr.open_zarr(store_from_url(cfg.url, **store_kwargs), consolidated=False)[cfg.var]
+    da = xr.open_zarr(obstore_store(cfg.url, **store_kwargs), consolidated=False)[cfg.var]
     da = da.isel({da.dims[0]: manifest.sample_indices(SplitName.TRAIN, geom)})
     # one timestep per sample (full inner dims); the DataLoader collates batch_size.
     input_dims = {da.dims[0]: 1, **{d: int(da.sizes[d]) for d in da.dims[1:]}}

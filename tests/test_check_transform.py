@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import zarr
 
-from insitubatch import ensure_local_dir, open_geometries, store_from_url
+from insitubatch import ensure_local_dir, obstore_store, open_geometries
 from insitubatch.check_transform import gil_probe, load_transform, main, read_chunk
 from insitubatch.types import ChunkRead, DecodedChunk
 
@@ -67,10 +67,10 @@ not_callable = 42
 
 
 @pytest.fixture
-def store(tmp_path):
+def url(tmp_path):
     url = f"file://{tmp_path}/syn.zarr"
     ensure_local_dir(url)
-    g = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    g = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     arr = g.create_array("t2m", shape=(24, 6, 8), chunks=(8, 6, 8), dtype="f4")
     arr[:] = np.random.default_rng(0).standard_normal((24, 6, 8)).astype("f4")
     return url
@@ -139,51 +139,49 @@ def test_load_transform_non_callable(transforms_file):
 # -- one-chunk read ---------------------------------------------------------
 
 
-def test_read_chunk_matches_source(store):
-    geom = open_geometries(store, variables=["t2m"])["t2m"]
-    chunk = read_chunk(store, "t2m", 1, geom)
+def test_read_chunk_matches_source(url):
+    geom = open_geometries(obstore_store(url), variables=["t2m"])["t2m"]
+    chunk = read_chunk(obstore_store(url), "t2m", 1, geom)
     assert chunk.data.shape == (8, 6, 8) and chunk.sample_offset == 8
 
 
 # -- main() integration: exit codes + report --------------------------------
 
 
-def test_main_passes_for_correct_reshaping_transform(store, transforms_file, capsys):
-    rc = main([store, "--var", "t2m", "--transform", f"{transforms_file}:MeanLastAxis", *FAST])
+def test_main_passes_for_correct_reshaping_transform(url, transforms_file, capsys):
+    rc = main([url, "--var", "t2m", "--transform", f"{transforms_file}:MeanLastAxis", *FAST])
     out = capsys.readouterr().out
     assert rc == 0
     assert "8/chunk" in out and "(6, 8)" in out  # geometry line
     assert "-> (6,)" in out and "[OK]" in out  # declared output validated
 
 
-def test_main_fails_on_wrong_output_inner(store, transforms_file, capsys):
-    rc = main([store, "--var", "t2m", "--transform", f"{transforms_file}:wrong_declare", *FAST])
+def test_main_fails_on_wrong_output_inner(url, transforms_file, capsys):
+    rc = main([url, "--var", "t2m", "--transform", f"{transforms_file}:wrong_declare", *FAST])
     out = capsys.readouterr().out
     assert rc == 1
     assert "MISMATCH" in out and "_persist would raise" in out
 
 
-def test_main_fails_on_undeclared_reshape(store, transforms_file, capsys):
-    rc = main(
-        [store, "--var", "t2m", "--transform", f"{transforms_file}:reshape_no_declare", *FAST]
-    )
+def test_main_fails_on_undeclared_reshape(url, transforms_file, capsys):
+    rc = main([url, "--var", "t2m", "--transform", f"{transforms_file}:reshape_no_declare", *FAST])
     out = capsys.readouterr().out
     assert rc == 1
     assert "does not declare output_inner" in out
 
 
-def test_main_bad_transform_returns_2(store, capsys):
-    rc = main([store, "--var", "t2m", "--transform", "nope_no_colon", *FAST])
+def test_main_bad_transform_returns_2(url, capsys):
+    rc = main([url, "--var", "t2m", "--transform", "nope_no_colon", *FAST])
     assert rc == 2
     assert "could not load --transform" in capsys.readouterr().err
 
 
-def test_main_store_auth_flags_pass_through(store, transforms_file, capsys):
-    """--skip-signature / --request-payer thread into the store open (so check_transform
+def test_main_store_auth_flags_pass_through(url, transforms_file, capsys):
+    """--skip-signature / --request-payer thread into the url open (so check_transform
     reaches the same public / Requester-Pays stores the loader does)."""
     rc = main(
         [
-            store,
+            url,
             "--var",
             "t2m",
             "--transform",
@@ -196,10 +194,10 @@ def test_main_store_auth_flags_pass_through(store, transforms_file, capsys):
     assert rc == 0
 
 
-def test_main_chunk_out_of_range(store, transforms_file, capsys):
+def test_main_chunk_out_of_range(url, transforms_file, capsys):
     rc = main(
         [
-            store,
+            url,
             "--var",
             "t2m",
             "--transform",
@@ -216,19 +214,19 @@ def test_main_chunk_out_of_range(store, transforms_file, capsys):
 # -- GIL probe plumbing -----------------------------------------------------
 
 
-def test_gil_probe_reports_fields_and_classifies_vectorized(store, transforms_file):
-    geom = open_geometries(store, variables=["t2m"])["t2m"]
-    base = read_chunk(store, "t2m", 0, geom)
+def test_gil_probe_reports_fields_and_classifies_vectorized(url, transforms_file):
+    geom = open_geometries(obstore_store(url), variables=["t2m"])["t2m"]
+    base = read_chunk(obstore_store(url), "t2m", 0, geom)
     fn = load_transform(f"{transforms_file}:vectorized_scale")
     out = gil_probe(fn, base, threads=2, min_seconds=0.02, repeats=1)
     assert {"iters", "serial_s", "parallel_s", "speedup", "per_call_ms", "mb_s"} <= out.keys()
     assert out["iters"] >= 1 and out["serial_s"] > 0 and out["speedup"] > 0
 
 
-def test_gil_probe_single_thread_speedup_about_one(store, transforms_file):
+def test_gil_probe_single_thread_speedup_about_one(url, transforms_file):
     # threads=1: serial and parallel are the same work -> speedup ~1 (no scaling claimed).
-    geom = open_geometries(store, variables=["t2m"])["t2m"]
-    base = read_chunk(store, "t2m", 0, geom)
+    geom = open_geometries(obstore_store(url), variables=["t2m"])["t2m"]
+    base = read_chunk(obstore_store(url), "t2m", 0, geom)
     fn = load_transform(f"{transforms_file}:vectorized_scale")
     out = gil_probe(fn, base, threads=1, min_seconds=0.02, repeats=1)
     assert out["speedup"] == pytest.approx(1.0, abs=0.6)

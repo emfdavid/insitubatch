@@ -5,7 +5,7 @@ from the cloud, feed a simulated training loop, and report per-batch wait time.
 What differs:
 
 - **Storage is obstore.** Pass any zarr ``--url`` (e.g. an S3 ERA5 store); reads
-  go through ``store_from_url`` (so ``--request-payer`` works for Requester-Pays).
+  go through ``obstore_store`` (so ``--request-payer`` works for Requester-Pays).
 - **Parallelism is in the event loop, not workers.** There is no ``num_workers``
   knob — insitubatch fans out IO on its async loop and prefetches; a different
   parallelism model for the same batches.
@@ -43,9 +43,9 @@ import zarr
 from insitubatch import (
     SplitName,
     ensure_local_dir,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 from insitubatch.types import Batch
@@ -62,7 +62,7 @@ def _synthetic(
 ) -> tuple[str, str]:
     url = f"file://{tmp}/era5.zarr"
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     arr = group.create_array(
         "t2m",
         shape=(n, lat, lon),
@@ -122,7 +122,7 @@ def run_demo(
     if request_payer:
         store_kwargs["request_payer"] = True
 
-    geom = open_geometries(url, variables=[var], **store_kwargs)[var]
+    geom = open_geometries(obstore_store(url), variables=[var], **store_kwargs)[var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
     # Caching is the pool's policy (V2: "don't evict"). --cache-resident sizes the budget
     # to hold the whole train split, so epoch 2+ is served from the pool (decode-once);
@@ -133,7 +133,7 @@ def run_demo(
         cache_budget_bytes = (len(manifest.chunks[SplitName.TRAIN.value]) + 2) * per_chunk
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         geometries={var: geom},
         batch_size=batch_size,

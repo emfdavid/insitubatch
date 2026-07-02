@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import zarr
 
-from insitubatch import ensure_local_dir, open_geometries, store_from_url, valid_anchor_range
+from insitubatch import ensure_local_dir, obstore_store, open_geometries, valid_anchor_range
 from insitubatch.pool import ChunkPool
 from insitubatch.scheduler import Scheduler, SchedulerConfig
 from insitubatch.types import ArrayGeometry
@@ -27,7 +27,7 @@ LAYOUTS = {"single_inner": (2, 9, 7), "spatial": (2, 4, 4)}
 def tiled_store(tmp_path):
     url = f"file://{tmp_path}/sched.zarr"
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     data = np.random.default_rng(1).standard_normal(SHAPE).astype("f4")
     srcs = {}
     for var, chunks in LAYOUTS.items():
@@ -60,7 +60,7 @@ def _drain_in_order(sched: Scheduler, geom: ArrayGeometry, var: str, *, unpin: b
 @pytest.mark.parametrize("bounded", [False, True])  # unbounded, then a 2-chunk budget
 def test_scheduler_fills_pool_matches_array(tiled_store, var, bounded):
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=[var])
+    geoms = open_geometries(obstore_store(url), variables=[var])
     geom = geoms[var]
     budget = None
     if bounded:
@@ -81,7 +81,9 @@ def test_scheduler_fills_pool_matches_array(tiled_store, var, bounded):
 def test_scheduler_inflight_saturates_to_budget(tiled_store):
     """With many tiles and a small budget, in-flight peaks at exactly max_inflight."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["spatial"])  # 3 chunks x 6 tiles = 18 reads
+    geoms = open_geometries(
+        obstore_store(url), variables=["spatial"]
+    )  # 3 chunks x 6 tiles = 18 reads
     with _make(url, geoms, max_inflight=4) as sched:
         fut = sched.start(range(geoms["spatial"].n_chunks))
         _drain_in_order(sched, geoms["spatial"], "spatial", unpin=False)
@@ -98,7 +100,7 @@ def test_scheduler_close_closes_the_loop(tiled_store):
     free-threaded 3.13t (where finalizer timing exposes the latent leak).
     """
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     sched = _make(url, geoms)
     sched.start(range(geoms["single_inner"].n_chunks))
     sched.close()
@@ -114,7 +116,7 @@ def test_scheduler_windowed_views_decode_once_and_lead(tiled_store):
     on the array (the producer drops edge anchors; here we do it explicitly).
     """
     url, srcs = tiled_store
-    base = open_geometries(url, variables=["single_inner"])["single_inner"]
+    base = open_geometries(obstore_store(url), variables=["single_inner"])["single_inner"]
     geoms = {"now": base, "next": base.shift(1)}  # one array, two views
     spc = base.sample_chunk_size
     src = srcs["single_inner"]

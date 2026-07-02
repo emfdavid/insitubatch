@@ -20,7 +20,7 @@ from typing import Literal
 import numpy as np
 import zarr
 
-from insitubatch.store import ensure_local_dir, store_from_url
+from insitubatch.store import ensure_local_dir, obstore_store
 
 
 def make_dataset(
@@ -59,7 +59,7 @@ def make_dataset(
     # S3 Express One Zone (directory buckets, --x-s3): obstore needs s3_express=True;
     # it is NOT inferred from the bucket name. (env equivalent: AWS_S3_EXPRESS=true)
     store_kwargs = {"s3_express": True} if s3_express else {}
-    store = store_from_url(url, read_only=False, **store_kwargs)
+    store = obstore_store(url, read_only=False, **store_kwargs)
     group = zarr.open_group(store=store, mode="w")
     rng = np.random.default_rng(seed)
     chunks = (sample_chunk, *inner_chunks)

@@ -21,17 +21,17 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterable
-from typing import Any
 
 import numpy as np
 import zarr
+from zarr.abc.store import Store
 
 from insitubatch import (
-    StoreLike,
+    arraylake_store,
     ensure_local_dir,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 from insitubatch.types import Batch
@@ -51,14 +51,6 @@ SYNTH_VARS = ("t2m", "u10", "v10")
 SYNTH_HORIZON = 24  # 24 steps x 1 h = 24 h
 
 LABELS = ("t2m", "u10", "v10")  # canonical input labels (store-independent)
-
-
-def open_arraylake_store(repo: str, *, branch: str = "main") -> StoreLike:
-    """Read-only Icechunk session store for an Arraylake repo (needs ``--extra arraylake``
-    + ``al auth login`` / ``ARRAYLAKE_TOKEN``). Passed straight to ``InSituDataset``."""
-    from arraylake import Client
-
-    return Client().get_repo(repo).readonly_session(branch).store
 
 
 def _advect(field: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -125,7 +117,7 @@ def make_advection_store(url: str, *, n_steps: int = 768, size: int = 48, seed: 
     wind_v = np.broadcast_to(v.astype("f4"), (n_steps, size, size))
 
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     for name, data in (("t2m", t2m), ("u10", wind_u), ("v10", wind_v)):
         arr = group.create_array(
             name,
@@ -138,7 +130,7 @@ def make_advection_store(url: str, *, n_steps: int = 768, size: int = 48, seed: 
 
 
 def forecast_dataset(
-    store: StoreLike,
+    store: Store,
     *,
     variables: tuple[str, str, str] = SYNTH_VARS,
     horizon: int = SYNTH_HORIZON,
@@ -147,11 +139,11 @@ def forecast_dataset(
     shuffle: bool = True,
     cache_dir: str | None = None,
     max_inflight: int | None = None,
-    **store_kwargs: Any,
 ) -> InSituDataset:
     """One windowed dataset: inputs ``{t2m, u10, v10}@t`` + ``target = t2m@(t+horizon)``.
 
-    ``store`` is a URL or a prebuilt zarr Store (e.g. an Arraylake/Icechunk session store).
+    ``store`` is a zarr Store -- build it with :func:`~insitubatch.obstore_store` /
+    :func:`~insitubatch.fsspec_store` / :func:`~insitubatch.arraylake_store`.
     ``variables`` names the three input arrays in the store (synthetic short names, the
     WeatherBench2 long names, or group-qualified paths); the dataset's labels are always
     ``t2m, u10, v10, target`` so the model code is store-agnostic. The target is the first
@@ -161,7 +153,7 @@ def forecast_dataset(
     high-latency network); ``max_inflight`` throttles read-ahead. Iterate the returned
     dataset's ``.train`` / ``.val`` views.
     """
-    opened = open_geometries(store, variables=list(variables), **store_kwargs)
+    opened = open_geometries(store, variables=list(variables))
     geoms = {label: opened[var] for label, var in zip(LABELS, variables, strict=True)}
     geoms["target"] = opened[variables[0]].shift(horizon)
     manifest = split_by_chunk(
@@ -175,7 +167,6 @@ def forecast_dataset(
         shuffle=shuffle,
         cache_dir=cache_dir,
         max_inflight=max_inflight,
-        **store_kwargs,
     )
 
 
@@ -266,18 +257,20 @@ def build_datasets(args: argparse.Namespace) -> InSituDataset:
     """One forecast dataset from CLI args -- iterate ``ds.train`` / ``ds.val``. ``--source``
     picks offline synthetic (written fresh), the public WeatherBench2 ``gs://`` store, or the
     Arraylake/Icechunk repo (real ERA5; pass ``--sample-range`` to subset the archive)."""
-    store: StoreLike
+    store: Store
     if args.source == "arraylake":
-        store = open_arraylake_store(args.repo)
+        store = arraylake_store(args.repo)
         a, b, c = WB2_VARS
         variables = (f"{args.group}/{a}", f"{args.group}/{b}", f"{args.group}/{c}")
-        horizon, kw = WB2_HORIZON, {}
+        horizon = WB2_HORIZON
     elif args.source == "wb2":
-        store, variables, horizon, kw = WB2_URL, WB2_VARS, WB2_HORIZON, {"skip_signature": True}
+        store = obstore_store(WB2_URL, skip_signature=True)  # anonymous read of the public bucket
+        variables, horizon = WB2_VARS, WB2_HORIZON
     else:
-        store = args.url or "file:///tmp/insitu_advection.zarr"
-        make_advection_store(store, n_steps=args.n_steps)
-        variables, horizon, kw = SYNTH_VARS, SYNTH_HORIZON, {}
+        url = args.url or "file:///tmp/insitu_advection.zarr"
+        make_advection_store(url, n_steps=args.n_steps)
+        store = obstore_store(url)
+        variables, horizon = SYNTH_VARS, SYNTH_HORIZON
     return forecast_dataset(
         store,
         variables=variables,
@@ -287,5 +280,4 @@ def build_datasets(args: argparse.Namespace) -> InSituDataset:
         shuffle=True,
         cache_dir=args.cache_dir,
         max_inflight=args.max_inflight,
-        **kw,
     )

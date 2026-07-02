@@ -9,9 +9,9 @@ from insitubatch import (
     SplitName,
     StandardScaler,
     ensure_local_dir,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 from insitubatch.types import ChunkRead, DecodedChunk
@@ -20,7 +20,7 @@ from insitubatch.types import ChunkRead, DecodedChunk
 def _write(tmp_path, *, n=80, spc=8, inner=(3, 4), seed=0) -> tuple[str, np.ndarray]:
     url = f"file://{tmp_path}/d.zarr"
     ensure_local_dir(url)
-    store = store_from_url(url, read_only=False)
+    store = obstore_store(url, read_only=False)
     group = zarr.open_group(store=store, mode="w")
     arr = group.create_array("t2m", shape=(n, *inner), chunks=(spc, *inner), dtype="f4")
     src = (np.random.default_rng(seed).standard_normal((n, *inner)) * 5.0 + 10.0).astype("f4")
@@ -53,7 +53,7 @@ def test_standard_scaler_save_load(tmp_path) -> None:
 
 def test_chunk_transform_normalizes_batches(tmp_path) -> None:
     url, src = _write(tmp_path)
-    geoms = open_geometries(url)
+    geoms = open_geometries(obstore_store(url))
     manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
     # Pre-fit global stats over the train split (as a user would, or via the
     # partial_fit-over-loader pattern), then apply at the chunk stage.
@@ -62,7 +62,7 @@ def test_chunk_transform_normalizes_batches(tmp_path) -> None:
     sc = StandardScaler(mean={"t2m": np.float64(m)}, std={"t2m": np.float64(s)})
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=10,
         block_chunks=4,
@@ -80,7 +80,7 @@ def test_reshaping_chunk_transform_through_dataset(tmp_path) -> None:
     """A reshaping chunk_transform (mean over the last inner axis, (3,4)->(3,)) flows
     end-to-end through InSituDataset: every batch carries the post-transform geometry."""
     url, src = _write(tmp_path, inner=(3, 4))
-    geoms = open_geometries(url)
+    geoms = open_geometries(obstore_store(url))
     manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 
     class MeanLastAxis:
@@ -92,7 +92,11 @@ def test_reshaping_chunk_transform_through_dataset(tmp_path) -> None:
             return geom.inner_shape[:-1], geom.dtype
 
     ds = InSituDataset(
-        url, manifest, batch_size=10, block_chunks=4, chunk_transforms=[MeanLastAxis()]
+        obstore_store(url),
+        manifest,
+        batch_size=10,
+        block_chunks=4,
+        chunk_transforms=[MeanLastAxis()],
     )
     ds.set_epoch(0)
     for batch in ds.train:
@@ -106,14 +110,14 @@ def test_cross_variable_windspeed_is_a_batch_transform(tmp_path) -> None:
     # stage (the chunk stage sees one variable at a time).
     url = f"file://{tmp_path}/uv.zarr"
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     rng = np.random.default_rng(0)
     su = rng.standard_normal((40, 2, 2)).astype("f4")
     sv = rng.standard_normal((40, 2, 2)).astype("f4")
     group.create_array("u10", shape=(40, 2, 2), chunks=(8, 2, 2), dtype="f4")[:] = su
     group.create_array("v10", shape=(40, 2, 2), chunks=(8, 2, 2), dtype="f4")[:] = sv
 
-    geoms = open_geometries(url)
+    geoms = open_geometries(obstore_store(url))
     manifest = split_by_chunk(geoms["u10"], fractions=(0.8, 0.1, 0.1))
 
     def windspeed(batch):
@@ -121,7 +125,7 @@ def test_cross_variable_windspeed_is_a_batch_transform(tmp_path) -> None:
         return batch
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=8,
         block_chunks=4,

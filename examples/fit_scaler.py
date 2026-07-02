@@ -35,9 +35,9 @@ import zarr
 from insitubatch import (
     Batch,
     ensure_local_dir,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 
@@ -55,7 +55,7 @@ def _synthetic(tmp: str, *, n: int = 256, inner: tuple[int, int] = (32, 32), spc
     """Two variables with deliberately different mean/scale, so standardization shows."""
     url = f"file://{tmp}/era5.zarr"
     ensure_local_dir(url)
-    g = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    g = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     rng = np.random.default_rng(0)
     for i, var in enumerate(("t2m", "u10")):
         a = g.create_array(var, shape=(n, *inner), chunks=(spc, *inner), dtype="f4")
@@ -109,13 +109,13 @@ def run_demo(
     # A real store (WeatherBench2) has many variables on *different* sample axes (coords,
     # pressure levels); InSituDataset requires one shared sample axis, so select a
     # compatible set. None = every variable (fine for the synthetic two-var store).
-    geoms = open_geometries(url, variables=variables, **store_kwargs)
+    geoms = open_geometries(obstore_store(url), variables=variables, **store_kwargs)
     var0 = next(iter(geoms))
     manifest = split_by_chunk(geoms[var0], fractions=(1.0, 0.0, 0.0))
 
     # A cache big enough to hold the split: the fit pass warms it, training reuses it.
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         geometries=geoms,
         batch_size=16,
@@ -130,7 +130,7 @@ def run_demo(
     scalers, fit_s, n = fit_over_loader(ds)
 
     # verify the streamed partial_fit matches the true global mean/std
-    grp = zarr.open_group(store=store_from_url(url, **store_kwargs), mode="r")
+    grp = zarr.open_group(store=obstore_store(url, **store_kwargs), mode="r")
     max_err = 0.0
     for v, s in scalers.items():
         arr = grp[v]

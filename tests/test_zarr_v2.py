@@ -22,9 +22,9 @@ import zarr
 
 from insitubatch import (
     ensure_local_dir,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 
@@ -37,7 +37,7 @@ def test_iterates_store_v2_and_v3(
     url = f"file://{tmp_path}/d.zarr"
     ensure_local_dir(url)
     group = zarr.open_group(
-        store=store_from_url(url, read_only=False), mode="w", zarr_format=zarr_format
+        store=obstore_store(url, read_only=False), mode="w", zarr_format=zarr_format
     )
     arr = group.create_array(
         "t2m",
@@ -49,10 +49,10 @@ def test_iterates_store_v2_and_v3(
     src = np.arange(40 * 16, dtype="f4").reshape(40, 4, 4)
     arr[:] = src
 
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         shuffle=False,
         batch_size=8,

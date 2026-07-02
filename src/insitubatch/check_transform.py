@@ -37,9 +37,10 @@ from pathlib import Path
 
 import numpy as np
 import zarr
+from zarr.abc.store import Store
 
 from .pool import output_geometry
-from .store import as_store, open_geometries
+from .store import obstore_store, open_geometries
 from .types import ArrayGeometry, ChunkRead, DecodedChunk
 
 ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
@@ -83,14 +84,12 @@ def load_transform(target: str) -> ChunkTransform:
     return fn
 
 
-def read_chunk(
-    url: str, var: str, chunk_index: int, geom: ArrayGeometry, **store_kwargs: bool
-) -> DecodedChunk:
+def read_chunk(store: Store, var: str, chunk_index: int, geom: ArrayGeometry) -> DecodedChunk:
     """Decode exactly one outer chunk of ``var`` into a :class:`DecodedChunk`.
 
     Uses a plain zarr slice -- this is a one-off development read, not the training hot path
     (the no-getitem stance is about throughput), so zarr stitching the inner grid is fine."""
-    group = zarr.open_group(store=as_store(url, **store_kwargs), mode="r")
+    group = zarr.open_group(store=store, mode="r")
     arr = group[var]
     samples = geom.samples_in_chunk(chunk_index)
     data = np.asarray(arr[samples.start : samples.stop])  # type: ignore[index]
@@ -203,11 +202,13 @@ def main(argv: list[str] | None = None) -> int:
     threads = a.threads or min(4, os.cpu_count() or 1)
     # Same store-auth surface as the loader (see examples/wb2_dataloader.py) so check_transform
     # reaches the same public / requester-pays stores. Typed bool so the **kwargs stays mypy-clean.
+    # TODO: a --backend fsspec flag for gs:// Rapid/requester-pays via insitubatch.fsspec_store.
     store_kwargs: dict[str, bool] = {}
     if a.skip_signature:
         store_kwargs["skip_signature"] = True
     if a.request_payer:
         store_kwargs["request_payer"] = True
+    store = obstore_store(a.url, **store_kwargs)
 
     try:
         fn = load_transform(a.transform)
@@ -215,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: could not load --transform {a.transform!r}: {exc}", file=sys.stderr)
         return 2
 
-    geoms = open_geometries(a.url, variables=[a.var], **store_kwargs)
+    geoms = open_geometries(store, variables=[a.var])
     geom = geoms[a.var]
     if not 0 <= a.chunk < geom.n_chunks:
         print(f"error: --chunk {a.chunk} out of range [0, {geom.n_chunks})", file=sys.stderr)
@@ -235,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{geom.slot_shape(a.chunk)} = {src_mb:.1f} MB decoded"
     )
 
-    base = read_chunk(a.url, a.var, a.chunk, geom, **store_kwargs)
+    base = read_chunk(store, a.var, a.chunk, geom)
     in_shape, in_dtype = base.data.shape, base.data.dtype
     out = fn(_fresh(base))
     out_data = out.data

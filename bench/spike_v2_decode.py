@@ -22,13 +22,13 @@ import zarr
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 
-from insitubatch.store import ensure_local_dir, store_from_url
+from insitubatch.store import ensure_local_dir, obstore_store
 
 
 async def fetch_decode_scatter(url: str, var: str, max_inflight: int) -> np.ndarray:
     """Reconstruct the whole array by fetching every stored chunk under one flat
     ``max_inflight`` budget, decoding it, and scattering it into place."""
-    aa = zarr.open_array(store=store_from_url(url), path=var, mode="r")._async_array
+    aa = zarr.open_array(store=obstore_store(url), path=var, mode="r")._async_array
     proto = default_buffer_prototype()
     spec = ArraySpec(
         shape=aa.metadata.chunks,
@@ -71,7 +71,7 @@ def main() -> None:
     tmp = tempfile.mkdtemp(prefix="spike-v2-")
     url = f"file://{tmp}/s.zarr"
     ensure_local_dir(url)
-    g = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    g = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     rng = np.random.default_rng(0)
     # partial edge chunks on every axis, both single-inner and spatially chunked
     shape = (5, 9, 7)
