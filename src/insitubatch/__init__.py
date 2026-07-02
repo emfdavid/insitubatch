@@ -24,6 +24,7 @@ from .shuffle import (
 from .split import SplitManifest, split_by_chunk, valid_anchor_range
 from .store import (
     arraylake_store,
+    close_store,
     ensure_local_dir,
     fsspec_store,
     obstore_store,
@@ -59,6 +60,7 @@ __all__ = [
     "StandardScaler",
     "StoredChunkRead",
     "arraylake_store",
+    "close_store",
     "block_shuffled_order",
     "build_stored_chunk_reads",
     "chunk_permutation",

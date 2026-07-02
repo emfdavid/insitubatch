@@ -19,6 +19,8 @@ is passed straight to the engine -- no constructor needed.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 from typing import Any
 from urllib.parse import urlparse
@@ -79,6 +81,30 @@ def arraylake_store(repo: str, *, branch: str = "main") -> Store:
     from arraylake import Client
 
     return Client().get_repo(repo).readonly_session(branch).store
+
+
+def close_store(store: Store) -> None:
+    """Best-effort teardown for a store that holds an async fsspec session (gcsfs, s3fs).
+
+    Such a backend creates an aiohttp session on the first event loop that awaits it --
+    for a zarr store, that is zarr's loop, not fsspec's -- but gcsfs's finalizer captures
+    ``fs.loop`` (which is ``None`` here) and closes the session on the *wrong* loop at GC,
+    spewing a harmless-looking "Task was destroyed / attached to a different loop"
+    traceback and leaking the connection. Closing the session here on the loop it actually
+    lives on makes that finalizer a no-op.
+
+    A no-op for stores with no such session (obstore's ``ObjectStore`` has no ``.fs``) and
+    for already-closed or not-running loops. gcsfs recreates the session lazily, so a
+    store closed here still works if reused -- but call this only when done with it.
+    """
+    fs: Any = getattr(store, "fs", None)
+    session = getattr(fs, "_session", None)
+    loop = getattr(session, "_loop", None)
+    if session is None or loop is None or session.closed or not loop.is_running():
+        return
+    with contextlib.suppress(Exception):  # teardown is best-effort; never raise from close
+        asyncio.run_coroutine_threadsafe(session.close(), loop).result(timeout=5)
+        fs._session = None
 
 
 def ensure_local_dir(url: str) -> str:

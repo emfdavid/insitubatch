@@ -8,10 +8,12 @@ threading -- the part that would break silently on a rename.
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 from unittest.mock import MagicMock
 
-from insitubatch import arraylake_store
+from insitubatch import arraylake_store, close_store, obstore_store
 
 
 def test_arraylake_store_threads_repo_and_branch(monkeypatch) -> None:
@@ -46,3 +48,35 @@ def test_arraylake_store_defaults_to_main_branch(monkeypatch) -> None:
     arraylake_store("org/repo")
 
     repo.readonly_session.assert_called_once_with("main")
+
+
+def test_close_store_is_noop_for_obstore(tmp_path) -> None:
+    # obstore's ObjectStore has no async session (no .fs) -> close_store must be a
+    # harmless no-op, not raise. This is the common path (default backend).
+    close_store(obstore_store(f"file://{tmp_path}"))  # no exception = pass
+
+
+def test_close_store_closes_async_session_on_its_loop() -> None:
+    # An fsspec/gcsfs store's aiohttp session lives on some loop; close_store must close
+    # it *on that loop* and drop the handle so gcsfs's finalizer is a no-op. Mocked so it
+    # runs without a cloud backend: a live loop in a thread + a fake session.
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.closed = False
+            self._loop = loop
+
+        async def close(self) -> None:
+            self.closed = True
+
+    session = FakeSession()
+    fs = type("FakeFS", (), {"_session": session})()
+    store = type("FakeStore", (), {"fs": fs})()
+
+    close_store(store)  # type: ignore[arg-type]  # duck-typed store stand-in
+
+    assert session.closed is True  # closed on its own loop
+    assert fs._session is None  # handle dropped so the finalizer won't re-close
+    loop.call_soon_threadsafe(loop.stop)
