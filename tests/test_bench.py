@@ -97,6 +97,52 @@ def test_workers_engine_spawns(tmp_path) -> None:
     assert rows and rows[0].n_samples > 0
 
 
+def test_run_fsspec_backend_threads_to_row(tmp_path) -> None:
+    # The M-GCS A/B: an engine must read through the fsspec backend and stamp it on the
+    # JSONL row so obstore vs fsspec rows are distinguishable. file:// exercises the whole
+    # dispatch without cloud (FsspecStore auto-wraps the sync LocalFileSystem).
+    pytest.importorskip("fsspec")
+    url = f"file://{tmp_path}/f.zarr"
+    make_dataset(url, n_samples=40, inner=(3, 3), sample_chunk=8, variables=["t2m"])
+    cfg = Cfg(
+        engine="insitu",
+        url=url,
+        storage="file",
+        backend="fsspec",
+        sample_chunk=8,
+        batch_size=8,
+        epochs=1,
+    )
+    rows = run(cfg)
+    assert rows and rows[0].n_samples > 0
+    assert rows[0].backend == "fsspec"
+
+
+def test_make_dataset_fsspec_backend_round_trips(tmp_path) -> None:
+    # make_dataset --backend fsspec is the only writer that reaches GCS Rapid (gRPC).
+    # Prove a full write->read round-trip through fsspec; file:// exercises it locally,
+    # which requires fsspec_store's auto_mkdir default (LocalFileSystem won't create the
+    # nested chunk dirs zarr writes, unlike obstore's LocalStore).
+    pytest.importorskip("fsspec")
+    url = f"file://{tmp_path}/w.zarr"
+    make_dataset(
+        url, n_samples=32, inner=(3, 3), sample_chunk=8, variables=["t2m"], backend="fsspec"
+    )
+    cfg = Cfg(
+        engine="naive",
+        url=url,
+        storage="file",
+        backend="fsspec",
+        sample_chunk=8,
+        batch_size=8,
+        epochs=1,
+    )
+    # 32 samples / chunk 8 = 4 chunks; run() splits (0.8, 0.1, 0.1) -> train = 3 chunks,
+    # and naive reads only the train split, so exactly 24 samples come back.
+    rows = run(cfg)
+    assert rows and rows[0].n_samples == 24
+
+
 def test_run_forwards_store_kwargs(tmp_path) -> None:
     # Regression: engines build the store from store_kwargs and hand a Store to
     # open_geometries/InSituDataset -- the kwargs must NOT be splatted into those (the

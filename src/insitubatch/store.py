@@ -57,6 +57,12 @@ def fsspec_store(url: str, *, read_only: bool = True, **storage_options: Any) ->
     ``file://``) is auto-wrapped as async by zarr; ``gs://`` via gcsfs is
     natively async. See :func:`obstore_store` for the obstore-backed constructor.
     """
+    # LocalFileSystem does not create parent dirs on write (unlike obstore's LocalStore
+    # and every object store, where prefixes are implicit), so writing a zarr's nested
+    # chunk paths 404s. Default auto_mkdir for file:// so local writes behave like the
+    # other backends; harmless on reads, and never sent to object stores.
+    if urlparse(url).scheme in ("", "file"):
+        storage_options.setdefault("auto_mkdir", True)
     return zarr.storage.FsspecStore.from_url(
         url, storage_options=storage_options or None, read_only=read_only
     )

@@ -52,7 +52,8 @@ def rss_breakdown_mb() -> tuple[float, float]:
 class Result:
     engine: str  # insitu | naive | memory | workers | xbatcher
     cache: str  # none | memory | disk
-    storage: str  # file | s3
+    storage: str  # file | s3 | gs
+    backend: str  # obstore | fsspec | arraylake -- which store built the reads (M-GCS A/B)
     sample_chunk: int
     n_samples: int
     epoch: int
