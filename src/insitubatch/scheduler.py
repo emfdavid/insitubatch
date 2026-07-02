@@ -314,9 +314,7 @@ class Scheduler:
         """
         if self._foreign_loop is None:
             return await coro
-        return await asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(coro, self._foreign_loop)
-        )
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._foreign_loop))
 
     async def _ensure_arrays(self) -> None:
         if self._arrays:
