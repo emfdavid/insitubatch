@@ -54,7 +54,7 @@ jobs:
           # cache pulls cloudpickle so the cross-run cache fingerprint exercises its
           # cloudpickle path here rather than importorskip-skipping it.
           - python: "3.12"
-            extras: "--extra torch --extra bench --extra icechunk --extra cache"
+            extras: "--extra torch --extra bench --extra icechunk --extra cache --extra gcsfs"
           # JAX alone.
           - python: "3.12"
             extras: "--extra jax"
