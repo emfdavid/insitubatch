@@ -44,16 +44,26 @@ import zarr
 
 from insitubatch import SplitManifest, SplitName, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
-from insitubatch.store import obstore_store
 
 from ._profile import record_pyspy
+from .backend import build_store
 from .make_dataset import make_dataset
 
 
-def _store_kwargs(url: str, anon: bool, request_payer: bool, s3_express: bool) -> dict:
+def _store_kwargs(
+    url: str, backend: str, anon: bool, request_payer: bool, s3_express: bool
+) -> dict:
+    """Backend-specific store kwargs. ``--anon`` must be explicit: an owned (private)
+    GCS bucket reads with ambient credentials, so gs:// is not forced anonymous."""
     kw: dict = {}
-    if anon or url.startswith("gs://"):
-        kw["skip_signature"] = True
+    if backend == "fsspec":
+        if anon:
+            kw["token"] = "anon"  # gcsfs anonymous read of a public bucket
+        if request_payer:
+            kw["requester_pays"] = True
+        return kw
+    if anon:
+        kw["skip_signature"] = True  # obstore anonymous read
     if request_payer:
         kw["request_payer"] = True
     if s3_express:  # S3 Express One Zone directory bucket (--x-s3); not inferred from the name
@@ -78,6 +88,7 @@ def _insitu(
     block_chunks: int = 2,
     max_inflight: int = 32,
     window: int = 0,
+    backend: str = "obstore",
 ) -> tuple[float, int]:
     """One insitu pass over the first ``max_chunks`` chunks; (MB/s, peak resident chunks).
 
@@ -91,8 +102,12 @@ def _insitu(
     most exposed at the GRIB end (one sample/chunk = max chunk-rate = max pin/unpin/lock
     churn) and under free-threading. MB/s counts the anchor-input bytes either way, so
     the windowing machinery's overhead shows as a drop at equal anchor rate.
+
+    ``backend`` selects the store (obstore | fsspec) so the max_inflight sweep can be
+    run on either -- fsspec routes its reads through zarr's loop (the cross-loop fix),
+    so this is where any bridge overhead at high concurrency would surface.
     """
-    store = obstore_store(url, **kw)
+    store = build_store(backend, url, **kw)
     geom = open_geometries(store, variables=[var])[var]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     geoms = {var: geom}
@@ -120,10 +135,12 @@ def _insitu(
     return n * bps / 1e6 / dt, ds.resident_peak
 
 
-def _insitu_mb(url: str, var: str, kw: dict[str, Any], **opts: int) -> float:
+def _insitu_mb(
+    url: str, var: str, kw: dict[str, Any], *, backend: str = "obstore", **opts: int
+) -> float:
     """Just the MB/s of an :func:`_insitu` pass -- a typed target for ``partial`` in
     the ``show`` sweeps (a ``lambda x=x:`` loop-capture defeats mypy inference)."""
-    return _insitu(url, var, kw, **opts)[0]
+    return _insitu(url, var, kw, backend=backend, **opts)[0]
 
 
 def _insitu_cache(
@@ -134,6 +151,7 @@ def _insitu_cache(
     max_chunks: int,
     block_chunks: int,
     cache_dir: str,
+    backend: str = "obstore",
 ) -> tuple[float, float]:
     """Two epochs over the first ``max_chunks`` chunks with a budget that holds them
     all; returns (cold MB/s, warm MB/s). The manifest is restricted to exactly those
@@ -141,7 +159,7 @@ def _insitu_cache(
     then served entirely from the cache (no S3, no decode). ``cache_dir`` spills the
     slots to NVMe (mmap); pass it to keep heap bounded on fat data.
     """
-    store = obstore_store(url, **kw)
+    store = build_store(backend, url, **kw)
     geom = open_geometries(store, variables=[var])[var]
     full = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     train = full.chunks[SplitName.TRAIN.value][:max_chunks]
@@ -180,17 +198,18 @@ def _insitu_cache(
 
 
 def _raw_get_mb_s(
-    url: str, var: str, kw: dict[str, Any], concurrency: int, max_chunks: int
+    url: str, var: str, kw: dict[str, Any], concurrency: int, max_chunks: int, backend: str
 ) -> float:
-    """Fetch raw (still-encoded) chunk objects via obstore — no decode.
+    """Fetch raw (still-encoded) chunk objects — no decode, no engine — as the pure
+    transfer-stack floor. ``backend`` picks the fetcher: obstore's Rust GET or a
+    concurrent gcsfs ``cat_file``. Comparing the two is the cleanest "what does the
+    Python fsspec layer cost" number, isolated from decode/gather/loop.
 
-    Enumerates the *real* stored-chunk grid (outer x inner) from the array's
-    chunks, so it's correct for spatially-chunked arrays (not just single inner
-    chunk). max_chunks bounds the number of OUTER chunks; every inner chunk under
-    them is fetched.
+    Enumerates the *real* stored-chunk grid (outer x inner) from the array's chunks, so
+    it's correct for spatially-chunked arrays. max_chunks bounds the number of OUTER
+    chunks; every inner chunk under them is fetched, concurrency threads at a time.
     """
-    arr = zarr.open_array(store=obstore_store(url, **kw), path=var, mode="r")  # sync; for chunks
-    obs = obstore.store.from_url(url, **kw)
+    arr = zarr.open_array(store=build_store(backend, url, **kw), path=var, mode="r")  # for chunks
     n_outer = min(max_chunks, math.ceil(arr.shape[0] / arr.chunks[0]))
     inner_ranges = [
         range(math.ceil(s / c)) for s, c in zip(arr.shape[1:], arr.chunks[1:], strict=True)
@@ -201,8 +220,23 @@ def _raw_get_mb_s(
         for inner in itertools.product(*inner_ranges)
     ]
 
-    def fetch(key: str) -> int:
-        return len(bytes(obstore.get(obs, key).bytes()))
+    if backend == "fsspec":
+        import fsspec
+
+        proto, _, rest = url.partition("://")
+        root = rest.rstrip("/")
+        # A dedicated *sync* fs (own session on fsspec's loop), separate from the async
+        # zarr store above -- so the thread pool drives concurrent cat_file without the
+        # cross-loop session sharing that trips the engine path.
+        raw_fs = fsspec.filesystem(proto, **kw)
+
+        def fetch(key: str) -> int:
+            return len(raw_fs.cat_file(f"{root}/{key}"))
+    else:
+        obs = obstore.store.from_url(url, **kw)
+
+        def fetch(key: str) -> int:
+            return len(bytes(obstore.get(obs, key).bytes()))
 
     t = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -216,6 +250,12 @@ def main() -> None:
     )
     p.add_argument("--url", default=None, help="zarr URL; default = synthetic file://")
     p.add_argument("--var", default="t2m")
+    p.add_argument(
+        "--backend",
+        default="obstore",
+        choices=["obstore", "fsspec"],
+        help="store backend for the fetch-sensitive sections (1b, 2): obstore or fsspec/gcsfs",
+    )
     p.add_argument("--max-chunks", type=int, default=64, help="chunks to probe (bounds the cost)")
     p.add_argument("--repeats", type=int, default=3, help="runs per point; report median (min-max)")
     p.add_argument("--decode-threads", default="1,2,4,8,0", help="sec 1 sweep (0=auto)")
@@ -276,8 +316,8 @@ def main() -> None:
         a.url = f"file://{tmp}/era5.zarr"
         a.var = "t2m"
         make_dataset(a.url, n_samples=512, inner=(721, 1440), sample_chunk=8, variables=["t2m"])
-    kw = _store_kwargs(a.url, a.anon, a.request_payer, a.s3_express)
-    print(f"probe {a.url}  var={a.var}  first {a.max_chunks} chunks\n")
+    kw = _store_kwargs(a.url, a.backend, a.anon, a.request_payer, a.s3_express)
+    print(f"probe {a.url}  var={a.var}  backend={a.backend}  first {a.max_chunks} chunks\n")
 
     def show(label: str, fn: Callable[[], float]) -> None:
         med, lo, hi = _stats(fn, a.repeats)
@@ -302,6 +342,7 @@ def main() -> None:
                 block_chunks=bc,
                 max_inflight=mi_warm,
                 window=a.window,
+                backend=a.backend,
             )
         except Exception as exc:  # noqa: BLE001 - prewarm is best-effort
             print(f"   prewarm failed: {type(exc).__name__}: {exc}")
@@ -324,6 +365,7 @@ def main() -> None:
                     max_chunks=a.max_chunks,
                     block_chunks=bc,
                     window=a.window,
+                    backend=a.backend,
                 ),
             )
 
@@ -342,6 +384,7 @@ def main() -> None:
                     block_chunks=bc,
                     max_inflight=mi,
                     window=a.window,
+                    backend=a.backend,
                 )
                 for _ in range(a.repeats)
             )
@@ -355,15 +398,25 @@ def main() -> None:
     if a.cache_dir:
         print(f"\n1c) cross-epoch cache ({a.max_chunks} chunks, budget holds all, mmap):")
         cold, warm = _insitu_cache(
-            a.url, a.var, kw, max_chunks=a.max_chunks, block_chunks=bc, cache_dir=a.cache_dir
+            a.url,
+            a.var,
+            kw,
+            max_chunks=a.max_chunks,
+            block_chunks=bc,
+            cache_dir=a.cache_dir,
+            backend=a.backend,
         )
         print(f"   epoch 0 (cold):   {cold:8.1f} MB/s")
         print(f"   epoch 1 (cached): {warm:8.1f} MB/s   ({warm / cold:.1f}x cold)")
 
     if not a.no_raw:
-        print("\n2) raw obstore concurrent GET MB/s (no decode):")
+        fetcher = "gcsfs cat_file" if a.backend == "fsspec" else "obstore GET"
+        print(f"\n2) raw concurrent {fetcher} MB/s (no decode):")
         for c in (int(x) for x in a.concurrency.split(",")):
-            show(f"concurrency={c:>2}", partial(_raw_get_mb_s, a.url, a.var, kw, c, a.max_chunks))
+            show(
+                f"concurrency={c:>2}",
+                partial(_raw_get_mb_s, a.url, a.var, kw, c, a.max_chunks, a.backend),
+            )
 
     if tmp:
         none_url = f"file://{tmp}/era5_none.zarr"
