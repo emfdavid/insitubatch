@@ -12,7 +12,7 @@ import time
 import numpy as np
 import pytest
 
-from insitubatch import open_geometries, split_by_chunk, valid_anchor_range
+from insitubatch import obstore_store, open_geometries, split_by_chunk, valid_anchor_range
 from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry, Batch
 
@@ -84,10 +84,10 @@ def _forecast_dataset(write_zarr, *, n, spc, shuffle, **kw):
     """A dataset with two views of one array: input ``x`` at the anchor, target ``y``
     one step ahead (``shift(1)``) -- the canonical forecast setup, no reshard."""
     url, srcs = write_zarr(n=n, spc=spc)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     geoms = {"x": geom, "y": geom.shift(1)}
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
-    ds = InSituDataset(url, manifest, geometries=geoms, shuffle=shuffle, **kw)
+    ds = InSituDataset(obstore_store(url), manifest, geometries=geoms, shuffle=shuffle, **kw)
     return ds, srcs["t2m"]
 
 
@@ -130,10 +130,12 @@ def test_windowed_history_and_target(write_zarr) -> None:
     """A three-view window {-1, 0, +1} drops both edge anchors and reads each offset."""
     url, srcs = write_zarr(n=24, spc=4)
     src = srcs["t2m"]
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     geoms = {"prev": geom.shift(-1), "now": geom, "next": geom.shift(1)}
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
-    ds = InSituDataset(url, manifest, geometries=geoms, shuffle=True, batch_size=5, seed=1)
+    ds = InSituDataset(
+        obstore_store(url), manifest, geometries=geoms, shuffle=True, batch_size=5, seed=1
+    )
     ds.set_epoch(0)
 
     anchors = []
@@ -154,13 +156,15 @@ def test_windowed_eviction_and_cross_epoch_reuse(write_zarr) -> None:
     where a chunk freed for a miss was gathered as stale memory."""
     url, srcs = write_zarr(n=160, spc=8)  # 20 chunks
     src = srcs["t2m"]
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     geoms = {"x": geom, "y": geom.shift(1)}
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     # block_chunks=2, no override: the windowed working set holds only a few blocks, so
     # 20 chunks force repeated eviction. shuffle=False keeps the read-union local (the
     # tight budget is viable) while still exercising churn and cross-epoch reuse.
-    ds = InSituDataset(url, manifest, geometries=geoms, shuffle=False, batch_size=5, block_chunks=2)
+    ds = InSituDataset(
+        obstore_store(url), manifest, geometries=geoms, shuffle=False, batch_size=5, block_chunks=2
+    )
     for epoch in range(3):
         ds.set_epoch(epoch)
         anchors = []
@@ -182,11 +186,11 @@ def test_windowed_partial_iteration_then_clean_epoch(write_zarr) -> None:
     """
     url, srcs = write_zarr(n=160, spc=8)  # 20 chunks
     src = srcs["t2m"]
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     geoms = {"x": geom, "y": geom.shift(1)}
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         geometries=geoms,
         shuffle=True,
@@ -226,10 +230,10 @@ def test_windowed_val_correct_after_train_shared_pool(write_zarr) -> None:
     corrupted) -- the cross-split overlap the single shared pool is meant to exploit."""
     url, srcs = write_zarr(n=120, spc=8)  # 15 chunks
     src = srcs["t2m"]
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     geoms = {"x": geom, "y": geom.shift(1)}  # forecast: input x[t], target y[t]=x[t+1]
     manifest = split_by_chunk(geom, fractions=(0.7, 0.3, 0.0))
-    ds = InSituDataset(url, manifest, geometries=geoms, batch_size=6, block_chunks=2)
+    ds = InSituDataset(obstore_store(url), manifest, geometries=geoms, batch_size=6, block_chunks=2)
 
     ds.set_epoch(0)
     for _ in ds.train:  # warm/pollute the shared pool (windowed reads spill across the split)

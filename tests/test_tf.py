@@ -12,16 +12,16 @@ import pytest
 
 tf = pytest.importorskip("tensorflow")
 
-from insitubatch import open_geometries, split_by_chunk  # noqa: E402
+from insitubatch import obstore_store, open_geometries, split_by_chunk  # noqa: E402
 from insitubatch.frameworks import as_tf_dataset, to_tf  # noqa: E402
 from insitubatch.source import InSituDataset  # noqa: E402
 
 
 def _ds(write_zarr):
     url, srcs = write_zarr(n=40, spc=8)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
-    ds = InSituDataset(url, manifest, shuffle=False, batch_size=8, block_chunks=2)
+    ds = InSituDataset(obstore_store(url), manifest, shuffle=False, batch_size=8, block_chunks=2)
     ds.set_epoch(0)
     return ds, srcs
 

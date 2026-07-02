@@ -50,12 +50,12 @@ from dataclasses import dataclass
 
 import numpy as np
 import zarr.api.asynchronous as za
+from zarr.abc.store import Store
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
-from .store import StoreLike, as_store
 from .types import ArrayGeometry, StoredChunkRead
 
 
@@ -119,14 +119,12 @@ class Scheduler:
 
     def __init__(
         self,
-        store: StoreLike,
+        store: Store,
         geometries: dict[str, ArrayGeometry],
         pool: ChunkPool,
         config: SchedulerConfig | None = None,
-        **store_kwargs: object,
     ) -> None:
         self._store = store
-        self._store_kwargs = store_kwargs
         self._geometries = geometries
         self._config = config or SchedulerConfig()
         if self._config.on_bad_chunk not in ("raise", "nan"):
@@ -280,7 +278,7 @@ class Scheduler:
         async with self._open_lock:
             if self._arrays:
                 return
-            store = as_store(self._store, **self._store_kwargs)  # type: ignore[arg-type]
+            store = self._store
             # Open each distinct array once, keyed by its zarr path: several windowed
             # views (same path, different offset) share one open + one decode path.
             for geom in self._geometries.values():

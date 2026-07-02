@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import numpy as np
 import pytest
 
-from insitubatch import open_geometries, split_by_chunk
+from insitubatch import obstore_store, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.types import DecodedChunk
 
@@ -24,9 +24,9 @@ def _boom(chunk: DecodedChunk) -> DecodedChunk:
 
 def test_error_propagates_through_prefetch(write_zarr) -> None:
     url, _ = write_zarr(n=40, spc=8)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
-    ds = InSituDataset(url, manifest, chunk_transforms=[_boom])
+    ds = InSituDataset(obstore_store(url), manifest, chunk_transforms=[_boom])
     ds.set_epoch(0)
     with pytest.raises(ValueError, match="boom"):
         list(ds.train)
@@ -37,7 +37,7 @@ def test_bad_chunk_raises_by_default_then_nan_fills(write_zarr) -> None:
     fills it with NaN and carries on (the rest of the data intact)."""
     url, srcs = write_zarr(n=40, spc=8, inner=(2, 2))  # 5 chunks of 8
     src = srcs["t2m"]
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
 
     # Corrupt chunk 1's stored bytes so decode fails (not a valid compressed stream).
@@ -45,12 +45,14 @@ def test_bad_chunk_raises_by_default_then_nan_fills(write_zarr) -> None:
     assert chunk.exists(), f"chunk file not found: {chunk}"
     chunk.write_bytes(b"\x00\x01\x02\x03")
 
-    ds = InSituDataset(url, manifest, shuffle=False, batch_size=8)
+    ds = InSituDataset(obstore_store(url), manifest, shuffle=False, batch_size=8)
     ds.set_epoch(0)
     with pytest.raises(Exception):  # noqa: B017 - decode raises a codec-specific type
         list(ds.train)
 
-    ds = InSituDataset(url, manifest, shuffle=False, batch_size=8, on_bad_chunk="nan")
+    ds = InSituDataset(
+        obstore_store(url), manifest, shuffle=False, batch_size=8, on_bad_chunk="nan"
+    )
     ds.set_epoch(0)
     batches = list(ds.train)
     idx = np.concatenate([b.sample_indices for b in batches])

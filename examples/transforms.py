@@ -34,7 +34,7 @@ from dataclasses import dataclass
 import numpy as np
 import zarr
 
-from insitubatch import ensure_local_dir, open_geometries, split_by_chunk, store_from_url
+from insitubatch import ensure_local_dir, obstore_store, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry, Batch, DecodedChunk
 
@@ -45,7 +45,7 @@ def build_store(tmp: str, *, n: int = 64, lat: int = 16, lon: int = 32, spc: int
     """Write a tiny 3-variable zarr: temperature in Kelvin and the two wind components."""
     url = f"file://{tmp}/synthetic.zarr"
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     rng = np.random.default_rng(0)
     fields = {
         "t2m": 273.15 + 10.0 * rng.standard_normal((n, lat, lon)).astype("f4"),
@@ -139,14 +139,14 @@ def run_demo(
         tmp = tempfile.mkdtemp(prefix="insitu-transforms-")
         url = build_store(tmp)
     try:
-        geoms = open_geometries(url, variables=list(VARIABLES))
+        geoms = open_geometries(obstore_store(url), variables=list(VARIABLES))
         manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
         source_inner = geoms["t2m"].inner_shape
 
         # Two chunk stages: K->C (shape-preserving) then a reshaping Coarsen (halves the grid).
         # The cache slot is sized at the *coarsened* shape via Coarsen.output_inner.
         ds = InSituDataset(
-            url,
+            obstore_store(url),
             manifest,
             geometries=geoms,
             batch_size=batch_size,

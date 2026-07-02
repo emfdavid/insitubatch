@@ -23,13 +23,11 @@ from .shuffle import (
 )
 from .split import SplitManifest, split_by_chunk, valid_anchor_range
 from .store import (
-    StoreLike,
     arraylake_store,
-    as_store,
     ensure_local_dir,
     fsspec_store,
+    obstore_store,
     open_geometries,
-    store_from_url,
 )
 from .transforms import (
     BatchTransform,
@@ -59,19 +57,17 @@ __all__ = [
     "SplitManifest",
     "SplitName",
     "StandardScaler",
-    "StoreLike",
     "StoredChunkRead",
     "arraylake_store",
-    "as_store",
     "block_shuffled_order",
     "build_stored_chunk_reads",
     "chunk_permutation",
     "ensure_local_dir",
     "fsspec_store",
+    "obstore_store",
     "open_geometries",
     "sequential_order",
     "shuffle_quality",
     "split_by_chunk",
-    "store_from_url",
     "valid_anchor_range",
 ]
