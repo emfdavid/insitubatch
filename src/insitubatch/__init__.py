@@ -22,7 +22,15 @@ from .shuffle import (
     shuffle_quality,
 )
 from .split import SplitManifest, split_by_chunk, valid_anchor_range
-from .store import StoreLike, as_store, ensure_local_dir, open_geometries, store_from_url
+from .store import (
+    StoreLike,
+    arraylake_store,
+    as_store,
+    ensure_local_dir,
+    fsspec_store,
+    open_geometries,
+    store_from_url,
+)
 from .transforms import (
     BatchTransform,
     ChunkTransform,
@@ -53,11 +61,13 @@ __all__ = [
     "StandardScaler",
     "StoreLike",
     "StoredChunkRead",
+    "arraylake_store",
     "as_store",
     "block_shuffled_order",
     "build_stored_chunk_reads",
     "chunk_permutation",
     "ensure_local_dir",
+    "fsspec_store",
     "open_geometries",
     "sequential_order",
     "shuffle_quality",

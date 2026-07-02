@@ -70,6 +70,37 @@ def as_store(store: StoreLike, *, read_only: bool = True, **kwargs: Any) -> Stor
     return store
 
 
+def fsspec_store(url: str, *, read_only: bool = True, **storage_options: Any) -> Store:
+    """Return a zarr ``FsspecStore`` for ``url`` (any fsspec-supported backend).
+
+    Reaches stores via a backend fsspec filesystem -- notably GCS Rapid/zonal
+    buckets (gRPC) and GCS requester-pays, which obstore does not currently
+    support. ``**storage_options`` pass straight through to
+    ``FsspecStore.from_url`` (credentials, project, endpoint, Rapid config, ...).
+
+    Requires an fsspec backend for the URL scheme: ``insitubatch[gcsfs]`` for
+    ``gs://``, or bring your own (``s3fs``, ...). A sync backend (e.g. local
+    ``file://``) is auto-wrapped as async by zarr; ``gs://`` via gcsfs is
+    natively async. See :func:`store_from_url` for the obstore-backed constructor.
+    """
+    return zarr.storage.FsspecStore.from_url(
+        url, storage_options=storage_options or None, read_only=read_only
+    )
+
+
+def arraylake_store(repo: str, *, branch: str = "main") -> Store:
+    """Open an Arraylake repo and return its read-only Icechunk session store.
+
+    Auth comes from a cached ``al auth login`` or ``ARRAYLAKE_TOKEN``; the client
+    vends the bucket credentials for the repo. The returned object is a zarr-v3
+    ``Store`` bound to the branch snapshot -- exactly what the engine accepts.
+    Requires ``insitubatch[arraylake]``.
+    """
+    from arraylake import Client
+
+    return Client().get_repo(repo).readonly_session(branch).store
+
+
 def ensure_local_dir(url: str) -> str:
     """For a ``file://`` URL, create the target directory so writes can land.
 
