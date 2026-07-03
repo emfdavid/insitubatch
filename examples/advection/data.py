@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterable
+from typing import Literal
 
 import numpy as np
 import zarr
@@ -75,7 +76,17 @@ def _advect(field: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
     )
 
 
-def make_advection_store(url: str, *, n_steps: int = 768, size: int = 48, seed: int = 0) -> None:
+def make_advection_store(
+    url: str,
+    *,
+    n_steps: int = 768,
+    size: int = 48,
+    sample_chunk: int = 48,
+    seed: int = 0,
+    compress: bool = True,
+    write_batch_mb: int = 256,
+    write_concurrency: int = 32,
+) -> None:
     """Write a synthetic 3-variable advected-field zarr (``t2m``, ``u10``, ``v10``).
 
     A smooth, time-*constant* deformation wind advects the temperature field; every hour is
@@ -83,7 +94,13 @@ def make_advection_store(url: str, *, n_steps: int = 768, size: int = 48, seed: 
     -- see below) so every timestep has the same statistics and a contiguous split is honest.
     ``u10`` / ``v10`` are stored over time (broadcast) so all three arrays share the sample
     axis the engine batches along. Fields are ~unit-scale (no normalization needed). Chunked
-    at 48 steps so there are several chunks to split/shuffle.
+    at ``sample_chunk`` steps so there are several chunks to split/shuffle.
+
+    Scales to a large cloud store (``url`` a ``gs://`` / ``s3://`` prefix) without
+    materializing the whole array: the sequential advection is generated and written a
+    **slab of whole chunks at a time**, bounding writer RAM to ``write_batch_mb`` while
+    ``write_concurrency`` overlaps the chunk PUTs on zarr's async loop. ``size`` sets the
+    spatial resolution; total volume is ``3 * n_steps * size**2 * 4`` bytes uncompressed.
     """
     rng = np.random.default_rng(seed)
     yy, xx = np.mgrid[0:size, 0:size] / size
@@ -92,6 +109,7 @@ def make_advection_store(url: str, *, n_steps: int = 768, size: int = 48, seed: 
     # field, and varying enough that the model must *read* the wind, not memorize a shift.
     u = 0.20 * (np.sin(2 * np.pi * yy) * np.cos(2 * np.pi * xx))
     v = 0.20 * (np.cos(2 * np.pi * yy) * np.sin(2 * np.pi * xx))
+    wind_u, wind_v = u.astype("f4"), v.astype("f4")
 
     def smooth_field() -> np.ndarray:
         """A random unit-scale field of mid-frequency modes (a ~5-cell shift is visible)."""
@@ -101,32 +119,61 @@ def make_advection_store(url: str, *, n_steps: int = 768, size: int = 48, seed: 
             f += rng.normal() * np.cos(2 * np.pi * (kx * xx + ky * yy) + rng.uniform(0, 2 * np.pi))
         return (f - f.mean()) / f.std()
 
+    ensure_local_dir(url)
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
+    shape = (n_steps, size, size)
+    chunks = (sample_chunk, size, size)
+    compressors: Literal["auto"] | None = "auto" if compress else None
+    arrays = {
+        name: group.create_array(
+            name,
+            shape=shape,
+            chunks=chunks,
+            dtype="f4",
+            compressors=compressors,
+            dimension_names=("time", "lat", "lon"),
+        )
+        for name in ("t2m", "u10", "v10")
+    }
+
+    # Slab = a whole number of sample-axis chunks fitting in write_batch_mb, so every slab
+    # write is chunk-aligned (no read-modify-write) and the writer's RAM stays bounded.
+    rows_that_fit = max(1, (write_batch_mb * 1_000_000) // (size * size * 4))
+    slab_rows = max(sample_chunk, (rows_that_fit // sample_chunk) * sample_chunk)
+
     # A *stationary* forced-advection process: each step advects the field by the wind, then
     # adds a little fresh structure to replenish what bilinear interpolation dissipates, and
     # renormalizes. Every timestep then has the same statistics (so a contiguous split is
     # honest), and t2m(t+24) is the field advected 24 steps -- predictable from t2m(t) + the
     # wind (the model beats persistence by learning the displacement) up to the small forcing.
     field = smooth_field()
-    t2m = np.empty((n_steps, size, size), dtype="f4")
-    for t in range(n_steps):
-        t2m[t] = field
-        field = _advect(field, u, v) + 0.12 * smooth_field()
-        field = (field - field.mean()) / field.std()
+    buf = np.empty((slab_rows, size, size), dtype="f4")
+    with zarr.config.set({"async.concurrency": write_concurrency}):
+        for start in range(0, n_steps, slab_rows):
+            stop = min(start + slab_rows, n_steps)
+            n = stop - start
+            for i in range(n):
+                buf[i] = field
+                field = _advect(field, u, v) + 0.12 * smooth_field()
+                field = (field - field.mean()) / field.std()
+            arrays["t2m"][start:stop] = buf[:n]
+            arrays["u10"][start:stop] = np.broadcast_to(wind_u, (n, size, size))
+            arrays["v10"][start:stop] = np.broadcast_to(wind_v, (n, size, size))
 
-    wind_u = np.broadcast_to(u.astype("f4"), (n_steps, size, size))
-    wind_v = np.broadcast_to(v.astype("f4"), (n_steps, size, size))
 
-    ensure_local_dir(url)
-    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
-    for name, data in (("t2m", t2m), ("u10", wind_u), ("v10", wind_v)):
-        arr = group.create_array(
-            name,
-            shape=data.shape,
-            chunks=(48, size, size),
-            dtype="f4",
-            dimension_names=("time", "lat", "lon"),
-        )
-        arr[:] = data
+def _synthetic_ready(url: str, n_steps: int, size: int) -> bool:
+    """True if a synthetic store already exists at ``url`` with the requested geometry.
+
+    Lets ``--source synthetic --url gs://...`` generate a large cloud store once and reuse
+    it across training runs instead of rewriting it every time. A shape mismatch (different
+    ``--n-steps`` / ``--size``) or any open failure (absent / partial) returns False, so a
+    changed request regenerates rather than silently training on the stale store.
+    """
+    try:
+        t2m = zarr.open_group(store=obstore_store(url), mode="r")["t2m"]
+        return isinstance(t2m, zarr.Array) and t2m.shape == (n_steps, size, size)
+    except Exception:
+        return False
 
 
 def forecast_dataset(
@@ -250,7 +297,20 @@ def cli() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--n-steps", type=int, default=768, help="synthetic trajectory length (hours)")
-    p.add_argument("--url", default=None, help="synthetic store path (default: a temp file)")
+    p.add_argument("--size", type=int, default=48, help="synthetic spatial resolution (NxN grid)")
+    p.add_argument(
+        "--sample-chunk", type=int, default=48, help="synthetic sample-axis chunk length (steps)"
+    )
+    p.add_argument(
+        "--url",
+        default=None,
+        help="synthetic store path (file:// temp default; gs://... for a cloud store)",
+    )
+    p.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="force-rewrite the synthetic store even if one with the same geometry exists",
+    )
     p.add_argument(
         "--cache-dir",
         default=None,
@@ -291,7 +351,10 @@ def build_datasets(args: argparse.Namespace) -> InSituDataset:
         variables, horizon = WB2_VARS, WB2_HORIZON
     else:
         url = args.url or "file:///tmp/insitu_advection.zarr"
-        make_advection_store(url, n_steps=args.n_steps)
+        if args.regenerate or not _synthetic_ready(url, args.n_steps, args.size):
+            make_advection_store(
+                url, n_steps=args.n_steps, size=args.size, sample_chunk=args.sample_chunk
+            )
         store = obstore_store(url)
         variables, horizon = SYNTH_VARS, SYNTH_HORIZON
     return forecast_dataset(
