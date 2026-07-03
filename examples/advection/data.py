@@ -170,6 +170,18 @@ def forecast_dataset(
     )
 
 
+def preload_epoch(ds: InSituDataset) -> list[Batch]:
+    """Materialize one shuffled epoch of training batches into RAM (the ``--ceiling`` feed).
+
+    The compute-only ceiling run replays this list every epoch: same model, same loop,
+    same batch volume, but zero fetch/decode. Building it reads through the loader once
+    (setup, not measured); ``insitu_samples_per_s / ceiling_samples_per_s`` is then the
+    pure loader overhead. Cheap here -- the synthetic/WB2-128x64 window fits in RAM.
+    """
+    ds.set_epoch(0)
+    return list(ds.train)
+
+
 def inputs_and_targets(batch: Batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Split a windowed ``Batch`` into ``(x, persistence, target)`` numpy arrays.
 
@@ -249,6 +261,17 @@ def cli() -> argparse.Namespace:
         type=int,
         default=None,
         help="throttle read-ahead depth (lower = lower cold TTFB over a high-latency network)",
+    )
+    p.add_argument(
+        "--ceiling",
+        action="store_true",
+        help="also run the compute-only in-memory ceiling (RAM-preloaded batches, no IO)",
+    )
+    p.add_argument(
+        "--metrics-out",
+        default=None,
+        metavar="PATH",
+        help="append per-(run,epoch) JSONL metrics here (default: print only, no file)",
     )
     return p.parse_args()
 
