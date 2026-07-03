@@ -491,6 +491,23 @@ Perf track (the core thesis):
   storage matches or beats obstore's raw-read path — if so, fsspec earns a spot as a
   core dep and a co-equal fast path (today it is an optional extra). Pending: validate a
   real Rapid bucket end-to-end, then drop the `ops_gcp.md` VERIFY markers.
+  - **Preliminary — standard HTTP GCS (n2-standard-8, 2026-07-03; `ops_gcp.md` §7a).**
+    On plain HTTP GCS, **obstore wins the transfer floor decisively.** Decode-free raw
+    concurrent GET (best of a 4→32 concurrency sweep, MB/s): obstore 1211 / 1581 / 802 at
+    c1 / c4 / c16 vs gcsfs 529 / 606 / 487 — a **~1.6–2.6× obstore lead**. The mechanism is
+    visible in the sweep: obstore *scales* with concurrency (c1 raw: 376→681→1042→1211),
+    while gcsfs `cat_file` **plateaus at ~500–600 MB/s and degrades past 16 threads**
+    (c1: 343→513→529→358) — the per-request Python/aiohttp path on the one fsspec loop is
+    the ceiling. End-to-end (insitu, fetch+decode) the gap **compresses to ~1.15–1.2×**
+    only because this 8-core box is **decode-bound at ~450 MB/s** (the decode-threads sweep
+    saturates 445→456 at 4–8 threads, well under obstore's raw 0.8–1.6 GB/s), so both
+    backends hit the same decode wall. That ~20% is therefore a *floor* on fsspec's HTTP
+    penalty — on more cores / faster decode the fetch gap re-widens toward the ~2× raw
+    number. **Takeaway:** obstore stays the HTTP default; fsspec is *not* a co-equal fast
+    path on HTTP, but it is not a correctness regression. Its case rests entirely on the
+    **Rapid/zonal gRPC** path obstore cannot reach — still the deciding, unrun experiment
+    (blocked on Rapid quota). Not yet on the published `docs/benchmarks.md`: that waits for
+    the complete standard-vs-Rapid story so the numbers aren't read as "fsspec is worse."
   - **Event-loop ownership (shipped) + a TODO to simplify it.** A genuinely-async
     fsspec backend (gcsfs, s3fs) binds its aiohttp session to the *first event loop that
     awaits it*, permanently — no ctor knob pins it. For a zarr store that first loop is
