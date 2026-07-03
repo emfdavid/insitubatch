@@ -261,6 +261,91 @@ faster floor.
 > Rapid `storage_options`, and the measured numbers all need checking on the live box before
 > they mean anything. Treat provisioning below as an experiment plan, not a settled runbook.
 
+### 7a — Standard-GCS A/B (obstore vs fsspec): run this first
+
+Before Rapid, establish that fsspec is **not a regression on standard GCS** — the
+prerequisite for co-equal status, and the same harness you re-point at the Rapid bucket
+below. Runnable on any box (recipe validated on an `n2-standard-8` with a 375 GB local SSD
+at `/mnt/nvme`). The one box limit that matters here is **decode saturation** (few cores →
+the full pipeline goes decode-bound, which is backend-invariant and *hides* the fetch
+difference), so the sharpest backend signal is the **decode-free raw GET** (`probe_decode`
+section 2). The **ChunkPool cache is post-decode and backend-invariant** — obstore and
+fsspec share the same decoded bytes — so it does *not* discriminate the backends; the NVMe
+is used to (a) run the end-to-end suite as designed (mmap tier, not a RAM-only degraded
+mode) and (b) measure the decode-once ceiling (cold vs warm, `probe_decode` §1c), which
+tells you whether you are fetch-bound enough for the backend to matter at all. **Gotcha:**
+a cache is keyed by chunk, not by backend, so never point both backends at the *same*
+`--cache-dir` — the second run would hit the first's decoded chunks and measure the cache,
+not its own reads. The discriminating A/B (Step 1) is therefore cache-free; cached runs use
+a fresh per-backend dir.
+
+`probe_decode` prints human-readable tables → capture as `.log`; the `bench` suite writes
+JSONL natively → `--out …jsonl`. All logs land in `bench/results/`.
+
+```bash
+export PREFIX="gs://$BUCKET/era5"          # the _c{spc}.zarr family from §6
+export NVME=/mnt/nvme                      # the local SSD (fixed at 1 drive for this class)
+mkdir -p bench/results "$NVME/insitu-cache"
+{ hostname; nproc; date -u; } | tee bench/results/BOX.txt   # stamp the hardware
+
+# Step 0 — characterize THIS box (don't trust the spec sheet). One obstore run gives:
+#   section 1  = where decode saturates on your cores;
+#   section 1c = the decode-once ceiling (cold vs warm epoch off NVMe) -> if warm >> cold
+#                you're fetch/decode-bound (backend can matter); if warm ~= cold, delivery-bound;
+#   section 2  = the NIC ceiling (where raw-GET MB/s stops rising).
+uv run python -m bench.probe_decode --url "${PREFIX}_c8.zarr" --backend obstore \
+  --max-chunks 64 --repeats 3 --decode-threads 1,2,4,8,0 \
+  --concurrency 4,8,16,32,64 --max-inflight 32 --cache-dir "$NVME/insitu-cache/calib" \
+  2>&1 | tee bench/results/probe_calib_obstore_c8.log
+
+# Step 1 — the A/B: raw transfer floor (section 2) + bridge scaling (section 1b), both
+#   backends, grib->mid->fat. The grib end (c1) is the discriminating case (per-request Python cost).
+for BK in obstore fsspec; do
+  for SPC in 1 4 16; do
+    uv run python -m bench.probe_decode --url "${PREFIX}_c${SPC}.zarr" --backend "$BK" \
+      --max-chunks 128 --repeats 3 --no-decode-sweep \
+      --max-inflight 8,16,32 --concurrency 4,8,16,32 \
+      2>&1 | tee "bench/results/probe_${BK}_c${SPC}.log"
+  done
+done
+
+# Step 1b (optional sharpener) — pure request-rate: tiny objects, all per-call overhead,
+#   no bandwidth. Where obstore's Rust path would win most, if anywhere.
+uv run python bench/make_dataset.py --url "gs://$BUCKET/tiny_c1.zarr" \
+  --n-samples 4000 --inner 64,64 --sample-chunk 1 --variables t2m
+for BK in obstore fsspec; do
+  uv run python -m bench.probe_decode --url "gs://$BUCKET/tiny_c1.zarr" --backend "$BK" \
+    --max-chunks 256 --repeats 3 --no-decode-sweep --max-inflight 16,32 --concurrency 8,16,32 \
+    2>&1 | tee "bench/results/probe_${BK}_tiny.log"
+done
+
+# Step 2 — end-to-end confirmation, mmap cache tier on NVMe. Fresh per-backend cache dir
+#   (never shared — see the gotcha above) so each backend's reads are its own.
+for BK in obstore fsspec; do
+  uv run python -m bench --url-prefix "$PREFIX" --backend "$BK" \
+    --chunk-sizes 1,2,4,8,16,32 --engines insitu,naive --repeats 3 --max-batches 100 \
+    --cache-dir "$NVME/insitu-cache/e2e_${BK}" \
+    --out "bench/results/gcs_e2e_${BK}.jsonl"
+done
+```
+
+**Read it:** fsspec earns co-equal *on standard GCS* if raw-GET (Step 1 section 2, read
+*below* your Step-0 NIC ceiling — especially c1/tiny) is within ~10–15 % of obstore, the
+section-1b curves don't flatten fsspec early (the cross-loop bridge isn't throttling), and
+end-to-end insitu tracks obstore. A large c1/tiny raw-GET gap is the one red flag (the
+per-request Python tax). This proves *not a regression* — **not** the Rapid win, which
+needs the gRPC bucket below (DESIGN.md M-GCS).
+
+> **Sustained-rate caveat — big-chunk raw-GET reads low, for *both* backends.** `--max-chunks`
+> fixes the *object count*, so a larger `sample-chunk` moves proportionally more bytes per
+> point (single-inner-chunk: c16 ≈ 16× the bytes of c1). Those points therefore measure
+> **sustained** throughput after GCP/GCS burst credits deplete, not the **burst** rate the
+> small-chunk points catch — so a dip in MB/s at c16/c32 is this byte-volume artifact, *not*
+> a backend effect (it hits obstore and fsspec equally). The verdict is the **gap between
+> backends at a fixed chunk size**, which is invariant to it. To make per-chunk-size points
+> directly comparable, hold bytes ~constant by scaling `--max-chunks` *down* as chunk size
+> rises (e.g. 128 at c1 → 8 at c16).
+
 Open questions to resolve first:
 
 - **gcsfs Rapid `storage_options`.** How gcsfs is told to use the zonal gRPC endpoint (an
