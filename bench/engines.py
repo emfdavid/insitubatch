@@ -121,13 +121,14 @@ def run(
 ) -> list[Result]:
     store_kwargs = store_kwargs or {}
     # Each engine builds its own store from (backend, url, store_kwargs) rather than
-    # being handed this live Store. That's deliberate, not an oversight: the workers /
-    # xbatcher baselines pickle their dataset to child processes (forkserver/spawn --
-    # obstore's Rust runtime and gcsfs sessions aren't fork-safe), so they *must*
-    # reconstruct the store inside each worker; a live Store can't cross that boundary.
-    # Passing a store would serve only the in-process engines and split the interface
-    # in two while still keeping these args on Cfg -- so we keep one construction path.
-    # The store object is cheap (lazy; no IO until first read, and gcsfs caches the fs).
+    # being handed this live Store. Not because stores can't be serialized -- obstore's
+    # ObjectStore and zarr's FsspecStore both pickle fine (fsspec drops the aiohttp
+    # session and recreates it on demand in the child) -- but because the workers /
+    # xbatcher baselines run their dataset in child processes where each worker opens its
+    # *own* fresh connection from the config, and those procs are forkserver/spawn (not
+    # fork: obstore's tokio runtime is not fork-safe). Keeping one construction-from-cfg
+    # path is simpler than passing a live store to the in-process engines and cfg to the
+    # workers. Construction is cheap (lazy; no IO until first read, and gcsfs caches the fs).
     geom = open_geometries(build_store(cfg.backend, cfg.url, **store_kwargs))[cfg.var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
     engines = {

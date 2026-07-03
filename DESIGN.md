@@ -491,6 +491,49 @@ Perf track (the core thesis):
   storage matches or beats obstore's raw-read path — if so, fsspec earns a spot as a
   core dep and a co-equal fast path (today it is an optional extra). Pending: validate a
   real Rapid bucket end-to-end, then drop the `ops_gcp.md` VERIFY markers.
+  - **Event-loop ownership (shipped) + a TODO to simplify it.** A genuinely-async
+    fsspec backend (gcsfs, s3fs) binds its aiohttp session to the *first event loop that
+    awaits it*, permanently — no ctor knob pins it. For a zarr store that first loop is
+    **zarr's** process-wide store-IO loop (`zarr.core.sync._get_loop()`), because any
+    zarr sync call (`open_geometries`, `xr.open_zarr`, user code) touches the store
+    first. That is the correct owner: the session living on zarr's loop is what keeps the
+    store drivable by *any* zarr code — so insitu **conforms** (routes its reads there)
+    rather than hijacking the session onto its own loop (which would crash every other
+    zarr-sync consumer). Today the scheduler keeps its own orchestration loop and bridges
+    each fsspec read to zarr's loop (`run_coroutine_threadsafe`); obstore is loop-agnostic
+    (Rust runtime) and is awaited inline. Teardown closes the session on its own loop
+    (`close_store`) so gcsfs's finalizer — which wrongly targets `fsspec.asyn.get_loop()` —
+    is a no-op.
+
+    ```mermaid
+    flowchart TD
+        subgraph proc["insitubatch process (one training run)"]
+          OG["any zarr sync call<br/>open_geometries / xr.open_zarr"]
+          SL["Scheduler loop<br/>own loop, new thread per pass<br/>orchestration + decode/scatter pool"]
+          ZL["zarr store-IO loop<br/>zarr.core.sync._get_loop()"]
+          SESS[("gcsfs aiohttp session")]
+          OBS["obstore ObjectStore<br/>Rust tokio runtime, loop-agnostic"]
+          FL["fsspec.asyn.get_loop()<br/>NOT where the session lives"]
+        end
+        OG -->|"first await creates the session here"| ZL
+        ZL -->|owns| SESS
+        SL -->|"fsspec read: run_coroutine_threadsafe (bridge)"| ZL
+        SL -->|"obstore read: await inline"| OBS
+        FL -.->|"gcsfs finalizer wrongly targets this;<br/>close_store fixes the mismatch at teardown"| SESS
+    ```
+
+    **TODO — unify on zarr's loop; delete the bridge.** Run the scheduler's orchestration
+    *on* zarr's loop for all backends instead of spinning a private loop+thread per pass.
+    This removes `_fsspec_io_loop` / `_io` / `_foreign_loop` (the bridge) **and** the
+    per-pass `new_event_loop()` + thread churn — collapsing to one loop with one clear
+    owner (obstore rides it fine; the gcsfs session is already there). Not a late edit to
+    the working PR: it rewrites the Scheduler concurrency core, so its **acceptance gate is
+    a stress test** that a consumer-stalled, back-pressured `_drive` sharing zarr's
+    *process-global* loop cannot starve or deadlock other zarr-sync work (it is await-heavy
+    and offloads decode/scatter, so it *should* be fine — verify, don't assume). Must not
+    set that loop's default executor (pass the decode pool explicitly) or stop it on
+    `close()`. `close_store` stays either way (the finalizer mismatch is independent of who
+    drives the reads).
 - **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
   with bounded host memory.
 
