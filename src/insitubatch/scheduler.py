@@ -44,19 +44,49 @@ import asyncio
 import contextlib
 import os
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Any, TypeVar
 
 import numpy as np
 import zarr.api.asynchronous as za
+from zarr.abc.store import Store
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
-from .store import StoreLike, as_store
 from .types import ArrayGeometry, StoredChunkRead
+
+_T = TypeVar("_T")
+
+
+def _fsspec_io_loop(store: Store) -> asyncio.AbstractEventLoop | None:
+    """The event loop an fsspec-backed store's IO must run on, if not the caller's.
+
+    A genuinely-async fsspec backend (gcsfs, s3fs) binds its aiohttp session to
+    whichever event loop *first awaits* one of its coroutines, and can never be used
+    from another loop ("Future attached to a different loop"). Neither zarr's
+    ``FsspecStore`` nor gcsfs exposes a knob to pin that loop -- the ``loop=``
+    constructor arg does not bind the session -- and zarr's ``FsspecStore.get``
+    awaits ``fs._cat_file`` on the *calling* loop with no routing of its own.
+
+    zarr drives all of *its* store IO on one process-wide background loop
+    (``zarr.core.sync._get_loop()``); because insitu reads a zarr store opened through
+    zarr (``open_geometries``/``open_array``), the session is created there. So the
+    correct, self-consistent choice is to route insitu's fsspec reads to that same
+    loop: the session lives there, and driving every read there keeps one loop for the
+    store even if nothing opened it first. ``None`` for stores needing no routing --
+    obstore's ``ObjectStore`` bridges its Rust runtime to whatever loop awaits it
+    (no ``.fs``), so the scheduler awaits it inline.
+    """
+    fs = getattr(store, "fs", None)
+    if fs is None or not getattr(fs, "asynchronous", False):
+        return None
+    from zarr.core.sync import _get_loop
+
+    return _get_loop()
 
 
 @dataclass(slots=True)
@@ -119,14 +149,12 @@ class Scheduler:
 
     def __init__(
         self,
-        store: StoreLike,
+        store: Store,
         geometries: dict[str, ArrayGeometry],
         pool: ChunkPool,
         config: SchedulerConfig | None = None,
-        **store_kwargs: object,
     ) -> None:
         self._store = store
-        self._store_kwargs = store_kwargs
         self._geometries = geometries
         self._config = config or SchedulerConfig()
         if self._config.on_bad_chunk not in ("raise", "nan"):
@@ -145,6 +173,9 @@ class Scheduler:
         workers = self._config.decode_threads or min(32, (os.cpu_count() or 4) + 4)
         self._decode_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="insitu-dec")
         self._loop = asyncio.new_event_loop()
+        # Set once reads begin: the foreign loop an fsspec store pins its IO to (gcsfs/
+        # s3fs), or None for a loop-agnostic store (obstore). See _fsspec_io_loop / _io.
+        self._foreign_loop: asyncio.AbstractEventLoop | None = None
         self._inflight: asyncio.Semaphore | None = None
         self._capacity: asyncio.Event | None = None  # set on unpin -> wakes a parked admit
         self._open_lock: asyncio.Lock | None = None
@@ -273,6 +304,18 @@ class Scheduler:
                 return
             await self._capacity.wait()
 
+    async def _io(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        """Await a store coroutine on the loop that store's IO belongs to.
+
+        obstore is loop-agnostic -> await inline on our loop. An fsspec store's IO must
+        run on its own loop (see :func:`_fsspec_io_loop`); schedule it there and bridge
+        the result back to ours, without blocking either loop -- so read concurrency is
+        preserved across the boundary.
+        """
+        if self._foreign_loop is None:
+            return await coro
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._foreign_loop))
+
     async def _ensure_arrays(self) -> None:
         if self._arrays:
             return
@@ -280,13 +323,16 @@ class Scheduler:
         async with self._open_lock:
             if self._arrays:
                 return
-            store = as_store(self._store, **self._store_kwargs)  # type: ignore[arg-type]
+            # Resolve the store's IO loop once, before the first store touch (open reads
+            # metadata) -- an fsspec store crashes if that touch runs on our loop.
+            self._foreign_loop = _fsspec_io_loop(self._store)
+            store = self._store
             # Open each distinct array once, keyed by its zarr path: several windowed
             # views (same path, different offset) share one open + one decode path.
             for geom in self._geometries.values():
                 if geom.path in self._arrays:
                     continue
-                aa = await za.open_array(store=store, path=geom.path, mode="r")
+                aa = await self._io(za.open_array(store=store, path=geom.path, mode="r"))
                 # Format-agnostic: zarr-v2 metadata exposes `dtype`/`encode_chunk_key`
                 # where v3 has `data_type`/`chunk_key_encoding.encode_chunk_key` -- so the
                 # engine reads public v2 stores (WeatherBench2 ARCO) as well as v3.
@@ -349,7 +395,7 @@ class Scheduler:
 
     async def _fetch_decode(self, read: StoredChunkRead, ctx: _ArrayCtx) -> np.ndarray:
         key = ctx.path + "/" + ctx.encode(read.coords)
-        buf = await ctx.store.get(key, prototype=self._proto)  # type: ignore[attr-defined]
+        buf = await self._io(ctx.store.get(key, prototype=self._proto))  # type: ignore[attr-defined]
         if buf is None:  # absent chunk == all fill_value (zarr's getitem semantics)
             return np.full(ctx.chunk_shape, ctx.fill_value, dtype=ctx.dtype)
         [decoded] = list(await ctx.codec.decode([(buf, ctx.spec)]))  # type: ignore[attr-defined]

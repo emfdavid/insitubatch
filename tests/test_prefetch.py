@@ -16,9 +16,9 @@ import zarr
 from insitubatch import (
     SplitName,
     ensure_local_dir,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 
@@ -26,7 +26,7 @@ from insitubatch.source import InSituDataset
 def _write(tmp_path, *, n=160, spc=8, inner=(2, 2)) -> str:
     url = f"file://{tmp_path}/d.zarr"
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     arr = group.create_array("t2m", shape=(n, *inner), chunks=(spc, *inner), dtype="f4")
     arr[:] = np.arange(n * int(np.prod(inner)), dtype="f4").reshape(n, *inner)
     return url
@@ -34,7 +34,7 @@ def _write(tmp_path, *, n=160, spc=8, inner=(2, 2)) -> str:
 
 def test_producer_runs_ahead_of_consumer(tmp_path) -> None:
     url = _write(tmp_path)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
 
     produced: list[int] = []
@@ -44,7 +44,7 @@ def test_producer_runs_ahead_of_consumer(tmp_path) -> None:
         return batch
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=4,
         block_chunks=2,
@@ -69,12 +69,12 @@ def test_producer_runs_ahead_of_consumer(tmp_path) -> None:
 
 def test_prefetch_preserves_values_and_coverage(tmp_path) -> None:
     url = _write(tmp_path)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
-    src = zarr.open_group(store=store_from_url(url), mode="r")["t2m"][:]
+    src = zarr.open_group(store=obstore_store(url), mode="r")["t2m"][:]
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=4,
         block_chunks=2,
@@ -104,10 +104,10 @@ def test_partial_iteration_reaps_producer(tmp_path) -> None:
     test.)
     """
     url = _write(tmp_path, n=160, spc=8)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=4,
         block_chunks=2,
@@ -142,13 +142,13 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
     parked, no in-flight work). Pins must not survive an epoch.
     """
     url = _write(tmp_path, n=160, spc=8)  # 20 chunks; train split ~16
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
 
     # budget = 2 * block_chunks chunks; batch_size < one block so a block yields
     # several batches -> breaking after one batch leaves the current block pinned too.
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=4,
         block_chunks=2,

@@ -74,6 +74,8 @@ The same task two ways — complementary engines for the same ndim-batch problem
 can see the cold-start trade-off and pick what fits your workload:
 
 - [`wb2_dataloader.py`](wb2_dataloader.py) — the insitu single-event-loop loader.
+  `--backend fsspec` (needs `--extra gcsfs`) reads the same store through `fsspec_store`
+  (gcsfs) instead of obstore — the A/B for GCS Rapid/zonal + Requester-Pays.
 - [`wb2_xbatcher.py`](wb2_xbatcher.py) — the xbatcher + torch `DataLoader` worker stack
   (xbatcher defines the batches, the `DataLoader` runs them), the pattern from Earthmover's
   `dataloader-demo`, with a focus on cold-start latency and how `forkserver-preload` cuts it

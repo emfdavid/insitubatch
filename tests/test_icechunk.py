@@ -14,10 +14,9 @@ import pytest
 import zarr
 
 from insitubatch import (
-    as_store,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 
@@ -96,22 +95,4 @@ def test_icechunk_matches_url_path(icechunk_store, write_zarr) -> None:
         return np.concatenate([b.arrays["t2m"] for b in ds.train], axis=0)
 
     np.testing.assert_array_equal(collect(store), src)
-    np.testing.assert_array_equal(collect(url), src)
-
-
-def test_as_store_passthrough(icechunk_store) -> None:
-    store, _ = icechunk_store(n=8, spc=8)
-    assert as_store(store) is store  # an existing Store is returned unchanged
-
-
-def test_as_store_builds_url(tmp_path) -> None:
-    url = f"file://{tmp_path}"  # an existing dir; obstore canonicalizes the root
-    built = as_store(url)
-    assert isinstance(built, zarr.abc.store.Store)
-    assert type(built) is type(store_from_url(url))
-
-
-def test_as_store_rejects_kwargs_with_prebuilt_store(icechunk_store) -> None:
-    store, _ = icechunk_store(n=8, spc=8)
-    with pytest.raises(TypeError, match="apply only to URL stores"):
-        as_store(store, region="us-east-1")
+    np.testing.assert_array_equal(collect(obstore_store(url)), src)

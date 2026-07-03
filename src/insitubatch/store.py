@@ -1,25 +1,26 @@
-"""Storage shim: one URL, any backend.
+"""Storage: the engine reads a zarr ``Store``; constructors build one per backend.
 
-The whole local-now / cloud-later story is a single function. ``obstore`` already
-dispatches on URL scheme (``file://``, ``s3://``, ``gs://``, ``az://``,
-``memory://``) and ``zarr.storage.ObjectStore`` wraps it for the async zarr path.
-So Phase 0 (local ``file://``) and Phase 1 (``s3://...``) differ only in the URL --
-no hot-path code change, and the read path stays pure Rust (no fsspec layer).
+The engine's whole contract is "a zarr-v3 ``Store``" -- the hot path only ever
+speaks that interface, so any backend works. There is no URL-vs-object dispatch:
+callers pick a constructor for their backend and hand the resulting ``Store`` to
+:class:`~insitubatch.source.InSituDataset` and :func:`open_geometries`.
 
-We deliberately do *not* route through fsspec / universal_pathlib on the read
-hot path: the entire thesis is that obstore wins by bypassing the fsspec/s3fs
-Python layer. (obstore.fsspec exists if path-style ergonomics are ever wanted
-off the hot path -- but not here.)
+- :func:`obstore_store` -- URL-addressable stores via ``obstore`` (``file://``,
+  ``s3://``, ``gs://``, ``az://``, ``memory://``). Pure-Rust read path, no fsspec
+  layer; the local-now / cloud-later story is just a different URL.
+- :func:`fsspec_store` -- fsspec-backed, for what obstore does not reach (GCS
+  Rapid/zonal over gRPC, requester-pays).
+- :func:`arraylake_store` -- an Arraylake/Icechunk session store, bound to a
+  repository snapshot/branch (no URL round-trips to it, so it must be an object).
 
-A URL is one way to name a store, not the only one. The engine's actual contract
-is "a zarr-v3 ``Store``", so callers may hand in a prebuilt store instead of a
-URL (:data:`StoreLike`, normalized by :func:`as_store`). This is required for
-Icechunk: a session store is bound to a repository snapshot/branch and has no URL
-that round-trips to it -- but it is a zarr Store, so the hot path is unchanged.
+Anything that is already a zarr ``Store`` (a custom store, an Icechunk session)
+is passed straight to the engine -- no constructor needed.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 from typing import Any
 from urllib.parse import urlparse
@@ -32,42 +33,78 @@ from zarr.abc.store import Store
 
 from .types import ArrayGeometry
 
-# What the engine reads from: a URL (we build an obstore-backed store) or an
-# already-built zarr-v3 Store. The hot path only ever speaks the zarr Store
-# interface, so any backend works -- Icechunk session stores in particular have
-# no URL that round-trips to them, so they must be passed as objects.
-StoreLike = str | Store
-"""A store argument: either a URL string (resolved by :func:`as_store` /
-:func:`store_from_url`) or an already-constructed obstore ``Store``."""
 
-
-def store_from_url(url: str, *, read_only: bool = True, **kwargs: Any) -> zarr.storage.ObjectStore:
-    """Return a zarr ObjectStore for ``url`` (any obstore-supported scheme).
+def obstore_store(url: str, *, read_only: bool = True, **kwargs: Any) -> Store:
+    """Return an obstore-backed zarr ``Store`` for ``url`` (any obstore scheme).
 
     ``file:///abs/path.zarr`` for local; ``s3://bucket/path.zarr`` for cloud.
     Extra ``kwargs`` pass through to ``obstore.store.from_url`` (region,
-    credentials, client options, ...).
+    credentials, client options, ...). The read path stays pure Rust -- no fsspec
+    Python layer.
     """
     obs = obstore.store.from_url(url, **kwargs)
     return zarr.storage.ObjectStore(obs, read_only=read_only)
 
 
-def as_store(store: StoreLike, *, read_only: bool = True, **kwargs: Any) -> Store:
-    """Normalize a URL *or* an already-built zarr Store into a zarr Store.
+def fsspec_store(url: str, *, read_only: bool = True, **storage_options: Any) -> Store:
+    """Return a zarr ``FsspecStore`` for ``url`` (any fsspec-supported backend).
 
-    A ``str`` is opened via :func:`store_from_url` (obstore-backed); an existing
-    Store (e.g. an Icechunk session store) is returned unchanged. ``kwargs`` and
-    ``read_only`` configure URL construction only -- passing them alongside a
-    prebuilt store is a usage error (the store already carries that state).
+    Reaches stores via a backend fsspec filesystem -- notably GCS Rapid/zonal
+    buckets (gRPC) and GCS requester-pays, which obstore does not currently
+    support. ``**storage_options`` pass straight through to
+    ``FsspecStore.from_url`` (credentials, project, endpoint, Rapid config, ...).
+
+    Requires an fsspec backend for the URL scheme: ``insitubatch[gcsfs]`` for
+    ``gs://``, or bring your own (``s3fs``, ...). A sync backend (e.g. local
+    ``file://``) is auto-wrapped as async by zarr; ``gs://`` via gcsfs is
+    natively async. See :func:`obstore_store` for the obstore-backed constructor.
     """
-    if isinstance(store, str):
-        return store_from_url(store, read_only=read_only, **kwargs)
-    if kwargs:
-        raise TypeError(
-            f"store_kwargs {sorted(kwargs)} apply only to URL stores; a prebuilt "
-            f"{type(store).__name__} was passed and already carries its configuration."
-        )
-    return store
+    # LocalFileSystem does not create parent dirs on write (unlike obstore's LocalStore
+    # and every object store, where prefixes are implicit), so writing a zarr's nested
+    # chunk paths 404s. Default auto_mkdir for file:// so local writes behave like the
+    # other backends; harmless on reads, and never sent to object stores.
+    if urlparse(url).scheme in ("", "file"):
+        storage_options.setdefault("auto_mkdir", True)
+    return zarr.storage.FsspecStore.from_url(
+        url, storage_options=storage_options or None, read_only=read_only
+    )
+
+
+def arraylake_store(repo: str, *, branch: str = "main") -> Store:
+    """Open an Arraylake repo and return its read-only Icechunk session store.
+
+    Auth comes from a cached ``al auth login`` or ``ARRAYLAKE_TOKEN``; the client
+    vends the bucket credentials for the repo. The returned object is a zarr-v3
+    ``Store`` bound to the branch snapshot -- exactly what the engine accepts.
+    Requires ``insitubatch[arraylake]``.
+    """
+    from arraylake import Client
+
+    return Client().get_repo(repo).readonly_session(branch).store
+
+
+def close_store(store: Store) -> None:
+    """Best-effort teardown for a store that holds an async fsspec session (gcsfs, s3fs).
+
+    Such a backend creates an aiohttp session on the first event loop that awaits it --
+    for a zarr store, that is zarr's loop, not fsspec's -- but gcsfs's finalizer captures
+    ``fs.loop`` (which is ``None`` here) and closes the session on the *wrong* loop at GC,
+    spewing a harmless-looking "Task was destroyed / attached to a different loop"
+    traceback and leaking the connection. Closing the session here on the loop it actually
+    lives on makes that finalizer a no-op.
+
+    A no-op for stores with no such session (obstore's ``ObjectStore`` has no ``.fs``) and
+    for already-closed or not-running loops. gcsfs recreates the session lazily, so a
+    store closed here still works if reused -- but call this only when done with it.
+    """
+    fs: Any = getattr(store, "fs", None)
+    session = getattr(fs, "_session", None)
+    loop = getattr(session, "_loop", None)
+    if session is None or loop is None or session.closed or not loop.is_running():
+        return
+    with contextlib.suppress(Exception):  # teardown is best-effort; never raise from close
+        asyncio.run_coroutine_threadsafe(session.close(), loop).result(timeout=5)
+        fs._session = None
 
 
 def ensure_local_dir(url: str) -> str:
@@ -83,16 +120,17 @@ def ensure_local_dir(url: str) -> str:
 
 
 def open_geometries(
-    store: StoreLike,
+    store: Store,
     variables: list[str] | None = None,
-    **kwargs: Any,
 ) -> dict[str, ArrayGeometry]:
-    """Introspect a zarr group (URL or Store) into ``{name: ArrayGeometry}``.
+    """Introspect a zarr group ``Store`` into ``{name: ArrayGeometry}``.
 
-    Lets ``InSituDataset`` be built from a store spec alone -- geometry (shape,
+    Lets ``InSituDataset`` be built from a store alone -- geometry (shape,
     chunks, dtype) is read from the array metadata rather than hand-specified.
+    Build the ``store`` with :func:`obstore_store` / :func:`fsspec_store` /
+    :func:`arraylake_store`, or pass any prebuilt zarr ``Store``.
     """
-    group = zarr.open_group(store=as_store(store, **kwargs), mode="r")
+    group = zarr.open_group(store=store, mode="r")
     names = variables if variables is not None else [k for k, _ in group.arrays()]
     out: dict[str, ArrayGeometry] = {}
     for name in names:

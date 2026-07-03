@@ -44,7 +44,7 @@ from collections.abc import Callable
 import numpy as np
 from zarr.abc.store import Store
 
-from insitubatch import SplitName, open_geometries, split_by_chunk
+from insitubatch import SplitName, arraylake_store, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 from insitubatch.types import Batch
 
@@ -55,19 +55,6 @@ WB2_GROUP = "era5/6h_240x121"
 # Surface field, dims (time, lon, lat). Single-variable keeps the sample geometry
 # v1-friendly (specific_humidity carries a `level` axis; add it explicitly if wanted).
 DEFAULT_VAR = "2m_temperature"
-
-
-def open_arraylake_store(repo: str, *, branch: str = "main") -> Store:
-    """Open an Arraylake repo and return its read-only Icechunk session store.
-
-    Auth comes from a cached ``al auth login`` or ``ARRAYLAKE_TOKEN``; the client
-    vends the bucket credentials for the (public) repo. The returned store is a
-    zarr-v3 Store -- exactly what ``InSituDataset`` accepts directly.
-    """
-    from arraylake import Client
-
-    ic_repo = Client().get_repo(repo)
-    return ic_repo.readonly_session(branch).store
 
 
 def _crop(patch: tuple[int, int], seed: int) -> Callable[[Batch], Batch]:
@@ -244,7 +231,7 @@ def main() -> None:
     p.add_argument("--cache-dir", default=None, help="spill cached slots to this NVMe dir (mmap)")
     a = p.parse_args()
 
-    store = open_arraylake_store(a.repo, branch=a.branch)
+    store = arraylake_store(a.repo, branch=a.branch)
     run(
         store,
         var=a.var,

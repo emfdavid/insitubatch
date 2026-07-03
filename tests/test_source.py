@@ -12,9 +12,9 @@ import zarr
 from insitubatch import (
     SplitName,
     ensure_local_dir,
+    obstore_store,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.shuffle import block_shuffled_order
 from insitubatch.source import InSituDataset, _partition_blocks
@@ -49,22 +49,22 @@ def test_partition_blocks_empty() -> None:
 def test_unequal_chunking_raises(tmp_path) -> None:
     url = f"file://{tmp_path}/uv.zarr"
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     group.create_array("u10", shape=(40, 2, 2), chunks=(8, 2, 2), dtype="f4")
     group.create_array("v10", shape=(40, 2, 2), chunks=(4, 2, 2), dtype="f4")  # different spc
-    geoms = open_geometries(url)
+    geoms = open_geometries(obstore_store(url))
     manifest = split_by_chunk(geoms["u10"], fractions=(0.8, 0.1, 0.1))
 
     with pytest.raises(ValueError, match="same sample-axis"):
-        InSituDataset(url, manifest, geometries=geoms)
+        InSituDataset(obstore_store(url), manifest, geometries=geoms)
 
 
 def test_shuffle_false_is_in_order(write_zarr) -> None:
     url, _ = write_zarr(n=40, spc=8)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         shuffle=False,
         batch_size=5,
@@ -77,10 +77,10 @@ def test_shuffle_false_is_in_order(write_zarr) -> None:
 
 def test_shuffle_true_covers_but_reorders(write_zarr) -> None:
     url, _ = write_zarr(n=40, spc=8)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         shuffle=True,
         seed=1,
@@ -98,7 +98,7 @@ def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
     # non-consecutive batches. With the cache off, last-use eviction must still
     # decode each chunk exactly once per epoch (naive per-batch eviction re-reads).
     url, _ = write_zarr(n=80, spc=4)  # 20 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
 
     decoded: collections.Counter[int] = collections.Counter()
@@ -108,7 +108,7 @@ def test_chunk_decoded_once_per_epoch_without_cache(write_zarr) -> None:
         return chunk
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=1,
         block_chunks=20,
@@ -130,11 +130,11 @@ def test_residency_is_bounded_by_block(write_zarr) -> None:
     # split. The lower bound is one block: a batch may draw across a whole block,
     # so the block must be co-resident to gather.
     url, _ = write_zarr(n=160, spc=4)  # 40 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     block_chunks, batch_size = 8, 4
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=batch_size,
         block_chunks=block_chunks,
@@ -153,7 +153,7 @@ def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
     # + transformed exactly ONCE across two epochs; epoch 2 is served from the pool
     # (cross-epoch reuse, the B2 win). Both backings: heap and mmap'd-on-NVMe.
     url, _ = write_zarr(n=160, spc=8)  # 20 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
 
     transformed: collections.Counter[int] = collections.Counter()
@@ -163,7 +163,7 @@ def test_cache_decode_once_across_epochs(write_zarr, tmp_path, kind) -> None:
         return chunk
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         batch_size=4,
         block_chunks=4,
@@ -190,7 +190,7 @@ def test_cache_persists_across_runs(write_zarr, tmp_path) -> None:
     # same cache_dir serves every chunk from disk -- no re-decode (the chunk transform
     # never runs in run 2) -- and yields byte-identical batches in the same draw order.
     url, _ = write_zarr(n=160, spc=8)  # 20 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     cache = str(tmp_path / "cache")
 
@@ -202,7 +202,7 @@ def test_cache_persists_across_runs(write_zarr, tmp_path) -> None:
 
     def make() -> InSituDataset:
         return InSituDataset(
-            url,
+            obstore_store(url),
             manifest,
             batch_size=4,
             block_chunks=4,
@@ -244,7 +244,7 @@ def test_persist_stale_transform_raises_then_rebuilds_with_flag(write_zarr, tmp_
     # (a stale cache is almost never intended). reset_stale_cache=True instead wipes it and
     # rebuilds cold -- yielding correct batches again.
     url, _ = write_zarr(n=80, spc=8)  # 10 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     cache = str(tmp_path / "cache")
 
@@ -258,7 +258,7 @@ def test_persist_stale_transform_raises_then_rebuilds_with_flag(write_zarr, tmp_
 
     def make(transform, reset=False) -> InSituDataset:
         return InSituDataset(
-            url,
+            obstore_store(url),
             manifest,
             batch_size=4,
             block_chunks=4,
@@ -295,13 +295,13 @@ def test_persist_warns_when_cache_unusable(write_zarr, tmp_path, caplog) -> None
     # were deleted under a surviving manifest) -> one loud WARNING per epoch, and the
     # chunks are still re-fetched correctly (a miss, never a raise).
     url, _ = write_zarr(n=80, spc=8)  # 10 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     cache = tmp_path / "cache"
 
     def make() -> InSituDataset:
         return InSituDataset(
-            url,
+            obstore_store(url),
             manifest,
             batch_size=4,
             block_chunks=4,
@@ -337,9 +337,9 @@ def test_sample_range_subsets_what_the_dataset_reads(write_zarr) -> None:
     # sample_range restricts the manifest to the covering chunks; the dataset then
     # yields exactly those samples (chunk-aligned).
     url, _ = write_zarr(n=80, spc=8)  # 10 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0), sample_range=(16, 40))
-    ds = InSituDataset(url, manifest, shuffle=False, batch_size=8)
+    ds = InSituDataset(obstore_store(url), manifest, shuffle=False, batch_size=8)
     ds.set_epoch(0)
     idx = np.concatenate([b.sample_indices for b in ds.train])
     assert set(idx.tolist()) == set(range(16, 40))  # chunks 2,3,4 -> samples 16..39
@@ -349,9 +349,9 @@ def test_split_views_share_one_pool_and_cover_disjoint(write_zarr) -> None:
     """train / val / test / all are views on *one* dataset sharing *one* pool; the splits
     are disjoint and ``all`` is their union."""
     url, _ = write_zarr(n=80, spc=8)  # 10 chunks
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(0.6, 0.2, 0.2))
-    ds = InSituDataset(url, manifest, batch_size=8, block_chunks=4)
+    ds = InSituDataset(obstore_store(url), manifest, batch_size=8, block_chunks=4)
     pool = ds._pool  # the one pool every view shares
 
     seen: dict[str, set[int]] = {}
@@ -370,9 +370,11 @@ def test_split_views_share_one_pool_and_cover_disjoint(write_zarr) -> None:
 
 def test_val_view_is_deterministic_train_shuffles(write_zarr) -> None:
     url, _ = write_zarr(n=80, spc=8)
-    geom = open_geometries(url)["t2m"]
+    geom = open_geometries(obstore_store(url))["t2m"]
     manifest = split_by_chunk(geom, fractions=(0.6, 0.2, 0.2))
-    ds = InSituDataset(url, manifest, batch_size=8, block_chunks=4, shuffle=True, seed=1)
+    ds = InSituDataset(
+        obstore_store(url), manifest, batch_size=8, block_chunks=4, shuffle=True, seed=1
+    )
     ds.set_epoch(0)
     val0 = np.concatenate([b.sample_indices for b in ds.val])
     ds.set_epoch(5)  # different epoch

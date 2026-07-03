@@ -18,6 +18,7 @@ import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .engines import Cfg, run
 from .make_dataset import make_family
@@ -32,7 +33,7 @@ def run_suite(
     out: str | Path = DEFAULT_OUT,
     data_dir: str | Path | None = None,
     url_prefix: str | None = None,
-    storage: str = "file",
+    backend: str = "obstore",
     chunk_sizes: Sequence[int] = (1, 8),
     engines: Sequence[str] = ("naive", "workers", "xbatcher", "insitu", "memory"),
     caches: Sequence[str] = ("none",),  # insitu only: "none" (read-once) | "resident" (hold split)
@@ -51,13 +52,20 @@ def run_suite(
     s3_express: bool = False,
     verbose: bool = True,
 ) -> list[Result]:
+    # Auth knobs are named per backend: obstore uses request_payer / s3_express (S3),
+    # gcsfs uses requester_pays. For an owned standard bucket both are empty and the
+    # backend falls back to ambient credentials -- which is the M-GCS A/B case.
     store_kwargs: dict[str, bool] = {}
-    if request_payer:
-        store_kwargs["request_payer"] = True
-    # S3 Express One Zone (directory buckets, --x-s3): obstore needs s3_express=True;
-    # it is NOT inferred from the bucket name. (env equivalent: AWS_S3_EXPRESS=true)
-    if s3_express:
-        store_kwargs["s3_express"] = True
+    if backend == "fsspec":
+        if request_payer:
+            store_kwargs["requester_pays"] = True
+    else:  # obstore
+        if request_payer:
+            store_kwargs["request_payer"] = True
+        # S3 Express One Zone (directory buckets, --x-s3): obstore needs s3_express=True;
+        # it is NOT inferred from the bucket name. (env equivalent: AWS_S3_EXPRESS=true)
+        if s3_express:
+            store_kwargs["s3_express"] = True
     if url_prefix:
         urls = {spc: f"{url_prefix}_c{spc}.zarr" for spc in chunk_sizes}
     else:
@@ -65,6 +73,9 @@ def run_suite(
         urls = make_family(
             f"file://{ddir}/era5", tuple(chunk_sizes), n_samples=n_samples, inner=inner
         )
+    # The JSONL row's storage label is just the URL scheme (file | s3 | gs) -- no need
+    # for a separate flag to restate what the prefix already says.
+    storage = urlparse(next(iter(urls.values()))).scheme or "file"
 
     scratch = (
         Path(cache_dir) if cache_dir else Path(tempfile.mkdtemp(prefix="insitubatch-bench-cache-"))
@@ -82,6 +93,7 @@ def run_suite(
             engine="insitu",
             url=url,
             storage=storage,
+            backend=backend,
             sample_chunk=spc,
             batch_size=batch_size,
             block_chunks=bc_warm,
@@ -133,6 +145,7 @@ def run_suite(
                                     engine=engine,
                                     url=url,
                                     storage=storage,
+                                    backend=backend,
                                     sample_chunk=spc,
                                     batch_size=batch_size,
                                     block_chunks=bc,
@@ -184,7 +197,12 @@ def main() -> None:
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--data-dir", default=None, help="where to write local datasets (default: temp)")
     p.add_argument("--url-prefix", default=None, help="pre-generated data: <prefix>_c<spc>.zarr")
-    p.add_argument("--storage", default="file", choices=["file", "s3"])
+    p.add_argument(
+        "--backend",
+        default="obstore",
+        choices=["obstore", "fsspec", "arraylake"],
+        help="store backend to read through: obstore (Rust), fsspec (gcsfs), or arraylake",
+    )
     p.add_argument("--full", action="store_true", help="chunk-size spectrum + sweeps")
     p.add_argument("--engines", default=None, help="comma list of engines to run")
     p.add_argument(
@@ -215,7 +233,7 @@ def main() -> None:
         out=a.out,
         data_dir=a.data_dir,
         url_prefix=a.url_prefix,
-        storage=a.storage,
+        backend=a.backend,
         epochs=a.epochs,
         repeats=a.repeats,
         cache_dir=a.cache_dir,

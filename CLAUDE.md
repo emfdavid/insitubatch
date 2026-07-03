@@ -57,8 +57,12 @@ for the thesis and [docs/architecture.md](docs/architecture.md) for the pipeline
 - **Sample geometry v1:** a sample is a slice of the outer (sample) axis that does
   not cross a chunk boundary. No cross-chunk samples; cross-variable derived
   fields are batch-stage only.
-- **One URL, any backend:** `store_from_url` (obstore) gives `file://` locally,
-  `s3://`/`gs://` in the cloud — no hot-path change.
+- **One contract, any backend:** the engine reads a zarr-v3 `Store`; constructors
+  build one per backend (`obstore_store` for `file://`/`s3://`/`gs://`,
+  `fsspec_store` for what obstore can't reach — GCS Rapid/zonal, requester-pays —,
+  `arraylake_store` for Icechunk sessions). No str-vs-Store dispatch, no hot-path
+  change. obstore is the default URL path today; fsspec is under evaluation as a
+  co-equal fast path for GCS.
 
 ## Do not
 

@@ -24,7 +24,7 @@ import zarr
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
 
-from insitubatch import ensure_local_dir, open_geometries, store_from_url
+from insitubatch import ensure_local_dir, obstore_store, open_geometries
 from insitubatch.plan import build_stored_chunk_reads
 from insitubatch.pool import ChunkPool
 from insitubatch.types import ArrayGeometry, StoredChunkRead
@@ -39,7 +39,7 @@ def tiled_store(tmp_path):
     """Write the spike's two-layout store; return (url, {var: source array})."""
     url = f"file://{tmp_path}/tiled.zarr"
     ensure_local_dir(url)
-    group = zarr.open_group(store=store_from_url(url, read_only=False), mode="w")
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     data = np.random.default_rng(0).standard_normal(SHAPE).astype("f4")
     srcs = {}
     for var, chunks in LAYOUTS.items():
@@ -51,7 +51,7 @@ def tiled_store(tmp_path):
 
 async def _decode_tiles(url: str, var: str) -> dict[tuple[int, ...], np.ndarray]:
     """Fetch + decode every stored tile of ``var`` (the spike's zarr-internals path)."""
-    aa = zarr.open_array(store=store_from_url(url), path=var, mode="r")._async_array
+    aa = zarr.open_array(store=obstore_store(url), path=var, mode="r")._async_array
     proto = default_buffer_prototype()
     spec = ArraySpec(
         shape=aa.metadata.chunks,
@@ -72,7 +72,7 @@ async def _decode_tiles(url: str, var: str) -> dict[tuple[int, ...], np.ndarray]
 
 def test_build_stored_chunk_reads_expands_and_dedups(tiled_store):
     url, _ = tiled_store
-    geoms = open_geometries(url)
+    geoms = open_geometries(obstore_store(url))
     reads = build_stored_chunk_reads([0, 1, 0], geoms)  # repeat 0 -> must dedup
 
     # spatial expands to its inner grid (3x2=6), single_inner to 1; x2 outer chunks.
@@ -94,7 +94,7 @@ def test_pool_aliased_labels_decode_once(tiled_store):
     """
     url, srcs = tiled_store
     array = "single_inner"
-    base = open_geometries(url, variables=[array])[array]  # base.name == array
+    base = open_geometries(obstore_store(url), variables=[array])[array]  # base.name == array
     geoms = {"now": base, "next": base}  # two labels, one underlying array
     tiles = asyncio.run(_decode_tiles(url, array))
     reads = build_stored_chunk_reads(range(base.n_chunks), {array: base})
@@ -121,7 +121,7 @@ def test_pool_aliased_labels_decode_once(tiled_store):
 def test_pool_scatter_reconstructs_array(tiled_store, var):
     """Concurrent tile scatter assembles each outer chunk == arr[:] (FT stress)."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=[var])
+    geoms = open_geometries(obstore_store(url), variables=[var])
     geom = geoms[var]
     tiles = asyncio.run(_decode_tiles(url, var))
     reads = build_stored_chunk_reads(range(geom.n_chunks), geoms)
@@ -186,7 +186,7 @@ def test_pool_mmap_backing_parity_and_cleanup(tiled_store, tmp_path, var):
     """mmap-backed slots reconstruct == arr[:], live as files on disk, and the
     files are freed on close()."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=[var])
+    geoms = open_geometries(obstore_store(url), variables=[var])
     geom = geoms[var]
     tiles = asyncio.run(_decode_tiles(url, var))
     backing = tmp_path / "slots"
@@ -213,7 +213,7 @@ def test_pool_mmap_backing_parity_and_cleanup(tiled_store, tmp_path, var):
 def test_pool_mmap_backing_with_transform(tiled_store, tmp_path):
     """A shape-preserving chunk_transform's output is written back into the memmap."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
 
@@ -261,7 +261,7 @@ def test_pool_reshaping_transform_heap_gather(tiled_store):
     Today gather allocates at the *source* inner_shape and assigns from the post-transform
     slot (output shape) -> broadcast error. The output geometry must drive gather."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     spc = geom.sample_chunk_size
@@ -279,7 +279,7 @@ def test_pool_reshaping_transform_heap_gather(tiled_store):
 def test_pool_reshaping_transform_dtype_recast(tiled_store):
     """A dtype-changing transform (f4 -> f8) propagates its dtype through gather."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     spc = geom.sample_chunk_size
@@ -307,7 +307,7 @@ def test_pool_reshaping_transform_mmap_persist_roundtrip(
     if no_cloudpickle:
         monkeypatch.setattr("insitubatch.pool.cloudpickle", None)
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     spc = geom.sample_chunk_size
@@ -337,7 +337,7 @@ def test_pool_reshaping_transform_structural_mismatch_is_miss(tiled_store, tmp_p
     """A persisted output-shaped entry whose *output* geometry no longer matches (the
     transform now yields a different inner shape) is invalidated structurally -- a miss."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -371,7 +371,7 @@ def test_pool_reshaping_transform_structural_mismatch_is_miss(tiled_store, tmp_p
 def test_pool_wait_ready_raises_on_failure(tiled_store):
     """A poisoned tile surfaces on the waiting consumer (fail-fast), not a hang."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["spatial"])
+    geoms = open_geometries(obstore_store(url), variables=["spatial"])
     pool = ChunkPool(geoms)
     pool.try_admit("spatial", 0)
     pool.fail("spatial", 0, RuntimeError("boom"))
@@ -383,7 +383,7 @@ def test_pool_lru_evicts_unpinned_under_budget(tiled_store):
     """Admission evicts unpinned-LRU to make room; pinned chunks are never dropped,
     and a still-resident chunk is retained (the cross-epoch-reuse mechanic)."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     spc = geom.sample_chunk_size
@@ -419,7 +419,7 @@ def test_pool_pin_is_reference_counted_not_boolean(tiled_store):
     resident until the *last* release -- a single unpin after a double-pin must not free
     it (the boolean-set bug). Pins are counts: N pins need N unpins."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     full = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
@@ -446,7 +446,7 @@ def test_pool_unpin_all_drops_abandoned_partial_keeps_ready(tiled_store):
     never be a valid cache entry -- but retain a fully ready chunk for cross-epoch
     reuse, with the byte accounting reclaimed."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["spatial"])
+    geoms = open_geometries(obstore_store(url), variables=["spatial"])
     geom = geoms["spatial"]
     tiles = asyncio.run(_decode_tiles(url, "spatial"))
     inner = list(geom.inner_coords())
@@ -475,7 +475,7 @@ def test_pool_unpin_all_drops_abandoned_partial_keeps_ready(tiled_store):
 def test_pool_persist_requires_cache_dir(tiled_store):
     """persist=True only makes sense with a backing dir to keep files in -- fail fast."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     with pytest.raises(ValueError, match="cache_dir|backing_dir"):
         ChunkPool(geoms, persist=True)
 
@@ -491,7 +491,7 @@ def test_pool_cross_run_persistence(tiled_store, tmp_path):
     """A persistent cache survives process exit: a new pool over the same dir serves
     each chunk as a ready hit (no re-scatter), reconstructing the source exactly."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     spc = geom.sample_chunk_size
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
@@ -525,7 +525,7 @@ def test_pool_persist_crash_recovery_without_close(tiled_store, tmp_path):
     pool over the same dir revives them all as hits -- re-decoding ZERO. The close-only manifest
     could not do this: it wrote nothing on a crash."""
     url, srcs = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     spc = geom.sample_chunk_size
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
@@ -556,7 +556,7 @@ def test_pool_persist_partial_iteration_recovers_completed_subset(tiled_store, t
     """A crash partway through the first epoch: only the chunks that *completed* are logged, so
     a reopen revives exactly that subset -- the rest are misses (re-decoded), not false hits."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -577,7 +577,7 @@ def test_pool_persist_log_dedups_across_epochs_and_runs(tiled_store, tmp_path):
     refetch, and across a close+reopen) never appends a duplicate line -- the count stays equal
     to the number of distinct cached chunks."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -609,7 +609,7 @@ def test_pool_close_is_idempotent(tiled_store, tmp_path):
     and ChunkPool.__del__ is a third best-effort call. The second call releases nothing (the log
     handle is already None, the slots already freed) and must not raise."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -626,7 +626,7 @@ def test_pool_persist_missing_file_is_miss_not_raise(tiled_store, tmp_path):
     eviction, which keeps the file) is a **miss**: revive fails to open it, drops the entry, and
     the chunk is re-fetched. Never a raise -- the cache is a transparent optimization."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -652,7 +652,7 @@ def test_pool_persist_evicted_chunk_revives_from_kept_file(tiled_store, tmp_path
     budget pressure keeps its ``.npy`` on disk, so touching it again revives it as a HIT from
     NVMe -- no re-fetch. (This is why a missing file is never expected from eviction.)"""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -676,7 +676,7 @@ def test_pool_persist_invalidates_on_geometry_mismatch(tiled_store, tmp_path):
     geometry is ignored (a miss), not served -- the structural fingerprint check.
     The dataset/pipeline identity is the cache_dir path; the user versions that."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -698,7 +698,7 @@ def test_pool_persist_invalidates_on_transform_change(tiled_store, tmp_path):
     hit; a changed transform is a *stale* cache, which RAISES by default (not a false hit, and
     not a silent cold-start -- a stale cache is almost never what the user intended)."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -727,7 +727,7 @@ def test_pool_persist_reset_stale_cache_gcs_and_rebuilds(tiled_store, tmp_path):
     """reset_stale_cache=True opts into wiping a stale cache: the old .npy files and log are
     deleted and the cache rebuilds cold (no raise, no false hit)."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -759,7 +759,7 @@ def test_pool_persist_cache_key_overrides_fingerprint(tiled_store, tmp_path):
     """An explicit transform.cache_key is authoritative: distinct function objects sharing
     a key reopen as a hit; bumping the key invalidates."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -790,7 +790,7 @@ def test_pool_persist_cloudpickle_catches_closure_change(tiled_store, tmp_path):
     closed-over constant get different fingerprints (a source hash would falsely match)."""
     pytest.importorskip("cloudpickle")
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -817,7 +817,7 @@ def test_pool_persist_without_cloudpickle_warns_and_falls_back(
     warning. The source hash still reopens an unchanged transform as a hit."""
     monkeypatch.setattr("insitubatch.pool.cloudpickle", None)
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "cache"
@@ -842,7 +842,7 @@ def _persist_two(tiled_store, backing):
     tampered/malformed entry can be an *interior* (non-tail) line -- a corrupt tail is treated
     as a crash artifact and dropped, an interior one is corruption and raises."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
@@ -934,7 +934,7 @@ def test_pool_spill_unlinks_without_persist(tiled_store, tmp_path):
     """Without persist, a backing dir is scratch: files are unlinked on close and no
     manifest is written (the persistence machinery is persist-only)."""
     url, _ = tiled_store
-    geoms = open_geometries(url, variables=["single_inner"])
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     backing = tmp_path / "spill"

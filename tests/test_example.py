@@ -21,6 +21,21 @@ def test_wb2_example_crops_subregion(tmp_path) -> None:
     assert summary["ttfb_ms"] >= 0.0
 
 
+def test_wb2_example_forwards_store_kwargs(tmp_path) -> None:
+    # Regression: run_demo forwards auth kwargs (skip_signature/request_payer) to the
+    # *store constructor*, not to open_geometries/InSituDataset. The synthetic path has
+    # empty store_kwargs, so only a non-empty kwarg exercises the forwarding -- exactly
+    # the path the Store-only migration broke (obstore ignores request_payer on file://).
+    summary = run_demo(url=None, request_payer=True, batch_size=8, verbose=False)
+    assert summary["samples"] > 0
+
+
+def test_wb2_example_fsspec_backend(tmp_path) -> None:
+    pytest.importorskip("fsspec")  # gcsfs extra; fsspec_store reads file:// via zarr's wrapper
+    summary = run_demo(url=None, backend="fsspec", batch_size=8, verbose=False)
+    assert summary["samples"] > 0
+
+
 def test_wb2_xbatcher_example_spawns(tmp_path) -> None:
     pytest.importorskip("torch")
     pytest.importorskip("xbatcher")
@@ -59,7 +74,11 @@ def test_fit_scaler_example_partial_fit(tmp_path) -> None:
     pytest.importorskip("sklearn")  # bench extra
     from examples.fit_scaler import run_demo
 
-    summary = run_demo(url=None, cache_dir=str(tmp_path / "cache"), verbose=False)
+    # skip_signature is a store-constructor kwarg forwarded via **store_kwargs; passing it
+    # here traverses the forwarding the migration broke (obstore ignores it on file://).
+    summary = run_demo(
+        url=None, cache_dir=str(tmp_path / "cache"), verbose=False, skip_signature=True
+    )
     assert summary["samples"] > 0
     assert summary["stat_max_err"] < 1e-3  # partial_fit over the loader == true global stats
     assert abs(summary["scaled_mean"]) < 1e-2  # batch-stage scaling -> standardized output

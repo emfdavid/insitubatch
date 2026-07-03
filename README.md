@@ -148,16 +148,19 @@ two splits both read decodes once. Handoff to torch / JAX / TF is a thin, option
 adapter layer in `insitubatch.frameworks`; the core imports no framework.
 
 ```python
-from insitubatch import open_geometries, split_by_chunk
+from insitubatch import obstore_store, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 
-url = "file:///data/era5.zarr"  # or "s3://bucket/era5.zarr" — same code
-geoms = open_geometries(url)  # {var: ArrayGeometry} from zarr metadata
+# The engine reads a zarr Store; build one per backend. obstore_store covers
+# file://, s3://, gs://, az://. (fsspec_store reaches GCS Rapid/requester-pays;
+# arraylake_store opens an Icechunk session — same InSituDataset below.)
+store = obstore_store("file:///data/era5.zarr")  # or "s3://bucket/era5.zarr"
+geoms = open_geometries(store)  # {var: ArrayGeometry} from zarr metadata
 # contiguous chunk blocks by default (no time-series leakage);
 # pass contiguous=False for exchangeable samples (independent scenes)
 manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 
-ds = InSituDataset(url, manifest, batch_size=32, block_chunks=16)
+ds = InSituDataset(store, manifest, batch_size=32, block_chunks=16)
 
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)

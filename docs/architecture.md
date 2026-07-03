@@ -352,7 +352,7 @@ def fill_nan(chunk):                      # your policy: climatology, interpolat
     np.nan_to_num(chunk.data, copy=False, nan=0.0)
     return chunk
 
-ds = InSituDataset(url, manifest, on_bad_chunk="nan", chunk_transforms=[fill_nan])
+ds = InSituDataset(store, manifest, on_bad_chunk="nan", chunk_transforms=[fill_nan])
 for batch in ds.train:
     ...
 print(ds.bad_chunks)   # the (array, chunk_index, inner_coord) reads that were bad this epoch
@@ -386,9 +386,10 @@ two train chunks shares its neighbours' weather). Set `contiguous=False` only wh
 **exchangeable** (independent scenes); it shuffles chunks before partitioning.
 
 ```python
-from insitubatch import open_geometries, split_by_chunk
+from insitubatch import obstore_store, open_geometries, split_by_chunk
 
-geom = open_geometries(url)[var]
+store = obstore_store(url)                 # or fsspec_store / arraylake_store
+geom = open_geometries(store)[var]
 # time series (default): contiguous blocks, no cross-boundary leakage
 manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
 # independent scenes: shuffle chunks before splitting
@@ -410,20 +411,22 @@ used only for this off-hot-path planning step; the engine itself never touches x
 
 ```python
 import xarray as xr
-from insitubatch import open_geometries, split_by_chunk, store_from_url
+from insitubatch import obstore_store, open_geometries, split_by_chunk
 from insitubatch.source import InSituDataset
 
+store = obstore_store(url)                 # one Store, reused for planning + the engine
+
 # define the window in xarray
-xds = xr.open_zarr(store_from_url(url))
+xds = xr.open_zarr(store)
 sel = xds.sel(time=slice("2020-01-01", "2021-01-01"))
 times = xds.indexes["time"]
 i0 = times.get_loc(sel.time.values[0])
 i1 = times.get_loc(sel.time.values[-1]) + 1  # half-open
 
 # pure zarr/numpy from here
-geom = open_geometries(url)[var]
+geom = open_geometries(store)[var]
 manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1), sample_range=(i0, i1))
-ds = InSituDataset(url, manifest, ...)
+ds = InSituDataset(store, manifest, ...)
 ```
 
 **Limitation — chunk-aligned and contiguous.** The selection snaps *outward* to chunk

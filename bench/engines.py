@@ -29,11 +29,11 @@ from insitubatch import (
     SplitName,
     open_geometries,
     split_by_chunk,
-    store_from_url,
 )
 from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry
 
+from .backend import build_store
 from .result import Result, peak_rss_mb, rss_breakdown_mb
 
 
@@ -41,8 +41,9 @@ from .result import Result, peak_rss_mb, rss_breakdown_mb
 class Cfg:
     engine: str
     url: str
-    storage: str  # file | s3
+    storage: str  # file | s3 | gs
     sample_chunk: int  # for the JSONL row (the dataset's chunk size)
+    backend: str = "obstore"  # obstore | fsspec | arraylake -- the store to read through
     var: str = "t2m"
     batch_size: int = 32
     block_chunks: int = 16
@@ -96,6 +97,7 @@ def _result(
         engine=cfg.engine,
         cache=cfg.cache,
         storage=cfg.storage,
+        backend=cfg.backend,
         sample_chunk=cfg.sample_chunk,
         n_samples=n,
         epoch=epoch,
@@ -118,7 +120,16 @@ def run(
     cfg: Cfg, *, cache_dir: str | None = None, store_kwargs: dict | None = None
 ) -> list[Result]:
     store_kwargs = store_kwargs or {}
-    geom = open_geometries(cfg.url, **store_kwargs)[cfg.var]
+    # Each engine builds its own store from (backend, url, store_kwargs) rather than
+    # being handed this live Store. Not because stores can't be serialized -- obstore's
+    # ObjectStore and zarr's FsspecStore both pickle fine (fsspec drops the aiohttp
+    # session and recreates it on demand in the child) -- but because the workers /
+    # xbatcher baselines run their dataset in child processes where each worker opens its
+    # *own* fresh connection from the config, and those procs are forkserver/spawn (not
+    # fork: obstore's tokio runtime is not fork-safe). Keeping one construction-from-cfg
+    # path is simpler than passing a live store to the in-process engines and cfg to the
+    # workers. Construction is cheap (lazy; no IO until first read, and gcsfs caches the fs).
+    geom = open_geometries(build_store(cfg.backend, cfg.url, **store_kwargs))[cfg.var]
     manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
     engines = {
         "insitu": _run_insitu,
@@ -153,7 +164,7 @@ def _run_insitu(
         budget = (n_train + 2) * per_chunk  # hold every train chunk + a margin
         cdir = cache_dir
     ds = InSituDataset(
-        cfg.url,
+        build_store(cfg.backend, cfg.url, **store_kwargs),
         manifest,
         geometries={cfg.var: geom},
         batch_size=cfg.batch_size,
@@ -164,7 +175,6 @@ def _run_insitu(
         seed=cfg.seed,
         cache_dir=cdir,
         cache_budget_bytes=budget,
-        **store_kwargs,
     )
     out = []
     for epoch in range(cfg.epochs):
@@ -183,7 +193,9 @@ def _run_naive(
     cache_dir: str | None,
     store_kwargs: dict,
 ) -> list[Result]:
-    arr = zarr.open_array(store=store_from_url(cfg.url, **store_kwargs), path=cfg.var, mode="r")
+    arr = zarr.open_array(
+        store=build_store(cfg.backend, cfg.url, **store_kwargs), path=cfg.var, mode="r"
+    )
     spc = geom.sample_chunk_size
 
     def batches() -> Iterator[np.ndarray]:
@@ -205,7 +217,9 @@ def _run_memory(
     cache_dir: str | None,
     store_kwargs: dict,
 ) -> list[Result]:
-    arr = zarr.open_array(store=store_from_url(cfg.url, **store_kwargs), path=cfg.var, mode="r")
+    arr = zarr.open_array(
+        store=build_store(cfg.backend, cfg.url, **store_kwargs), path=cfg.var, mode="r"
+    )
     full = np.asarray(arr[:])
     idx0 = manifest.sample_indices(SplitName.TRAIN, geom)
     out = []
@@ -228,7 +242,10 @@ class _SampleReader:
     opening its own zarr handle per worker. Must be top-level (not a closure) so
     it pickles to DataLoader worker processes under the `spawn` start method."""
 
-    def __init__(self, url: str, var: str, idx: np.ndarray, store_kwargs: dict) -> None:
+    def __init__(
+        self, backend: str, url: str, var: str, idx: np.ndarray, store_kwargs: dict
+    ) -> None:
+        self.backend = backend
         self.url = url
         self.var = var
         self.idx = idx
@@ -241,7 +258,9 @@ class _SampleReader:
     def __getitem__(self, i: int) -> np.ndarray:
         if self._arr is None:
             self._arr = zarr.open_array(
-                store=store_from_url(self.url, **self.store_kwargs), path=self.var, mode="r"
+                store=build_store(self.backend, self.url, **self.store_kwargs),
+                path=self.var,
+                mode="r",
             )
         return np.asarray(self._arr[int(self.idx[i])])
 
@@ -282,7 +301,7 @@ def _run_workers(
     # DataLoader accepts it at runtime; cast(Any) satisfies the stub (which wants a Dataset)
     # without a `type: ignore` that flips to "unused" when torch (its stub) isn't installed.
     loader: DataLoader = DataLoader(
-        cast(Any, _SampleReader(cfg.url, cfg.var, idx, store_kwargs)),
+        cast(Any, _SampleReader(cfg.backend, cfg.url, cfg.var, idx, store_kwargs)),
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         shuffle=cfg.shuffle,
@@ -310,7 +329,8 @@ def _run_xbatcher(
     from torch.utils.data import DataLoader
     from xbatcher.loaders.torch import MapDataset
 
-    da = xr.open_zarr(store_from_url(cfg.url, **store_kwargs), consolidated=False)[cfg.var]
+    store = build_store(cfg.backend, cfg.url, **store_kwargs)
+    da = xr.open_zarr(store, consolidated=False)[cfg.var]
     da = da.isel({da.dims[0]: manifest.sample_indices(SplitName.TRAIN, geom)})
     # one timestep per sample (full inner dims); the DataLoader collates batch_size.
     input_dims = {da.dims[0]: 1, **{d: int(da.sizes[d]) for d in da.dims[1:]}}

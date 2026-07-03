@@ -31,15 +31,15 @@ import logging
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any
 
 import numpy as np
+from zarr.abc.store import Store
 
 from .pool import ChunkPool, output_geometry
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
-from .store import StoreLike, open_geometries
+from .store import close_store, open_geometries
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRead
 
 logger = logging.getLogger(__name__)
@@ -107,7 +107,7 @@ class InSituDataset:
 
     def __init__(
         self,
-        store: StoreLike,
+        store: Store,
         manifest: SplitManifest,
         geometries: dict[str, ArrayGeometry] | None = None,
         *,
@@ -124,13 +124,9 @@ class InSituDataset:
         on_bad_chunk: str = "raise",
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
         batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
-        **store_kwargs: Any,
     ) -> None:
         self.store = store
-        self.store_kwargs = store_kwargs
-        self.geometries = (
-            geometries if geometries is not None else open_geometries(store, **store_kwargs)
-        )
+        self.geometries = geometries if geometries is not None else open_geometries(store)
         self.manifest = manifest
         self.variables = list(self.geometries)
 
@@ -379,7 +375,6 @@ class InSituDataset:
             self.geometries,
             self._pool,
             self.scheduler_config,
-            **self.store_kwargs,
         ) as sched:
             producer = threading.Thread(
                 target=produce, args=(sched,), name="insitu-prefetch", daemon=True
@@ -422,18 +417,23 @@ class InSituDataset:
                     )
 
     def close(self) -> None:
-        """Release the cache pool's backing (mmap handles, cached chunks).
+        """Release the cache pool's backing (mmap handles, cached chunks) and any async
+        store session.
 
         The pool persists across epochs, so close it when done training -- not per
         epoch. With ``persist=True`` the cache files + manifest are kept on disk for a
         future run (only the in-memory handles are released); otherwise the mmap spill
-        files are unlinked. Idempotent; also called on GC.
+        files are unlinked. An fsspec/gcsfs store's aiohttp session is closed on its own
+        loop here (a no-op for obstore) so it does not leak or spew a teardown traceback
+        at GC; gcsfs recreates it lazily if the store is reused. Idempotent; also called
+        on GC.
         """
         self._pool.close()
+        close_store(self.store)
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):  # best-effort on GC
-            self._pool.close()
+            self.close()
 
 
 class _SplitView:

@@ -12,6 +12,7 @@ import numpy as np
 
 from insitubatch import (
     StandardScaler,
+    obstore_store,
     open_geometries,
     split_by_chunk,
 )
@@ -21,13 +22,13 @@ from insitubatch.source import InSituDataset
 def test_transforms_prefetch_reconstruct(write_zarr) -> None:
     url, srcs = write_zarr(n=50, spc=8, inner=(2, 2))  # 7 chunks; last holds 50-48=2
     src = srcs["t2m"]
-    geoms = open_geometries(url)
+    geoms = open_geometries(obstore_store(url))
     manifest = split_by_chunk(geoms["t2m"], fractions=(1.0, 0.0, 0.0))
     mean, std = src.astype("f8").mean(), src.astype("f8").std()  # global stats, pre-fit
     scaler = StandardScaler(mean={"t2m": np.float64(mean)}, std={"t2m": np.float64(std)})
 
     ds = InSituDataset(
-        url,
+        obstore_store(url),
         manifest,
         shuffle=False,
         batch_size=6,
