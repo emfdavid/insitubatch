@@ -20,6 +20,7 @@ regardless of the store, so the training files are store-agnostic.
 from __future__ import annotations
 
 import argparse
+import time
 from collections.abc import Callable, Iterable
 from typing import Literal
 
@@ -82,6 +83,7 @@ def make_advection_store(
     n_steps: int = 768,
     size: int = 48,
     sample_chunk: int = 48,
+    inner_chunk: int | None = None,
     seed: int = 0,
     compress: bool = True,
     write_batch_mb: int = 256,
@@ -96,12 +98,20 @@ def make_advection_store(
     axis the engine batches along. Fields are ~unit-scale (no normalization needed). Chunked
     at ``sample_chunk`` steps so there are several chunks to split/shuffle.
 
+    ``inner_chunk`` tiles the spatial dims into ``inner_chunk x inner_chunk`` stored chunks
+    (default: one chunk covering the whole ``size x size`` field). Tiling makes one sample's
+    field fan out into a grid of concurrent reads -- the ARCO/ERA5 norm, and the axis for
+    sweeping inner fan-out vs the single-fat-chunk regime.
+
     Scales to a large cloud store (``url`` a ``gs://`` / ``s3://`` prefix) without
     materializing the whole array: the sequential advection is generated and written a
     **slab of whole chunks at a time**, bounding writer RAM to ``write_batch_mb`` while
     ``write_concurrency`` overlaps the chunk PUTs on zarr's async loop. ``size`` sets the
     spatial resolution; total volume is ``3 * n_steps * size**2 * 4`` bytes uncompressed.
     """
+    ic = inner_chunk or size
+    if not 1 <= ic <= size:
+        raise ValueError(f"inner_chunk {ic} must be in 1..size ({size})")
     rng = np.random.default_rng(seed)
     yy, xx = np.mgrid[0:size, 0:size] / size
     # A smooth, spatially-varying deformation wind (a couple of low modes), ~0.2 cells/step
@@ -122,7 +132,7 @@ def make_advection_store(
     ensure_local_dir(url)
     group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     shape = (n_steps, size, size)
-    chunks = (sample_chunk, size, size)
+    chunks = (sample_chunk, ic, ic)
     compressors: Literal["auto"] | None = "auto" if compress else None
     arrays = {
         name: group.create_array(
@@ -140,6 +150,15 @@ def make_advection_store(
     # write is chunk-aligned (no read-modify-write) and the writer's RAM stays bounded.
     rows_that_fit = max(1, (write_batch_mb * 1_000_000) // (size * size * 4))
     slab_rows = max(sample_chunk, (rows_that_fit // sample_chunk) * sample_chunk)
+
+    total_mb = 3 * n_steps * size * size * 4 / 1e6
+    print(
+        f"make_advection_store: {url}\n"
+        f"  3 vars x ({n_steps}, {size}, {size})  chunks=({sample_chunk}, {ic}, {ic})  "
+        f"~{total_mb:.0f} MB uncompressed  compress={'auto' if compress else 'none'}",
+        flush=True,
+    )
+    t0 = time.perf_counter()
 
     # A *stationary* forced-advection process: each step advects the field by the wind, then
     # adds a little fresh structure to replenish what bilinear interpolation dissipates, and
@@ -159,19 +178,35 @@ def make_advection_store(
             arrays["t2m"][start:stop] = buf[:n]
             arrays["u10"][start:stop] = np.broadcast_to(wind_u, (n, size, size))
             arrays["v10"][start:stop] = np.broadcast_to(wind_v, (n, size, size))
+            elapsed = time.perf_counter() - t0
+            rate = stop / elapsed if elapsed else 0.0
+            print(
+                f"  wrote {stop}/{n_steps} steps ({stop / n_steps:.0%})  "
+                f"{elapsed:.1f}s  {rate:.0f} steps/s",
+                flush=True,
+            )
+    print(f"  done: {url} in {time.perf_counter() - t0:.1f}s", flush=True)
 
 
-def _synthetic_ready(url: str, n_steps: int, size: int) -> bool:
+def _synthetic_ready(
+    url: str, n_steps: int, size: int, sample_chunk: int, inner_chunk: int | None
+) -> bool:
     """True if a synthetic store already exists at ``url`` with the requested geometry.
 
     Lets ``--source synthetic --url gs://...`` generate a large cloud store once and reuse
-    it across training runs instead of rewriting it every time. A shape mismatch (different
-    ``--n-steps`` / ``--size``) or any open failure (absent / partial) returns False, so a
-    changed request regenerates rather than silently training on the stale store.
+    it across training runs instead of rewriting it every time. A mismatch in shape
+    (``--n-steps`` / ``--size``) *or chunking* (``--sample-chunk`` / ``--inner-chunk``), or any
+    open failure (absent / partial), returns False, so a changed request regenerates rather
+    than silently training on the stale store.
     """
+    ic = inner_chunk or size
     try:
         t2m = zarr.open_group(store=obstore_store(url), mode="r")["t2m"]
-        return isinstance(t2m, zarr.Array) and t2m.shape == (n_steps, size, size)
+        return (
+            isinstance(t2m, zarr.Array)
+            and t2m.shape == (n_steps, size, size)
+            and t2m.chunks == (sample_chunk, ic, ic)
+        )
     except Exception:
         return False
 
@@ -291,6 +326,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-chunk", type=int, default=48, help="synthetic sample-axis chunk length (steps)"
     )
     p.add_argument(
+        "--inner-chunk",
+        type=int,
+        default=None,
+        help="synthetic inner (spatial) chunk edge; default one chunk over the whole field",
+    )
+    p.add_argument(
         "--url",
         default=None,
         help="synthetic store path (file:// temp default; gs://... for a cloud store)",
@@ -334,9 +375,15 @@ def build_datasets(args: argparse.Namespace) -> InSituDataset:
         variables, horizon = WB2_VARS, WB2_HORIZON
     else:
         url = args.url or "file:///tmp/insitu_advection.zarr"
-        if args.regenerate or not _synthetic_ready(url, args.n_steps, args.size):
+        if args.regenerate or not _synthetic_ready(
+            url, args.n_steps, args.size, args.sample_chunk, args.inner_chunk
+        ):
             make_advection_store(
-                url, n_steps=args.n_steps, size=args.size, sample_chunk=args.sample_chunk
+                url,
+                n_steps=args.n_steps,
+                size=args.size,
+                sample_chunk=args.sample_chunk,
+                inner_chunk=args.inner_chunk,
             )
         store = obstore_store(url)
         variables, horizon = SYNTH_VARS, SYNTH_HORIZON
