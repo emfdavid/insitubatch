@@ -58,6 +58,42 @@ def test_torch_beats_persistence(synth_store) -> None:
     assert model_rmse < persistence_rmse
 
 
+def test_torch_metrics_collects_stall_ceiling_and_writes_jsonl(synth_store, tmp_path) -> None:
+    pytest.importorskip("torch")
+    import json
+
+    from examples._forecast_metrics import MetricsLog
+    from examples.advection.train_torch_metrics import train
+
+    out = tmp_path / "metrics.jsonl"
+    log = MetricsLog(str(out))
+    model_rmse, persistence_rmse = train(_dataset(synth_store), epochs=3, ceiling=True, log=log)
+    log.flush()
+
+    assert model_rmse > 0 and persistence_rmse > 0  # a real training run happened (skill: sibling)
+
+    runs: dict[str, list] = {}
+    for m in log.rows:
+        runs.setdefault(m.run, []).append(m)
+    assert set(runs) == {"insitu", "ceiling"}  # --ceiling ran the compute-only baseline too
+    assert len(runs["insitu"]) == len(runs["ceiling"]) == 3  # one row per epoch per run
+
+    for m in log.rows:
+        assert 0.0 <= m.data_stall_fraction <= 1.0
+        assert m.n_batches > 0 and m.n_samples > 0 and m.samples_per_s > 0
+        assert m.wall_s == pytest.approx(m.data_wait_s + m.compute_s)  # wall is the split's sum
+        assert m.data_stall_fraction == pytest.approx(m.data_wait_s / m.wall_s)
+
+    # val skill is patched onto the insitu run's final row only (known after the eval pass)
+    assert runs["insitu"][-1].val_model_rmse == model_rmse
+    assert np.isnan(runs["ceiling"][-1].val_model_rmse)
+
+    # the JSONL mirrors the in-memory rows one line each
+    written = [json.loads(line) for line in out.read_text().splitlines()]
+    assert len(written) == len(log.rows) == 6
+    assert {r["run"] for r in written} == {"insitu", "ceiling"}
+
+
 def test_jax_beats_persistence(synth_store) -> None:
     pytest.importorskip("flax")
     from examples.advection.train_jax import train

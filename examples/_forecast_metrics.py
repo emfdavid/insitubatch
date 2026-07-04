@@ -32,6 +32,7 @@ from pathlib import Path
 # are reclaimable and excluded). bench is a repo-root dev package; the examples run
 # from the repo root (``python -m examples...``), so this import resolves there.
 from bench.result import rss_breakdown_mb
+from insitubatch.source import InSituDataset
 from insitubatch.types import Batch
 
 
@@ -198,3 +199,14 @@ class MetricsLog:
             for m in self.rows:
                 f.write(json.dumps(asdict(m)) + "\n")
         print(f"wrote {len(self.rows)} rows -> {self.path}")
+
+
+def preload_epoch(ds: InSituDataset) -> list[Batch]:
+    """Materialize one shuffled epoch of training batches into RAM (the ``--ceiling`` feed).
+
+    The compute-only ceiling run replays this list every epoch: same model, same loop, same
+    batch volume, but zero fetch/decode. Building it reads through the loader once (setup, not
+    measured); ``insitu_samples_per_s / ceiling_samples_per_s`` is then the pure loader
+    overhead. Cheap where the epoch's decoded batches fit in RAM (synthetic / WB2-128x64)."""
+    ds.set_epoch(0)
+    return list(ds.train)
