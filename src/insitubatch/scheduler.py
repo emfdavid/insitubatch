@@ -232,13 +232,15 @@ class Scheduler:
 
     # -- public, synchronous surface ---------------------------------------
 
-    def start(self, chunk_ids: Sequence[int] | np.ndarray) -> Future:
+    def start(self, chunk_ids: Sequence[int] | np.ndarray, ref_spc: int) -> Future:
         """Begin streaming the stored chunks of ``chunk_ids`` (priority order).
 
+        ``chunk_ids`` are in the reference (manifest) grid; ``ref_spc`` is that grid's
+        sample-chunk size, used to map anchor chunks onto each variable's own chunks.
         Returns the driver future; a failure there poisons the pool so consumers
         re-raise. The consumer drives demand independently via :attr:`pool`.
         """
-        reads = build_stored_chunk_reads(chunk_ids, self._geometries)
+        reads = build_stored_chunk_reads(chunk_ids, self._geometries, ref_spc)
         fut = asyncio.run_coroutine_threadsafe(self._drive(reads), self._loop)
         fut.add_done_callback(self._on_drive_done)
         return fut

@@ -177,6 +177,41 @@ forecasting `{"x": g, "y": g.shift(horizon)}` pattern, which composes with any
 - Cross-node concatenation (many well-arrays into one stream) is a **catalog layer above
   the core**, not part of this contract.
 
+### Use-case support
+
+Concrete cross-domain use cases against the contract above — what works today, what is a
+reserved (additive) extension, and what is deliberately out of scope.
+
+**Supported now:**
+
+| Use case | Example | How |
+|---|---|---|
+| Train over a time/sample axis | ERA5/HRRR reanalysis; astronomy light curves | `sample_axis=0` (default) |
+| Sample over *any* single axis | OME-NGFF 2D segmentation over `Z`; `T`-frame or volumetric stacks | `open_geometries(store, sample_axis=2)` |
+| Paired inputs+targets with *different* sample-axis chunking | microscopy raw image + label mask (Z-chunk 1 vs 30) | two variables, one manifest |
+| Forecasting input/target windows | weather: input@`t`, target@`t+h` | `g.shift(h)` views (decode-once) |
+| Whole inner field per sample, spatial grid fetched decode-once | ARCO/ERA5 `721×1440` fields; microscopy planes | inner (field) chunking |
+| Cross-variable derived fields & per-sample random augmentation | `windspeed=√(u²+v²)`; random crop of the whole field | `batch_transform` |
+| Chunk-aligned splits, block shuffle, cross-run cache | all domains | shipped |
+
+**Reserved (committed as additive, not yet built):**
+
+| Use case | Example | Extension |
+|---|---|---|
+| Multiple sample axes (product index) | HCS `Well×Field×Time`; `Year×Day` | `sample_axis` widens `int → int \| tuple` |
+| Native spatial patch / sliding window (memory-optimal crops) | ERA5 `64×64` patches for a ViT; radio-astronomy cubes | patch *extent* (geometry) + origin sampler + partial-field residency |
+| GPU `device_transform` stage | any | milestone M2 |
+
+**Out of scope (by design):**
+
+| Not supported | Example | Why |
+|---|---|---|
+| Cross-chunk / cross-sample-boundary stencils | finite differences across a time-chunk seam | a sample cannot span a chunk boundary |
+| Cross-node concatenation into one stream | many HCS well-arrays as one dataset | catalog layer above the core |
+| General compute graph / cross-chunk reductions | lazy dask-style evaluation | dask is off the hot path by design; reductions run *over* the loader |
+| Resharding into a sample-per-file format | MDS/tar/WebDataset ETL | we train **in place**, no reshard |
+| Scattered / boolean sample selection for splits | arbitrary index masks | splits are chunk-contiguous (leakage-safe) |
+
 ## Prefetch
 
 `source.InSituDataset.__iter__` runs a **background producer thread** that

@@ -130,16 +130,22 @@ class InSituDataset:
         self.manifest = manifest
         self.variables = list(self.geometries)
 
-        # Variables must share the sample axis (length + chunk size): the draw order
-        # and gather use a single chunk size for all variables.
-        spcs = {g.sample_chunk_size for g in self.geometries.values()}
+        # Variables must share the sample-axis *length* (samples are paired row-for-row);
+        # they may chunk that axis differently (raw Z-chunk 1 + label mask Z-chunk 30). The
+        # manifest defines the reference anchor grid; each variable maps anchors onto its own
+        # chunks. n_samples must match the manifest so the anchor grid indexes every variable.
         lengths = {g.n_samples for g in self.geometries.values()}
-        if len(spcs) > 1 or len(lengths) > 1:
+        if len(lengths) > 1:
             raise ValueError(
-                "All variables must share the same sample-axis length and chunk "
-                f"size; got sample_chunk_size={sorted(spcs)}, "
+                f"All variables must share the same sample-axis length; got "
                 f"n_samples={sorted(lengths)}."
             )
+        if lengths and manifest.n_samples != next(iter(lengths)):
+            raise ValueError(
+                f"manifest sample-axis length {manifest.n_samples} does not match the "
+                f"variables' n_samples {next(iter(lengths))}."
+            )
+        self._ref_spc = manifest.sample_chunk_size  # the anchor grid (shuffle/split/gather)
 
         self.batch_size = batch_size
         self.block_chunks = block_chunks
@@ -175,31 +181,56 @@ class InSituDataset:
         # boundary, so an anchor chunk's read-union spans up to 2 + ceil(span/spc)
         # chunks per variable (span = max offset - min offset); with every offset 0 the
         # factor is 1 -- the plain 2 * block_chunks working set.
-        spc0 = next(iter(self.geometries.values())).sample_chunk_size
         offsets = [g.offset for g in self.geometries.values()]
         span = max(offsets) - min(offsets)
         windowed = any(o != 0 for o in offsets)
-        window_factor = 2 + (-(-span // spc0)) if windowed else 1  # 2 + ceil(span/spc)
+        uniform_spc = len({g.sample_chunk_size for g in self.geometries.values()}) == 1
         # Size from the OUTPUT geometry: the pool caches post-transform chunks, so a regrid
         # that grows (or shrinks) the data changes the resident footprint the budget must hold.
-        per_chunk_all_vars = int(
-            sum(
-                g.sample_chunk_size * int(np.prod(o.inner_shape)) * o.dtype.itemsize
-                for g, o in zip(
-                    self.geometries.values(), self._out_geometries.values(), strict=True
-                )
+        out_geoms = list(self._out_geometries.values())
+        geoms = list(self.geometries.values())
+
+        def bytes_per_chunk(g: ArrayGeometry, o: ArrayGeometry) -> int:
+            return int(g.sample_chunk_size * int(np.prod(o.inner_shape)) * o.dtype.itemsize)
+
+        if uniform_spc:
+            # Uniform chunk size: every variable's chunk aligns to the reference grid, so a
+            # block reads exactly its own chunks. (Unchanged formula.)
+            spc0 = geoms[0].sample_chunk_size
+            window_factor = 2 + (-(-span // spc0)) if windowed else 1  # 2 + ceil(span/spc)
+            per_chunk_all_vars = sum(
+                bytes_per_chunk(g, o) for g, o in zip(geoms, out_geoms, strict=True)
             )
-        )
-        working_set = 2 * block_chunks * window_factor * per_chunk_all_vars
-        if windowed and self.shuffle:
-            # Shuffle permutes chunk order, so a windowed read can spill into chunks
-            # owned by any other block: a chunk admitted early may be needed late. Until
-            # bounded residency (re-fetch the spill) lands, hold the whole split resident
-            # -- decode-once, the accepted memory cost of windows (spill to NVMe via
-            # cache_dir on large splits). Only `.train` shuffles (eval views are
-            # sequential and spill only locally), so size to the train split.
-            n_train_chunks = len(self.manifest.chunks[SplitName.TRAIN.value])
-            working_set = max(working_set, n_train_chunks * per_chunk_all_vars)
+            working_set = 2 * block_chunks * window_factor * per_chunk_all_vars
+            if windowed and self.shuffle:
+                # Shuffle permutes chunk order, so a windowed read can spill into chunks
+                # owned by any other block: a chunk admitted early may be needed late. Until
+                # bounded residency (re-fetch the spill) lands, hold the whole split resident
+                # -- decode-once, the accepted memory cost of windows (spill to NVMe via
+                # cache_dir on large splits). Only `.train` shuffles (eval views are
+                # sequential and spill only locally), so size to the train split.
+                n_train_chunks = len(self.manifest.chunks[SplitName.TRAIN.value])
+                working_set = max(working_set, n_train_chunks * per_chunk_all_vars)
+        else:
+            # Non-uniform chunk size: a variable maps the reference anchor grid onto its own
+            # chunks, so a block touches a variable-specific chunk count. A 2-block read-ahead
+            # window of `2*block_chunks*ref_spc` anchor samples (plus the offset span) covers,
+            # per variable, ceil(window/spc)+1 of its chunks (the +1 for boundary misalignment).
+            def var_bytes(g: ArrayGeometry, o: ArrayGeometry, samples: int) -> int:
+                n_chunks = -(-(samples + span) // g.sample_chunk_size) + 1
+                return n_chunks * bytes_per_chunk(g, o)
+
+            pairs = list(zip(geoms, out_geoms, strict=True))
+            window_samples = 2 * block_chunks * self._ref_spc
+            working_set = sum(var_bytes(g, o, window_samples) for g, o in pairs)
+            if self.shuffle:
+                # Under shuffle a variable chunk can be needed by scattered blocks (a coarse
+                # chunk straddling reference-block boundaries) -- like a window spill -- so
+                # hold the train split resident per variable (decode-once). A tighter bound is
+                # future work; different-axis-chunking is today a modest-sized microscopy case.
+                train_samples = len(self.manifest.chunks[SplitName.TRAIN.value]) * self._ref_spc
+                train_ws = sum(var_bytes(g, o, train_samples) for g, o in pairs)
+                working_set = max(working_set, train_ws)
         self.cache_budget_bytes = max(int(cache_budget_bytes or 0), working_set)
         # persist turns the cache_dir mmap tier into a cross-run cache (files + manifest
         # survive close; reopen revives them as hits). It needs a dir to keep files in;
@@ -259,21 +290,21 @@ class InSituDataset:
         return np.asarray(ids, dtype=np.int64)
 
     def _draw_order(self, split: SplitName | None, shuffle: bool) -> np.ndarray:
-        geom = self.geometries[self.variables[0]]
         chunk_ids = self._chunk_ids(split)
-        spc = geom.sample_chunk_size
+        spc = self._ref_spc  # the manifest's anchor grid, shared by every variable
+        n_samples = self.manifest.n_samples
         if shuffle:
             order = block_shuffled_order(
                 chunk_ids,
                 spc,
-                geom.n_samples,
+                n_samples,
                 block_chunks=self.block_chunks,
                 seed=self.seed,
                 epoch=self._epoch,
             )
         else:
-            order = sequential_order(chunk_ids, spc, geom.n_samples)
-        return self._drop_edge_anchors(order, spc, geom.n_samples)
+            order = sequential_order(chunk_ids, spc, n_samples)
+        return self._drop_edge_anchors(order, spc, n_samples)
 
     def _drop_edge_anchors(self, order: np.ndarray, spc: int, n_samples: int) -> np.ndarray:
         """Keep only anchors whose every windowed read ``anchor + offset`` is on the
@@ -294,7 +325,7 @@ class InSituDataset:
         anchor = block_rows[:, 0].astype(np.int64) * spc + block_rows[:, 1].astype(np.int64)
         keys: set[tuple[str, int]] = set()
         for geom in self.geometries.values():
-            read_cid = (anchor + geom.offset) // spc
+            read_cid = (anchor + geom.offset) // geom.sample_chunk_size  # variable's own grid
             keys.update((geom.path, int(c)) for c in np.unique(read_cid))
         return keys
 
@@ -313,8 +344,7 @@ class InSituDataset:
         overlaps the per-batch compute. Chunks the pool already holds (cross-epoch or
         cross-split hits) cost no fetch.
         """
-        geom = self.geometries[self.variables[0]]
-        spc = geom.sample_chunk_size
+        spc = self._ref_spc  # the manifest anchor grid, shared by every variable
         order = self._draw_order(split, shuffle)
         blocks = _partition_blocks(order, self.block_chunks)
         ordered_chunks = [int(c) for _rstart, _rstop, cids in blocks for c in cids]
@@ -345,7 +375,7 @@ class InSituDataset:
         def produce(sched: Scheduler) -> None:
             bs = self.batch_size
             try:
-                sched.start(ordered_chunks)
+                sched.start(ordered_chunks, spc)
                 for bi, (rstart, rstop, _cids) in enumerate(blocks):
                     # A block's batches draw across its whole read-union, so wait it all
                     # assembled (and claimed by the driver -- see ChunkPool.wait_ready)

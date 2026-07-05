@@ -20,6 +20,7 @@ from .types import ArrayGeometry, StoredChunkRead
 def build_stored_chunk_reads(
     chunk_ids: Sequence[int] | np.ndarray,
     geometries: dict[str, ArrayGeometry],
+    ref_spc: int,
 ) -> list[StoredChunkRead]:
     """Expand outer chunk ids into deduped stored-chunk reads, in priority order.
 
@@ -40,17 +41,18 @@ def build_stored_chunk_reads(
     (same path, different ``offset``) collapse to a single fetch -- decode-once.
     Dedup also makes the function safe to call with repeated ids.
 
-    ``chunk_ids`` are *anchor* chunks. A windowed variable reads ``array[anchor +
-    offset]``, so its anchor chunk's samples map to one or two offset-shifted *read*
-    chunks; each is expanded here (clamped to the array, since edge anchors that would
-    read off the array are dropped from the draw upstream). With every ``offset == 0``
-    this is exactly ``anchor chunk -> itself``.
+    ``chunk_ids`` are *anchor* chunks in the **reference** grid (``ref_spc`` = the
+    manifest's sample-chunk size, which defines the shuffle/split anchor grid). A windowed
+    variable reads ``array[anchor + offset]``, and a variable that chunks the sample axis
+    differently from the reference maps those anchor samples onto *its own* chunks -- so one
+    anchor chunk expands to the (offset-shifted) chunks each variable needs. With every
+    ``offset == 0`` and a uniform chunk size this is exactly ``anchor chunk -> itself``.
     """
     reads: list[StoredChunkRead] = []
     seen: set[StoredChunkRead] = set()
     for cid in chunk_ids:
         for geom in geometries.values():
-            for read_cid in _read_chunks(geom, int(cid)):
+            for read_cid in _read_chunks(geom, int(cid), ref_spc):
                 for inner in geom.inner_coords():
                     read = StoredChunkRead(geom.path, read_cid, inner)
                     if read not in seen:
@@ -59,17 +61,21 @@ def build_stored_chunk_reads(
     return reads
 
 
-def _read_chunks(geom: ArrayGeometry, anchor_chunk: int) -> range:
-    """Offset-shifted read chunks an anchor chunk needs for ``geom`` (1-2, clamped).
+def _read_chunks(geom: ArrayGeometry, anchor_chunk: int, ref_spc: int) -> range:
+    """Offset-shifted read chunks an anchor chunk needs for ``geom`` (clamped).
 
-    The anchor samples ``[start, stop)`` of ``anchor_chunk`` read array samples
-    ``[start+offset, stop-1+offset]``; clamp to ``[0, n_samples)`` (edge anchors are
-    dropped from the draw) and return the half-open range of chunks they span.
+    ``anchor_chunk`` is in the reference grid: its anchor samples are ``[k*ref_spc,
+    (k+1)*ref_spc)`` (clamped to the array). Those read array samples ``[start+offset,
+    stop-1+offset]``, mapped onto ``geom``'s *own* chunk grid (``geom.sample_chunk_size``).
+    A variable coarser than the reference collapses several anchor chunks onto one of its
+    chunks; a finer one spans several. Edge anchors that read off the array are dropped from
+    the draw upstream, so an empty span here means nothing to fetch.
     """
-    spc = geom.sample_chunk_size
-    anchors = geom.samples_in_chunk(anchor_chunk)
-    lo = max(0, anchors.start + geom.offset)
-    hi = min(geom.n_samples - 1, anchors.stop - 1 + geom.offset)
+    start = anchor_chunk * ref_spc
+    stop = min(start + ref_spc, geom.n_samples)
+    lo = max(0, start + geom.offset)
+    hi = min(geom.n_samples - 1, stop - 1 + geom.offset)
     if lo > hi:  # the whole anchor chunk reads off the array (edge); nothing to fetch
         return range(0)
+    spc = geom.sample_chunk_size
     return range(lo // spc, hi // spc + 1)
