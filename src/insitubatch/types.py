@@ -28,42 +28,73 @@ class SplitName(StrEnum):
 class ArrayGeometry:
     """The minimal geometry the engine needs about one zarr array.
 
-    We only model the *sample axis* (the outer dimension, axis 0 by convention:
-    time for ERA5/HRRR) explicitly, because that is the axis we split, shuffle,
-    and batch along. The trailing dims are carried opaquely as ``inner_shape``
-    and are kept contiguous to preserve partial zero-copy.
+    We only model the *sample axis* explicitly, because that is the axis we split,
+    shuffle, and batch along; the remaining dims are carried opaquely as
+    ``inner_shape`` and kept contiguous to preserve partial zero-copy. ``shape`` and
+    ``chunks`` are in **physical** (zarr) axis order -- they mirror the array's own
+    metadata -- and ``sample_axis`` names which physical axis is the sample axis
+    (``0`` by convention: time for ERA5/HRRR; e.g. ``2`` for the Z of an OME-NGFF
+    ``(T,C,Z,Y,X)`` microscopy stack sampled slice-by-slice). The engine works in a
+    *logical* view where the sample axis leads and the inner axes follow in physical
+    order; the one physical<->logical permutation is confined to the scheduler
+    (:meth:`physical_chunk_coord` for read addressing; a ``moveaxis`` on the decoded
+    tile). Everything downstream -- planning, pooling, gather -- is sample-first.
 
     ``offset`` makes a variable a *windowed view*: it reads ``array[anchor + offset]``
-    around a shared sample anchor. Two geometries with the same ``path`` and different
-    ``offset`` (e.g. ``g`` and ``g.shift(1)``) are two views of one array -- they decode
-    once and share slots. Offset 0 is not special; everything is relative to the anchor.
+    along the sample axis around a shared anchor. Two geometries with the same ``path``
+    and different ``offset`` (e.g. ``g`` and ``g.shift(1)``) are two views of one array --
+    they decode once and share slots. Offset 0 is not special; everything is relative to
+    the anchor.
     """
 
     path: str  # the array's zarr path within the store, e.g. "t2m" or "surface/hourly/t2m"
-    shape: tuple[int, ...]
-    chunks: tuple[int, ...]
+    shape: tuple[int, ...]  # physical (zarr) axis order
+    chunks: tuple[int, ...]  # physical (zarr) axis order
     dtype: np.dtype
     offset: int = 0  # sample-axis read shift: this view reads array[anchor + offset]
+    sample_axis: int = 0  # which *physical* axis is the sample (outer) axis
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.sample_axis < len(self.shape):
+            raise ValueError(
+                f"sample_axis {self.sample_axis} out of range for {len(self.shape)}-D "
+                f"array {self.path!r} with shape {self.shape}"
+            )
 
     def shift(self, k: int) -> ArrayGeometry:
         """A view of the same array read ``k`` samples later (composes: ``shift(1).shift(1)``
         is ``offset += 2``). Declare a forecast target as ``g.shift(horizon)``."""
         return replace(self, offset=self.offset + k)
 
+    def _drop_sample(self, dims: tuple[int, ...]) -> tuple[int, ...]:
+        """``dims`` (a physical shape/chunks tuple) with the sample axis removed --
+        the inner axes in physical order, which is the engine's logical inner order."""
+        return dims[: self.sample_axis] + dims[self.sample_axis + 1 :]
+
+    def physical_chunk_coord(
+        self, chunk_index: int, inner_coord: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        """Full physical zarr stored-chunk coordinate for a logical read.
+
+        Reinsert the sample-axis chunk index ``chunk_index`` at ``sample_axis`` among the
+        inner-axis chunk coords (which are in physical inner order). With ``sample_axis == 0``
+        this is exactly ``(chunk_index, *inner_coord)`` -- the identity the old code assumed."""
+        return inner_coord[: self.sample_axis] + (chunk_index,) + inner_coord[self.sample_axis :]
+
     @property
     def n_samples(self) -> int:
         """Length of the sample (outer) axis."""
-        return self.shape[0]
+        return self.shape[self.sample_axis]
 
     @property
     def sample_chunk_size(self) -> int:
         """How many samples live in one chunk along the sample axis."""
-        return self.chunks[0]
+        return self.chunks[self.sample_axis]
 
     @property
     def inner_shape(self) -> tuple[int, ...]:
-        """Shape of a single sample (everything past the sample axis)."""
-        return self.shape[1:]
+        """Shape of a single sample (every axis but the sample axis, physical order)."""
+        return self._drop_sample(self.shape)
 
     @property
     def n_chunks(self) -> int:
@@ -89,8 +120,8 @@ class ArrayGeometry:
 
     @property
     def inner_chunks(self) -> tuple[int, ...]:
-        """Stored-chunk shape on the inner (non-sample) axes."""
-        return self.chunks[1:]
+        """Stored-chunk shape on the inner (non-sample) axes (physical order)."""
+        return self._drop_sample(self.chunks)
 
     def inner_grid(self) -> tuple[range, ...]:
         """Per-inner-axis range of stored-chunk indices (ceil div of shape/chunk)."""

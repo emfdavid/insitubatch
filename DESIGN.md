@@ -4,6 +4,17 @@
 > on top of solved async IO (obstore / zarr v3 / icechunk), with a Python hot
 > path that scales with **chunks, not samples**.
 
+> **How the docs divide up (read this first).** This file is the **evolution
+> ledger**: *why* the design is shaped the way it is, the pivots that got here, and
+> the rationale for roads not taken — written in past/decision tense. The **current
+> stable contract** (what a user builds against *now*) lives in
+> [docs/architecture.md](docs/architecture.md); **delivery + status** live in the
+> Milestones (`M-*`) and Status sections below. To avoid the version-label collision
+> this file used to have, **numbers name only two things**: the one-time *engine
+> generation* (the reader+buffer → scheduler+pool rewrite, "V2") and the *milestones*.
+> Capabilities are named, not numbered — the sample-geometry ladder is
+> "single-axis → windowed → arbitrary-axis → …", not "geometry v1/v2/v3".
+
 ## The thesis
 
 The hard part of feeding a GPU from a cloud Zarr archive is **not** raw IO speed
@@ -76,24 +87,67 @@ shared-cache + intra-chunk shuffle win       async fan-out is the whole game
 `build_stored_chunk_reads()` is vectorized: Python touches **O(reads)**, never
 O(samples).
 
-## Sample geometry (v1 contract)
+## Sample geometry — how the ladder evolved
 
-- **v1:** a sample is a slice along the **outer dimension** (axis 0; time for
-  ERA5/HRRR) that **does not cross a chunk boundary**. This keeps gathers to one
-  coalesced copy per chunk and preserves partial zero-copy.
-- **must support now:** the degenerate end — **one slice per chunk**
-  (GRIB-per-timestep). Same scheduler, fan-out ratio just slides to 1:1.
-- **inner (spatial) chunking is supported** — and is how you get concurrency in
-  the *fat* outer-chunk regime. The reader fetches each outer chunk with a
-  full-inner `getitem`, so if the inner dims are chunked (the ARCO/ERA5 norm) zarr
-  fans the read across the spatial grid; with few outer chunks, the grid is what
-  keeps reads parallel. So "inner dims single-chunk" is a simplification, not a
-  requirement. (Concurrency then has two dials: our `block_chunks`/`max_inflight`
-  on the outer axis, and zarr's `async.concurrency` on the inner grid per read.)
-- **later (opt-in):** windows spanning *n* outer chunks, and pushing a spatial
-  *sub-selection* into the read (read only the inner chunks covering a crop, rather
-  than reading the full field and cropping in a `batch_transform`) — both trade
-  zero-copy for flexibility.
+> The **live contract** is in [docs/architecture.md](docs/architecture.md) ("the
+> axis-role contract"). This section is the *why*: the capability ladder and the
+> decisions (including the tempting generalizations we deferred).
+
+The foundational choice: a sample is a slice along **one** axis that **does not cross a
+chunk boundary**, so gathers stay one coalesced copy per chunk and preserve partial
+zero-copy. Everything since has generalized *which* slice, without giving that up. The
+degenerate end — **one slice per chunk** (GRIB-per-timestep) — was a must-support from
+day one; the same scheduler just slides its fan-out to 1:1. Inner (field) axes may be
+chunked, and that inner grid is where concurrency comes from in the fat-outer-chunk
+regime (two dials: our `block_chunks`/`max_inflight` on the sample axis, zarr's
+`async.concurrency` on the inner grid).
+
+The ladder, in the order it was built:
+
+1. **Single-axis slice** — the original contract: sample axis = physical axis 0 (time).
+2. **Windowed / multi-offset** (M-W, PR #4) — a variable became a `(label, path, offset)`
+   *view*; `g.shift(k)` reads `array[anchor+offset]` along the sample axis, several views
+   of one array decode once. This is the forecasting unlock; a *sample* may now reference
+   several chunks, but each read is still a within-chunk slice (details in the M-W entry
+   under Roadmap).
+3. **Arbitrary sample axis** — `sample_axis` lets *any single* physical axis be
+   the sample axis (OME-NGFF "sample over Z"), by carrying `shape`/`chunks` in physical
+   order and confining one physical↔logical permutation to the scheduler. Cheap precisely
+   *because* it preserves the "sample is a contiguous slice of one axis" invariant: after
+   one `moveaxis` the sample axis leads and every downstream stage is unchanged.
+   Cross-domain validated end-to-end against a real IDR OME-NGFF microscopy store (zarr
+   v2, anonymous S3), streaming over `Z` with byte-exact reads.
+
+**Deferred generalizations, and *why* (so they aren't relitigated):**
+
+- **Multiple sample axes → one product index** (HCS `Well×Field×Time`, `Year×Day`). The
+  blocker is not feasibility — it's that a tuple sample axis **breaks the contiguity
+  invariant** that makes single-axis cheap: the samples in an outer chunk become a
+  *product grid*, forcing the scalar `chunk_index` to an N-D coordinate, `samples_in_chunk`
+  from a `range` to a Cartesian product, and multi-axis slot/gather. That is the *same*
+  multi-dimensional-draw-space refactor **patching** needs (a patch position is just
+  another draw coordinate) — so doing it now pulls the hard part of patching into what was
+  meant to be the cheap increment. And we don't have to, to keep the API commitment:
+  `sample_axis: int` widens to `int | tuple[int, ...]` **non-breakingly**. So: single-axis
+  shipped, tuple reserved. (Tantalizingly, the tuple case collapses to the existing
+  1-sample-per-chunk path when every extra sample axis is chunked-at-1 — as `T`/`Z` usually
+  are in OME-NGFF — but shipping a `tuple` that *only* works under that hidden precondition
+  is a special-case that violates "one obvious way", so we hold for the general form.)
+- **Patch / sliding-window sub-selection** — push a spatial crop into the read (fetch only
+  the inner tiles a `(64,64)` crop covers) instead of reading the whole field. The design
+  resolution: **geometry owns the patch _extent_** (declarative), the **sampler owns the
+  _origins_** (a strided grid, or a random draw — "random crop" is a draw policy, not
+  geometry, and already works today as a `batch_transform` over the whole field). The real
+  work is **partial-field residency** — a de-risk spike confirmed the engine currently
+  assembles (and budgets) the *whole* field per outer chunk, so bounded memory on a giant
+  ERA5/radio field needs the pool to hold only a crop's tiles. That is a residency change,
+  not a `Batch`-contract change — which is what keeps it an *additive* future.
+- **Per-variable sample-axis chunk size** — pairing e.g. an OME-NGFF raw array (Z-chunk 1)
+  with its label mask (Z-chunk 30) is blocked by the shared-chunk-size guard. Orthogonal to
+  `sample_axis`; the next increment. It's genuinely separate work (not a one-liner) because
+  the read planner and `gather` both interpret draw chunk-ids in a single reference grid —
+  lifting that means mapping one anchor grid onto each variable's own chunk grid, and it
+  interacts with windowed residency.
 
 GRIB / NetCDF are consumed via a **virtual-zarr** view (virtualizarr / kerchunk /
 icechunk) so the engine only ever speaks zarr-async — we never parse GRIB.
@@ -437,8 +491,11 @@ on fat-spatial S3: 1052 MB/s at `max_inflight=32` (beats the 930 v1 peak) with
 residency flat across the concurrency sweep. **B2 done** — the `ChunkPool` is now
 the cache too (byte budget + pin/unpin + LRU, heap or mmap backing; cross-epoch
 decode-once reuse via `cache_dir`/`cache_budget_bytes`; cross-*run* persistence via
-`persist=True`, M-C2). **Not yet built:** `Regrid` + the GPU/device transform stage (M2),
-bounded read-ahead (M-RA).
+`persist=True`, M-C2). **Arbitrary sample axis** — `sample_axis` lets any single
+physical axis be the sample axis (cross-domain validated end-to-end on a real IDR OME-NGFF
+microscopy store, sampling over `Z`); see the geometry-ladder section. **Not yet built:**
+`Regrid` + the GPU/device transform stage (M2), bounded read-ahead (M-RA), per-variable
+sample-axis chunk size (the raw+labels microscopy pairing).
 
 ## Roadmap / milestones
 
@@ -613,7 +670,7 @@ Engine track (make it real for models — see [docs/architecture.md](docs/archit
     transform declares which variables it applies to (explicit mapping vs the current
     name-gating convention). Documented as a limitation in docs/architecture.md (cache
     invalidation section).
-- **M-W — windowed / multi-offset sampling (sample geometry v2).** The forecasting
+- **M-W — windowed / multi-offset sampling (geometry ladder: the *windowed* rung).** The forecasting
   unlock, and a prerequisite for the canonical WeatherBench examples and the M4
   "around their models" play. Today a batch draws **one shared time index for all
   variables**, so input@t / target@t+1 is inexpressible; shuffle destroys temporal

@@ -94,22 +94,28 @@ def output_geometry(geom: ArrayGeometry, transforms: Sequence[ChunkTransform]) -
     A reshaping transform (regrid / dtype recast) declares ``output_inner(geom) ->
     (inner_shape, dtype)``; the pipeline folds them so each transform sees the geometry
     produced by the ones before it. Only the *inner* dims and dtype may change -- the
-    sample axis (``shape[0]`` / ``chunks[0]``) is spliced straight back from the source, so
-    a transform can neither move nor reshape it (the sample-geometry invariant). A transform
+    sample axis is spliced straight back from the source at its physical position, so a
+    transform can neither move nor reshape it (the sample-geometry invariant). A transform
     without ``output_inner`` is identity; with none reshaping, the source geometry returns
     unchanged. Output ``chunks`` are set to the inner shape (the cache slot is one assembled
     buffer, never inner-tiled), keeping the geometry self-consistent."""
+
+    def rebuild(inner_shape: tuple[int, ...], dt: np.dtype) -> ArrayGeometry:
+        # Reinsert the (whole, single-chunk) sample dim at its physical axis so the
+        # output geometry stays in physical order with the same sample_axis.
+        ax, n, spc = geom.sample_axis, geom.n_samples, geom.sample_chunk_size
+        shape = (*inner_shape[:ax], n, *inner_shape[ax:])
+        chunks = (*inner_shape[:ax], spc, *inner_shape[ax:])
+        return replace(geom, shape=shape, chunks=chunks, dtype=dt)
+
     inner, dt = geom.inner_shape, geom.dtype
     for t in transforms:
         declare = getattr(t, "output_inner", None)
         if declare is None:
             continue
-        current = replace(
-            geom, shape=(geom.shape[0], *inner), chunks=(geom.chunks[0], *inner), dtype=dt
-        )
-        inner, dt = declare(current)
+        inner, dt = declare(rebuild(inner, dt))
         inner, dt = tuple(int(s) for s in inner), np.dtype(dt)
-    return replace(geom, shape=(geom.shape[0], *inner), chunks=(geom.chunks[0], *inner), dtype=dt)
+    return rebuild(inner, dt)
 
 
 def _transform_token(fn: ChunkTransform) -> str:

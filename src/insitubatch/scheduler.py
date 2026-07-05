@@ -126,6 +126,7 @@ class _ArrayCtx:
     chunk_shape: tuple[int, ...]
     fill_value: object
     dtype: np.dtype
+    sample_axis: int  # physical axis to move to the front on decode (0 = no-op)
 
 
 def _bad_fill(ctx: _ArrayCtx) -> object:
@@ -354,6 +355,7 @@ class Scheduler:
                     chunk_shape=tuple(aa.metadata.chunks),
                     fill_value=aa.metadata.fill_value,
                     dtype=geom.dtype,
+                    sample_axis=geom.sample_axis,
                 )
 
     async def _one(self, read: StoredChunkRead) -> None:
@@ -394,9 +396,18 @@ class Scheduler:
                 self._inflight_now -= 1
 
     async def _fetch_decode(self, read: StoredChunkRead, ctx: _ArrayCtx) -> np.ndarray:
-        key = ctx.path + "/" + ctx.encode(read.coords)
+        # Seam 1: logical (chunk_index, *inner_coord) -> physical chunk coord. The read is
+        # addressed sample-first; reinsert the sample-axis index at its physical position
+        # before encoding the store key (identity when sample_axis == 0).
+        ax = ctx.sample_axis
+        phys = read.inner_coord[:ax] + (read.chunk_index,) + read.inner_coord[ax:]
+        key = ctx.path + "/" + ctx.encode(phys)
         buf = await self._io(ctx.store.get(key, prototype=self._proto))  # type: ignore[attr-defined]
         if buf is None:  # absent chunk == all fill_value (zarr's getitem semantics)
-            return np.full(ctx.chunk_shape, ctx.fill_value, dtype=ctx.dtype)
-        [decoded] = list(await ctx.codec.decode([(buf, ctx.spec)]))  # type: ignore[attr-defined]
-        return decoded.as_numpy_array()
+            tile = np.full(ctx.chunk_shape, ctx.fill_value, dtype=ctx.dtype)
+        else:
+            [decoded] = list(await ctx.codec.decode([(buf, ctx.spec)]))  # type: ignore[attr-defined]
+            tile = decoded.as_numpy_array()
+        # Seam 2: the decoded tile is in physical order; move the sample axis to the front
+        # so it matches the sample-first slot the pool scatters into (no-op when ax == 0).
+        return np.moveaxis(tile, ax, 0) if ax else tile

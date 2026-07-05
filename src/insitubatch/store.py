@@ -122,6 +122,8 @@ def ensure_local_dir(url: str) -> str:
 def open_geometries(
     store: Store,
     variables: list[str] | None = None,
+    *,
+    sample_axis: int = 0,
 ) -> dict[str, ArrayGeometry]:
     """Introspect a zarr group ``Store`` into ``{name: ArrayGeometry}``.
 
@@ -129,6 +131,12 @@ def open_geometries(
     chunks, dtype) is read from the array metadata rather than hand-specified.
     Build the ``store`` with :func:`obstore_store` / :func:`fsspec_store` /
     :func:`arraylake_store`, or pass any prebuilt zarr ``Store``.
+
+    ``sample_axis`` names which *physical* axis is the outer (sample) axis for
+    **every** returned variable -- ``0`` (default: time for ERA5/HRRR) or, e.g., the
+    ``Z`` of an OME-NGFF ``(T,C,Z,Y,X)`` stack sampled slice-by-slice (``sample_axis=2``).
+    Variables that need *different* sample axes are built individually (construct
+    :class:`ArrayGeometry` per array); the shape/chunks stay in physical order.
     """
     group = zarr.open_group(store=store, mode="r")
     names = variables if variables is not None else [k for k, _ in group.arrays()]
@@ -145,5 +153,6 @@ def open_geometries(
             shape=tuple(arr.shape),
             chunks=tuple(arr.chunks),
             dtype=np.dtype(arr.dtype),
+            sample_axis=sample_axis,
         )
     return out

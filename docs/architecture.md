@@ -121,6 +121,61 @@ and amortized across every sample that touches it; **read concurrency
 total memory is the budget + the prefetch queue (depth `d`) + the in-flight tiles —
 every term a tunable cap, none scaling with batch size or epoch length.
 
+## Sample geometry — the axis-role contract
+
+This is the stable contract the engine commits to, and the extension points reserved
+for it. (For *why* it evolved this way — and why the tempting generalizations are
+deferred — see the "Sample geometry" entry in [DESIGN.md](../DESIGN.md).)
+
+Every physical axis of a zarr array has one **role**:
+
+- **sample axis** — the axis the engine draws / shuffles / splits / windows along.
+  Exactly **one** per variable. `ArrayGeometry.sample_axis` names it as a *physical*
+  axis index (default `0`: time for ERA5/HRRR; `2` for the `Z` of an OME-NGFF
+  `(T,C,Z,Y,X)` microscopy stack sampled slice-by-slice — `open_geometries(store,
+  sample_axis=2)`). A sample is a slice along this axis that **does not cross a chunk
+  boundary**.
+- **field axis** — every other axis, carried **whole** as the per-sample payload
+  (`inner_shape`). Field axes may be *inner-chunked* (the ARCO/ERA5 norm); the engine
+  fetches each field axis's tiles and assembles them, decode-once, into the sample's
+  slot.
+
+`ArrayGeometry.shape`/`chunks` are in **physical** (zarr) order — they mirror the
+array metadata. The engine works in a *logical* view where the sample axis leads; the
+single physical↔logical permutation is confined to the scheduler (address the store
+key via `physical_chunk_coord`; `moveaxis` the decoded tile sample-first). With
+`sample_axis=0` both are identities, so the common path is untouched.
+
+**Windowing** is orthogonal to axis choice: a variable is a `(label, path, offset)`
+view, and `g.shift(k)` reads `array[anchor + offset]` *along the sample axis*. Several
+views of one array (same `path`, different `offset`) decode once and share slots — the
+forecasting `{"x": g, "y": g.shift(horizon)}` pattern, which composes with any
+`sample_axis`.
+
+**The frozen promises (an API a v0.1 user can build against):**
+
+- `Batch.arrays[label]` is always `(batch, *sample_inner)` — a leading batch axis plus
+  the per-sample payload. Future capabilities change what `sample_inner` *resolves to*,
+  never this shape.
+- The `(label, path, view)` variable model, decode-once dedup on shared `path`, and the
+  window helpers (`Batch.sample_indices` / `offsets` / `read_indices` / `stack`).
+- Framework adapters infer tensor shape from `view.geometries` (post-transform
+  `inner_shape`/`dtype`).
+
+**Reserved extension points (committed as *additive*, not yet built):**
+
+- **Multiple sample axes** (a product index — HCS `Well×Field×Time`, `Year×Day`).
+  `sample_axis: int` widens to `int | tuple[int, ...]` non-breakingly (a scalar still
+  means one axis). *Deferred:* a tuple trades away the "sample is a contiguous range in
+  one axis" invariant and pulls in the full product-draw-space refactor — see DESIGN.md.
+- **Patch / sliding-window sampling** (crop a giant field into `(64,64)` tiles). A field
+  axis gains an *extent* (declarative geometry); the crop *origins* are a sampler policy
+  (a strided grid, or a random draw — random crop already works today as a
+  `batch_transform` over the whole field). Memory-optimal patching (read only the tiles a
+  crop touches) is a pool/residency change, not a `Batch`-contract change.
+- Cross-node concatenation (many well-arrays into one stream) is a **catalog layer above
+  the core**, not part of this contract.
+
 ## Prefetch
 
 `source.InSituDataset.__iter__` runs a **background producer thread** that
@@ -689,12 +744,17 @@ pretending to be a general compute graph.
     cached. A cached cross-variable **derived variable** (compute once from
     co-scheduled input chunks, store as a pseudo-chunk keyed like any other) is a
     deliberate **future** feature.
-- **No cross-chunk / cross-sample-boundary ops.** A sample is a slice of the outer
-  (sample) axis that does **not span a chunk boundary** (the current contract). So
-  temporal stencils or windows that straddle two time-chunks (e.g. finite
+- **No cross-chunk / cross-sample-boundary ops.** A sample is a slice of the sample
+  axis (any single physical axis — see "the axis-role contract") that does **not span a
+  chunk boundary**. So temporal stencils or windows that straddle two chunks (e.g. finite
   differences across the seam, or a 6-step window crossing chunk edges) are not
   supported. Windows spanning *n* chunks are a future opt-in that trades away
   zero-copy.
+- **A field (inner) axis is carried whole.** A sample is the *entire* payload on every
+  non-sample axis; there is no spatial patching/cropping in the read yet, so a giant
+  field is assembled whole (crop it in a `batch_transform`). Native patch geometry —
+  and memory-optimal partial-field residency — is a reserved extension (see the
+  axis-role contract).
 - **Not a compute framework.** No general task graph, no cross-chunk reductions on
   the hot path, no lazy dask-style evaluation — by design (dask on the hot path is
   the thing we route around). Reductions like fitting a scaler run *over the loader*
@@ -702,10 +762,13 @@ pretending to be a general compute graph.
 - **Shuffle is approximate**, not global — chunk permutation + shuffle-block
   (`block_chunks` is the quality↔memory knob). Exact global shuffle is
   incompatible with chunk-aligned, low-copy reads.
-- **Variables must share the sample axis** (same length and chunk size) — an
-  enforced invariant; `InSituDataset` raises `ValueError` otherwise. The draw order
-  and gather use one chunk size for all variables; lifting this to per-variable
-  chunkings is future work.
+- **Variables must share the sample-axis length and chunk size** — an enforced
+  invariant; `InSituDataset` raises `ValueError` otherwise. The draw order and gather
+  use one chunk size for all variables, so pairing e.g. an OME-NGFF raw array
+  (Z-chunk 1) with its label mask (Z-chunk 30) is **not yet supported**; lifting the
+  shared-chunk-size half to per-variable chunkings is the next increment. (Which
+  *physical* axis is the sample axis is now free per the axis-role contract; only the
+  chunk *size* along it must currently match.)
 
 Rule of thumb: **per-variable, per-chunk, deterministic → chunk stage (cacheable).
 Cross-variable or per-sample-random → batch stage (not cached). Cross-chunk →
