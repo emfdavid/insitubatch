@@ -125,7 +125,8 @@ every term a tunable cap, none scaling with batch size or epoch length.
 
 This is the stable contract the engine commits to, and the extension points reserved
 for it. (For *why* it evolved this way — and why the tempting generalizations are
-deferred — see the "Sample geometry" entry in [DESIGN.md](../DESIGN.md).)
+deferred — see the "Sample geometry" entry in
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md).)
 
 Every physical axis of a zarr array has one **role**:
 
