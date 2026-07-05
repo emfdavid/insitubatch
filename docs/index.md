@@ -13,6 +13,15 @@ hot path that scales with **chunks, not samples**.
     open. `insitubatch` builds the layer that projects like light-speed-io and
     hypergrib stopped one step short of.
 
+**Where it wins.** On a well-chunked store it **matches a hand-tuned worker `DataLoader`**
+(swept to its best worker count) **at a fraction of the memory** — one process, bounded
+residency, ~ms to first batch instead of seconds of pool cold-start. When the chunk layout
+**isn't sample-optimized** — fat time-chunks, overlapping windows, verification grids — it pulls
+**far ahead of even a tuned worker pool**, because read planning decodes each shared chunk once
+where per-sample workers re-read it (the win grows with samples-per-chunk). It is **not** a
+universal speed win: at the one-sample-per-chunk (GRIB) end, or against an unbounded gather on
+large fields, a tuned pool can edge ahead per byte. Numbers: [Benchmarks](benchmarks.md).
+
 ## The problem, and the inversion
 
 The classic PyTorch `DataLoader` puts parallelism in worker **processes**, each running a

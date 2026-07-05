@@ -392,11 +392,13 @@ cache. This is the GCP twin of [`ops_aws.md` §10](ops_aws.md) (AWS G6 / L4).
 export ZONE=us-central1-a
 export GPU_INSTANCE=insitubatch-gpu
 
-# g2-standard-8 = 1x L4, 8 vCPU. The Deep Learning VM image ships the driver + CUDA;
+# g2-standard-16 = 1x L4, 16 vCPU. The Deep Learning VM image ships the driver + CUDA;
 # we still bring torch/jax/tf via uv (as on AWS). VERIFY the current image family.
+# vCPU count is load-bearing here: the async decode path scales with cores, so the
+# advection sweep numbers were taken on 16 vCPU -- an 8-vCPU box will read lower.
 gcloud compute instances create "$GPU_INSTANCE" \
   --zone="$ZONE" \
-  --machine-type=g2-standard-8 \
+  --machine-type=g2-standard-16 \
   --accelerator=type=nvidia-l4,count=1 \
   --maintenance-policy=TERMINATE \
   --image-family=common-cu123-debian-11 --image-project=deeplearning-platform-release \
@@ -444,8 +446,8 @@ gcloud compute instances delete "$INSTANCE" --zone="$ZONE"
 ## Cost
 
 - `n2-standard-32`: Spot ~$0.3–0.4/hr, on-demand ~$1.5/hr. **Stop or delete when done.**
-- `g2-standard-8` (1x L4): Spot ~$0.2–0.3/hr, on-demand ~$0.7–0.9/hr (**VERIFY** current
-  pricing). Local SSD is billed while the instance exists and wiped on stop.
+- `g2-standard-16` (1x L4, 16 vCPU): Spot ~$0.4–0.6/hr, on-demand ~$1.3–1.6/hr (**VERIFY**
+  current pricing). Local SSD is billed while the instance exists and wiped on stop.
 - GCS storage: ~$0.02/GB-mo (standard, regional). Rapid Storage is priced higher — **VERIFY**.
 - Static external IP (if used): a few cents a day while attached to a running VM; a
   reserved-but-unused address is billed at a higher rate — delete it at teardown.
