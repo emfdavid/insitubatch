@@ -46,16 +46,17 @@ def test_partition_blocks_empty() -> None:
     assert _partition_blocks(np.empty((0, 2), dtype=np.int64), block_chunks=4) == []
 
 
-def test_unequal_chunking_raises(tmp_path) -> None:
+def test_unequal_sample_length_raises(tmp_path) -> None:
     url = f"file://{tmp_path}/uv.zarr"
+    # Different sample-axis *length* is genuinely unsupported (samples aren't paired).
     ensure_local_dir(url)
     group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
     group.create_array("u10", shape=(40, 2, 2), chunks=(8, 2, 2), dtype="f4")
-    group.create_array("v10", shape=(40, 2, 2), chunks=(4, 2, 2), dtype="f4")  # different spc
+    group.create_array("v10", shape=(32, 2, 2), chunks=(8, 2, 2), dtype="f4")  # different length
     geoms = open_geometries(obstore_store(url))
     manifest = split_by_chunk(geoms["u10"], fractions=(0.8, 0.1, 0.1))
 
-    with pytest.raises(ValueError, match="same sample-axis"):
+    with pytest.raises(ValueError, match="sample-axis length"):
         InSituDataset(obstore_store(url), manifest, geometries=geoms)
 
 

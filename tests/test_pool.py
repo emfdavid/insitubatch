@@ -73,7 +73,8 @@ async def _decode_tiles(url: str, var: str) -> dict[tuple[int, ...], np.ndarray]
 def test_build_stored_chunk_reads_expands_and_dedups(tiled_store):
     url, _ = tiled_store
     geoms = open_geometries(obstore_store(url))
-    reads = build_stored_chunk_reads([0, 1, 0], geoms)  # repeat 0 -> must dedup
+    ref_spc = geoms["spatial"].sample_chunk_size
+    reads = build_stored_chunk_reads([0, 1, 0], geoms, ref_spc)  # repeat 0 -> must dedup
 
     # spatial expands to its inner grid (3x2=6), single_inner to 1; x2 outer chunks.
     per_outer = sum(g.n_inner_chunks(0) for g in geoms.values())
@@ -97,7 +98,7 @@ def test_pool_aliased_labels_decode_once(tiled_store):
     base = open_geometries(obstore_store(url), variables=[array])[array]  # base.name == array
     geoms = {"now": base, "next": base}  # two labels, one underlying array
     tiles = asyncio.run(_decode_tiles(url, array))
-    reads = build_stored_chunk_reads(range(base.n_chunks), {array: base})
+    reads = build_stored_chunk_reads(range(base.n_chunks), {array: base}, base.sample_chunk_size)
 
     pool = ChunkPool(geoms)
     for cid in range(base.n_chunks):
@@ -124,7 +125,7 @@ def test_pool_scatter_reconstructs_array(tiled_store, var):
     geoms = open_geometries(obstore_store(url), variables=[var])
     geom = geoms[var]
     tiles = asyncio.run(_decode_tiles(url, var))
-    reads = build_stored_chunk_reads(range(geom.n_chunks), geoms)
+    reads = build_stored_chunk_reads(range(geom.n_chunks), geoms, geom.sample_chunk_size)
 
     pool = ChunkPool(geoms)
     for cid in range(geom.n_chunks):

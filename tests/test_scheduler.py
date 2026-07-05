@@ -68,7 +68,7 @@ def test_scheduler_fills_pool_matches_array(tiled_store, var, bounded):
         budget = 2 * full  # holds two full chunks; admission must evict to fit the 3rd
 
     with _make(url, geoms, budget=budget) as sched:
-        fut = sched.start(range(geom.n_chunks))
+        fut = sched.start(range(geom.n_chunks), geom.sample_chunk_size)
         got = _drain_in_order(sched, geom, var, unpin=bounded)
         fut.result(timeout=30)  # surface any driver error
         assert sched.inflight_peak <= 4  # the single max_inflight budget holds
@@ -85,7 +85,7 @@ def test_scheduler_inflight_saturates_to_budget(tiled_store):
         obstore_store(url), variables=["spatial"]
     )  # 3 chunks x 6 tiles = 18 reads
     with _make(url, geoms, max_inflight=4) as sched:
-        fut = sched.start(range(geoms["spatial"].n_chunks))
+        fut = sched.start(range(geoms["spatial"].n_chunks), geoms["spatial"].sample_chunk_size)
         _drain_in_order(sched, geoms["spatial"], "spatial", unpin=False)
         fut.result(timeout=30)
         assert sched.inflight_peak == 4
@@ -102,7 +102,7 @@ def test_scheduler_close_closes_the_loop(tiled_store):
     url, _ = tiled_store
     geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     sched = _make(url, geoms)
-    sched.start(range(geoms["single_inner"].n_chunks))
+    sched.start(range(geoms["single_inner"].n_chunks), geoms["single_inner"].sample_chunk_size)
     sched.close()
     assert sched._loop.is_closed()
 
@@ -125,7 +125,7 @@ def test_scheduler_windowed_views_decode_once_and_lead(tiled_store):
     rows = np.stack([anchors // spc, anchors % spc], axis=1).astype(np.int64)
 
     with _make(url, geoms) as sched:
-        fut = sched.start(range(base.n_chunks))
+        fut = sched.start(range(base.n_chunks), base.sample_chunk_size)
         for cid in range(base.n_chunks):
             sched.pool.wait_ready(base.path, cid)  # slots are keyed by path
         batch = sched.pool.gather(rows, ["now", "next"], spc)
@@ -143,7 +143,7 @@ def test_scheduler_poisons_pool_on_driver_failure(tiled_store):
     url, _ = tiled_store
     ghost = ArrayGeometry(path="ghost", shape=(4, 2, 2), chunks=(2, 2, 2), dtype=np.dtype("f4"))
     with _make(url, {"ghost": ghost}) as sched:
-        fut = sched.start([0, 1])
+        fut = sched.start([0, 1], ghost.sample_chunk_size)
         with pytest.raises(Exception):  # noqa: B017 - zarr surfaces a store-specific error type
             fut.result(timeout=30)
         with pytest.raises(Exception):  # noqa: B017 - same error re-raised to the consumer

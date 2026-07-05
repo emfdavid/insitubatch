@@ -662,16 +662,16 @@ class ChunkPool:
     def gather(self, rows: np.ndarray, variables: list[str], sample_chunk_size: int) -> Batch:
         """Assemble one batch from ``[chunk_id, within]`` *anchor* draw rows.
 
-        Each row is one sample anchor ``t = chunk_id*spc + within``; each variable
-        reads its array at ``t + offset`` (offset 0 is the plain non-windowed case).
-        Output is in anchor-row order: row ``i`` of every variable is the same anchor,
-        ``sample_indices[i] == t_i``. Per variable the reads are grouped by the
-        variable's *own* (offset-shifted) chunk -- one coalesced fancy-index per chunk,
-        never a Python per-sample loop. The caller must have waited every referenced
-        ``(path, offset-shifted chunk)`` ready.
+        Each row is one sample anchor ``t = chunk_id*ref_spc + within`` in the reference
+        (manifest) grid; each variable reads its array at ``t + offset`` (offset 0 is the
+        plain non-windowed case). Output is in anchor-row order: row ``i`` of every variable
+        is the same anchor, ``sample_indices[i] == t_i``. Per variable the reads are grouped
+        by the variable's *own* (offset-shifted) chunk -- computed with that variable's
+        chunk size, so variables may chunk the sample axis differently -- one coalesced
+        fancy-index per chunk, never a Python per-sample loop. The caller must have waited
+        every referenced ``(path, offset-shifted chunk)`` ready.
         """
-        spc = sample_chunk_size
-        anchor = rows[:, 0].astype(np.int64) * spc + rows[:, 1].astype(np.int64)  # (N,)
+        anchor = rows[:, 0].astype(np.int64) * sample_chunk_size + rows[:, 1].astype(np.int64)
         n = anchor.shape[0]
 
         arrays: dict[str, np.ndarray] = {}
@@ -679,6 +679,7 @@ class ChunkPool:
             geom = self._geom[var]  # source: drives the read math (offset, path, chunking)
             out_geom = self._out_geom[var]  # post-transform: shape/dtype the consumer sees
             sample = anchor + geom.offset  # this view reads array[anchor + offset]
+            spc = geom.sample_chunk_size  # the variable's own grid (may differ from ref)
             read_cid = sample // spc
             within = sample % spc
             out = np.empty((n, *out_geom.inner_shape), dtype=out_geom.dtype)
