@@ -27,13 +27,17 @@ obstore, and dask thread pools nested inside forked workers. `insitubatch`
 concurrency budget and scatters them into a bounded pool that assembles batches —
 the pool doubles as the cache; torch runs `num_workers=0`.
 
-The payoff is being a **batteries-included** choice at both operating points: for
-**inference** it pays no worker-pool cold start (first batch in ~ms, not seconds — keeping a
-production hot pool alive is its own challenge); for **training** it uses far less memory
-(one process, not 32), reads each chunk once, and caches across epochs. Across the chunk
-spectrum it leads a *tuned* worker/xbatcher baseline; xbatcher stays ahead on single-pass
-throughput at the GRIB end (one sample per chunk, where there is nothing to amortize), and
-there the cross-epoch cache flips multi-epoch training back to insitu. Full comparison:
+The payoff is a **two-regime** story against the worker-process `DataLoader`. On a
+**well-chunked** store it **matches a hand-tuned worker/xbatcher pool** (swept to 32 workers)
+while running in **one process at bounded memory**, reaching first batch in ~ms rather than
+seconds of pool cold-start. When the chunk layout **isn't sample-optimized** — fat time-chunks,
+overlapping windows, verification grids — it pulls **far ahead of even a tuned pool**: read
+planning decodes each shared chunk **once** where a per-sample `__getitem__` re-reads it, so the
+win **grows with samples-per-chunk** (to ~25× at the fat end of the ERA5 sweep) and cross-epoch
+caching compounds it. The **honest boundary**: at the one-sample-per-chunk (GRIB) end there is
+nothing to amortize, so a tuned pool edges ahead on single-pass throughput, and against an
+*unbounded* concurrent gather on large fields bounded-inflight streaming trails per byte — the
+sweet spot is streaming with bounded memory, not a universal speed win. Full comparison:
 [Benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/).
 
 ## Status

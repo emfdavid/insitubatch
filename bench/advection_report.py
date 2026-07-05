@@ -11,7 +11,18 @@ median and inter-quartile range across repeats -- so no single run carries the c
 
 The compute-only ceiling is joined per ``geom`` (field geometry = the conv cost), giving each
 insitu config its ``% of ceiling``. Prints a Markdown table per sweep (paste-ready for
-docs/benchmarks.md) and, if plotly is present, writes an interactive HTML figure per sweep.
+docs/benchmarks.md).
+
+The figure metric is chosen **per sweep**, because they don't share a signal (if plotly is
+present, one interactive HTML each):
+
+* ``size`` -- a *compute* knob (field size sets the conv cost), so it moves **steady
+  throughput**: bars = samples/s (+IQR), line = steady stall %.
+* ``inflight`` / ``chunk`` / ``inner`` -- *IO* knobs. Once the cross-epoch cache is warm every
+  read is served from RAM, so steady throughput is flat **by construction**; the knob only
+  acts on the **cold first-fill**. So these plot bars = epoch-0 time-to-first-batch (ms), line
+  = epoch-0 stall %. (The tables stay on steady epochs -- that half is a throughput/ceiling
+  claim; only the figure follows the varying signal.)
 """
 
 from __future__ import annotations
@@ -21,14 +32,27 @@ from pathlib import Path
 
 import pandas as pd
 
+# The knob that varies in each sweep; its column is ``cfg_{_KNOB[sweep]}``.
+_KNOB = {
+    "inflight": "max_inflight",
+    "size": "size",
+    "chunk": "sample_chunk",
+    "inner": "inner_chunk",
+}
+# Which signal the figure follows: steady throughput vs the cold first-fill (see module docstring).
+_FIG_KIND = {"size": "throughput", "inflight": "cold", "chunk": "cold", "inner": "cold"}
+
 
 def load(path: str | Path) -> pd.DataFrame:
-    """Flatten the nested ``config`` dict into columns and keep steady (epoch>0) rows."""
+    """Flatten the nested ``config`` dict into columns (all epochs; consumers filter)."""
     raw = pd.read_json(path, lines=True)
     cfg = pd.json_normalize(raw["config"]).add_prefix("cfg_")
-    df = pd.concat([raw.drop(columns=["config"]), cfg], axis=1)
+    return pd.concat([raw.drop(columns=["config"]), cfg], axis=1)
+
+
+def _steady(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep steady (epoch>0) rows; fall back to all rows if a run had a single epoch."""
     steady = df[df["epoch"] > 0].copy()
-    # Fall back to all rows if a run only had one epoch (no warm rows to keep).
     return steady if not steady.empty else df
 
 
@@ -47,15 +71,13 @@ def _iqr(s: pd.Series) -> float:
 
 
 def summarize(df: pd.DataFrame, sweep: str) -> pd.DataFrame:
-    """One row per config of ``sweep``: median +/- IQR samples/s + stall, and % of ceiling."""
+    """One row per config of ``sweep``: median +/- IQR samples/s + stall, and % of ceiling.
+
+    Steady (epoch>0) only; ``df`` may span all sweeps -- the ceiling is joined per ``geom`` so
+    a config uses its geom's ceiling even when that ceiling was collected under another sweep."""
+    df = _steady(df)
     sdf = df[df["cfg_sweep"] == sweep]
-    # The knob that varies in this sweep (for a readable leading column).
-    knob = {
-        "inflight": "cfg_max_inflight",
-        "size": "cfg_size",
-        "chunk": "cfg_sample_chunk",
-        "inner": "cfg_inner_chunk",
-    }[sweep]
+    knob = f"cfg_{_KNOB[sweep]}"  # the varying knob's column (readable leading column)
     keys = [knob, "cfg_geom"]
 
     insitu = _per_repeat(sdf, "insitu", keys)
@@ -83,12 +105,7 @@ def summarize(df: pd.DataFrame, sweep: str) -> pd.DataFrame:
 
 
 def to_markdown(agg: pd.DataFrame, sweep: str) -> str:
-    knob = {
-        "inflight": "max_inflight",
-        "size": "size",
-        "chunk": "sample_chunk",
-        "inner": "inner_chunk",
-    }[sweep]
+    knob = _KNOB[sweep]
     knob_col = f"cfg_{knob}"
     lines = [
         f"### {sweep}",
@@ -105,28 +122,55 @@ def to_markdown(agg: pd.DataFrame, sweep: str) -> str:
     return "\n".join(lines)
 
 
-def _figure(agg: pd.DataFrame, sweep: str, out_dir: Path) -> str | None:
+def _xlabels(col: pd.Series) -> pd.Series:
+    """Knob values as categorical x labels, ``NaN`` -> ``default`` (the unthrottled engine)."""
+    return col.fillna(-1).astype(int).astype(str).replace("-1", "default")
+
+
+def _cold_start(df: pd.DataFrame, sweep: str) -> pd.DataFrame:
+    """Per-knob cold first-fill (epoch 0): median TTFB (ms) + stall over repeats, knob-sorted."""
+    knob = f"cfg_{_KNOB[sweep]}"
+    cold = df[(df["cfg_sweep"] == sweep) & (df["run"] == "insitu") & (df["epoch"] == 0)]
+    return (
+        cold.groupby(knob, dropna=False)
+        .agg(ttfb_ms=("ttfb_ms", "median"), stall=("data_stall_fraction", "median"))
+        .reset_index()
+        .sort_values(knob, na_position="last")
+        .reset_index(drop=True)
+    )
+
+
+def _figure(df: pd.DataFrame, agg: pd.DataFrame, sweep: str, out_dir: Path) -> str | None:
+    """One HTML per sweep, plotting the signal that actually varies (see ``_FIG_KIND``)."""
     try:
         import plotly.graph_objects as go
     except ImportError:
         return None
-    knob = {
-        "inflight": "max_inflight",
-        "size": "size",
-        "chunk": "sample_chunk",
-        "inner": "inner_chunk",
-    }[sweep]
-    x = agg[f"cfg_{knob}"].fillna(-1).astype(int).astype(str).replace("-1", "default")
+    knob = _KNOB[sweep]
     fig = go.Figure()
-    fig.add_bar(
-        x=x, y=agg["samples_per_s"], name="samples/s", error_y={"array": agg["samples_iqr"]}
-    )
-    fig.add_scatter(x=x, y=agg["stall"] * 100, name="stall %", yaxis="y2", mode="lines+markers")
+    if _FIG_KIND[sweep] == "throughput":
+        # Compute knob: it moves steady throughput.
+        x = _xlabels(agg[f"cfg_{knob}"])
+        fig.add_bar(
+            x=x, y=agg["samples_per_s"], name="samples/s", error_y={"array": agg["samples_iqr"]}
+        )
+        fig.add_scatter(x=x, y=agg["stall"] * 100, name="stall %", yaxis="y2", mode="lines+markers")
+        y_title, y2_name, subtitle = "samples/s (median, IQR)", "stall %", "steady throughput"
+    else:
+        # IO knob: steady throughput is cache-flat, so plot the cold first-fill it does move.
+        cold = _cold_start(df, sweep)
+        x = _xlabels(cold[f"cfg_{knob}"])
+        fig.add_bar(x=x, y=cold["ttfb_ms"], name="cold TTFB (ms)")
+        fig.add_scatter(
+            x=x, y=cold["stall"] * 100, name="epoch-0 stall %", yaxis="y2", mode="lines+markers"
+        )
+        y_title = "cold time-to-first-batch (ms)"
+        y2_name, subtitle = "epoch-0 stall %", "cold first-fill"
     fig.update_layout(
-        title=f"advection sweep: {sweep}",
+        title=f"advection sweep: {sweep} — {subtitle}",
         xaxis_title=knob,
-        yaxis_title="samples/s (median, IQR)",
-        yaxis2={"title": "stall %", "overlaying": "y", "side": "right", "rangemode": "tozero"},
+        yaxis_title=y_title,
+        yaxis2={"title": y2_name, "overlaying": "y", "side": "right", "rangemode": "tozero"},
         legend={"orientation": "h"},
     )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +191,7 @@ def main() -> None:
             continue
         agg = summarize(df, sweep)
         print("\n" + to_markdown(agg, sweep) + "\n")
-        fig = _figure(agg, sweep, args.out)
+        fig = _figure(df, agg, sweep, args.out)
         if fig:
             print(f"figure -> {fig}")
 

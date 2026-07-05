@@ -239,10 +239,87 @@ depending* on the GIL is a stronger position than needing it. The
 (`py-spy --native`) makes it visual: time is in Rust IO + C decode + numpy, with only a
 thin Python sliver.
 
+## Keeping the accelerator fed — stall vs the compute ceiling
+
+Stories 1–4 measure the loader against other loaders on a CPU box. This one asks a
+different question on a **GPU**: when a real training step is pulling batches, what
+fraction of the GPU's time is spent *waiting on data* (`data_stall_fraction`) versus
+computing? The reference is the **compute ceiling** — the identical training loop with
+the data preloaded in RAM (zero IO), i.e. the fastest this model can possibly run. insitu's
+`% of ceiling` is how much of that the streaming loader keeps.
+
+!!! note "GPU run"
+    A **real advection-forecast training loop** (a small conv net, `--device cuda`) on a
+    [`g2-standard-16`](https://github.com/emfdavid/insitubatch/blob/main/bench/ops_gcp.md)
+    (1× NVIDIA L4, **16 vCPU**, us-central1-a). Data is **WeatherBench2** (the public ARCO
+    ERA5 store) for the read-depth sweep, plus synthetic incompressible-f32 stores for the
+    geometry sweeps. **5 epochs × 5 repeats** per config (`bench/advection_sweep.py`),
+    median reported; the loop trains — on WB2 held-out data the model beats persistence
+    (24 h RMSE **1.98 vs 2.23**), so this is a forecaster, not a throughput harness.
+
+**The headline: insitu keeps the L4 94–98% fed, and the loop is compute-bound, not
+IO-bound.** The heavier the per-sample compute, the closer to the ceiling — decode overlaps
+more compute — so *growing* the field only tightens the result. Median across repeats:
+
+| workload (geom) | compute ceiling | insitu (warm) | **% of ceiling** | warm stall |
+|---|--:|--:|--:|--:|
+| WB2 128×64 | 1406 samp/s | 1330 | **94.6%** | 3.5% |
+| synthetic 64² | 4392 samp/s | 3842 | **87.7%** | 10.4% |
+| synthetic 128² | 588 samp/s | 577 | **98.0%** | 1.8% |
+| synthetic 256² | 145 samp/s | 143 | **98.4%** | 0.5% |
+
+The only config that dips is the **smallest** field (64²): cheapest compute per sample, so
+IO is the largest share and stall rises to ~10% — and even there insitu keeps ~88%. You
+cannot reach an IO-bound regime by making the field *bigger* (bytes and conv cost both scale
+with pixels); only by shrinking it, and insitu stays ahead when you do.
+
+<iframe src="../figures/advection_size.html" width="100%" height="420" frameborder="0"></iframe>
+
+### Read-ahead depth is a cold-start knob, not a throughput knob
+
+Throttling `max_inflight` (concurrent in-flight reads) on the real WB2 store stretches the
+**cold first-fill** but leaves **steady state untouched** — after epoch 0 the cross-epoch
+cache (story 3) serves every read, so prefetch depth stops mattering:
+
+| max_inflight | 1 | 2 | 4 | 8 | 16 | default |
+|---|--:|--:|--:|--:|--:|--:|
+| cold TTFB | 3.46 s | 1.20 s | 0.66 s | 0.45 s | 0.35 s | 0.32 s |
+| epoch-0 stall | 80.5% | 40.0% | 19.3% | 14.0% | 11.1% | 10.4% |
+| **warm samp/s** | 1332 | 1327 | 1330 | 1329 | 1327 | 1332 |
+| warm stall | 3.7% | 3.7% | 3.6% | 3.6% | 3.7% | 3.4% |
+
+This is the honest form of "stall rises when you starve the prefetcher": it rises **only in
+the cold fill**, where read-ahead is doing real work (single-inflight stretches first-batch
+latency 10×, 0.32 → 3.46 s), and vanishes once warm. Steady-state throughput and stall are
+flat across the whole depth sweep.
+
+<iframe src="../figures/advection_inflight.html" width="100%" height="420" frameborder="0"></iframe>
+
+### Across the chunk spectrum, the loader stays ahead
+
+Sweeping the sample chunk from fat (256) toward the one-sample-per-read GRIB end (4), and
+fanning a fat chunk out into spatial tiles (`inner_chunk` 128 → 32), both hold ~98% of the
+ceiling on the 128² load — the geometry barely moves the result:
+
+| sample_chunk (fat → GRIB) | 256 | 64 | 16 | 4 |
+|---|--:|--:|--:|--:|
+| % of ceiling | 98.2 | 98.1 | 97.4 | 97.3 |
+| warm stall | 1.8% | 1.8% | 2.1% | 2.3% |
+
+Shrinking the chunk 64× toward GRIB costs ~1% of the ceiling; spatial tiling is flat within
+noise. On this compute load the loader is never the bottleneck — the deferred baseline
+head-to-head (below) is where the chunk spectrum separates *engines*. The only visible cost is
+again in the cold fill: TTFB rises as chunks shrink (0.41 → 0.73 s) or fan into more tiles
+(0.40 → 1.21 s), since both mean more, smaller first-fill reads.
+
+<iframe src="../figures/advection_chunk.html" width="100%" height="420" frameborder="0"></iframe>
+<iframe src="../figures/advection_inner.html" width="100%" height="420" frameborder="0"></iframe>
+
 ## Deferred
 
-- **Prefetch overlap vs per-batch compute** (`g3`) — needs a `compute_ms` sweep; insitu
-  stays GPU-fed while baselines stall once IO-bound.
+- **GPU baseline head-to-head** — the section above establishes insitu stays GPU-fed
+  (94–98% of the compute ceiling); the matching `compute_ms` sweep of the **worker stacks**
+  stalling once IO-bound is still to run.
 - **GPU-native path** (M2) — `device_transform` after DLPack; GPU-utilization graphs.
 
 ## Reproduce
