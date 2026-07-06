@@ -1,8 +1,10 @@
 # API reference
 
-The public surface is everything re-exported from the top-level `insitubatch`
-package (its `__all__`), plus the framework-neutral `InSituDataset` source from
-`insitubatch.source` and the optional DLPack adapters in `insitubatch.frameworks`.
+The public surface is the top-level `insitubatch` package — **everything in its
+`__all__`**. `InSituDataset` and the framework adapters are re-exported there, so
+import them from the package root (`from insitubatch import InSituDataset, to_torch`),
+not from submodules. The adapters are optional: they import torch / JAX / TF **lazily**,
+only when called, so importing `insitubatch` never pulls a framework in.
 
 ## `insitubatch`
 
@@ -10,11 +12,11 @@ package (its `__all__`), plus the framework-neutral `InSituDataset` source from
     options:
       show_root_heading: false
 
-## `insitubatch.source`
+## `InSituDataset`
 
-::: insitubatch.source.InSituDataset
+::: insitubatch.InSituDataset
 
-## `insitubatch.frameworks`
+## Framework adapters
 
 ::: insitubatch.frameworks
     options:

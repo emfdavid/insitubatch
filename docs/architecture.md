@@ -189,6 +189,7 @@ reserved (additive) extension, and what is deliberately out of scope.
 | Train over a time/sample axis | ERA5/HRRR reanalysis; astronomy light curves | `sample_axis=0` (default) |
 | Sample over *any* single axis | OME-NGFF 2D segmentation over `Z`; `T`-frame or volumetric stacks | `open_geometries(store, sample_axis=2)` |
 | Paired inputs+targets with *different* sample-axis chunking | microscopy raw image + label mask (Z-chunk 1 vs 30) | two variables, one manifest |
+| Multiple co-registered variables at one anchor (data + mask + weight) | radio astronomy MSv4 visibilities: `VISIBILITY` + `FLAG` + `WEIGHT`, sampled over `time` | variables share one manifest |
 | Forecasting input/target windows | weather: input@`t`, target@`t+h` | `g.shift(h)` views (decode-once) |
 | Whole inner field per sample, spatial grid fetched decode-once | ARCO/ERA5 `721×1440` fields; microscopy planes | inner (field) chunking |
 | Cross-variable derived fields & per-sample random augmentation | `windspeed=√(u²+v²)`; random crop of the whole field | `batch_transform` |
@@ -211,6 +212,19 @@ reserved (additive) extension, and what is deliberately out of scope.
 | General compute graph / cross-chunk reductions | lazy dask-style evaluation | dask is off the hot path by design; reductions run *over* the loader |
 | Resharding into a sample-per-file format | MDS/tar/WebDataset ETL | we train **in place**, no reshard |
 | Scattered / boolean sample selection for splits | arbitrary index masks | splits are chunk-contiguous (leakage-safe) |
+
+**Mapping a new domain onto the contract — worked example: radio astronomy (MSv4).** The
+[xradio](https://github.com/casangi/xradio) MeasurementSet-v4 visibility dataset stores
+`VISIBILITY` `(time, baseline_id, frequency, polarization)` (complex) alongside `FLAG`
+(same shape, boolean) and `WEIGHT`. This is the same shape as the shipped microscopy case:
+pick the **sample axis** (`time` for per-integration samples, or `frequency`/`baseline_id`),
+carry the rest as the inner field, and gather `VISIBILITY` + `FLAG` + `WEIGHT` at one anchor
+from **one manifest** — no reshard. The natural task, **RFI-flag detection** (predict `FLAG`
+from `|VISIBILITY|`), is the segmentation pattern with an amplitude-threshold baseline in
+place of Otsu. Complex data needs no special support: take `np.abs()` in a `batch_transform`
+(or at the model boundary), so the numpy `Batch` and the DLPack adapters only ever see real
+arrays. This is a schema-level mapping, not yet a shipped example — but every capability it
+needs is validated today.
 
 ## Prefetch
 

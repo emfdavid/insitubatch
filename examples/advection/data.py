@@ -29,14 +29,14 @@ import zarr
 from zarr.abc.store import Store
 
 from insitubatch import (
+    Batch,
+    InSituDataset,
     arraylake_store,
     ensure_local_dir,
     obstore_store,
     open_geometries,
     split_by_chunk,
 )
-from insitubatch.source import InSituDataset
-from insitubatch.types import Batch
 
 # The public WeatherBench2 ERA5 (6-hourly) ARCO store the wb2_* examples use.
 WB2_URL = (
