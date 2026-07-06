@@ -61,6 +61,27 @@ def test_fine_variable_maps_onto_coarse_reference(tmp_path) -> None:
     ds.close()
 
 
+def test_windowed_target_on_coarser_variable(tmp_path) -> None:
+    # shift + per-variable chunks together: a forecast whose target is a *differently-chunked*
+    # variable read one step ahead. input = raw (spc=1); target = labels (spc=8) shifted +1.
+    url = f"file://{tmp_path}/w.zarr"
+    srcs = _write_two(url, n=40, spc_a=1, spc_b=8)
+    opened = open_geometries(obstore_store(url))
+    geoms = {"x": opened["raw"], "y": opened["labels"].shift(1)}
+    manifest = split_by_chunk(opened["raw"], fractions=(1.0, 0.0, 0.0))  # anchor grid spc=1
+    ds = InSituDataset(
+        obstore_store(url), manifest, geometries=geoms, batch_size=6, block_chunks=3, shuffle=False
+    )
+    seen = 0
+    for b in ds.all:
+        for i, anchor in enumerate(b.sample_indices):
+            np.testing.assert_array_equal(b.arrays["x"][i], srcs["raw"][anchor])
+            np.testing.assert_array_equal(b.arrays["y"][i], srcs["labels"][anchor + 1])
+            seen += 1
+    assert seen == 39  # shift(1) drops the last anchor (no sample at n)
+    ds.close()
+
+
 def test_uneven_chunking_shuffled(tmp_path) -> None:
     url = f"file://{tmp_path}/c.zarr"
     srcs = _write_two(url, n=48, spc_a=2, spc_b=12)
