@@ -90,3 +90,41 @@ def test_windowing_composes_with_sample_axis(tmp_path) -> None:
             np.testing.assert_array_equal(b.arrays["x"][i], logical[anchor])
             np.testing.assert_array_equal(b.arrays["y"][i], logical[anchor + 1])
     ds.close()
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_shift_and_uneven_chunks_compose_with_sample_axis(tmp_path, shuffle) -> None:
+    # All three seams at once: a shifted target (window) drawn from a *differently-chunked*
+    # variable (per-variable chunks) over a *non-zero* sample axis. raw Z-chunk 1, labels
+    # Z-chunk 3, sampled over Z (axis 1); target = labels one Z-slice ahead. Exercises the
+    # plan/gather offset math, the per-variable spc mapping, and the scheduler moveaxis together.
+    url = f"file://{tmp_path}/zwc.zarr"
+    ensure_local_dir(url)
+    group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
+    rdata = np.arange(2 * 9 * 4 * 4, dtype="f4").reshape(2, 9, 4, 4)  # (C, Z, Y, X)
+    ldata = rdata + 1000.0  # distinguishable per variable
+    group.create_array("raw", shape=(2, 9, 4, 4), chunks=(2, 1, 4, 4), dtype="f4")[:] = rdata
+    group.create_array("labels", shape=(2, 9, 4, 4), chunks=(2, 3, 4, 4), dtype="f4")[:] = ldata
+
+    opened = open_geometries(obstore_store(url), sample_axis=1)
+    geoms = {"x": opened["raw"], "y": opened["labels"].shift(1)}
+    manifest = split_by_chunk(opened["raw"], fractions=(1.0, 0.0, 0.0))  # anchor grid = raw spc=1
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        geometries=geoms,
+        batch_size=2,
+        block_chunks=3,
+        shuffle=shuffle,
+    )
+
+    rlog = np.moveaxis(rdata, 1, 0)  # (Z, C, Y, X)
+    llog = np.moveaxis(ldata, 1, 0)
+    anchors: list[int] = []
+    for b in ds.all:
+        for i, anchor in enumerate(b.sample_indices):
+            np.testing.assert_array_equal(b.arrays["x"][i], rlog[anchor])  # B+C: no shift
+            np.testing.assert_array_equal(b.arrays["y"][i], llog[anchor + 1])  # A+B+C
+            anchors.append(int(anchor))
+    assert sorted(anchors) == list(range(8))  # 9 Z-slices, shift(1) drops the last, each once
+    ds.close()
