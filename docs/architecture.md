@@ -1,8 +1,8 @@
 # Architecture: loaders, parallelism, and prefetch
 
 This doc contrasts the classic worker-based data loader with insitubatch's
-async-driven engine, then specifies the prefetch pipeline and the Earth2Studio
-integration surfaces. For the why behind the project see
+async-driven engine, then specifies the prefetch pipeline, the sample-geometry contract, and
+how downstream frameworks integrate. For the why behind the project see
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md).
 
 ## The inversion in one line
@@ -704,81 +704,27 @@ experimentation) and the kvikio/GDS NVMe→GPU feed off the persistent `.npy` ti
 on the roadmap
 ([DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md)).
 
-## Earth2Studio integration
+## Downstream integration — tensors, not xarray
 
-A raw `zarr.storage.ObjectStore(obstore ...)` swap in their ARCO source delivers
-*faster bytes* — that's an **obstore** win, not an insitubatch one. insitubatch
-earns its place by adding what obstore alone does not:
+insitubatch delivers **tensor batches** and never builds `xr.DataArray`. That decides how it
+plugs into an xarray-native inference framework such as
+[Earth2Studio](https://github.com/NVIDIA/earth2studio): **around the models, not inside their
+xarray loop.** A raw `ObjectStore(obstore)` store-swap in such a framework's ARCO source buys
+*faster bytes* — but that is an **obstore** win, not ours. insitubatch earns its place for
+batched training / fine-tuning / hindcast scoring: read the ARCO/zarr store → DLPack →
+`(torch.Tensor, coords)` and drive the model directly (the `coords` we supply is a light
+`OrderedDict` of coordinate arrays — metadata, not the xarray machinery), instead of routing
+every `(time, variable)` through the framework's per-request xarray `DataSource`. What that
+adds over the store-swap is the **loader**:
 
-1. **Bounded fan-out** — their `gather(*tasks)` is *unbounded*; a hindcast /
-   scoring request over thousands of timesteps spawns thousands of concurrent
-   getitems. `max_inflight` sustains throughput at bounded memory.
-2. **Read-plan dedup across a request** — ensembles (many members), multiple lead
-   times, and overlapping verification windows touch the same chunks repeatedly;
-   their per-`(time, var)` task model re-reads them, our plan collapses to one
-   read each.
-3. **Prefetch overlap** — for sequential inference (rolling through init times;
-   autoregressive rollout pulling forcings each step), prefetch the next step's
-   inputs *during* the current step's compute. This hides the IO time observed in
-   real ensemble runs (e.g. StormCast).
-4. **For training on big hindcasts (the real target)** — the whole loader: split,
-   shuffle, prefetch, bounded memory.
+- **Bounded fan-out** — one `max_inflight` budget vs an unbounded `gather` over thousands of
+  timesteps; sustained throughput at bounded memory.
+- **Read-plan dedup across a request** — ensembles, lead times, and overlapping verification
+  windows touch the same chunks repeatedly; the plan collapses them to one read each.
+- **Prefetch overlap** for sequential/autoregressive rollout, and split + shuffle for training.
 
-### Where tensors are born (grounded in `run.py` / `data/utils.py`)
-
-```
-DataSource.__call__ ──► xr.DataArray         # ARCO: zarr-async + fsspec/gcsfs
-        ▼
-fetch_data(source, time, variable, lead_time, device)
-        ▼
-prep_data_array(da, device) ──► (torch.Tensor, coords)
-        ▼
-prognostic.create_iterator(x, coords) ──► rollout yields (torch.Tensor, coords)
-```
-
-xarray is **load-bearing all the way down to `prep_data_array`** — it carries
-their lexicon/vocabulary, lat/lon coords, and optional regridding (`interp_to`).
-The torch tensor only materializes at the end. So inside their inference loop
-there is **no public "give me a torch batch from cloud" hook**; the only clean
-public seam is the `xr.DataArray` DataSource.
-
-### Two integration philosophies — only one is ours
-
-- **Inside their inference loop → obstore store-swap (NOT insitubatch).** Keep
-  their xarray DataSource; swap `FsspecStore(gcsfs/MSC)` → `ObjectStore(obstore)`
-  for faster bytes. Having insitubatch *build* `xr.DataArray` would add a
-  conversion and force us to reimplement their lexicon/coords/regrid machinery.
-  That is an **obstore** contribution, not an insitubatch one.
-
-- **Around their models → insitubatch delivers tensor batches (the real play).**
-  For training, fine-tuning, and big batched hindcast/scoring, skip
-  `DataSource`/`fetch_data`/xarray entirely: insitubatch reads ARCO / your zarr →
-  DLPack → `(torch.Tensor, coords)` and feeds `prognostic.create_iterator(x,
-  coords)` directly. The `coords` we supply is a light `OrderedDict` of
-  coordinate arrays (variable names, lat/lon, lead/time) — metadata, not the
-  xarray machinery. This is "closer to the GPU," many-samples-through-the-GPU, and
-  exactly what our infra does.
-
-> insitubatch never builds xarray. Stay-in-their-loop = obstore store-swap;
-> batched workloads = insitubatch drives their *model* with tensor batches.
-
-(Tell: `fetch_data(legacy=False)` already returns a **cupy-backed** `xr.DataArray`
-for CUDA — NVIDIA themselves reaching for GPU-resident arrays. A fully
-tensor-native fast path in E2S is conceivable later, but it is a larger change to
-their framework, and out of scope today.)
-
-### Positioning vs NVIDIA MSC and GDS
-
-- **MSC (Multi-Storage Client)** is an `fsspec` client (integrates with
-  Zarr/Xarray via `msc://`). Its value is multi-backend access + caching (incl.
-  local NVMe) + observability — not a faster cold-read primitive. Because it
-  routes through fsspec, obstore can still beat it on **cold raw-read
-  throughput**. MSC shines with big infra + a warm NVMe cache; insitubatch's
-  niche is **cold-cache / streaming / commodity-infra / bounded-memory**.
-- **GDS (GPUDirect Storage / cuFile)** is a separate path — direct DMA from
-  NVMe/NVMe-oF into GPU memory. No evidence MSC uses GDS. GDS is where our
-  **Phase 2 kvikio path** lives — a GPU-direct route MSC doesn't natively
-  provide. (From docs, not MSC source — confirm before using in a public claim.)
+A reference integration — an Earth2Studio `DataSource` backed by `InSituDataset` — is in
+[emfdavid/earth2studio#1](https://github.com/emfdavid/earth2studio/pull/1).
 
 ## What this does NOT do (scope boundaries)
 
@@ -812,13 +758,13 @@ pretending to be a general compute graph.
 - **Shuffle is approximate**, not global — chunk permutation + shuffle-block
   (`block_chunks` is the quality↔memory knob). Exact global shuffle is
   incompatible with chunk-aligned, low-copy reads.
-- **Variables must share the sample-axis length and chunk size** — an enforced
-  invariant; `InSituDataset` raises `ValueError` otherwise. The draw order and gather
-  use one chunk size for all variables, so pairing e.g. an OME-NGFF raw array
-  (Z-chunk 1) with its label mask (Z-chunk 30) is **not yet supported**; lifting the
-  shared-chunk-size half to per-variable chunkings is the next increment. (Which
-  *physical* axis is the sample axis is now free per the axis-role contract; only the
-  chunk *size* along it must currently match.)
+- **Variables must share the sample-axis *length*** — an enforced invariant;
+  `InSituDataset` raises `ValueError` otherwise (samples are paired row-for-row across
+  variables). They **may** chunk that axis *differently*: the manifest defines a reference
+  anchor grid and each variable maps global anchors onto its own chunk grid, so an OME-NGFF
+  raw array (Z-chunk 1) pairs with its label mask (Z-chunk 30) with no reshard. Which
+  *physical* axis is the sample axis is also free (the axis-role contract) — only the
+  *length* along it must match.
 
 Rule of thumb: **per-variable, per-chunk, deterministic → chunk stage (cacheable).
 Cross-variable or per-sample-random → batch stage (not cached). Cross-chunk →
