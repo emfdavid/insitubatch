@@ -8,6 +8,12 @@ and TensorFlow. It turns an existing Zarr archive into a shuffled, split-aware
 data source built to **keep the GPU fed** — **with no reshard** — and a Python
 hot path that scales with **chunks, not samples**.
 
+It is **domain-general**: the sample axis is a *role*, not a fixed dimension. The same engine
+trains on ERA5/weather over time, segments **OME-NGFF microscopy** volumes over `Z`
+([runnable example](https://github.com/emfdavid/insitubatch/blob/main/examples/microscopy) —
+raw image + label mask co-batched with no reshard), and maps cleanly onto **radio-astronomy**
+visibilities. See the [use-case tables](architecture.md#use-case-support).
+
 !!! quote
     The IO race is over (obstore/icechunk saturate the NIC). The *loader* race is
     open. `insitubatch` builds the layer that projects like light-speed-io and
@@ -48,9 +54,15 @@ The core `InSituDataset` is a framework-neutral iterable of numpy `Batch` object
 torch / JAX / TF handoff is a thin optional DLPack adapter in `insitubatch.frameworks`.
 
 ```python
-from insitubatch import obstore_store, open_geometries, split_by_chunk
-from insitubatch.source import InSituDataset
-from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset
+from insitubatch import (
+    InSituDataset,
+    as_tf_dataset,
+    as_torch,
+    obstore_store,
+    open_geometries,
+    split_by_chunk,
+    to_jax,
+)
 from torch.utils.data import DataLoader
 
 # The engine reads a zarr Store; obstore_store builds one for file://, s3://, gs://.

@@ -13,6 +13,12 @@ Jax and TensorFlow. It turns an existing Zarr archive into a shuffled,
 split-aware data source built to **keep the GPU fed** — **with no reshard**
 — and a Python hot path that scales with **chunks, not samples**.
 
+It is **domain-general**: the sample axis is a *role*, not a fixed dimension. The same engine
+trains on ERA5/weather over time, segments **OME-NGFF microscopy** volumes over `Z`
+([runnable example](examples/microscopy/) — raw image + label mask co-batched with no reshard),
+and maps cleanly onto **radio-astronomy** visibilities — one contract, *any* single sample axis,
+variables that chunk it differently.
+
 > The IO race is over (obstore/icechunk saturate the NIC). The *loader* race is
 > open. `insitubatch` builds the layer that projects like light-speed-io and
 > hypergrib stopped one step short of. See [DESIGN.md](DESIGN.md).
@@ -149,11 +155,11 @@ The core `InSituDataset` is a **framework-neutral source of numpy `Batch` object
 inherits nothing framework-specific. You iterate its split *views* (`ds.train` shuffled,
 `ds.val` / `ds.test` / `ds.all` deterministic), which all share **one** pool, so a chunk
 two splits both read decodes once. Handoff to torch / JAX / TF is a thin, optional DLPack
-adapter layer in `insitubatch.frameworks`; the core imports no framework.
+adapter (re-exported from the package root; defined in `insitubatch.frameworks`) — the core
+imports no framework, and importing `insitubatch` pulls none in.
 
 ```python
-from insitubatch import obstore_store, open_geometries, split_by_chunk
-from insitubatch.source import InSituDataset
+from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_chunk
 
 # The engine reads a zarr Store; build one per backend. obstore_store covers
 # file://, s3://, gs://, az://. (fsspec_store reaches GCS Rapid/requester-pays;
@@ -180,7 +186,7 @@ differ — torch needs a `Dataset` subclass, JAX iterates directly, TF wraps via
 `from_generator`:
 
 ```python
-from insitubatch.frameworks import as_torch, to_jax, as_tf_dataset
+from insitubatch import as_tf_dataset, as_torch, to_jax
 from torch.utils.data import DataLoader
 
 # torch: parallelism is in our event loop, so num_workers=0, batch_size=None

@@ -1,6 +1,6 @@
 [project]
 name = "insitubatch"
-version = "0.0.3"
+version = "0.1.0"
 description = "Train in place on n-dimensional cloud tensors: the data-loader orchestration layer on top of solved async IO (obstore / zarr v3 / icechunk)."
 readme = "README.md"
 license = "MIT"

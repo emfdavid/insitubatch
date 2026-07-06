@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.0 — 2026-07-06
+
+**The sample-geometry generalization + a stable public API.** insitubatch is no longer
+weather-only: the sample axis is now a *role*, not a fixed dimension, validated cross-domain
+against a real bio-imaging store — and the headline classes are exposed at the package root
+so the surface is exactly `insitubatch.__all__`.
+
+- **Arbitrary sample axis** — `open_geometries(store, sample_axis=k)` lets *any single*
+  physical axis be the sample axis (e.g. sample over `Z` of an OME-NGFF `(T,C,Z,Y,X)` stack),
+  by keeping `shape`/`chunks` in physical order and confining one physical↔logical permutation
+  to the scheduler. The common (axis-0) path is unchanged.
+- **Per-variable sample-axis chunk size** — co-registered variables may chunk the sample axis
+  *differently* (the OME-NGFF raw image Z-chunk 1 + label mask Z-chunk 30 pairing) as long as
+  they share its *length*. The manifest defines a reference anchor grid; each variable maps
+  global anchors onto its own chunk grid. Composes with windowing and arbitrary axes; covered
+  including the uneven-tail case where a coarse chunk runs out at the end of the axis.
+- **Cross-domain example** — `examples/microscopy/`: OME-NGFF cell segmentation streamed from
+  the public IDR store, raw + mask co-batched over `Z` with no reshard, a tiny CNN beating an
+  Otsu-threshold baseline. Proves the geometry generalizes beyond weather.
+- **Public API surface** — `InSituDataset` and the framework adapters (`to_torch`, `to_jax`,
+  `to_tf`, `as_torch`, `as_tf_dataset`) are now re-exported from the top-level package (added
+  to `__all__`); import them from `insitubatch`, not submodules. Re-exports are identity and
+  the adapters still import their framework lazily, so importing `insitubatch` pulls in none.
+- **Advection GPU benchmark** — a stall/ceiling sweep (`bench/advection_sweep.py`) and results:
+  the loader holds 94–98% of the in-memory compute ceiling on the advection forecast, i.e. it
+  keeps a GPU fed; two-regime framing and figures on the benchmarks page.
+- **Docs** — the sample-geometry *axis-role contract* (architecture) and *how the ladder
+  evolved* (DESIGN); cross-domain use-case tables; a radio-astronomy (xradio MSv4) mapping for
+  astrophysics readers.
+
 ## 0.0.3 — 2026-06-29
 
 First **Alpha** release. Headline: the V2 decoupled fetch scheduler + the `ChunkPool`
