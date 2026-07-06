@@ -117,6 +117,17 @@ The ladder, in the order it was built:
    one `moveaxis` the sample axis leads and every downstream stage is unchanged.
    Cross-domain validated end-to-end against a real IDR OME-NGFF microscopy store (zarr
    v2, anonymous S3), streaming over `Z` with byte-exact reads.
+4. **Per-variable sample-axis chunk size** — co-registered variables may chunk the sample
+   axis *differently* (OME-NGFF raw Z-chunk 1 + label mask Z-chunk 30) as long as they share
+   its *length*. The manifest's chunk size becomes the **reference anchor grid**
+   (shuffle/split/gather); each variable maps global anchors onto its *own* chunk grid in the
+   read planner and `gather`. Orthogonal to `sample_axis`, and it composes with windowing and
+   arbitrary axes — tests cover all three overlapping, plus the uneven tail where a coarse
+   chunk runs out at the end of the axis. Cross-domain validated end-to-end on the real IDR
+   raw+mask pairing (byte-exact). *Residency deferral (same class as windowed+shuffle, M-W):*
+   under shuffle a non-uniform variable's chunk can be needed by scattered blocks, so the
+   budget currently holds the whole train split resident per variable; a tighter bound
+   (per-block re-fetch) is the shared deferred bounded-residency work.
 
 **Deferred generalizations, and *why* (so they aren't relitigated):**
 
@@ -142,13 +153,6 @@ The ladder, in the order it was built:
   assembles (and budgets) the *whole* field per outer chunk, so bounded memory on a giant
   ERA5/radio field needs the pool to hold only a crop's tiles. That is a residency change,
   not a `Batch`-contract change — which is what keeps it an *additive* future.
-- **Per-variable sample-axis chunk size** — pairing e.g. an OME-NGFF raw array (Z-chunk 1)
-  with its label mask (Z-chunk 30) is blocked by the shared-chunk-size guard. Orthogonal to
-  `sample_axis`; the next increment. It's genuinely separate work (not a one-liner) because
-  the read planner and `gather` both interpret draw chunk-ids in a single reference grid —
-  lifting that means mapping one anchor grid onto each variable's own chunk grid, and it
-  interacts with windowed residency.
-
 GRIB / NetCDF are consumed via a **virtual-zarr** view (virtualizarr / kerchunk /
 icechunk) so the engine only ever speaks zarr-async — we never parse GRIB.
 
@@ -492,10 +496,12 @@ residency flat across the concurrency sweep. **B2 done** — the `ChunkPool` is 
 the cache too (byte budget + pin/unpin + LRU, heap or mmap backing; cross-epoch
 decode-once reuse via `cache_dir`/`cache_budget_bytes`; cross-*run* persistence via
 `persist=True`, M-C2). **Arbitrary sample axis** — `sample_axis` lets any single
-physical axis be the sample axis (cross-domain validated end-to-end on a real IDR OME-NGFF
-microscopy store, sampling over `Z`); see the geometry-ladder section. **Not yet built:**
-`Regrid` + the GPU/device transform stage (M2), bounded read-ahead (M-RA), per-variable
-sample-axis chunk size (the raw+labels microscopy pairing).
+physical axis be the sample axis, and **per-variable sample-axis chunk size** lets
+co-registered variables chunk it differently (the raw Z-chunk 1 + label mask Z-chunk 30
+pairing) — both cross-domain validated end-to-end on a real IDR OME-NGFF microscopy store
+(sampling over `Z`); see the geometry-ladder section. **Not yet built:** `Regrid` + the
+GPU/device transform stage (M2), bounded read-ahead (M-RA), and bounded windowed/non-uniform
+residency under shuffle (per-block re-fetch instead of holding the whole train split).
 
 ## Roadmap / milestones
 
