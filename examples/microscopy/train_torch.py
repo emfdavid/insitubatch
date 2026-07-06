@@ -16,9 +16,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from insitubatch.frameworks import to_torch
-from insitubatch.source import InSituDataset
-from insitubatch.types import Batch
+from insitubatch import Batch, InSituDataset, to_torch
 
 from .data import build_datasets, cli, evaluate, inputs_and_targets
 

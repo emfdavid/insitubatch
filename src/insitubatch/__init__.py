@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .frameworks import as_tf_dataset, as_torch, to_jax, to_tf, to_torch
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
 from .scheduler import Scheduler, SchedulerConfig
@@ -21,6 +22,7 @@ from .shuffle import (
     sequential_order,
     shuffle_quality,
 )
+from .source import InSituDataset
 from .split import SplitManifest, split_by_chunk, valid_anchor_range
 from .store import (
     arraylake_store,
@@ -53,6 +55,7 @@ __all__ = [
     "ChunkRead",
     "ChunkTransform",
     "DecodedChunk",
+    "InSituDataset",
     "Scheduler",
     "SchedulerConfig",
     "SplitManifest",
@@ -60,6 +63,8 @@ __all__ = [
     "StandardScaler",
     "StoredChunkRead",
     "arraylake_store",
+    "as_tf_dataset",
+    "as_torch",
     "close_store",
     "block_shuffled_order",
     "build_stored_chunk_reads",
@@ -71,5 +76,8 @@ __all__ = [
     "sequential_order",
     "shuffle_quality",
     "split_by_chunk",
+    "to_jax",
+    "to_tf",
+    "to_torch",
     "valid_anchor_range",
 ]

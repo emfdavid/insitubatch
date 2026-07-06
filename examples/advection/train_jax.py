@@ -16,9 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from insitubatch.frameworks import to_jax
-from insitubatch.source import InSituDataset
-from insitubatch.types import Batch
+from insitubatch import Batch, InSituDataset, to_jax
 
 from .data import build_datasets, cli, evaluate
 

@@ -31,13 +31,13 @@ import zarr
 from zarr.abc.store import Store
 
 from insitubatch import (
+    Batch,
+    InSituDataset,
     ensure_local_dir,
     obstore_store,
     open_geometries,
     split_by_chunk,
 )
-from insitubatch.source import InSituDataset
-from insitubatch.types import Batch
 
 # A public OME-NGFF (zarr v0.1) image in the EMBL-EBI Image Data Repository: a 3D two-channel
 # confocal stack with an expert instance-segmentation label. Read anonymously off the IDR S3.

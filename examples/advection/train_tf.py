@@ -12,9 +12,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from insitubatch.frameworks import to_tf
-from insitubatch.source import InSituDataset
-from insitubatch.types import Batch
+from insitubatch import Batch, InSituDataset, to_tf
 
 from .data import build_datasets, cli, evaluate
 
