@@ -4,9 +4,11 @@ Runnable examples (not shipped in the wheel). Run from the repo root, e.g.
 `python -m examples.advection.train_torch`.
 
 The InsituDataset is a general purpose, batteries included, tool for batching zarr compatible 
-data into the python ML ecosystem. The examples are forecasting focused because there are large
+data into the python ML ecosystem. Most examples are forecasting focused because there are large
 public zarr datasets available and the time shifting on insitu data is an added challenge that
-shows the generalization.
+shows the generalization; [`microscopy/`](#microscopy--ome-ngff-cell-segmentation-over-z) is the
+cross-domain companion — a different geometry (sample over Z, two variables chunked differently)
+on a real bio-imaging store, to show the engine is not weather-specific.
 
 ## advection/ — a 24-hour forecast, one dataset, three frameworks
 
@@ -67,6 +69,41 @@ CUDA torch via `--torch-backend`, Arraylake auth) is documented in
 and a shifted target as `(label, path, offset)` views, and train in your framework — the
 windowing (`Batch.offsets`, `Batch.stack`, `Batch.read_indices`) and the no-reshard,
 chunk-once IO are the engine's job.
+
+## microscopy/ — OME-NGFF cell segmentation over Z
+
+The cross-domain showcase: **the same engine, a different geometry.** Where advection samples
+the *outer* time axis and windows it, [`microscopy/`](microscopy/data.py) samples a *middle*
+axis — one Z-plane of an OME-NGFF `(T,C,Z,Y,X)` confocal stack (`sample_axis=2`) — and gathers
+two co-registered variables at each anchor: the 2-channel `raw` image (chunked **one plane
+deep** on Z) and its `mask` label (chunked **30 planes deep**, tiled in Y/X). Different physical
+chunking, different channel count, one sample grid, **no reshard** — the arbitrary-sample-axis +
+per-variable-chunking unlock, on a real store.
+
+```bash
+uv sync --extra torch
+uv run python -m examples.microscopy.train_torch                    # synthetic cells (offline)
+uv run python -m examples.microscopy.train_torch --source idr       # the real IDR image (streamed)
+```
+
+The task is per-plane **foreground segmentation**, and the baseline is a global intensity
+threshold (**Otsu**) — the segmentation analog of persistence. Otsu reads each pixel's intensity
+alone, so a smooth autofluorescence *haze* gradient defeats it (a bright-background pixel
+outshines a dim cell elsewhere; no single threshold separates them). A tiny CNN that reads the
+neighborhood — sharp cells vs low-frequency haze — beats it: on the synthetic store by
+construction, on the real IDR image the claim is "same pipeline, real data, no reshard" (not
+SOTA Dice — the label is expert instance annotation and the model is four conv layers). Each run
+prints the held-out foreground IoU, model vs Otsu.
+
+### Data sources (`--source`)
+
+| `--source` | store | notes |
+| --- | --- | --- |
+| `synthetic` *(default)* | offline **cell stack** written to a temp zarr | Gaussian cells + a haze gradient noise Otsu can't beat; `--n-planes` / `--size` / `--mask-chunk` size it |
+| `idr` | the public **IDR** OME-NGFF image `s3://idr/...` (EMBL-EBI) | streamed anonymously; `--sample-range` subsets the 236-plane stack |
+
+Only `train_torch.py` ships here — framework-neutrality is the advection example's job; this
+example's job is to prove the *geometry* generalizes.
 
 ## The WeatherBench2 cold-start pair (with xbatcher)
 
