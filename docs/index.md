@@ -50,8 +50,9 @@ diagrams, and the read-plan abstraction;
 
 ## Shape of the API
 
-The core `InSituDataset` is a framework-neutral iterable of numpy `Batch` objects;
-torch / JAX / TF handoff is a thin optional DLPack adapter in `insitubatch.frameworks`.
+The core `InSituDataset` is a framework-neutral iterable of numpy `Batch` objects; torch /
+JAX / TF handoff is a thin optional DLPack adapter, re-exported from the package root (defined
+in `insitubatch.frameworks`) — importing `insitubatch` pulls in no framework.
 
 ```python
 from insitubatch import (

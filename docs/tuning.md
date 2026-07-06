@@ -8,10 +8,11 @@ the engine behaves this way — the read plan, the pool, the prefetch pipeline �
 
 Hold these two sentences and the rest follows:
 
-- A **sample** is one slice of the outer (sample) axis — a timestep, an observation, a
-  model state, whatever your rows are — spanning the whole inner extent of its chunk.
-- A **batch** draws `batch_size` shuffled samples from a **window** of `block_chunks` outer
-  chunks that the loader keeps decoded in memory at once.
+- A **sample** is one slice of the **sample axis** — a timestep, an observation, a model
+  state, a microscopy `Z`-plane, whatever your rows are (it can be *any* single physical axis,
+  not just axis 0) — spanning the whole inner extent of its chunk.
+- A **batch** draws `batch_size` shuffled samples from a **window** of `block_chunks`
+  sample-axis chunks that the loader keeps decoded in memory at once.
 
 So the loader reads each chunk once, holds a rolling window of them, and serves shuffled
 batches out of that window — concurrency fills the window, the window bounds memory.

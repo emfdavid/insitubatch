@@ -516,8 +516,7 @@ used only for this off-hot-path planning step; the engine itself never touches x
 
 ```python
 import xarray as xr
-from insitubatch import obstore_store, open_geometries, split_by_chunk
-from insitubatch.source import InSituDataset
+from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_chunk
 
 store = obstore_store(url)                 # one Store, reused for planning + the engine
 
