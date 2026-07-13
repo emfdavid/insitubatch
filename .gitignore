@@ -16,6 +16,9 @@ wheels/
 bench/results/
 bench/figures/
 
+# Generated example stores (virtual-reference Icechunk repos, rebuilt from committed URI lists)
+examples/hubble/hubble_store/
+
 # MkDocs build output (docs/figures/ is committed for the published site)
 site/
 

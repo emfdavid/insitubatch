@@ -1,0 +1,14 @@
+[
+  "s3://stpubdata/hst/public/icg9/icg919k0q/icg919k0q_flt.fits",
+  "s3://stpubdata/hst/public/icg9/icg919k1q/icg919k1q_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick901hxq/ick901hxq_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick901hzq/ick901hzq_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick901i4q/ick901i4q_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick901i7q/ick901i7q_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick902n7q/ick902n7q_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick902n9q/ick902n9q_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick902nbq/ick902nbq_flt.fits",
+  "s3://stpubdata/hst/public/ick9/ick902neq/ick902neq_flt.fits",
+  "s3://stpubdata/hst/public/idnm/idnm20cmq/idnm20cmq_flt.fits",
+  "s3://stpubdata/hst/public/idnm/idnm20cnq/idnm20cnq_flt.fits"
+]
