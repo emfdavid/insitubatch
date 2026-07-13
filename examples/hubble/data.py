@@ -251,13 +251,18 @@ def psnr(pred: np.ndarray, clean: np.ndarray, data_range: float = 10.0) -> float
 
 
 def median_baseline(noisy: np.ndarray, size: int = 3) -> np.ndarray:
-    """Naive denoiser: a per-frame median filter -- the no-training reference to beat."""
-    from scipy.ndimage import median_filter
+    """Naive denoiser: a per-frame ``size``x``size`` median filter -- the no-training reference.
 
-    out = np.empty_like(noisy)
-    for i in range(noisy.shape[0]):  # (B, 1, H, W)
-        out[i, 0] = median_filter(noisy[i, 0], size=size)
-    return out
+    Pure vectorized numpy (edge-padded sliding windows, median over the window stack) so the
+    example needs no scipy, matching the numpy baselines in the other examples. ``(B, 1, H, W)``.
+    """
+    pad = size // 2
+    padded = np.pad(noisy, ((0, 0), (0, 0), (pad, pad), (pad, pad)), mode="edge")
+    h, w = noisy.shape[2], noisy.shape[3]
+    windows = np.stack(
+        [padded[:, :, i : i + h, j : j + w] for i in range(size) for j in range(size)], axis=0
+    )
+    return np.median(windows, axis=0).astype(noisy.dtype)
 
 
 # --------------------------------------------------------------------------- CLI glue
