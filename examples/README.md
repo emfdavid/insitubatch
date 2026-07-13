@@ -105,6 +105,41 @@ prints the held-out foreground IoU, model vs Otsu.
 Only `train_torch.py` ships here — framework-neutrality is the advection example's job; this
 example's job is to prove the *geometry* generalizes.
 
+## hubble/ — denoising real telescope frames from FITS (no reshard)
+
+The **archival-format** showcase: the data never was zarr. [`hubble/`](hubble/data.py) indexes
+real Hubble WFC3/IR frames of **M16 (the Eagle Nebula)** on MAST's public AWS bucket
+(`s3://stpubdata`, anonymous) as **virtual references** — [VirtualiZarr](https://github.com/zarr-developers/VirtualiZarr)
+parses each `_flt.fits` header (`kerchunk.fits`) and commits byte-range references to a local
+Icechunk repo. No pixels are copied or resharded; the store is a few kB pointing at the original
+FITS objects. insitubatch then streams the frames straight from S3, `sample_axis=0` making each
+frame one sample. The build-time index libraries (`virtualizarr`/`kerchunk`/`astropy`) are needed
+*only* to build the store — the training hot path is `icechunk` + numpy, never kerchunk.
+
+```bash
+uv sync --extra torch
+uv run --with scipy python -m examples.hubble.train_torch          # offline synthetic frames (default)
+
+# real Hubble frames on S3 -- indexes them into a virtual-reference store first (needs the
+# build-time stack), then streams and trains:
+uv run --with virtualizarr --with kerchunk --with astropy --with icechunk --with s3fs --with scipy \
+  python -m examples.hubble.train_torch --source hubble --build
+```
+
+The task is per-frame **Gaussian-noise removal** (a deliberately didactic stand-in — the point is
+training on the real archive, not a SOTA denoiser), and the baseline is a **median filter** (the
+no-training reference). Two chunk stages run vectorized on the decode pool — a robust
+per-frame normalization (`clean_normalize`) then a block-mean `Coarsen` (1014→253, keeping the CPU
+demo light while still reading whole frames) — and the per-sample noise lives in the `AddNoise`
+batch stage, per the transform-cost contract. A short run beats the baseline (real ≈26.4 vs ≈24.7 dB
+PSNR; synthetic sharp-star frames similar). Because a FITS image is one chunk, this is the
+*streaming-in-place* value (no reshard over a giant archive), not the many-samples-per-chunk
+decode-amortization of the chunked-zarr examples. `--source synthetic` (the default) needs no
+network or FITS stack — it also backs the drift test in `tests/test_hubble.py`.
+
+> Note: MAST's *anonymous* bucket throttles (HTTP 503) under heavy concurrent read-ahead, so
+> `max_inflight` is capped low by default; an authenticated/retrying path on AWS would raise it.
+
 ## The WeatherBench2 cold-start pair (with xbatcher)
 
 The same task two ways — complementary engines for the same ndim-batch problem — so you
