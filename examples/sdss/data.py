@@ -31,13 +31,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import xarray as xr
 import zarr
 from zarr.abc.store import Store
+
+if TYPE_CHECKING:
+    from virtualizarr.manifests import ManifestArray
 
 from insitubatch import (
     Batch,
@@ -119,60 +123,131 @@ def make_synthetic_store(
 
 
 # --------------------------------------------------------------------------- build time
-FIBERS_PER_CHUNK = 64  # split one plate's fibers into contiguous virtual chunks (640 -> 10 chunks)
+#
+# A single plate is ~640 fibers x ~3864 wave (~10 MB) -- it fits in memory, so one plate is a demo,
+# not a streaming workload. The two build modes trade off along the FITS byte layout (no reshard in
+# either -- both only rewrite the *chunk manifest*, never the pixels):
+#
+#   one plate   -> _single_plate_fiber_chunks: full wave width, many fibers per chunk
+#                  (the O(chunks) decode-amortization regime; toy scale).
+#   many plates -> _many_plates_common_grid:   plates cropped to a shared wavelength window and
+#                  folded into one flat fiber axis, one fiber per chunk (the streaming regime; the
+#                  only no-reshard way to concat ragged-width plates -- scales to the archive).
+#
+FIBERS_PER_CHUNK = 64  # one plate's 640 fibers -> 10 contiguous chunks
 
 
-def _rechunk_fibers(plate: xr.Dataset, fibers_per_chunk: int) -> xr.Dataset:
-    """Split a plate's whole-image virtual chunk into contiguous fiber-block chunks -- no reshard.
+def _chunk_ref(array: ManifestArray) -> tuple[str, int]:
+    """The ``(path, byte offset)`` of the single virtual chunk kerchunk emits for a plate HDU."""
+    manifest = array.manifest
+    return str(manifest._paths[0, 0]), int(manifest._offsets[0, 0])
 
-    ``kerchunk.fits`` maps the ``(fiber, wave)`` HDU to a single virtual chunk: one byte range
-    ``[offset, offset + n_fiber*n_wave*itemsize)``. Because the fiber axis is the *outer* axis of
-    the row-major image, fiber block ``i`` occupies a *contiguous* sub-range
-    ``offset + i*fibers_per_chunk*n_wave*itemsize`` of length ``fibers_per_chunk*n_wave*itemsize``.
-    So we rebuild the manifest as ``n_fiber // fibers_per_chunk`` sub-refs -- pure byte arithmetic,
-    no pixels moved -- giving insitubatch multiple sample-axis chunks (each still many fibers, the
-    decode-amortization regime) that :func:`~insitubatch.split_by_chunk` can partition.
+
+def _grid_start(plate: xr.Dataset) -> float:
+    return float(plate[FLUX_VAR].attrs["COEFF0"])  # log10(wavelength) of bin 0
+
+
+def _grid_step(plate: xr.Dataset) -> float:
+    return float(plate[FLUX_VAR].attrs["COEFF1"])  # dloglam per bin (identical across SDSS plates)
+
+
+def _virtual_flux(
+    template: xr.Dataset,
+    shape: tuple[int, int],
+    chunk_shape: tuple[int, int],
+    entries: dict[str, dict[str, object]],
+) -> xr.Dataset:
+    """Assemble a virtual ``flux (fiber, wave)`` dataset from explicit byte-range chunk refs.
+
+    Reuses ``template``'s dtype/codec metadata (from the opened plate) and overrides only the shape
+    and chunk grid -- the chunks point back into the original FITS bytes, so nothing is copied.
     """
-    import dataclasses
-
     from virtualizarr.manifests import ChunkManifest, ManifestArray
 
-    ma = plate[FLUX_VAR].data
-    manifest = ma.manifest
-    path = str(manifest._paths[0, 0])
-    base_offset = int(manifest._offsets[0, 0])
-    n_fiber, n_wave = ma.shape
-    row_bytes = n_wave * ma.dtype.itemsize
+    metadata = template[FLUX_VAR].data.metadata
+    grid = replace(metadata.chunk_grid, chunk_shape=chunk_shape)
+    array = ManifestArray(
+        metadata=replace(metadata, shape=shape, chunk_grid=grid),
+        chunkmanifest=ChunkManifest(entries=entries),
+    )
+    return xr.Dataset({FLUX_VAR: xr.Variable(("fiber", "wave"), array)})
+
+
+def _single_plate_fiber_chunks(plate: xr.Dataset, fibers_per_chunk: int) -> xr.Dataset:
+    """One plate -> contiguous fiber-block chunks at full wave width (many fibers per chunk).
+
+    kerchunk maps the ``(fiber, wave)`` HDU to ONE virtual chunk: the byte range
+    ``[offset, offset + n_fiber*row_bytes)``. The fiber axis is the outer (row) axis, so fiber block
+    ``i`` is the contiguous sub-range ``offset + i*fibers_per_chunk*row_bytes`` -- pure byte
+    arithmetic. Each chunk still holds many fibers: the decode-amortization regime.
+    """
+    array = plate[FLUX_VAR].data
+    path, base = _chunk_ref(array)
+    n_fiber, n_wave = array.shape
+    row_bytes = n_wave * array.dtype.itemsize
     if n_fiber % fibers_per_chunk:
         raise ValueError(f"{n_fiber} fibers not divisible by fibers_per_chunk={fibers_per_chunk}")
 
     block_bytes = fibers_per_chunk * row_bytes
-    entries = {
-        f"{i}.0": {"path": path, "offset": base_offset + i * block_bytes, "length": block_bytes}
+    entries: dict[str, dict[str, object]] = {
+        f"{i}.0": {"path": path, "offset": base + i * block_bytes, "length": block_bytes}
         for i in range(n_fiber // fibers_per_chunk)
     }
-    grid = dataclasses.replace(ma.metadata.chunk_grid, chunk_shape=(fibers_per_chunk, n_wave))
-    rechunked = ManifestArray(
-        metadata=dataclasses.replace(ma.metadata, chunk_grid=grid),
-        chunkmanifest=ChunkManifest(entries=entries),
+    return _virtual_flux(plate, (n_fiber, n_wave), (fibers_per_chunk, n_wave), entries)
+
+
+def _many_plates_common_grid(plates: list[xr.Dataset]) -> xr.Dataset:
+    """N plates -> one flat fiber axis on a shared wavelength window, one fiber per chunk.
+
+    Plates cover slightly different wavelength ranges, so they cannot share a rectangular ``wave``
+    axis at full width. But every plate uses the same ``dloglam`` (COEFF1) and their start
+    wavelengths (COEFF0) differ by whole bins, so cropping each plate to the common overlap window
+    lands them on ONE grid *exactly* -- no resampling. After the crop each fiber's window is still a
+    contiguous byte sub-range, so a fiber is one virtual chunk and the plates concatenate into a
+    flat ``(total_fiber, width)`` sample axis. One fiber per chunk is the streaming regime, but it
+    scales to the whole archive (thousands of plates) with no reshard and no download.
+    """
+    step = _grid_step(plates[0])
+    starts = [_grid_start(p) for p in plates]
+    window_lo = max(starts)
+    window_hi = min(
+        start + p[FLUX_VAR].data.shape[1] * step for p, start in zip(plates, starts, strict=True)
     )
-    return xr.Dataset({FLUX_VAR: xr.Variable(("fiber", "wave"), rechunked)})
+    width = round((window_hi - window_lo) / step)
+
+    entries: dict[str, dict[str, object]] = {}
+    fiber = 0
+    for plate, start in zip(plates, starts, strict=True):
+        array = plate[FLUX_VAR].data
+        path, base = _chunk_ref(array)
+        n_fiber, n_wave = array.shape
+        itemsize = array.dtype.itemsize
+        row_bytes = n_wave * itemsize
+        offset_bins = round((window_lo - start) / step)
+        if abs((window_lo - start) / step - offset_bins) > 1e-3:
+            raise ValueError("plate wavelength grids are not bin-aligned; cannot crop losslessly")
+        window_bytes = width * itemsize
+        for f in range(n_fiber):
+            byte0 = base + f * row_bytes + offset_bins * itemsize
+            entries[f"{fiber}.0"] = {"path": path, "offset": byte0, "length": window_bytes}
+            fiber += 1
+    return _virtual_flux(plates[0], (fiber, width), (1, width), entries)
 
 
 def build_store(
-    plate_url: str,
+    plate_urls: list[str],
     store_path: str | os.PathLike[str] = DEFAULT_STORE,
     *,
     fibers_per_chunk: int = FIBERS_PER_CHUNK,
 ) -> str:
-    """Index one SDSS ``spPlate`` FITS (over HTTPS) into a local Icechunk repo of virtual refs.
+    """Index one or more SDSS ``spPlate`` FITS (HTTPS) into a local Icechunk repo of virtual refs.
 
     Idempotent: rebuilds ``store_path`` from scratch. Requires the ``astronomy`` extra
-    (``virtualizarr``, ``kerchunk``, ``astropy``, ``icechunk``). The plate's ``PRIMARY`` flux HDU
-    -- all ~640 fibers on one common log-wavelength grid -- is virtually re-chunked along the fiber
-    axis (:func:`_rechunk_fibers`) so each fiber is one sample and each chunk is many fibers. (Only
-    one plate: different plates cover slightly different wavelength ranges, so they cannot share a
-    rectangular ``wave`` axis without resampling -- exactly the reshard this example avoids.)
+    (``virtualizarr``, ``kerchunk``, ``astropy``, ``icechunk``). A **single** plate becomes
+    full-width fiber-block chunks (many fibers per chunk -- decode-amortization); **several** plates
+    are cropped to a shared wavelength window and folded into one flat fiber axis (one fiber per
+    chunk -- streaming at archive scale). Both modes move no pixels -- see
+    :func:`_single_plate_fiber_chunks` and :func:`_many_plates_common_grid`.
     """
     import shutil
 
@@ -186,10 +261,17 @@ def build_store(
     shutil.rmtree(store_path, ignore_errors=True)
 
     registry = ObjectStoreRegistry({SDSS_HOST: HTTPStore.from_url(SDSS_HOST)})
-    plate = open_virtual_dataset(url=plate_url, registry=registry, parser=FITSParser()).rename(
-        {"PRIMARY": FLUX_VAR}
+    plates = [
+        open_virtual_dataset(url=u, registry=registry, parser=FITSParser()).rename(
+            {"PRIMARY": FLUX_VAR}
+        )
+        for u in plate_urls
+    ]
+    virtual = (
+        _single_plate_fiber_chunks(plates[0], fibers_per_chunk)
+        if len(plates) == 1
+        else _many_plates_common_grid(plates)
     )
-    rechunked = _rechunk_fibers(plate, fibers_per_chunk)
 
     ice_prefix = SDSS_HOST + "/"
     config = icechunk.RepositoryConfig.default()
@@ -202,8 +284,8 @@ def build_store(
         authorize_virtual_chunk_access=icechunk.containers_credentials({ice_prefix: None}),
     )
     session = repo.writable_session("main")
-    rechunked.virtualize.to_icechunk(session.store)
-    session.commit(f"index SDSS spPlate {plate_url.rsplit('/', 1)[-1]}")
+    virtual.virtualize.to_icechunk(session.store)
+    session.commit(f"index {len(plate_urls)} SDSS spPlate frame(s)")
     return store_path
 
 
@@ -348,9 +430,9 @@ def build_datasets(args: argparse.Namespace) -> InSituDataset:
         store = obstore_store(url)
     else:
         if args.build:
-            plate_url = load_uris(args.uris)[0]
-            print(f"building store from {plate_url} ...")
-            build_store(plate_url, args.store)
+            plate_urls = load_uris(args.uris)[: args.plates]
+            print(f"building store from {len(plate_urls)} plate(s): {plate_urls} ...")
+            build_store(plate_urls, args.store)
         store = open_store(args.store)
     return reconstruct_dataset(store, batch_size=args.batch_size, sigma=args.sigma)
 
@@ -366,6 +448,13 @@ def cli(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--uris", default=str(DEFAULT_URIS), help="JSON list of spPlate FITS URLs")
     p.add_argument("--store", default=str(DEFAULT_STORE), help="local Icechunk repo path")
     p.add_argument("--build", action="store_true", help="(re)build the sdss store first")
+    p.add_argument(
+        "--plates",
+        type=int,
+        default=1,
+        help="real spPlate count: 1 = full-width many-fibers/chunk (decode-amortization); "
+        ">1 = common-window 1-fiber/chunk (streaming at archive scale)",
+    )
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--latent-dim", type=int, default=LATENT_DIM)
