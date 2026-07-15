@@ -121,9 +121,9 @@ uv sync --extra torch
 uv run python -m examples.hubble.train_torch                      # offline synthetic frames (default)
 
 # real Hubble frames on S3 -- indexes them into a virtual-reference store first (needs the
-# build-time stack), then streams and trains:
-uv run --with virtualizarr --with kerchunk --with astropy --with icechunk --with s3fs \
-  python -m examples.hubble.train_torch --source hubble --build
+# `astronomy` build-time stack), then streams and trains:
+uv sync --extra torch --extra astronomy
+uv run python -m examples.hubble.train_torch --source hubble --build
 ```
 
 The task is per-frame **Gaussian-noise removal** (a deliberately didactic stand-in — the point is

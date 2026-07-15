@@ -102,6 +102,20 @@ gcsfs = [
 arraylake = [
     "arraylake>=0.14",
 ]
+# Build-time FITS index stack for the astronomy examples (Hubble images, SDSS
+# spectra): kerchunk.fits parses each FITS header, VirtualiZarr exposes the
+# byte-range references, and they are committed to an Icechunk store. Needed only
+# to BUILD the reference store -- the training hot path is icechunk + numpy, never
+# kerchunk/astropy. astropy also backs the ground-truth read in tests. The SDSS
+# (binary-table / structured-dtype) path additionally requires two unreleased
+# upstream fixes, pinned to git in [tool.uv.sources] below.
+astronomy = [
+    "virtualizarr>=2.6",
+    "kerchunk>=0.2.10",
+    "astropy>=8.0",
+    "s3fs>=2024.6",
+    "icechunk>=0.2",
+]
 
 [dependency-groups]
 dev = [
@@ -115,6 +129,20 @@ dev = [
 [build-system]
 requires = ["uv_build>=0.11.21,<0.12.0"]
 build-backend = "uv_build"
+
+# Temporary git pins for the SDSS/spectra astronomy example, which reads FITS binary
+# tables (structured dtypes) end-to-end. Both fixes are merged/in-flight upstream but
+# not yet in a release; these entries are dev-environment only (uv strips them from the
+# published wheel, so the abstract `zarr>=3.0` requirement downstream is unchanged).
+# Drop each pin once a release carrying the fix ships.
+#   - zarr: struct-dtype byte-order handling in the bytes codec
+#     (zarr-developers/zarr-python#4142, merged; not in a release past v3.2.1).
+#   - virtualizarr: kerchunk struct-dtype refs for FITS binary tables
+#     (zarr-developers/VirtualiZarr#1037, open on the emfdavid fork; on merge, repoint
+#     to a zarr-developers/VirtualiZarr main commit, then to the release).
+[tool.uv.sources]
+zarr = { git = "https://github.com/zarr-developers/zarr-python.git", rev = "bbe27d7ce9713d50e34df2cda5108f4dcf410b92" }
+virtualizarr = { git = "https://github.com/emfdavid/VirtualiZarr.git", rev = "8a1563f236355534d06362034c1a05ab27667eba" }
 
 [tool.ruff]
 line-length = 100
