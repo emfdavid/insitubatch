@@ -1424,7 +1424,7 @@ requires-dist = [
     { name = "virtualizarr", marker = "extra == 'virtual'", git = "https://github.com/emfdavid/VirtualiZarr.git?rev=8a1563f236355534d06362034c1a05ab27667eba" },
     { name = "xarray", specifier = ">=2024.9" },
     { name = "xbatcher", marker = "extra == 'bench'", specifier = ">=0.3" },
-    { name = "zarr", git = "https://github.com/zarr-developers/zarr-python.git?rev=bbe27d7ce9713d50e34df2cda5108f4dcf410b92" },
+    { name = "zarr", specifier = ">=3.0" },
 ]
 provides-extras = ["torch", "jax", "tf", "gpu", "virtual", "cache", "bench", "docs", "icechunk", "gcsfs", "arraylake", "astronomy"]
 
@@ -4085,8 +4085,8 @@ wheels = [
 
 [[package]]
 name = "zarr"
-version = "3.2.2.dev106+gbbe27d7c"
-source = { git = "https://github.com/zarr-developers/zarr-python.git?rev=bbe27d7ce9713d50e34df2cda5108f4dcf410b92#bbe27d7ce9713d50e34df2cda5108f4dcf410b92" }
+version = "3.2.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "donfig" },
     { name = "google-crc32c" },
@@ -4094,6 +4094,10 @@ dependencies = [
     { name = "numpy" },
     { name = "packaging" },
     { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/93/8d/aeb164004f87543b06ef54f885d02c342c31ceb274e2bbec470a98927621/zarr-3.2.1.tar.gz", hash = "sha256:71565b738a0e7e8ed226f0516eba8c6bb53440ad7669a8c48ebb3534a161d035", size = 675161, upload-time = "2026-05-05T12:37:22.383Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/0a/469e2bd01be1490336e6c8707386845655d59261543315778a3ccc7e8019/zarr-3.2.1-py3-none-any.whl", hash = "sha256:f78cdd3d9687ad0e9f9cba2c5683b64f0c52589c19f685eeabe872e93cc0d2c7", size = 319617, upload-time = "2026-05-05T12:37:20.66Z" },
 ]
 
 [[package]]

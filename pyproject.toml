@@ -130,18 +130,18 @@ dev = [
 requires = ["uv_build>=0.11.21,<0.12.0"]
 build-backend = "uv_build"
 
-# Temporary git pins for the SDSS/spectra astronomy example, which reads FITS binary
-# tables (structured dtypes) end-to-end. Both fixes are merged/in-flight upstream but
-# not yet in a release; these entries are dev-environment only (uv strips them from the
-# published wheel, so the abstract `zarr>=3.0` requirement downstream is unchanged).
-# Drop each pin once a release carrying the fix ships.
-#   - zarr: struct-dtype byte-order handling in the bytes codec
-#     (zarr-developers/zarr-python#4142, merged; not in a release past v3.2.1).
+# Temporary git pin for FITS binary-table (structured-dtype) support, exercised by
+# tests/test_fits_bintable.py. This entry is dev-environment only (uv strips it from the
+# published wheel, so downstream requirements are unchanged). Drop it once a release ships.
 #   - virtualizarr: kerchunk struct-dtype refs for FITS binary tables
-#     (zarr-developers/VirtualiZarr#1037, open on the emfdavid fork; on merge, repoint
-#     to a zarr-developers/VirtualiZarr main commit, then to the release).
+#     (zarr-developers/VirtualiZarr#1037, open on the emfdavid fork). Released VirtualiZarr
+#     raises on the list-valued field specs; on merge, repoint to a zarr-developers/VirtualiZarr
+#     main commit, then to the release.
+# NOTE: the related zarr struct-dtype byte-order fix (zarr-developers/zarr-python#4142) is NOT
+# pinned -- it fixes the direct `zarr.create_array('>f4')` path, but VirtualiZarr/icechunk store
+# the struct fields with native-order labels, so the codec fix never engages: consumers reinterpret
+# each field with `.view('>f4')` at the numpy boundary regardless of the zarr version.
 [tool.uv.sources]
-zarr = { git = "https://github.com/zarr-developers/zarr-python.git", rev = "bbe27d7ce9713d50e34df2cda5108f4dcf410b92" }
 virtualizarr = { git = "https://github.com/emfdavid/VirtualiZarr.git", rev = "8a1563f236355534d06362034c1a05ab27667eba" }
 
 [tool.ruff]
