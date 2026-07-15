@@ -160,8 +160,19 @@ uv run python -m examples.sdss.train_torch                       # offline synth
 # real SDSS spPlate over HTTPS -- indexes it into a virtual-reference store first (needs the
 # `astronomy` build-time stack), then streams and trains:
 uv sync --extra torch --extra astronomy
-uv run python -m examples.sdss.train_torch --source sdss --build
+uv run python -m examples.sdss.train_torch --source sdss --build             # 1 plate
+uv run python -m examples.sdss.train_torch --source sdss --build --plates 8  # 8 plates, aligned
 ```
+
+One plate (~640 spectra, ~10 MB) fits in memory, so `--plates` scales the real story. The two
+modes trade off along the FITS byte layout, and **both move no pixels — only the chunk manifest is
+rewritten:** a **single** plate is re-chunked along the fiber axis at full wave width (many fibers
+per chunk — the *decode-amortization* regime); **several** plates are cropped to their shared
+log-wavelength window and folded into one flat fiber axis (one fiber per chunk — the *streaming*
+regime). The crop is exact — every SDSS plate uses the same `dloglam` and their `COEFF0` start
+wavelengths differ by whole bins, so the windows align onto one grid with no resampling — which is
+the only no-reshard way to concatenate the ragged-width plates. That is the corpus-scale path: the
+full archive is thousands of plates (tens of GB) you would otherwise download and reshard.
 
 The task mirrors astroML's **spectral reconstruction**: recover the clean spectrum through a
 low-dimensional bottleneck. The baseline is **PCA** at the same latent dim — the optimal *linear*
@@ -174,11 +185,12 @@ network or FITS stack — redshift-shifted synthetic spectra on which the conv A
 and backs the drift test in `tests/test_sdss.py`. The real run is a *same-pipeline, real-archive*
 demonstration (one plate = ~640 spectra); the synthetic default carries the beats-PCA claim.
 
-> Only one plate per store: different plates cover slightly different wavelength ranges, so they
-> cannot share a rectangular `wave` axis without resampling — exactly the reshard this example
-> avoids. SDSS spectra also ship as FITS **binary tables** (structured big-endian dtypes);
-> `tests/test_fits_bintable.py` validates that path end-to-end through insitubatch and pins the
-> VirtualiZarr fix it needs ([#1037](https://github.com/zarr-developers/VirtualiZarr/pull/1037)).
+> Multi-plate is one-fiber-per-chunk by construction: cropping to the common window breaks the
+> multi-fiber contiguity the single-plate mode relies on, so decode-amortization and corpus scale
+> are mutually exclusive here — an honest boundary of the FITS byte layout. SDSS spectra also ship
+> as FITS **binary tables** (structured big-endian dtypes); `tests/test_fits_bintable.py` validates
+> that path end-to-end through insitubatch and pins the VirtualiZarr fix it needs
+> ([#1037](https://github.com/zarr-developers/VirtualiZarr/pull/1037)).
 
 ## The WeatherBench2 cold-start pair (with xbatcher)
 
