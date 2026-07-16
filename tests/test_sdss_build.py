@@ -49,10 +49,10 @@ def _write_plate(
 
 
 def _open_plate(tmp_dir: str, name: str):  # -> xr.Dataset
+    from obspec_utils.registry import ObjectStoreRegistry
     from obstore.store import LocalStore
     from virtualizarr import open_virtual_dataset
     from virtualizarr.parsers import FITSParser
-    from virtualizarr.registry import ObjectStoreRegistry
 
     prefix = f"file://{tmp_dir}"
     registry = ObjectStoreRegistry({prefix: LocalStore(prefix=tmp_dir)})
@@ -74,7 +74,7 @@ def _commit_and_open(virtual, tmp_dir: str):  # -> zarr Store
         authorize_virtual_chunk_access=icechunk.containers_credentials({prefix: None}),
     )
     session = repo.writable_session("main")
-    virtual.virtualize.to_icechunk(session.store)
+    virtual.vz.to_icechunk(session.store)
     session.commit("build")
     return repo.readonly_session("main").store
 

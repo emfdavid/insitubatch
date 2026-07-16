@@ -42,10 +42,10 @@ def _build_bintable_store(tmp_dir: str) -> tuple[str, np.ndarray]:
     """
     import icechunk
     from astropy.io import fits
+    from obspec_utils.registry import ObjectStoreRegistry
     from obstore.store import LocalStore
     from virtualizarr import open_virtual_dataset
     from virtualizarr.parsers import FITSParser
-    from virtualizarr.registry import ObjectStoreRegistry
 
     n = 64
     flux = (np.sin(np.linspace(0.0, 6.0, n)) * 10.0).astype(">f4")  # big-endian, as in real FITS
@@ -75,7 +75,7 @@ def _build_bintable_store(tmp_dir: str) -> tuple[str, np.ndarray]:
         authorize_virtual_chunk_access=icechunk.containers_credentials({ice_prefix: None}),
     )
     session = repo.writable_session("main")
-    vds.virtualize.to_icechunk(session.store)
+    vds.vz.to_icechunk(session.store)
     session.commit("index bintable")
     return f"{tmp_dir}/repo", flux
 

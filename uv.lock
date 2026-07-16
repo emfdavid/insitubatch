@@ -1340,6 +1340,7 @@ astronomy = [
     { name = "astropy" },
     { name = "icechunk" },
     { name = "kerchunk" },
+    { name = "obspec-utils" },
     { name = "s3fs" },
     { name = "virtualizarr" },
 ]
@@ -1410,6 +1411,7 @@ requires-dist = [
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
     { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.26" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "obspec-utils", marker = "extra == 'astronomy'", specifier = ">=0.9" },
     { name = "obstore", specifier = ">=0.3" },
     { name = "optax", marker = "extra == 'jax'", specifier = ">=0.2" },
     { name = "plotly", marker = "extra == 'bench'", specifier = ">=5.20" },
@@ -1420,8 +1422,8 @@ requires-dist = [
     { name = "tensorflow", marker = "extra == 'tf'", specifier = ">=2.16" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.2" },
     { name = "torchdata", marker = "extra == 'torch'", specifier = ">=0.10" },
-    { name = "virtualizarr", marker = "extra == 'astronomy'", git = "https://github.com/emfdavid/VirtualiZarr.git?rev=8a1563f236355534d06362034c1a05ab27667eba" },
-    { name = "virtualizarr", marker = "extra == 'virtual'", git = "https://github.com/emfdavid/VirtualiZarr.git?rev=8a1563f236355534d06362034c1a05ab27667eba" },
+    { name = "virtualizarr", marker = "extra == 'astronomy'", git = "https://github.com/zarr-developers/VirtualiZarr.git?rev=f46902d2d3346bff31c88bf7212a14a2a50934bc" },
+    { name = "virtualizarr", marker = "extra == 'virtual'", git = "https://github.com/zarr-developers/VirtualiZarr.git?rev=f46902d2d3346bff31c88bf7212a14a2a50934bc" },
     { name = "xarray", specifier = ">=2024.9" },
     { name = "xbatcher", marker = "extra == 'bench'", specifier = ">=0.3" },
     { name = "zarr", specifier = ">=3.0" },
@@ -3859,8 +3861,8 @@ wheels = [
 
 [[package]]
 name = "virtualizarr"
-version = "10000.dev608+g8a1563f23"
-source = { git = "https://github.com/emfdavid/VirtualiZarr.git?rev=8a1563f236355534d06362034c1a05ab27667eba#8a1563f236355534d06362034c1a05ab27667eba" }
+version = "2.7.1.dev14+gf46902d2d"
+source = { git = "https://github.com/zarr-developers/VirtualiZarr.git?rev=f46902d2d3346bff31c88bf7212a14a2a50934bc#f46902d2d3346bff31c88bf7212a14a2a50934bc" }
 dependencies = [
     { name = "numcodecs" },
     { name = "numpy" },

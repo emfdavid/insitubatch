@@ -252,10 +252,10 @@ def build_store(
     import shutil
 
     import icechunk
+    from obspec_utils.registry import ObjectStoreRegistry
     from obstore.store import HTTPStore
     from virtualizarr import open_virtual_dataset
     from virtualizarr.parsers import FITSParser
-    from virtualizarr.registry import ObjectStoreRegistry
 
     store_path = str(store_path)
     shutil.rmtree(store_path, ignore_errors=True)
@@ -284,7 +284,7 @@ def build_store(
         authorize_virtual_chunk_access=icechunk.containers_credentials({ice_prefix: None}),
     )
     session = repo.writable_session("main")
-    virtual.virtualize.to_icechunk(session.store)
+    virtual.vz.to_icechunk(session.store)
     session.commit(f"index {len(plate_urls)} SDSS spPlate frame(s)")
     return store_path
 
