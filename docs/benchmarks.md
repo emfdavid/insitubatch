@@ -101,6 +101,35 @@ grid (`era5_fat_g4/g16/g36`):
 You dial throughput from 23 → ~1130 MB/s purely via `max_inflight`, at **constant memory**
 — concurrency and residency are independent knobs.
 
+### The acceptance gate that justified the rewrite (exp_c, c6id.8xlarge)
+
+Kept for the record: the v1-vs-V2 A/B that decided the scheduler rewrite. Fat data
+(`sample_chunk=200`, ~830 MB outer chunks), in-region S3, median of 5.
+
+**v1 baseline** — read concurrency rode on `block_chunks`, so throughput *peaked* at the
+smallest window and fell as the window grew (the nested caps overshoot):
+
+| `block_chunks` (≈ resident) | single-inner MB/s | spatial (grid 15, read_conc 16) MB/s |
+|---|--:|--:|
+| 2 (~3.3 GB) | 76 | **930** |
+| 4 (~6.6 GB) | 120 | 871 |
+| 8 (~13 GB) | 178 | 724 (oversubscribed) |
+
+**V2 result** — same box, `block_chunks=2` fixed, sweeping the single `max_inflight` budget:
+
+| `max_inflight` | 8 | 16 | **32** | 64 | 128 |
+|---|--:|--:|--:|--:|--:|
+| MB/s | 388 | 788 | **1052** | 970 | 970 |
+| `resident` (chunks) | 4 | 4 | 4 | 4 | 4 |
+
+V2 **beats** the v1 spatial peak (1052 vs 930) at the *same* low memory, and residency is
+**flat at `2×block_chunks` for every `max_inflight`** — concurrency dialed independently of
+memory. Past the knee (`mi≈32`) throughput settles to a stable 970 plateau instead of v1's
+collapse to 724 under oversubscription. Re-run after the B2 admission rewrite
+(`resident_cap` → byte-budget pin/LRU) to confirm no regression: `981 / 981 / 988` MB/s at
+`mi = 32 / 64 / 128`, `resident = 4` throughout — the plateau sits a touch below the
+original 1052, inside the cold-S3 run-to-run spread.
+
 ---
 
 ## Story 3 — the cache (decode-once across epochs)
@@ -219,6 +248,36 @@ public store ([walkthrough](walkthrough.md), identical 48×32 samples, xbatcher 
 worker count) makes it concrete: xbatcher manages **~290 samples/s** at **~850 ms** to first
 batch, insitu **~4450 samples/s** at **~320 ms** — **~15×** throughput and ~2.7× TTFB,
 because WB2's fat time-chunks punish the per-sample decode while insitu reads each chunk once.
+
+---
+
+## Store backends — obstore vs fsspec/gcsfs on HTTP GCS
+
+The engine reads a zarr `Store`, so the backend is swappable (`--backend obstore|fsspec`).
+On **plain HTTP GCS** (n2-standard-8), obstore wins the transfer floor decisively.
+Decode-free raw concurrent GET, best of a 4→32 concurrency sweep, MB/s:
+
+| chunking | obstore | gcsfs (`cat_file`) | obstore lead |
+|---|--:|--:|--:|
+| c1 | 1211 | 529 | 2.3× |
+| c4 | 1581 | 606 | 2.6× |
+| c16 | 802 | 487 | 1.6× |
+
+The mechanism is visible in the sweep: obstore **scales** with concurrency (c1 raw:
+376 → 681 → 1042 → 1211), while gcsfs **plateaus at ~500–600 MB/s and degrades past 16
+threads** (c1: 343 → 513 → 529 → 358) — the per-request Python/aiohttp path on the single
+fsspec loop is the ceiling.
+
+End-to-end (fetch + decode) the gap **compresses to ~1.15–1.2×**, but only because this
+8-core box is **decode-bound at ~450 MB/s** (the decode-threads sweep saturates 445 → 456
+at 4–8 threads, well under obstore's raw 0.8–1.6 GB/s), so both backends hit the same
+decode wall. Read that ~20% as a *floor* on fsspec's HTTP penalty: on more cores or with a
+faster codec pipeline the fetch gap re-widens toward the ~2× raw number.
+
+**Takeaway:** obstore stays the HTTP default; fsspec is *not* a co-equal fast path on HTTP,
+but it is not a correctness regression either. Its case rests entirely on the
+**Rapid/zonal gRPC** path obstore cannot reach — that experiment has not run yet, so read
+this section as "obstore wins HTTP", not "fsspec is worse".
 
 ---
 
