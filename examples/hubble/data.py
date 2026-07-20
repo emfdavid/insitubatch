@@ -109,10 +109,10 @@ def build_store(
 
     import icechunk
     import xarray as xr
+    from obspec_utils.registry import ObjectStoreRegistry
     from obstore.store import S3Store
     from virtualizarr import open_virtual_dataset
     from virtualizarr.parsers import FITSParser
-    from virtualizarr.registry import ObjectStoreRegistry
 
     store_path = str(store_path)
     shutil.rmtree(store_path, ignore_errors=True)
@@ -138,7 +138,7 @@ def build_store(
         ),
     )
     session = repo.writable_session("main")
-    combined.virtualize.to_icechunk(session.store)
+    combined.vz.to_icechunk(session.store)
     session.commit(f"index {len(uris)} Hubble WFC3/IR frames")
     return store_path
 

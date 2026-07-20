@@ -121,9 +121,9 @@ uv sync --extra torch
 uv run python -m examples.hubble.train_torch                      # offline synthetic frames (default)
 
 # real Hubble frames on S3 -- indexes them into a virtual-reference store first (needs the
-# build-time stack), then streams and trains:
-uv run --with virtualizarr --with kerchunk --with astropy --with icechunk --with s3fs \
-  python -m examples.hubble.train_torch --source hubble --build
+# `astronomy` build-time stack), then streams and trains:
+uv sync --extra torch --extra astronomy
+uv run python -m examples.hubble.train_torch --source hubble --build
 ```
 
 The task is per-frame **Gaussian-noise removal** (a deliberately didactic stand-in — the point is
@@ -139,6 +139,58 @@ network or FITS stack — it also backs the drift test in `tests/test_hubble.py`
 
 > Note: MAST's *anonymous* bucket throttles (HTTP 503) under heavy concurrent read-ahead, so
 > `max_inflight` is capped low by default; an authenticated/retrying path on AWS would raise it.
+
+## sdss/ — reconstructing SDSS spectra streamed in place (no reshard)
+
+The **decode-amortization** companion to Hubble, and an [astroML](https://github.com/astroML/astroML)
+mirror. astroML's spectral-PCA workflow (`fetch_sdss_corrected_spectra` → `compute_sdss_pca`) first
+downloads the raw archive and resamples every spectrum onto a common grid into one `spec4000.npz`
+file — the exact download-and-reshard step insitubatch argues against. [`sdss/`](sdss/data.py)
+instead indexes a real **`spPlate`** frame on `data.sdss.org` (over HTTPS) as virtual references:
+one plate holds all ~640 fibers on a *common* log-wavelength grid as a single `(fiber, wave)` image,
+which [`_rechunk_fibers`](sdss/data.py) splits along the fiber axis into contiguous virtual chunks
+by **pure byte arithmetic** — no pixels moved. `sample_axis=0` makes each fiber one sample, and
+because a chunk is many fibers this lands in the **O(chunks) decode-amortization** regime (contrast
+Hubble's one image per chunk).
+
+```bash
+uv sync --extra torch
+uv run python -m examples.sdss.train_torch                       # offline synthetic spectra (default)
+
+# real SDSS spPlate over HTTPS -- indexes it into a virtual-reference store first (needs the
+# `astronomy` build-time stack), then streams and trains:
+uv sync --extra torch --extra astronomy
+uv run python -m examples.sdss.train_torch --source sdss --build             # 1 plate
+uv run python -m examples.sdss.train_torch --source sdss --build --plates 8  # 8 plates, aligned
+```
+
+One plate (~640 spectra, ~10 MB) fits in memory, so `--plates` scales the real story. The two
+modes trade off along the FITS byte layout, and **both move no pixels — only the chunk manifest is
+rewritten:** a **single** plate is re-chunked along the fiber axis at full wave width (many fibers
+per chunk — the *decode-amortization* regime); **several** plates are cropped to their shared
+log-wavelength window and folded into one flat fiber axis (one fiber per chunk — the *streaming*
+regime). The crop is exact — every SDSS plate uses the same `dloglam` and their `COEFF0` start
+wavelengths differ by whole bins, so the windows align onto one grid with no resampling — which is
+the only no-reshard way to concatenate the ragged-width plates. That is the corpus-scale path: the
+full archive is thousands of plates (tens of GB) you would otherwise download and reshard.
+
+The task mirrors astroML's **spectral reconstruction**: recover the clean spectrum through a
+low-dimensional bottleneck. The baseline is **PCA** at the same latent dim — the optimal *linear*
+reconstruction; a small **1-D convolutional autoencoder**, trained by SGD over the streamed
+mini-batches, beats it because galaxy spectra are translation-structured (varying redshift shifts
+the lines, which a fixed-dim linear basis reconstructs poorly). A per-fiber robust normalization
+(`normalize`) runs vectorized on the decode pool; the per-sample reconstruction noise lives in the
+`Corrupt` batch stage, per the transform-cost contract. `--source synthetic` (the default) needs no
+network or FITS stack — redshift-shifted synthetic spectra on which the conv AE clearly beats PCA —
+and backs the drift test in `tests/test_sdss.py`. The real run is a *same-pipeline, real-archive*
+demonstration (one plate = ~640 spectra); the synthetic default carries the beats-PCA claim.
+
+> Multi-plate is one-fiber-per-chunk by construction: cropping to the common window breaks the
+> multi-fiber contiguity the single-plate mode relies on, so decode-amortization and corpus scale
+> are mutually exclusive here — an honest boundary of the FITS byte layout. SDSS spectra also ship
+> as FITS **binary tables** (structured big-endian dtypes); `tests/test_fits_bintable.py` validates
+> that path end-to-end through insitubatch and pins the VirtualiZarr fix it needs
+> ([#1037](https://github.com/zarr-developers/VirtualiZarr/pull/1037)).
 
 ## The WeatherBench2 cold-start pair (with xbatcher)
 
