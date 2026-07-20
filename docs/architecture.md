@@ -121,6 +121,42 @@ and amortized across every sample that touches it; **read concurrency
 total memory is the budget + the prefetch queue (depth `d`) + the in-flight tiles —
 every term a tunable cap, none scaling with batch size or epoch length.
 
+### Event-loop ownership (fsspec backends)
+
+A genuinely-async fsspec backend (gcsfs, s3fs) binds its aiohttp session to the *first
+event loop that awaits it*, permanently — no constructor knob pins it. For a zarr store
+that first loop is **zarr's** process-wide store-IO loop (`zarr.core.sync._get_loop()`),
+because any zarr sync call (`open_geometries`, `xr.open_zarr`, user code) touches the
+store first. That is the correct owner: the session living on zarr's loop is what keeps
+the store drivable by *any* zarr code — so insitubatch **conforms** (routes its reads
+there) rather than hijacking the session onto its own loop, which would break every other
+zarr-sync consumer in the process. The scheduler keeps its own orchestration loop and
+bridges each fsspec read to zarr's loop (`run_coroutine_threadsafe`); obstore is
+loop-agnostic (Rust runtime) and is awaited inline. Teardown closes the session on its own
+loop (`close_store`), so gcsfs's finalizer — which wrongly targets
+`fsspec.asyn.get_loop()` — becomes a no-op.
+
+```mermaid
+flowchart TD
+    subgraph proc["insitubatch process (one training run)"]
+      OG["any zarr sync call<br/>open_geometries / xr.open_zarr"]
+      SL["Scheduler loop<br/>own loop, new thread per pass<br/>orchestration + decode/scatter pool"]
+      ZL["zarr store-IO loop<br/>zarr.core.sync._get_loop()"]
+      SESS[("gcsfs aiohttp session")]
+      OBS["obstore ObjectStore<br/>Rust tokio runtime, loop-agnostic"]
+      FL["fsspec.asyn.get_loop()<br/>NOT where the session lives"]
+    end
+    OG -->|"first await creates the session here"| ZL
+    ZL -->|owns| SESS
+    SL -->|"fsspec read: run_coroutine_threadsafe (bridge)"| ZL
+    SL -->|"obstore read: await inline"| OBS
+    FL -.->|"gcsfs finalizer wrongly targets this;<br/>close_store fixes the mismatch at teardown"| SESS
+```
+
+Collapsing the two loops into one — running the scheduler's orchestration *on* zarr's
+loop for all backends, deleting the bridge and the per-pass thread churn — is planned
+under M-GCS in [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md).
+
 ## Sample geometry — the axis-role contract
 
 This is the stable contract the engine commits to, and the extension points reserved

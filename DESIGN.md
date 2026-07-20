@@ -8,12 +8,18 @@
 > ledger**: *why* the design is shaped the way it is, the pivots that got here, and
 > the rationale for roads not taken — written in past/decision tense. The **current
 > stable contract** (what a user builds against *now*) lives in
-> [docs/architecture.md](docs/architecture.md); **delivery + status** live in the
-> Milestones (`M-*`) and Status sections below. To avoid the version-label collision
-> this file used to have, **numbers name only two things**: the one-time *engine
-> generation* (the reader+buffer → scheduler+pool rewrite, "V2") and the *milestones*.
-> Capabilities are named, not numbered — the sample-geometry ladder is
-> "single-axis → windowed → arbitrary-axis → …", not "geometry v1/v2/v3".
+> [docs/architecture.md](docs/architecture.md); **measurements** live in
+> [docs/benchmarks.md](docs/benchmarks.md); **delivery + status** live in the
+> Status and Roadmap (`M-*`) sections at the end of this file. Numbers here name only
+> two things: the one-time *engine generation* (the reader+buffer → scheduler+pool
+> rewrite, "V2") and the *milestones*. Capabilities are named, not numbered — the
+> sample-geometry ladder is "single-axis → windowed → arbitrary-axis → …", not
+> "geometry v1/v2/v3".
+>
+> Open work has exactly two homes: **Known limitations & defects** (things wrong or
+> missing in *our* code) and **Roadmap** (things not built yet). Live state of
+> external PRs and issues is deliberately *not* tracked here — see
+> [Upstream capabilities we plan to inherit](#upstream-capabilities-we-plan-to-inherit).
 
 ## The thesis
 
@@ -22,7 +28,7 @@ anymore. obstore / icechunk / tensorstore already saturate the NIC (~37 Gbps rea
 on a large EC2 box; flat throughput from 800 KB to 50 MB chunks). The unsolved
 part is the **training-loader orchestration that consumes that fast IO** —
 read-planning, chunk-aligned splits, shuffle, bounded buffering, batch assembly,
-framework handoff (torch today; JAX/TF planned) — without the per-chunk **Python
+framework handoff (torch / JAX / TF) — without the per-chunk **Python
 tax** throttling everything.
 
 Evidence the IO race is over and the loader race is open:
@@ -35,7 +41,7 @@ Evidence the IO race is over and the loader race is open:
   count rises, but **Python per-chunk overhead bounds the minimum time**.
 
 So insitubatch is **not** a faster IO library. It *stands on* obstore and the
-zarr v3 async store and builds the layer those projects stopped one step short of.
+zarr v3 async store and builds the layer those projects stopped one step short of - the ML DataLoader.
 
 ## What it is, by contrast
 
@@ -46,14 +52,15 @@ labels/coords as *off-hot-path planning* metadata, never the delivery format —
 arrive DLPack-ready with no labeled-array machinery in the loop. (xarray is still welcome for
 *defining* a window; see "Subsetting the sample axis" in the architecture doc.)
 
-| Neighbor | Why insitubatch is different |
-|---|---|
-| **MosaicML Streaming / WebDataset** | They require **resharding** into a sample-oriented format (MDS/tar) — a full ETL copy, and a "sample" becomes an opaque blob. insitubatch trains **in place** on the existing ndim Zarr; splits/shuffle/batches live in **coordinate space**. |
+| Neighbor | Why insitubatch is different                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+|---|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **MosaicML Streaming / WebDataset** | They require **resharding** into a sample-oriented format (MDS/tar) — a full ETL copy, and a "sample" becomes an opaque blob. insitubatch trains **in place** on the existing ndim Zarr; splits/shuffle/batches live in **coordinate space**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | **xbatcher + DataLoader (worker stack)** | xbatcher (an xarray-contrib community project) is the standard, elegant way to *define* ndim batches — **xarray-native**, yielding `xr.DataArray`. Its torch-worker engine (N **processes**) is strongest at the GRIB / one-sample-per-chunk end, and elsewhere pays worker cold start, memory ∝ workers, and per-sample decode on the uncached path. insitubatch keeps the same ndim batch semantics but stays at the **numpy/tensor** level on a *different engine* — one async loop — winning **cold start** (inference) and **memory** across the chunk spectrum (training). The caches differ in kind: insitu's in-place decoded-chunk pool (deduped, no second copy) vs xbatcher's opt-in **materialized-batch** zarr store; both now persist across runs (insitu via `persist=True`). Complementary tools; pick by regime (and we tune xbatcher well before any comparison). |
-| **Earth2Studio (NVIDIA)** | An **xarray-centric** inference framework: its `DataSource` yields `xr.DataArray`, and xarray is load-bearing down to `prep_data_array`. insitubatch doesn't build xarray — *inside* their loop the win is an obstore store-swap (an obstore contribution, not ours); *around* their models it feeds `(tensor, coords)` batches straight to `model.create_iterator`, where `coords` is a light metadata dict, not the xarray machinery. |
-| **DALI / kvikio / nvCOMP** | The GPU compute/decompress path — a *peer* we interop with (cupy→dlpack→torch, optional nvCOMP), not the orchestration. |
-| **anemoi-datasets** | Weather-locked, opinionated schema. We are general ndim arrays. |
-| **dask / Ray Data** | General compute schedulers. We deliberately keep dask **off the hot path** (its nested thread pools inside forked workers are the problem). |
+| **Earth2Studio (NVIDIA)** | An **xarray-centric** inference framework: its `DataSource` yields `xr.DataArray`, and xarray is load-bearing down to `prep_data_array`. insitubatch doesn't build xarray — *inside* their loop the win is an obstore store-swap (an obstore contribution, not ours); *around* their models it feeds `(tensor, coords)` batches straight to `model.create_iterator`, where `coords` is a light metadata dict, not the xarray machinery.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **zarrs / tensorstore / zarr-python** | **Substrate, not peers.** These are zarr *implementations* — chunk-granular read + codec pipelines. We consume one (zarr-python's, over an obstore/arraylake/fsspec `Store`) and build the sample-oriented layer above it: dedup, splits, shuffle, residency, batch assembly. A faster implementation underneath is a *win we inherit*, not a competitor — see the zarrs codec-pipeline spike in Open questions.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **DALI / kvikio / nvCOMP** | The GPU compute/decompress path — a *peer* we interop with (cupy→dlpack→torch, optional nvCOMP), not the orchestration.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **anemoi-datasets** | Weather-locked, opinionated schema. We are general ndim arrays.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| **dask / Ray Data** | General compute schedulers. We deliberately keep dask **off the hot path** (its nested thread pools inside forked workers are the problem).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 ## The core inversion
 
@@ -108,8 +115,7 @@ The ladder, in the order it was built:
 2. **Windowed / multi-offset** (M-W, PR #4) — a variable became a `(label, path, offset)`
    *view*; `g.shift(k)` reads `array[anchor+offset]` along the sample axis, several views
    of one array decode once. This is the forecasting unlock; a *sample* may now reference
-   several chunks, but each read is still a within-chunk slice (details in the M-W entry
-   under Roadmap).
+   several chunks, but each read is still a within-chunk slice. Detail below.
 3. **Arbitrary sample axis** — `sample_axis` lets *any single* physical axis be
    the sample axis (OME-NGFF "sample over Z"), by carrying `shape`/`chunks` in physical
    order and confining one physical↔logical permutation to the scheduler. Cheap precisely
@@ -124,12 +130,56 @@ The ladder, in the order it was built:
    read planner and `gather`. Orthogonal to `sample_axis`, and it composes with windowing and
    arbitrary axes — tests cover all three overlapping, plus the uneven tail where a coarse
    chunk runs out at the end of the axis. Cross-domain validated end-to-end on the real IDR
-   raw+mask pairing (byte-exact). *Residency deferral (same class as windowed+shuffle, M-W):*
-   under shuffle a non-uniform variable's chunk can be needed by scattered blocks, so the
-   budget currently holds the whole train split resident per variable; a tighter bound
-   (per-block re-fetch) is the shared deferred bounded-residency work.
+   raw+mask pairing (byte-exact).
 
-**Deferred generalizations, and *why* (so they aren't relitigated):**
+### The windowed rung — the scope decision and what shipped
+
+The problem it solved: a batch drew **one shared sample index for all variables**, so
+input@t / target@t+1 was inexpressible; shuffle destroys temporal adjacency (so a
+`batch_transform` can't pair times either); and a precomputed shifted-target variable
+means **resharding — impossible on read-only public ERA5/HRRR**.
+
+**Scope decision: a finite set of discrete offsets from an anchor is sufficient;
+promoting a window to a single cross-chunk contiguous-slab read is an explicit
+non-goal.** Every temporal access in forecasting is such a set — rollout reads only the
+initial condition (FourCastNet/Pangu/SFNO: 1 step; GraphCast: 2 = offsets `{-1,0}`) and
+the model generates futures; scoring reads ground truth at enumerable lead times;
+training pairs an input history with a target horizon. Multi-offset sampling already
+*expresses a contiguous window* as the offset range `0..L-1` over the **same** chunks a
+slab read would touch (we decode chunk-granular, so L point-gathers from a decoded chunk
+are cheap), so a slab read buys only marginal gather-ergonomics for very long windows.
+Recorded so it isn't relitigated.
+
+As built (PR #4), the engine stayed simpler than the original sketch:
+
+- A variable is a `(label, path, offset)` **view**; a window is just several views of one
+  array (`{"x": g, "y": g.shift(1)}`). `Batch` stays a **flat `{label: array}` dict** —
+  *no* lead axis, *no* `input`/`target` roles in the engine. It carries an `offsets`
+  metadata dict; `Batch.read_indices(label)` and `Batch.stack(labels)` are the projection
+  helpers (the user composes the window).
+- **No guard band.** The engine enforces *range validity only* (`anchor+offset ∈ [0,T)`;
+  `valid_anchor_range` drops edge anchors); offset 0 is not special. Partitioned anchors
+  give disjoint train/val labels for any offset (injective translation), and the shared
+  boundary timestep is only ever a val *input*, never scored. Task meaningfulness
+  (non-degenerate offset choices) is the **user's** responsibility, not the engine's.
+- Residency is **reference-counted** (`pool._pinned: dict[key,int]`, not a boolean set)
+  because a windowed chunk can feed several blocks; a per-epoch `claimed` flag orders
+  pin→consume→release across the epoch boundary (fixes a cross-epoch gather/leak race).
+  Decode-once across views holds (slots key on `path`).
+- **Splits are iterable views, not a constructor arg.** `InSituDataset` is split-agnostic;
+  you iterate `ds.train` / `ds.val` / `ds.test` / `ds.all`, all sharing **one** `ChunkPool`.
+  This matters *because* of windows: a windowed read near a split boundary spills into the
+  adjacent split's chunk, so the splits' *chunk reads* overlap even though no sample leaks
+  (the disjoint-anchor proof is about samples, not chunks) — one shared pool decodes those
+  boundary chunks once, where separate per-split datasets would decode them twice.
+  Per-split *config* (e.g. train-only augmentation) is intentionally unsupported on one
+  instance — make a second dataset for that; the default path stays clean.
+
+Validated by the advected-field forecast in `examples/advection/`: one `InSituDataset`
+feeds torch, JAX and TF training loops with the same tiny CNN, beating persistence ~1.6×
+on the synthetic store, and running the *same code* against WeatherBench2 ARCO ERA5.
+
+### Deferred generalizations, and *why* (so they aren't relitigated)
 
 - **Multiple sample axes → one product index** (HCS `Well×Field×Time`, `Year×Day`). The
   blocker is not feasibility — it's that a tuple sample axis **breaks the contiguity
@@ -153,6 +203,7 @@ The ladder, in the order it was built:
   assembles (and budgets) the *whole* field per outer chunk, so bounded memory on a giant
   ERA5/radio field needs the pool to hold only a crop's tiles. That is a residency change,
   not a `Batch`-contract change — which is what keeps it an *additive* future.
+
 GRIB / NetCDF are consumed via a **virtual-zarr** view (virtualizarr / kerchunk /
 icechunk) so the engine only ever speaks zarr-async — we never parse GRIB.
 
@@ -187,15 +238,15 @@ order functions size a short final chunk correctly (no out-of-range draws).
 
 v1 peak residency ≈ `block_chunks × outer_chunk_nbytes` (the shuffle/assembly
 window) + the prefetch queue (`prefetch_depth` batches) + the chunk-cache budget
-(M-C, RAM optionally spilled to NVMe). Because read concurrency follows
-`block_chunks` (a block fetches its chunks), v1 **couples three things into one
-knob**: read concurrency, residency, and shuffle span. Every term is still a
-tunable cap that never scales with batch size or epoch length — but the coupling is
-what V2 breaks.
+(M-C, RAM optionally spilled to NVMe). Because read concurrency followed
+`block_chunks` (a block fetches its chunks), v1 **coupled three things into one
+knob**: read concurrency, residency, and shuffle span. Every term was still a
+tunable cap that never scales with batch size or epoch length — but that coupling is
+what the V2 scheduler broke.
 
-## V2 — decoupled fetch scheduler (M1.6)
+## The fetch scheduler (V2)
 
-v1 fetches one *outer* chunk per `arr.getitem` (zarr stitches the inner grid),
+v1 fetched one *outer* chunk per `arr.getitem` (zarr stitches the inner grid),
 under two nested caps: `max_inflight` (outer) and zarr's `async.concurrency`
 (inner). That double-quantizes — a 15-tile field at inner-cap 10 takes 2 waves ≈
 half rate — and pins read concurrency to `block_chunks`.
@@ -213,6 +264,13 @@ runs a single budget over it:
 - **Two explicit caps**: ≤ `block_chunks` (+read-ahead) outer chunks resident
   (shuffle window); ≤ `max_inflight` inner tiles in flight (pipeline).
 
+Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
+`chunk_key_encoding.encode_chunk_key`, bytes via `store.get`, decode via
+`codec_pipeline.decode([(buf, ArraySpec)])`, scatter into the outer array — matches
+`arr.getitem` exactly for single-inner and spatial layouts incl. partial edge chunks.
+The acceptance gate (v1 baseline vs V2, and the flat-residency result that justified
+the rewrite) is recorded in [docs/benchmarks.md](docs/benchmarks.md).
+
 ### The pipeline: three GIL-free stages
 
 All three steps release the GIL — **fetch** (obstore/tokio, Rust), **decode**
@@ -220,7 +278,7 @@ All three steps release the GIL — **fetch** (obstore/tokio, Rust), **decode**
 in the bounded pool; the loop only does async fetch + scheduling. Fuse
 decode→transform→scatter into **one** pool task per chunk (one GIL-release window,
 no inter-stage handoff). Transform granularity is the wrinkle, since fetch is at
-*tile* granularity but the v1 `chunk_transform` contract is *per outer chunk*:
+*tile* granularity but the `chunk_transform` contract is *per outer chunk*:
 
 - **elementwise** transforms (e.g. `StandardScaler`) may fuse per tile — earliest
   overlap, lowest peak.
@@ -258,115 +316,17 @@ parameterized by:
   into the slot either way. mmap keeps **anon** (real pressure) low while pages stay
   reclaimable (the anon/file split we measure).
 - **policy** — a byte budget + eviction. Epoch-last-use with `budget = block_chunks`
-  → today's read-once buffer; large budget + LRU → cross-epoch cache. *Same machinery* —
+  → a read-once buffer; large budget + LRU → cross-epoch cache. *Same machinery* —
   caching stops being an optional intercept and becomes "raise the budget, switch to
   LRU, pick mmap backing."
 
 Caveats: (1) **mmap isn't free for read-once** — scattering into mmap is NVMe write
 traffic even when never reused, so default the pool to **heap** for streaming and
 use mmap only to spill a working set past RAM or for cross-epoch reuse. (2)
-**cross-*run* persistence is now a flag** (`persist=True`, M-C2 ✅) — intra-run/
+**cross-*run* persistence is a flag** (`persist=True`, M-C2) — intra-run/
 cross-epoch reuse is intrinsic (just don't evict); surviving process exit adds an
 append-only log of completed slots (written incrementally, so a crash mid-run still
 recovers) + a chunk-transform fingerprint, revived on reopen.
-
-Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
-`chunk_key_encoding.encode_chunk_key`, bytes via `store.get`, decode via
-`codec_pipeline.decode([(buf, ArraySpec)])`, scatter into the outer array — matches
-`arr.getitem` exactly for single-inner and spatial layouts incl. partial edge chunks.
-
-### Phasing
-
-- **B1 ✅** — V2 scheduler + a **heap `ChunkPool`** subsuming `ShuffleBlockBuffer`
-  (cache off, read-once). Landed the throughput/memory decoupling first.
-- **B2 ✅** — `ChunkPool` gains a **byte budget + pin/unpin + LRU** and an optional
-  **mmap backing** (`open_memmap` direct-scatter). One machinery: a small budget is
-  read-once; a large budget (`cache_budget_bytes`) retains drained chunks for
-  cross-epoch decode-once reuse (the scheduler skips fetch+decode+transform on a
-  still-resident chunk). The pool is dataset-owned (persists across epochs); B1's
-  `resident_cap` admission unified into the budget (consumer `unpin` replaces
-  `evict`, eviction is unpinned-LRU). **M-C2 ✅** later added cross-*run* persistence
-  (`persist=True`): an append-only log of completed slots + a chunk-transform fingerprint
-  survive `close` (and a crash), revived on reopen.
-
-Demonstrate: on `era5_fatspatial`, plot throughput **and** peak heap vs concurrency
-— v1 (concurrency = `block_chunks`) rises in both; V2 (`block_chunks` fixed small,
-`max_inflight` swept) reaches the ~1 GB/s knee at flat, low memory. Plus the
-measured de-quantization (inner-grid sweep at a fixed budget: v1 sawtooth, V2 flat).
-
-### v1 baseline & acceptance (exp_c — S3, c6id.8xlarge)
-
-Fat data (`sample_chunk=200`, ~830 MB outer chunks), insitu MB/s, median of 5:
-
-| block_chunks (≈ resident) | single-inner | spatial (grid 15, read_conc 16) |
-|---|---:|---:|
-| 2 (~3.3 GB) | 76 | **930** |
-| 4 (~6.6 GB) | 120 | 871 |
-| 8 (~13 GB) | 178 | 724 (oversubscribed) |
-
-Spatial peaks at `bc=2` (~30 in-flight ≈ the network knee) and *falls* as `bc`
-rises — the nested caps overshoot. **V2 acceptance test:** match ~930 MB/s at
-`block_chunks ≤ 2` with a single `max_inflight ≈ 32` budget, and show throughput
-*flat* (not falling) + memory flat as `max_inflight` rises past the knee. Datasets
-persist in S3 (`era5_fat.zarr`, `era5_fatspatial.zarr` under the bench bucket);
-re-probe with:
-
-```
-uv run python -m bench.probe_decode --url s3://$BUCKET/era5_fatspatial.zarr --var t2m \
-  --max-chunks 16 --repeats 5 --decode-threads 8 --block-chunks 2 --max-inflight 8,16,32,64 --no-raw
-```
-
-Section 1b sweeps `max_inflight` at fixed `block_chunks=2`: V2 passes if throughput
-rises to the network knee and stays *flat* (not falling, as v1's nested caps did
-when oversubscribed) while `resident` stays pinned at `2*block_chunks` independent
-of `max_inflight`.
-
-**V2 result (✅ passed, c6id.8xlarge, fat-spatial, median of 5):**
-
-| `max_inflight` | 8 | 16 | **32** | 64 | 128 |
-|---|---:|---:|---:|---:|---:|
-| MB/s | 388 | 788 | **1052** | 970 | 970 |
-| `resident` (chunks) | 4 | 4 | 4 | 4 | 4 |
-
-V2 **beats** the v1 spatial peak (1052 vs 930) at the *same* low memory (`bc=2`,
-`resident=4 ≈ 3.3 GB`), and — the thesis — residency is **flat at `2*block_chunks`
-for every `max_inflight`**, so concurrency is now dialed independently of memory.
-Past the knee (`mi≈32`) throughput settles to a **stable 970 plateau** (64 and 128
-identical) instead of v1's collapse to 724 under oversubscription. The ~8% settle
-from the 1052 peak is benign oversubscription, not a sawtooth; the sweet spot is
-`max_inflight ≈ 32` (the ~30-in-flight network knee).
-
-**Confirmed post-B2 (the admission rewrite `resident_cap` → byte-budget pin/LRU did
-not regress the thesis).** Re-running on the same box: throughput flat at the plateau
-across the sweep — `981 / 981 / 988` MB/s at `mi = 32 / 64 / 128` — with `resident = 4`
-at *every* `max_inflight`. The plateau sits a touch below the original 1052, inside
-the cold-S3 run-to-run spread (the small sample is noisy by design); the shape — rise
-to the knee, flat after, residency pinned — is intact.
-
-**Cache (B2), on S3:** with `cache_budget_bytes` large enough to hold the probed
-window (mmap on NVMe), epoch 0 cold `930` MB/s → epoch 1 **cached `2314` MB/s
-(2.5×)** — the cached epoch is served from the pool with no GET and no decode. The
-multiple grows with colder S3 or heavier decode; 2.5× is the conservative read.
-
-### B1 task list
-
-1. ✅ **`build_stored_chunk_reads`** — deduped stored-chunk reads `(outer, inner)` in
-   draw/priority order (`plan.py`).
-2. ✅ **`Scheduler`** — one `asyncio.Semaphore(max_inflight)` over fetch+decode+scatter
-   tasks; chunk-major priority; scatter into pre-allocated outer arrays (disjoint
-   writes, lock-published completion counter). Residency admission is a second
-   semaphore over outer positions. Spike `bench/spike_v2_decode.py` validated the
-   fetch+decode path. (Per-tile transform fusion deferred; transforms run on the
-   assembled chunk — see the pipeline section.)
-3. ✅ **Heap `ChunkPool`** — allocate / scatter / wait_ready / gather / evict / fail;
-   residency window = `2*block_chunks`; subsumes `ShuffleBlockBuffer` (deleted).
-4. ✅ **Wire into `source.py`** — V2 *replaces* v1 (no flag; the recorded exp_b/exp_c
-   baselines are the A/B reference). The v1 streaming reader (`AsyncChunkReader`) and
-   read plan (`build_read_plan`) were later removed as dead.
-5. ✅ **Validate** — local parity green (`test_pool`, `test_scheduler`, `test_source`)
-   and exp_c acceptance **passed** on fat-spatial S3 (1052 MB/s at `mi=32`, beats the
-   930 v1 peak; residency flat at `2*block_chunks` across the sweep — see the result
-   table above). Next: B2 (mmap backing + LRU; the pool subsumes the cache).
 
 ## Module map
 
@@ -392,8 +352,8 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
   meant read concurrency rode on the shuffle window (you bought concurrency with memory, and
   got a throughput sawtooth). The diagnosis that forced the rewrite: the wall was *read
   concurrency*, not decode or bandwidth. v2 flattens reads to stored-chunk granularity under
-  one `max_inflight` budget and makes residency a separate byte budget — see the V2 section
-  above. The two are now independent dials.
+  one `max_inflight` budget and makes residency a separate byte budget. The two are now
+  independent dials.
 - **The pool *is* the cache.** There was once a separate `ChunkCache` (memory/disk tiers). It
   collapsed into the `ChunkPool`: one byte-budgeted object that is the assembly buffer when
   small and the cache when large ("don't evict"). One machinery, and no copy between a buffer
@@ -407,7 +367,12 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
   runnable `examples/transforms.py`.
 - **No dask on the hot path.** The xarray/dask route nests worker thread pools inside forked
   DataLoader workers and oversubscribes cores; we route around it with a single async loop.
-  Lazy dask-style graphs are out by design, not by omission.
+  Lazy dask-style graphs are out by design, not by omission. Independent confirmation, from a
+  benchmark with no stake in our thesis: in
+  [zarrs/zarr_benchmarks](https://github.com/zarrs/zarr_benchmarks) the dask-over-zarr
+  configurations are **slower than plain zarr-python in every row** (e.g. 1.93 s vs 1.10 s
+  reading a 2 GB array) at **~2× the peak memory** (4.3 GB vs 2.4 GB) — and that is on local
+  NVMe, without the forked-worker nesting that makes it worse for us.
 - **No reshard.** The usual fix — rewrite the archive to one-sample-per-file — is a second
   copy that discards the chunk locality the store already has. We train in place and pay for
   it with an *approximate* shuffle instead.
@@ -419,6 +384,62 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
   their inference loop the win is an obstore store-swap (an obstore contribution, not ours);
   *around* their models, insitu delivers tensor batches directly. The two philosophies are
   laid out in `docs/architecture.md`.
+
+## Known limitations & defects
+
+Things wrong or missing in *our* code today, with the reasoning that sets their priority.
+(Things simply *not built yet* are milestones — see Roadmap.)
+
+- **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
+  shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
+  `span = max(offset) - min(offset)`. For a **sparse** offset set (leads `{24h, 240h}`:
+  2 offsets, span 216, `spc` 1 → factor 218) that over-reserves the memory budget ~100×
+  versus the 2 chunks per anchor actually needed. It does **not** over-*read* — the
+  `plan.py:_read_chunks` planner expands each offset independently (10 sparse leads × 8
+  inits = exactly 80 reads, not a 240-wide span). Fix: size the factor from the distinct
+  read-chunk count per anchor, not min→max span. Memory-only inefficiency, worst on
+  chunk-1 stores with wide sparse leads. **Low priority** — correctness is unaffected.
+- **Edge-anchor drop is silent.** `source.py:_drop_edge_anchors` keeps only anchors whose
+  every `anchor+offset` lands in `[0, n_samples)` and drops the rest with no counter and no
+  signal. This is **correct and desired for training** (skip incomplete windows), so the
+  engine must *not* raise — the policy belongs in the consumer, and the inference/scoring
+  path already closes it at the boundary (the Earth2Studio adapter validates `sample_range`
+  against `valid_anchor_range` and raises). The worthwhile follow-up is **observability**:
+  expose a `dropped_edge_anchors` count (or effective-vs-requested range) on `InSituDataset`
+  so any consumer can detect silent shrinkage without re-deriving `valid_anchor_range`. An
+  opt-in `on_edge="drop"|"raise"` is deliberately **deferred as YAGNI** until a second
+  inference-style consumer appears — don't add the knob for one caller.
+- **Cache invalidation is whole-pipeline, not per-variable.** `chunk_transforms` is one list
+  applied to every variable (each transform self-gates by name and no-ops on the rest), and
+  the fingerprint hashes the **whole list once** → a single `pipeline_hash` on every array's
+  entries. Editing a transform that only affects `t2m` therefore invalidates the *whole*
+  cache (`u10`/`v10` too, whose chunks are byte-identical) — and with the raise-on-stale
+  default the user must `reset_stale_cache` and re-decode everything. Fix: assign transforms
+  per variable (or derive, per array, the subset that touches it) and fingerprint **per
+  array**, which also drops the wasted no-op passes. Open design question: how a transform
+  declares which variables it applies to (explicit mapping vs today's name-gating
+  convention). Documented as a limitation in `docs/architecture.md`.
+- **Windowed + shuffle holds the whole split resident.** Shuffle spills a windowed chunk's
+  reads into arbitrary blocks, so residency is bounded by the split rather than the block;
+  the same applies to a non-uniformly chunked variable (geometry rung 4). The tighter bound
+  is per-block re-fetch — deferred, and shared between both cases.
+- **Refcount overhead on the non-windowed path (~3.5%, accepted).** Refcounted residency +
+  offset-aware `gather` cost ~3.5% at the **GRIB-end local worst case** (one sample/chunk,
+  ~36 KB blobs where decode is ≈ free, GIL build) — not residency (`resident` unchanged) and
+  not per-block setup; it is per-batch gather + per-chunk `dict`/`claimed` bookkeeping under
+  `pool._cv`. It shrinks toward noise at real chunk sizes and is invisible on blob stores.
+  The microscope for this and any future *locking* work is a tiny local store with negligible
+  decode under free-threading (`PYTHON_GIL=0`, where `pool._cv` is the only contention
+  point); recipe in [bench/benchmark_plan.md](bench/benchmark_plan.md). The lever, if a real
+  `c1`-on-S3 run ever shows it matters, is a non-windowed `gather` fast-path.
+- **Inherited: zarr-python's sharded-read path does not scale.** In
+  [zarrs/zarr_benchmarks](https://github.com/zarrs/zarr_benchmarks), zarr-python reading a
+  zstd+sharded array is **flat across concurrency 1→8** (2.01 → 1.78 s) and its
+  inner-chunk-of-shard reads *degrade* past concurrency 4 (3.43 → 3.79 s), while the Rust
+  implementation scales 4.6× over the same sweep. Our decode stage sits on that path, so any
+  sharded target store inherits the cliff. Not our defect to fix, but it bounds what tuning
+  can achieve on sharded data — and it is part of the motivation for the zarrs codec-pipeline
+  spike below.
 
 ## Open questions / spikes
 
@@ -437,6 +458,46 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
   spike (folded into the M1 codec sweep): measure the CPU chunk-stage ceiling
   (`n_cores × (decode + transform)`) vs NIC throughput — that ratio decides *when*
   a workload must switch to Config B.
+- **zarrs `ZarrsCodecPipeline` as a decode accelerator (spike, unrun).** The Rust `zarrs`
+  codec pipeline installs through zarr-python's own config
+  (`zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"})`) — the *same*
+  interface our scheduler already calls directly on fetched bytes. Upstream it is worth
+  **3.5× on roundtrip** (4.04 → 1.16 s) and **2.3× on sharded read-all** (1.88 → 0.80 s)
+  versus stock zarr-python. That matters because our GCP measurements put the box
+  **decode-bound at ~450 MB/s** while obstore delivered 0.8–1.6 GB/s raw — decode is the
+  live wall there, and this attacks it with no architectural change on our side.
+
+  **Where the cost actually is — neither library alone.** The isolating datapoint is the
+  *uncompressed* array, where numcodecs is never invoked: zarrs 0.58 s vs zarr-python
+  1.10 s. That ~1.9× is pipeline orchestration and per-chunk buffer copies — **zarr-python
+  side, no codec involved**. Compression widens the gap to 3.2× (0.26 vs 0.84), but both
+  implementations ultimately run the same compression algorithm, so that increment is far
+  more likely the *allocate-a-fresh-output-buffer-then-copy* **interface** between the
+  pipeline and the codec than libzstd throughput. Our own evidence says the codecs are not
+  the wall: zstd releases the GIL, the `decode_threads` sweep scaled 704 → 1574 MB/s from
+  1 → 8, and the flamegraph put zstd at ~13% of the hot path with no fat Python frame. So
+  the target is the **interface**, which is exactly what batched `out=` decode
+  ([#3060](https://github.com/zarr-developers/zarr-python/issues/3060), above) addresses
+  — the two are alternative attacks on the same copy, and inheriting the upstream fix is
+  cheaper than adopting a second implementation.
+
+  **Expected upside is smaller than the headline.** We call `codec_pipeline.decode`
+  directly (`scheduler.py`) with our own `store.get` and our own scatter, so most of that
+  ~1.9× zarr-python overhead is *already bypassed*. What a Rust pipeline could still win
+  for us is the decode call itself plus its buffer handling — a fraction of 3.5×, and
+  worth measuring precisely because we cannot infer it from these numbers.
+
+  **Two gates before adopting anything:** (1) confirm it serves our *direct-bytes* call
+  path (`codec_pipeline.decode` on buffers we fetched), not only store-mediated reads;
+  (2) confirm its Rust-side `threading.max_workers` can be pinned to 1 so **our** bounded
+  decode pool keeps ownership of concurrency — a codec pipeline spawning its own thread
+  pool underneath ours is structurally the nested-pool pathology we route around with dask,
+  and would be a regression however fast the codec is. Fold the measurement into the M1
+  codec sweep. Methodology caveat when citing the upstream numbers: they are local NVMe,
+  cold page cache, wall-clocked around a *fresh subprocess*, so interpreter and import
+  startup sits inside every Python row — the Python penalty is real but overstated by that
+  harness, and it says nothing about the cloud regime where decode is *overlapped* with
+  latency-bound IO rather than serialized.
 - **GIL**: even with Rust IO, Python decode/assembly can choke — so the standing
   rule is **chunk transforms must be vectorized numpy** (numcodecs C codecs and
   big-array numpy ops release the GIL; a pure-Python transform would serialize and
@@ -463,377 +524,188 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
   `state_dict` à la torchdata `StatefulDataLoader`).
 - **DDP**: shard *chunks* across ranks.
 
+## Upstream capabilities we plan to inherit
+
+Two pieces of our roadmap are cheaper — or differently shaped — if zarr-python lands
+capabilities already under design there. This section records **the design dependency**:
+what we would build versus what we would inherit. It deliberately does *not* track issue
+status, reviewers, or dates; that state lives outside this repo and goes stale here.
+
+- **Lazy indexing / `IndexTransform`** (zarr-python
+  [#3906](https://github.com/zarr-developers/zarr-python/pull/3906)) — a composable,
+  serializable description of "which elements of an array do I want", resolved lazily
+  rather than materialized. That is the same object our planner builds by hand, so a
+  shared upstream primitive is the natural foundation for `plan.py`: we would dogfood
+  their resolver against our planner and contribute the serialization-performance and
+  multi-window requirements. **What stays ours regardless:** the *batched* union of many
+  per-anchor windows into one deduplicated read set, in draw/priority order — that is
+  loader orchestration, not indexing, and it is the thing this project exists to do.
+- **Batched zero-copy `out=` decode** (zarr-python
+  [#3060](https://github.com/zarr-developers/zarr-python/issues/3060), under the
+  codec-pipeline umbrella [#2904](https://github.com/zarr-developers/zarr-python/issues/2904))
+  — decoding N chunks directly into N offset slices of one caller-provided buffer. Our
+  decode→slot path is already zero-copy except for **one intentional memcpy** in
+  `scatter` (`buffer[dst] = tile[src]`); a batched `out=` signature removes exactly that
+  copy by letting the codec write into the pool slot itself. The relevant requirement we
+  carry upstream is that the API be **batched** (N chunks → one buffer), not per-chunk —
+  a per-chunk `out=` leaves the loop-overhead shape unchanged. The decode-side
+  implementation is ours to write once a signature is agreed.
+
+Also relevant but monitor-only: `Store` read-into-buffer proposals help mainly on the
+uncompressed path (we are compressed nearly always), and sparse-read primitives are
+complementary to — not a replacement for — the chunk-dedup planner.
+
 ## Status
 
 **Maturity: Alpha** — validated on real cloud IO; API is pre-1.0 (breaking changes
-allowed). This section is the single source of truth for status; other pages link here.
+allowed). This section is the single source of truth for **our** delivery status; other
+pages link here. (Live state of upstream zarr / VirtualiZarr work is tracked outside this
+repo — see the section above for the design dependencies that matter.)
 
-**Phase 1 (real S3) validated.** Run on a `c6id.8xlarge` against in-region S3
-(ERA5-shaped `721×1440` fields, `sample_chunk=8`, warm), insitubatch delivers
-**~8× the throughput** of a tuned `xbatcher`/worker `DataLoader` baseline (swept to
-32 workers) and **~10× lower** time-to-first-batch — the map-style baseline
-re-decodes a whole chunk per sample (the ~8× ≈ `sample_chunk`); insitubatch reads
-each chunk once. It saturates ~85% of the raw-GET ceiling at `block_chunks=32`. See
-[the benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/).
+**Phase 1 (real S3) validated**, and the thesis holds across the chunk spectrum: on
+in-region S3 insitubatch delivers several-fold throughput and an order-of-magnitude lower
+time-to-first-batch versus a tuned `xbatcher`/worker `DataLoader` baseline, at flat memory,
+and keeps an L4 GPU 94–98% fed. All numbers, methodology and caveats live on
+[the benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/) — they are
+deliberately not duplicated here.
 
-The diagnosis that got there: the throughput wall was **read concurrency** (pinned
-at a fixed `max_inflight`), not decode or bandwidth. Fixes shipped — concurrency
-follows `block_chunks`, a bounded decode pool, S3 warm-up before timing,
-inner-chunk support, and one-block read-ahead so block-boundary IO overlaps compute
-(M1.5). The probe (`bench/probe_decode.py`) separates network vs decode on any
-store.
+Shipped: the planner, chunk-aligned splits, async obstore + fsspec/gcsfs store backends,
+the V2 scheduler + `ChunkPool` (M1.6), prefetch (M1.5), chunk/batch transforms and
+`StandardScaler` (M-T), the chunk cache with cross-epoch and cross-run persistence
+(M-C, M-C2), windowed/multi-offset sampling (M-W), arbitrary sample axis + per-variable
+sample-axis chunk size, the torch / JAX / TF DLPack surfaces (M3), a transform-development
+CLI, runnable examples across weather, microscopy and astronomy, and a published docs site.
 
-Built so far: planner, chunk-aligned splits, async obstore reads + bounded decode
-pool, coalesced gather, the **torch / JAX / TF framework surfaces (M3)** — DLPack
-`to_jax` / `to_tf` / `as_tf_dataset` over the numpy `Batch`, exercised by the
-three-framework advection examples — **chunk/batch transforms + `StandardScaler`
-(M-T)**, **prefetch (M1.5)**, runnable examples + a published docs site, and the
-**V2 decoupled fetch scheduler (M1.6, B1)** — `Scheduler` + `ChunkPool` are now the
-training engine (one `max_inflight` budget over stored chunks, residency decoupled
-at `2*block_chunks`); the v1 shuffle-block buffer is retired. **Acceptance passed**
-on fat-spatial S3: 1052 MB/s at `max_inflight=32` (beats the 930 v1 peak) with
-residency flat across the concurrency sweep. **B2 done** — the `ChunkPool` is now
-the cache too (byte budget + pin/unpin + LRU, heap or mmap backing; cross-epoch
-decode-once reuse via `cache_dir`/`cache_budget_bytes`; cross-*run* persistence via
-`persist=True`, M-C2). **Arbitrary sample axis** — `sample_axis` lets any single
-physical axis be the sample axis, and **per-variable sample-axis chunk size** lets
-co-registered variables chunk it differently (the raw Z-chunk 1 + label mask Z-chunk 30
-pairing) — both cross-domain validated end-to-end on a real IDR OME-NGFF microscopy store
-(sampling over `Z`); see the geometry-ladder section. **Not yet built:** `Regrid` + the
-GPU/device transform stage (M2), bounded read-ahead (M-RA), and bounded windowed/non-uniform
-residency under shuffle (per-block re-fetch instead of holding the whole train split).
+What is **not** built is exactly the set of unchecked milestones in the Roadmap below.
 
 ## Roadmap / milestones
 
-Perf track (the core thesis):
-- **M0 — local proof** ✅ real obstore IO, naive baseline, ~2.8× on GRIB regime.
-- **M1 — CPU EC2 / S3** run the harness against real S3 (us-east-1, c7i/m7i,
-  Spot); decode-codec sweep to measure the CPU chunk-stage ceiling vs NIC (the
-  one remaining decompression spike — see Open questions).
-- **M1.5 — prefetch** ✅ background producer + bounded queue (`prefetch_depth`)
-  overlap IO/decode/assembly with the consumer step; backpressure + early-exit
-  cleanup; tests assert the producer runs ahead. The producer walks shuffle-blocks
-  and reads **one block ahead** (a read-ahead thread fetches block N+1 while the
-  consumer drains block N), so block-boundary IO overlaps the per-batch compute
-  instead of stalling. Validated on WeatherBench2/GCS: at a realistic train step
-  the per-block sawtooth disappears (boundary waits 0.1 ms); at *zero* compute the
-  loader is IO-throughput-bound and the stall is only smoothed, not removed — that
-  is the network ceiling, not a scheduling bug.
-- **M1.6 — decoupled fetch scheduler (V2). ✅ B1 (acceptance passed: 1052 MB/s, residency flat).**
-  Flatten to stored-chunk granularity with one `max_inflight` budget over
-  inner+outer reads (full design above): decouples read concurrency from
-  residency/shuffle and kills the nested-cap sawtooth. `Scheduler` + `ChunkPool`
-  replace `AsyncChunkReader`/`ShuffleBlockBuffer` on the training path; the
-  zarr-internals path (fetch encoded bytes → `codec_pipeline` decode → scatter,
-  first proven in `bench/spike_v2_decode.py`) is the live engine, covered by
-  `test_pool`/`test_scheduler` parity + bound tests. Supersedes the one-block
-  look-ahead in `source.py`. exp_c fat-spatial acceptance passed (see the result
-  table). Remaining: B2 (mmap/LRU pool backing).
-- **M-RA — bounded read-ahead (decouple prefetch depth from the cache budget).** Today the
-  scheduler's read-ahead depth is gated *only* by the pool's byte budget: admission
-  (`try_admit`) parks just when the budget is full. A large `cache_budget_bytes`
-  (decode-once retention, e.g. `--cache-resident`) removes that backpressure, so the driver
-  eagerly admits + fetches the *whole* resident set at once. On a high-latency /
-  bandwidth-limited network this starves the current block — the first batch competes with
-  the whole-subset prefetch, inflating cold TTFB (observed on the WeatherBench2 Arraylake
-  example: ~7 s without the cache → ~50 s with `--cache-resident`, since `max_inflight`
-  worth of fetches fan out across the entire split). As a stopgap the example uses a low
-  `--max-inflight` so it doubles as a read-ahead throttle, but that couples two dials.
-  **Fix:** a fetch-ahead cap — a semaphore released on the consumer's `unpin` — that bounds
-  how far ahead of the consumer the driver admits, *independent* of the retention budget.
-  Then the cache retains consumed chunks (fast warm epochs) without eager whole-split
-  fetching (fast cold TTFB), and `max_inflight` goes back to being purely the concurrency
-  dial. Applies to both the V2 main engine and the M-W branch (whose residency rework did
-  not add a read-ahead cap either).
-- **M-GCS — fsspec/gcsfs store backend (in progress).** The engine now takes a zarr
-  `Store`, built per backend: `obstore_store` (default, pure-Rust URL path),
-  `fsspec_store` (`FsspecStore.from_url`, reaches what obstore can't — GCS Rapid/zonal
-  over gRPC, requester-pays — via `insitubatch[gcsfs]`), and `arraylake_store`
-  (Icechunk sessions). The str-vs-Store / `**store_kwargs` dispatch is gone. **Open
-  question under evaluation on the GCP bench box:** whether fsspec-over-gcsfs on Rapid
-  storage matches or beats obstore's raw-read path — if so, fsspec earns a spot as a
-  core dep and a co-equal fast path (today it is an optional extra). Pending: validate a
-  real Rapid bucket end-to-end, then drop the `ops_gcp.md` VERIFY markers.
-  - **Preliminary — standard HTTP GCS (n2-standard-8, 2026-07-03; `ops_gcp.md` §7a).**
-    On plain HTTP GCS, **obstore wins the transfer floor decisively.** Decode-free raw
-    concurrent GET (best of a 4→32 concurrency sweep, MB/s): obstore 1211 / 1581 / 802 at
-    c1 / c4 / c16 vs gcsfs 529 / 606 / 487 — a **~1.6–2.6× obstore lead**. The mechanism is
-    visible in the sweep: obstore *scales* with concurrency (c1 raw: 376→681→1042→1211),
-    while gcsfs `cat_file` **plateaus at ~500–600 MB/s and degrades past 16 threads**
-    (c1: 343→513→529→358) — the per-request Python/aiohttp path on the one fsspec loop is
-    the ceiling. End-to-end (insitu, fetch+decode) the gap **compresses to ~1.15–1.2×**
-    only because this 8-core box is **decode-bound at ~450 MB/s** (the decode-threads sweep
-    saturates 445→456 at 4–8 threads, well under obstore's raw 0.8–1.6 GB/s), so both
-    backends hit the same decode wall. That ~20% is therefore a *floor* on fsspec's HTTP
-    penalty — on more cores / faster decode the fetch gap re-widens toward the ~2× raw
-    number. **Takeaway:** obstore stays the HTTP default; fsspec is *not* a co-equal fast
-    path on HTTP, but it is not a correctness regression. Its case rests entirely on the
-    **Rapid/zonal gRPC** path obstore cannot reach — still the deciding, unrun experiment
-    (blocked on Rapid quota). Not yet on the published `docs/benchmarks.md`: that waits for
-    the complete standard-vs-Rapid story so the numbers aren't read as "fsspec is worse."
-  - **Event-loop ownership (shipped) + a TODO to simplify it.** A genuinely-async
-    fsspec backend (gcsfs, s3fs) binds its aiohttp session to the *first event loop that
-    awaits it*, permanently — no ctor knob pins it. For a zarr store that first loop is
-    **zarr's** process-wide store-IO loop (`zarr.core.sync._get_loop()`), because any
-    zarr sync call (`open_geometries`, `xr.open_zarr`, user code) touches the store
-    first. That is the correct owner: the session living on zarr's loop is what keeps the
-    store drivable by *any* zarr code — so insitu **conforms** (routes its reads there)
-    rather than hijacking the session onto its own loop (which would crash every other
-    zarr-sync consumer). Today the scheduler keeps its own orchestration loop and bridges
-    each fsspec read to zarr's loop (`run_coroutine_threadsafe`); obstore is loop-agnostic
-    (Rust runtime) and is awaited inline. Teardown closes the session on its own loop
-    (`close_store`) so gcsfs's finalizer — which wrongly targets `fsspec.asyn.get_loop()` —
-    is a no-op.
+Every entry is intent + state + a pointer. Design rationale lives in the sections above;
+measurements live in [docs/benchmarks.md](docs/benchmarks.md).
 
-    ```mermaid
-    flowchart TD
-        subgraph proc["insitubatch process (one training run)"]
-          OG["any zarr sync call<br/>open_geometries / xr.open_zarr"]
-          SL["Scheduler loop<br/>own loop, new thread per pass<br/>orchestration + decode/scatter pool"]
-          ZL["zarr store-IO loop<br/>zarr.core.sync._get_loop()"]
-          SESS[("gcsfs aiohttp session")]
-          OBS["obstore ObjectStore<br/>Rust tokio runtime, loop-agnostic"]
-          FL["fsspec.asyn.get_loop()<br/>NOT where the session lives"]
-        end
-        OG -->|"first await creates the session here"| ZL
-        ZL -->|owns| SESS
-        SL -->|"fsspec read: run_coroutine_threadsafe (bridge)"| ZL
-        SL -->|"obstore read: await inline"| OBS
-        FL -.->|"gcsfs finalizer wrongly targets this;<br/>close_store fixes the mismatch at teardown"| SESS
-    ```
+**Perf track** (the core thesis):
 
-    **TODO — unify on zarr's loop; delete the bridge.** Run the scheduler's orchestration
-    *on* zarr's loop for all backends instead of spinning a private loop+thread per pass.
-    This removes `_fsspec_io_loop` / `_io` / `_foreign_loop` (the bridge) **and** the
-    per-pass `new_event_loop()` + thread churn — collapsing to one loop with one clear
-    owner (obstore rides it fine; the gcsfs session is already there). Not a late edit to
-    the working PR: it rewrites the Scheduler concurrency core, so its **acceptance gate is
-    a stress test** that a consumer-stalled, back-pressured `_drive` sharing zarr's
-    *process-global* loop cannot starve or deadlock other zarr-sync work (it is await-heavy
-    and offloads decode/scatter, so it *should* be fine — verify, don't assume). Must not
-    set that loop's default executor (pass the decode pool explicitly) or stop it on
-    `close()`. `close_store` stays either way (the finalizer mismatch is independent of who
-    drives the reads).
-- **M2 — GPU full scale** kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation
-  with bounded host memory.
+- **M0 — local proof** ✅ real obstore IO, naive baseline, ~2.8× on the GRIB regime.
+- **M1 — CPU EC2 / S3** ⏳ decode-codec sweep to measure the CPU chunk-stage ceiling vs
+  NIC — the one remaining decompression spike (see Open questions), now also the natural
+  home for the zarrs codec-pipeline measurement.
+- **M1.5 — prefetch** ✅ background producer + bounded queue (`prefetch_depth`) overlapping
+  IO/decode/assembly with the consumer step, with backpressure and early-exit cleanup; the
+  producer reads **one block ahead** so block-boundary IO overlaps per-batch compute. At
+  zero compute the loader is IO-bound and the stall is smoothed, not removed — that is the
+  network ceiling, not a scheduling bug.
+- **M1.6 — decoupled fetch scheduler (V2)** ✅ `Scheduler` + `ChunkPool` replace
+  `AsyncChunkReader`/`ShuffleBlockBuffer`; one `max_inflight` budget over stored chunks,
+  residency a separate budget. Acceptance passed on fat-spatial S3. Design above; numbers
+  in docs/benchmarks.md.
+- **M-RA — bounded read-ahead** ⏳ decouple prefetch depth from the cache budget. Today
+  admission parks only when the pool's byte budget is full, so a large `cache_budget_bytes`
+  removes all backpressure and the driver eagerly fetches the *whole* resident set,
+  starving the current block and inflating cold TTFB (observed: ~7 s → ~50 s with
+  `--cache-resident`). The stopgap — a low `--max-inflight` doubling as a throttle —
+  couples two dials. **Fix:** a fetch-ahead semaphore released on the consumer's `unpin`,
+  bounding how far ahead of the consumer the driver admits, independent of retention. Then
+  the cache retains consumed chunks (fast warm epochs) without eager whole-split fetching
+  (fast cold TTFB). Applies to the V2 engine and the M-W residency path alike.
+- **M-GCS — fsspec/gcsfs store backend** ⏳ shipped and merged; one experiment outstanding.
+  The engine takes a zarr `Store`, built per backend: `obstore_store` (default, pure-Rust
+  URL path), `fsspec_store` (reaches what obstore cannot — GCS Rapid/zonal over gRPC,
+  requester-pays — via `insitubatch[gcsfs]`), `arraylake_store` (Icechunk sessions). On
+  plain HTTP GCS obstore wins the transfer floor decisively, so **obstore stays the HTTP
+  default** and fsspec is an optional extra (numbers in docs/benchmarks.md). fsspec's case
+  rests entirely on the **Rapid/zonal gRPC** path obstore cannot reach — still unrun,
+  blocked on quota. If it matches or beats obstore there, fsspec earns a core-dep,
+  co-equal-fast-path promotion; then the `ops_gcp.md` VERIFY markers come off.
+  Event-loop ownership is shipped and diagrammed in
+  [docs/architecture.md](docs/architecture.md); the follow-up is to run the scheduler's
+  orchestration *on* zarr's loop for all backends and delete the bridge plus the per-pass
+  thread churn. That rewrites the Scheduler concurrency core, so its acceptance gate is a
+  stress test that a consumer-stalled, back-pressured `_drive` sharing zarr's
+  process-global loop cannot starve or deadlock other zarr-sync work.
+- **M2 — GPU full scale** ⏳ kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation with
+  bounded host memory. The reference design is to transfer *compressed* bytes and decode on
+  the GPU via zarr-python's own GPU codec pipeline rather than hand-rolling nvCOMP; the
+  persistent `.npy` cache tier is the natural GDS feed.
 
-Engine track (make it real for models — see [docs/architecture.md](docs/architecture.md)):
-- **M-T — transforms.** ✅ `chunk_transform` + `batch_transform` hooks wired,
-  `StandardScaler` (chunk-stage applier) + the recommended **fit-over-the-loader**
-  pattern (sklearn `partial_fit`, warms the cache — `examples/fit_scaler.py`), incl.
-  cross-variable windspeed at the batch stage. Pending: `Regrid` (precomputed
-  weights) and `device_transform` (with the M3 adapters).
-  Scope limits hold: chunk transforms are single-variable/single-chunk;
-  cross-variable (e.g. windspeed) is batch-stage and uncached; cross-chunk is not
-  v1.
-- **M-C — chunk cache.** ✅ Caching **is** the `ChunkPool` policy (B2): a byte
-  budget + pin/unpin + LRU, with heap or mmap'd-`.npy` backing (NVMe page cache,
-  bounded working set). Raise `cache_budget_bytes` past the working set and drained
-  chunks are retained for cross-epoch **decode-once** reuse (the scheduler skips
-  fetch+decode+transform on a hit); `cache_dir` spills to NVMe. The v1 `cache=`
-  intercept and the standalone cache classes were retired — caching is no longer a
-  separate intercept, it became "don't evict." Deferred: an L1/L2 (RAM+NVMe) tier and
-  cached cross-variable derived variables (cross-*run* persistence is M-C2).
-- **M-C2 — cross-run persistent cache ✅.** `persist=True` (with `cache_dir`) keeps the
-  mmap'd `.npy` slots past `close` and records completed entries (`(array, chunk_index) →
-  file`) in an **append-only `insitu_cache.jsonl` log**, written *incrementally as each
-  chunk lands* — so a killed process (spot preempt / OOM / SIGTERM) leaves a usable cache
-  and the next run re-decodes only what hadn't finished (**crash recovery**, backlog #4).
-  A new pool over the same dir **revives** entries as ready hits on first touch, so
-  decode-once amortizes across *runs* — a relaunched job, a hyperparameter sweep, or
-  several processes on one box read decoded chunks straight from NVMe (no S3, no decode).
-  Invalidation: a **chunk-transform fingerprint** in the log header (explicit
-  `transform.cache_key` → optional cloudpickle hash of closures+globals → best-effort
-  source hash that warns). A fingerprint/format mismatch is a **stale** cache, which
-  **raises by default** (almost never intended); `reset_stale_cache=True` opts into GC'ing
-  the stale files + rebuilding (backlog #3). A per-entry **shape/dtype** check on revive is
-  a *miss* (re-fetch + overwrite), never an error; corruption/tampering (unreadable header,
-  malformed interior entry, non-bare filename) always raises. The log is self-deduplicating
-  and bounded to one line per cached chunk (the `_recorded` gate) — no compaction. Durability
-  is `flush` (process-death), not `fsync` (power-loss out of scope). Observability: per-epoch
-  `cache_hits`/`cache_misses` + one WARN when persistence was asked for but served nothing.
-  **Deliberately not in the key:** the store URL — Icechunk/Arraylake session stores have no
-  round-trippable URL, so the `cache_dir` path *is* the dataset identity (bury a version in
-  it); content/etag drift is the user's call. The key's `chunk_index` is the *global* zarr
-  index, so subsets/splits share entries. A **reshaping** `chunk_transform` (`Regrid` / dtype
-  recast) is supported on every tier including persistent mmap: it declares `output_inner ->
-  (inner_shape, dtype)`, the cache slot is sized at the output shape, and tiles assemble in a
-  transient source-shaped scratch buffer (the sample axis is invariant). *Still deferred:* a
-  raw-decoded tier keyed by source only, and the kvikio/GDS NVMe→GPU feed off the persistent
-  tier.
-  Scope: a read-through cache keyed by fingerprint; a shared/networked cache tier and
-  the L1/L2 split above are later.
-  - **TODO — per-variable transform fingerprint (scope invalidation per array).** Today
-    `chunk_transforms` is one list applied to every variable (each transform self-gates by
-    name and no-ops on the rest), and the cache fingerprint hashes the **whole list once** →
-    a single `pipeline_hash` on every array's entries. So editing a transform that only
-    affects `t2m` invalidates the *whole* cache (`u10`/`v10` too, whose chunks are
-    byte-identical) — with the raise-on-stale default the user must `reset_stale_cache` and
-    re-decode everything. Fix: let transforms be assigned per variable (or derive, per array,
-    the subset of transforms that actually touch it) and compute the fingerprint **per array**,
-    so a temperature-only edit invalidates only the temperature arrays — and each array runs
-    only through its own transforms (drops the wasted no-op passes). Design question: how a
-    transform declares which variables it applies to (explicit mapping vs the current
-    name-gating convention). Documented as a limitation in docs/architecture.md (cache
-    invalidation section).
-- **M-W — windowed / multi-offset sampling (geometry ladder: the *windowed* rung).** The forecasting
-  unlock, and a prerequisite for the canonical WeatherBench examples and the M4
-  "around their models" play. Today a batch draws **one shared time index for all
-  variables**, so input@t / target@t+1 is inexpressible; shuffle destroys temporal
-  adjacency (so a `batch_transform` can't pair times either); and a precomputed
-  shifted-target var means **resharding — impossible on read-only public ERA5/HRRR**.
-  Fix: a sample becomes an **anchor `t` + a window spec** mapping roles
-  (`input`/`target`) to sets of time-offsets; each `(var, t+offset)` stays a
-  *within-chunk single-index read* (the no-cross-chunk-**read** invariant holds — what
-  generalizes is that one *sample* may now reference several chunks). Gather runs per
-  role; `Batch` grows a lead axis (`x: {var:(B,L_in,*inner)}`,
-  `y: {var:(B,L_out,*inner)}`); anchors with any offset outside `[0,T)` are dropped at
-  manifest build. Shuffle/`split_by_chunk` operate on **anchors** (with a guard band so
-  a target can't leak across a split boundary); residency/pinning is **per-window** (a
-  sample pins the union of chunks its offsets touch — the block budget sizes to the
-  span), and offsets that share a chunk decode once (overlapping windows → strong
-  cross-sample cache reuse). The lead axis flows through `batch_transform` → the DLPack
-  adapters unchanged.
+**Engine track** (make it real for models — see [docs/architecture.md](docs/architecture.md)):
 
-  **Scope decision: multi-offset sampling is sufficient for Earth2Studio and for
-  training forecasters; promoting a window to a single cross-chunk contiguous-slab read
-  is an explicit non-goal.** Every temporal access in E2S/forecasting is a *finite set
-  of discrete offsets from an anchor* — rollout reads only the initial condition
-  (FourCastNet/Pangu/SFNO: 1 step; GraphCast: 2 = offsets `{-1,0}`), the model generates
-  futures; scoring reads ground truth at enumerable lead times; training pairs an input
-  history with a target horizon. And multi-offset sampling already *expresses a
-  contiguous window* as the offset range `0..L-1` over the **same** chunks a slab read
-  would touch (we decode chunk-granular, so L point-gathers from a decoded chunk are
-  cheap) — so a cross-chunk slab read buys only marginal gather-ergonomics for very long
-  windows. Recorded so it isn't relitigated. Validation: a synthetic *advected-field*
-  forecast where a tiny model beats persistence, then the WeatherBench framework
-  examples ride on top.
+- **M-T — transforms** ✅ `chunk_transform` + `batch_transform` hooks, `StandardScaler`
+  (chunk-stage applier) and the fit-over-the-loader pattern (`examples/fit_scaler.py`),
+  plus a `check_transform` CLI for geometry/cacheability/GIL-release validation. Scope
+  limits hold: chunk transforms are single-variable/single-chunk; cross-variable is
+  batch-stage and uncached; cross-chunk is out. ⏳ remaining: a production `Regrid`
+  (precomputed weights) and `device_transform` (lands with M2).
+- **M-C — chunk cache** ✅ caching **is** `ChunkPool` policy: byte budget + pin/unpin +
+  LRU, heap or mmap'd-`.npy` backing. Raise `cache_budget_bytes` past the working set and
+  drained chunks are retained for cross-epoch **decode-once** reuse; `cache_dir` spills to
+  NVMe. ⏳ deferred: an explicit L1/L2 (RAM+NVMe) tier, a raw-decoded tier keyed by source
+  only, and cached cross-variable derived variables.
+- **M-C2 — cross-run persistent cache** ✅ `persist=True` keeps mmap'd `.npy` slots past
+  `close` and records completed entries in an **append-only `insitu_cache.jsonl`** written
+  incrementally as each chunk lands — so a killed process leaves a usable cache and the
+  next run re-decodes only what had not finished. A new pool over the same dir revives
+  entries as ready hits, so decode-once amortizes across *runs* (relaunched jobs, sweeps,
+  several processes on one box). Invalidation is a chunk-transform fingerprint in the log
+  header; a stale cache **raises by default** (`reset_stale_cache=True` opts into GC +
+  rebuild), while corruption or tampering always raises. Reshaping transforms (`Regrid`,
+  dtype recast) are cacheable on every tier via `output_inner`. Closed decisions: the store
+  URL is **not** in the key (session stores have no round-trippable URL, so `cache_dir`
+  *is* the dataset identity); `chunk_index` is the *global* zarr index so subsets and
+  splits share entries; the log needs no compaction. See Known limitations for the
+  per-variable fingerprint gap.
+- **M-W — windowed / multi-offset sampling** ✅ the forecasting unlock and the prerequisite
+  for M4. Design, scope decision and as-built deviations are in the geometry-ladder section;
+  validated by `examples/advection/` across torch, JAX and TF.
 
-  **As built (PR #4, through Phase 3) — deviations from the sketch above.** The engine
-  stayed simpler than the role/lead-axis design:
-    - A variable is a `(label, path, offset)` **view**; a window is just several views
-      of one array (`{"x": g, "y": g.shift(1)}`). `Batch` stays a **flat `{label:
-      array}` dict** — *no* lead axis, *no* `input`/`target` roles in the engine. It
-      carries an `offsets` metadata dict; `Batch.read_indices(label)` and
-      `Batch.stack(labels)` are the projection helpers (the user composes the window).
-    - **No guard band.** The engine enforces *range validity only* (`anchor+offset ∈
-      [0,T)`, `valid_anchor_range` drops edge anchors); offset 0 is not special
-      ("relativity"). Partitioned anchors give disjoint train/val labels for any offset
-      (injective translation), and the shared boundary timestep is only ever a val
-      *input*, never scored — so a guard band is unnecessary. Task meaningfulness
-      (non-degenerate offset choices) is the **user's** responsibility, not the engine's.
-    - Residency is **reference-counted** (`pool._pinned: dict[key,int]`, not a boolean
-      set) because a windowed chunk can feed several blocks; a per-epoch `claimed` flag
-      orders pin→consume→release across the epoch boundary (fixes a cross-epoch
-      gather/leak race). windowed+shuffle holds the **whole split** resident (shuffle
-      spills reads into arbitrary blocks); bounded-residency windowed+shuffle (per-block
-      re-fetch) is deferred. Decode-once across views holds (slots key on `path`).
-    - **Splits are iterable views, not a constructor arg.** `InSituDataset` is
-      split-agnostic; you iterate `ds.train` (shuffled) / `ds.val` / `ds.test` / `ds.all`
-      (deterministic), all sharing **one** `ChunkPool`. This matters *because* of windows:
-      a windowed read near a split boundary spills into the adjacent split's chunk, so the
-      splits' *chunk reads* overlap even though no sample leaks (the disjoint-anchor proof
-      is about samples, not chunks) -- one shared pool decodes those boundary chunks once,
-      where separate per-split datasets would decode them twice. Per-split *config* (e.g.
-      train-only augmentation) is intentionally not supported on one instance -- make a
-      second dataset for that; the default path stays clean.
+**Reach track** (broaden + make a splash):
 
-  **Deferred — refcount hot-path cost (accept for now).** The refcounted residency +
-  offset-aware `gather` add ~**3.5%** to the *non-windowed* path at the **GRIB-end local
-  worst case** (one sample/chunk, ~36 KB blobs where decode is ≈ free, GIL build) — not
-  residency (`resident` unchanged) and not the per-block setup (a fast-path there moved
-  nothing); it is per-batch gather + per-chunk `dict`/`claimed` bookkeeping under
-  `pool._cv`. It shrinks toward noise with real chunk sizes (decode/IO dominate) and is
-  invisible on blob-store datasets. The deliberate microscope for this — and for any
-  future *locking* work — is a **tiny local store with negligible decode** under
-  **free-threading** (`PYTHON_GIL=0`, where `pool._cv` is the only contention point);
-  the harness recipe is in [bench/benchmark_plan.md](bench/benchmark_plan.md)
-  ("Windowed-sampling overhead"). Correctness was the bar for PR #4; the lever, if real-
-  `c1`-on-S3 ever shows it matters, is a non-windowed `gather` fast-path.
-
-  **Phase 4 (examples) — the advected-field forecast. ✅ implemented (`examples/advection/`).**
-  One `InSituDataset` feeds three framework training loops, showing the numpy `Batch` +
-  DLPack thesis end to end; on the synthetic field the same tiny CNN beats persistence
-  ~1.6× in torch, JAX, and TF (identical dataset + architecture). Plan as built:
-    - **Task:** a *direct* 24-hour forecast. Inputs `{t2m, u10, v10}` at anchor `t`
-      (cross-variable, same index) → target `t2m` at `t + 24h` (`g.shift(horizon)`):
-      `horizon = 24` steps on the 1-hourly synthetic store, `4` on the 6-hourly
-      WeatherBench2 store. The 24 h displacement is what makes advection (and the wind
-      inputs) *matter* vs persistence. The input window is assembled with
-      `Batch.stack(["t2m","u10","v10"])` → `(B, 3, H, W)`; the target is
-      `batch.arrays["t2m_next"]`.
-    - **No autoregressive rollout.** Chaining `n+1 → n+2 …` is a modeling/operational
-      choice, not the data layer's job — insitu delivers `(inputs@t, target@t+h)` pairs;
-      composing forecasts at serving time is the user's. Inference is a single forward
-      pass: forecast 24 h from the last available data.
-    - **One dataset → torch / JAX / TF.** `examples/advection/data.py` builds the store +
-      the single `forecast_dataset()`; `train_{torch,jax,tf}.py` each define the *same*
-      tiny CNN (3→1 channels) and a framework-native loop over the shared dataset via the
-      adapters (`as_torch` / `to_jax` / `as_tf_dataset`). Near-identical files differing
-      only in framework calls — the parallelism is the message. Shared numpy eval
-      (`rmse`, persistence baseline) in `data.py`.
-    - **Two stores, honest framing.** Synthetic advected field (seeded, time-constant
-      spatially-varying wind; tests + the pedagogical "beats persistence" result, true by
-      construction). WeatherBench2 6-hourly ARCO (`--wb2`, the real cloud store the
-      existing `wb2_*` examples use) runs the *same code* on real ERA5 — claim "same
-      pipeline, real data, no reshard", **not** SOTA skill (t2m persistence at a 24 h
-      multiple is a strong baseline; don't over-claim). A third real source may be
-      swapped in by URL + variable names.
-    - **Tests:** torch is in CI (`--extra torch`) — test data-gen advects, the dataset
-      yields the right windowed pairs, and torch training beats persistence on the
-      synthetic. JAX/TF gated with `importorskip` (their extras), mirroring
-      `test_jax.py` / `test_tf.py`.
-
-Reach track (broaden + make a splash):
-- **M3 — framework surfaces (done).** The core `Batch` is numpy and the engine
-  inherits no framework; handoff is thin DLPack adapters in `frameworks.py`
-  (`as_torch` / `to_jax` / `to_tf` + `as_tf_dataset`), each an optional extra.
-  The shapes are the ecosystems': torch needs a `Dataset` subclass, JAX iterates
-  directly (no native loader; the weather/climate frontier — GraphCast, NeuralGCM
-  — is JAX/torch, not TF), TF wraps via `tf.data.from_generator`. Same async
-  engine, multiple framework fronts. Next: `device_transform` (on-device, post
-  DLPack) and `prefetch(AUTOTUNE)` tuning land with the GPU path (M2).
-- **M4 — NVIDIA Earth2Studio target** (grounded in `data/arco.py`, `run.py`,
-  `data/utils.py`). Their pipeline is `DataSource → xr.DataArray → fetch_data →
-  prep_data_array → (torch.Tensor, coords) → model.create_iterator`. xarray is
-  load-bearing down to `prep_data_array`. Two integrations, only one is ours
-  (details in [docs/architecture.md](docs/architecture.md)):
+- **M3 — framework surfaces** ✅ the core `Batch` is numpy and the engine inherits no
+  framework; handoff is thin DLPack adapters (`as_torch` / `to_jax` / `to_tf` +
+  `as_tf_dataset`), each an optional extra. The shapes are the ecosystems': torch needs a
+  `Dataset` subclass, JAX iterates directly, TF wraps via `tf.data.from_generator`.
+  ⏳ `device_transform` and `prefetch(AUTOTUNE)` tuning land with M2.
+- **M4 — NVIDIA Earth2Studio target** ⏳ their pipeline is `DataSource → xr.DataArray →
+  fetch_data → prep_data_array → (torch.Tensor, coords) → model.create_iterator`, with
+  xarray load-bearing down to `prep_data_array`. Two integrations, only one is ours:
     - **Inside their inference loop = obstore, not insitubatch.** ARCO is already
-      zarr-v3-async; only the store backend differs (`FsspecStore(gcsfs/MSC)` vs
-      `ObjectStore(obstore gs://)`). A cold-cache backend-swap benchmark is a
-      clean **obstore** win (ARCO is `...chunk-1.zarr-v3` = our GRIB regime).
-      insitubatch building `xr.DataArray` would just reimplement their
-      lexicon/coords/regrid — not worth it.
-    - **Around their models = the insitubatch play.** For training / fine-tuning
-      / big batched hindcast & scoring, feed `prognostic.create_iterator(x,
-      coords)` tensor batches straight from insitubatch (zarr → DLPack → torch),
-      bypassing DataSource/fetch_data/xarray. `coords` is a light OrderedDict,
-      not the xarray machinery. This is the "closer to the GPU" headline.
-      **Depends on M-W** (multi-offset sampling) for the input-history / lead-time
-      supervision — which is sufficient here (no cross-chunk window reads needed).
-  Honesty bar: NVIDIA prefers **MSC** (fsspec-based; obstore can still beat it
-  cold) and caches via `AsyncCachingFileSystem`, so target MSC *cold-cache* on an
-  IO-bound workload (scoring/hindcast/large or lagged ensembles, NOT a single-IC
-  ensemble, which is rollout-bound). GFS/GRIB: later, our degenerate sweet spot
-  via virtual-zarr.
+      zarr-v3-async; only the store backend differs, so the available win there is a store
+      swap — an obstore contribution, not ours. insitubatch building `xr.DataArray` would
+      just reimplement their lexicon/coords/regrid. NVIDIA is executing this migration
+      themselves ([PR #964](https://github.com/NVIDIA/earth2studio/pull/964) moved GFS
+      byte-range GRIB reads to obstore, with HRRR/GEFS/CFS to follow). **Unmeasured:** we
+      expect a cold-cache swap to favour obstore because ARCO's `chunk-1` layout is the
+      latency-bound regime where obstore's concurrency scaling shows up — but neither we
+      nor the upstream PRs have published a cold-cache A/B, so treat it as a hypothesis
+      with a mechanism, not a result.
+    - **Around their models = the insitubatch play.** For training / fine-tuning / batched
+      hindcast and scoring, feed `prognostic.create_iterator(x, coords)` tensor batches
+      straight from insitubatch (zarr → DLPack → torch), bypassing
+      DataSource/fetch_data/xarray. This is the "closer to the GPU" headline, and it
+      depends on M-W.
+  Honesty bar: NVIDIA prefers **MSC** (fsspec-based) and caches via
+  `AsyncCachingFileSystem`, so target MSC *cold-cache* on an IO-bound workload
+  (scoring/hindcast/large or lagged ensembles — **not** a single-IC ensemble, which is
+  rollout-bound). GFS/GRIB is later, via virtual-zarr into our degenerate sweet spot.
 
-Backlog (deferred, unscheduled):
+**Backlog** (deferred, unscheduled):
+
 - **Bad/corrupt chunks — Phase 2.** Phase 1 shipped (`on_bad_chunk="raise"|"nan"`,
-  `ds.bad_chunks`). Deferred: a bad-chunk **registry** + an optional pre-scan
-  validation pass that records bad chunks into the `SplitManifest` so training
-  excludes them up front; and an **end-to-end HRRR (GRIB-under-zarr) showcase**
-  (`on_bad_chunk="nan"` + a fill `chunk_transform`) once a public HRRR-via-virtualizarr
+  `ds.bad_chunks`). Deferred: a bad-chunk **registry** + an optional pre-scan validation
+  pass recording bad chunks into the `SplitManifest` so training excludes them up front;
+  and an **end-to-end HRRR (GRIB-under-zarr) showcase** once a public HRRR-via-virtualizarr
   store is handy. (Sample-level NaN drop stays out — it breaks the fixed-shape gather;
   chunk-level manifest exclusion is the sane "drop.")
-- **Time-coordinate helper.** `split_by_chunk(sample_range=…)` (chunk-aligned) shipped
-  with the documented xarray pattern; a no-xarray
-  `samples_for_time_range(url, "time", start, stop) → indices` reading the 1-D coord
-  via the store is a small nice-to-have.
+- **Time-coordinate helper.** `split_by_chunk(sample_range=…)` shipped with the documented
+  xarray pattern; a no-xarray `samples_for_time_range(url, "time", start, stop) → indices`
+  reading the 1-D coord via the store is a small nice-to-have.
 - **Spatial / inner-dimension subsetting.** Outer (time) subsetting shipped
-  (`sample_range`); selecting a **lat/lon region or a level subset** still reads the
-  whole field and crops at the batch stage (wasteful IO). The on-thesis fix selects
-  only the stored chunks intersecting the inner region in the plan (coordinate-space,
-  like the outer split), so IO scales with the subregion, not the full grid.
-- **FT bench methodology.** Prewarm + controlled `decode_threads` sweep landed in the
-  bench refresh; remaining is reporting the **p50/p95 distribution** (not just
-  median/min-max) for the noisy free-threaded probe points.
+  (`sample_range`); selecting a **lat/lon region or a level subset** still reads the whole
+  field and crops at the batch stage (wasteful IO). The on-thesis fix selects only the
+  stored chunks intersecting the inner region in the plan (coordinate-space, like the outer
+  split), so IO scales with the subregion, not the full grid.
+- **zarrdataset comparison.** The microscopy example shipped; the head-to-head against
+  zarrdataset (a PyTorch `IterableDataset` over OME-NGFF, zarr-v2-only) plus baselines is
+  still open. Its 2D/3D **patch** sampling is the reserved patching capability we defer.
+- **FT bench methodology.** Prewarm + controlled `decode_threads` sweep landed; remaining is
+  reporting the **p50/p95 distribution** (not just median/min-max) for the noisy
+  free-threaded probe points.
