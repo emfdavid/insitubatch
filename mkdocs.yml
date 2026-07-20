@@ -30,6 +30,7 @@ theme:
 
 nav:
   - Home: index.md
+  - Examples: examples.md
   - Architecture: architecture.md
   - Tuning: tuning.md
   - Benchmarks: benchmarks.md

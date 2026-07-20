@@ -9,10 +9,10 @@ data source built to **keep the GPU fed** — **with no reshard** — and a Pyth
 hot path that scales with **chunks, not samples**.
 
 It is **domain-general**: the sample axis is a *role*, not a fixed dimension. The same engine
-trains on ERA5/weather over time, segments **OME-NGFF microscopy** volumes over `Z`
-([runnable example](https://github.com/emfdavid/insitubatch/blob/main/examples/microscopy) —
-raw image + label mask co-batched with no reshard), and maps cleanly onto **radio-astronomy**
-visibilities. See the [use-case tables](architecture.md#use-case-support).
+forecasts ERA5 weather over time, segments **OME-NGFF microscopy** volumes over `Z`, and
+denoises **Hubble telescope frames** streamed straight out of FITS — each a different
+geometry on a real public store, none of them resharded. See [Examples](examples.md) and the
+[use-case tables](architecture.md#use-case-support).
 
 !!! quote
     The IO race is over (obstore/icechunk saturate the NIC). The *loader* race is
@@ -27,6 +27,19 @@ residency, ~ms to first batch instead of seconds of pool cold-start. When the ch
 where per-sample workers re-read it (the win grows with samples-per-chunk). It is **not** a
 universal speed win: at the one-sample-per-chunk (GRIB) end, or against an unbounded gather on
 large fields, a tuned pool can edge ahead per byte. Numbers: [Benchmarks](benchmarks.md).
+
+## Cross-domain examples
+
+Four runnable showcases, each a *different* geometry on a real public store — and each with
+an offline synthetic mode so it runs with no network or credentials. Details and commands:
+[Examples](examples.md).
+
+| | Domain & store | The geometry it exercises |
+|---|---|---|
+| **advection** | WeatherBench2 ERA5 (`gs://`, anonymous) | Input at *t*, target at *t+24 h* as offset views of one array — then the *same* CNN trained in **torch, JAX and TF** |
+| **microscopy** | IDR OME-NGFF `(T,C,Z,Y,X)` on `s3://idr` | Samples a **middle** axis (`Z`); raw image and label mask chunked 1 vs 30 planes deep, co-batched |
+| **hubble** | Hubble WFC3/IR frames on MAST's `s3://stpubdata` | **FITS, not zarr** — virtual byte-range references, streamed and trained in place |
+| **wb2 pair** | WeatherBench2 ERA5 | The same task on insitu and on an xbatcher worker stack, for the cold-start trade-off |
 
 ## The problem, and the inversion
 
@@ -87,9 +100,8 @@ jbatch = to_jax(next(iter(ds.train)))                                    # JAX: 
 tfds = as_tf_dataset(ds.val)                                             # TF:    tf.data.Dataset
 ```
 
-See [`examples/advection`](https://github.com/emfdavid/insitubatch/blob/main/examples/advection) for
-working CNN forecast models using insituBatch implemented with Torch, Jax and Tensorflow with
-real ERA5 data.
+See [Examples](examples.md) for working CNN models built on `InSituDataset` — a three-framework
+ERA5 forecast, OME-NGFF microscopy segmentation over `Z`, and Hubble frame denoising from FITS.
 
 A runnable, network-free version of this — paralleling the Earthmover
 `dataloader-demo`, with a spatial subregion pulled out by a `batch_transform` —
@@ -119,9 +131,11 @@ uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 obstore reads, the decoupled fetch **`Scheduler`** + **`ChunkPool`** (assembly buffer
 *and* cache — byte budget + pin/LRU, heap or mmap-on-NVMe, with **cross-run
 persistence** via `persist=True`), approximate (shuffle-block) shuffle, chunk/batch
-**transforms** (incl. a fitted `StandardScaler`), **prefetch**, and the **torch / JAX /
-TF** surfaces. Not yet built: `Regrid` + the **GPU/device** transform stage, and
-multi-timestep windows that cross chunk boundaries.
+**transforms** (incl. a fitted `StandardScaler`), **prefetch**, **windowed multi-offset
+sampling**, an **arbitrary sample axis** with per-variable chunk sizes, and the **torch /
+JAX / TF** surfaces. Not yet built: a production `Regrid` + the **GPU/device** transform
+stage. (A window that crosses chunk boundaries as a single slab read is an explicit
+non-goal, not a gap — discrete offsets from an anchor already express it.)
 
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) is the single
 source of truth for status, the roadmap, and the scope limits.
