@@ -7,6 +7,9 @@ Venue notes (from the announcement format): the organizers prepend
 the solution → specifics*. Submit via the Google Form linked from
 <https://pangeo.io/showcase>.
 
+ORCID 0009-0000-2804-7191
+@emfdavid.bsky.social
+
 ## Title
 
 **insitubatch: Streaming ML Batches from Cloud Zarr, No Reshard**
@@ -37,7 +40,10 @@ event loop streams stored chunks under a single concurrency budget into a bounde
 pool that doubles as a decode-once cache. Splits, shuffle, and batches live in
 coordinate space over the existing Zarr — no second copy — and the Python hot path
 scales with **chunks, not samples**, at memory bounded by a residency budget rather
-than the working set.
+than the working set. You still define windows in xarray; labels and coordinates
+ride along as planning metadata rather than through the hot path. Handoff to
+PyTorch, JAX, or TensorFlow is a thin DLPack adapter — `num_workers=0`, batches
+arrive framework-ready.
 
 The sample axis is a *role*, not a fixed dimension, so one engine spans domains
 without special-casing. I'll walk through the runnable examples: a windowed
@@ -55,7 +61,7 @@ an earlier showcase.
 ## Speaker bio
 
 David Stuebe is a staff machine-learning engineer at ThinkLabs AI, building ML
-infrastructure for weather- and energy-grid applications. With a background in
+infrastructure for electric grid utilities. With a background in
 physical oceanography (MIT/WHOI Joint Program) and years of operational
 cloud-native weather-data work — including the Kerchunk/Zarr optimizations for NODD
 GRIB forecasts presented in an earlier Pangeo Showcase — David works on the data
