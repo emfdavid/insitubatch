@@ -411,6 +411,19 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   mixes chunks across block boundaries, diluting the block-local residency guarantee).
   **Priority pending user feedback** — no correctness impact, so we hold until someone hits it.
 
+- **Batch buffers are fresh per batch, and host memory is not pinned.** `pool.gather`
+  allocates a new array per batch rather than reusing one — the DLPack export aliases the
+  buffer into the consumer's tensor, so reuse needs lifetime tracking against the
+  `prefetch_depth` window — and nothing pins host memory for GPU transfer, so H2D copies
+  are pageable. The unified fix is a small **ring of pre-pinned buffers** (depth
+  ≈ `prefetch_depth`+1) handed out round-robin (a buffer is safe to reuse once its batch
+  has left the prefetch window): it removes the per-batch allocation *and* enables
+  `non_blocking` H2D transfer in one change — pinning fresh per batch would be worse
+  (`cudaHostAlloc` is expensive). Value scales with payload: negligible for small weather
+  fields (µs transfers, already hidden by prefetch), real for ViT/microscopy batches — so
+  **profile the H2D ceiling first** (pinned vs pageable bandwidth; is the copy on the
+  critical path or already overlapped?). Ties into the GPU `device_transform` stage (M2).
+
 - **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
   shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
   `span = max(offset) - min(offset)`. For a **sparse** offset set (leads `{24h, 240h}`:
