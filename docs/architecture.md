@@ -354,7 +354,95 @@ a full shuffle in practice:
 So even a modest window asymptotes quickly toward a global shuffle over the many epochs
 training actually runs — at memory cost `O(block_chunks)`, not `O(dataset)`.
 [`shuffle_quality`](api.md) scores an emitted order against a perfect global shuffle if you
-want to see it on your own data.
+want to see it on your own data. (`shuffle=False` swaps in a sequential order — chunks and
+samples in order — for eval / inference / reconstruction.)
+
+### Read-once and sample-once
+
+The pipeline holds two guarantees, and they are **orthogonal** — batch size touches neither:
+
+- **read-once** — a stored tile is fetched and decoded exactly once, however many samples,
+  batches, or epochs reference it (the read plan dedups; the `ChunkPool` keeps it resident;
+  gather reads from the slot).
+- **sample-once** — each valid sample lands in exactly one batch.
+
+`order` is the ledger for sample-once: an `(N, 2)` array of `[chunk_id, within]`, one row per
+drawn sample. It is a permutation of every valid anchor, so each sample appears once. The
+**sample-level fancy index is never stored** — `gather` recomputes it per batch from the rows
+(`anchor = chunk_id·spc + within`; `sample = anchor + offset`; scatter `slot.data[within[mask]]`
+per unique read chunk), Python work `O(chunks-in-batch)`, never `O(samples)`.
+
+The figure traces one epoch, archive → batch. Colour tracks the *bytes* — a chunk keeps its
+colour from the archive ① through the resident pool ③; the **read plan** ② in between is
+metadata (tile keys in shuffle-block order, *not* bytes), so the plan (dashed) stays distinct
+from the movement (thick). In stage ④ a batch is a row of colour-coded slices drawn across
+several resident chunks: one chunk feeds many batches yet is **never broken up** — it stays
+whole and reused, which is what read-once buys. (Loaders that pre-shuffle to disk instead
+dissolve the chunk into scattered rows; see the annbatch contrast in
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#what-it-is-by-contrast).)
+
+```mermaid
+flowchart TB
+    subgraph S1["① immutable archive — chunks along the sample axis"]
+        direction LR
+        A0["chunk 0"]:::cA
+        A1["chunk 1"]:::cB
+        A2["chunk 2"]:::cC
+        A3["chunk 3"]:::cD
+    end
+    subgraph S2["② read plan — deduped, shuffle-block order"]
+        direction LR
+        P["what to fetch, in what order · read 2 · 0 · 3 · 1 · … · <i>tile keys — not bytes</i>"]:::plan
+    end
+    subgraph S3["③ ChunkPool — block_chunks tiles resident &amp; intact"]
+        direction LR
+        R2["chunk 2"]:::cC
+        R0["chunk 0"]:::cA
+        R3["chunk 3"]:::cD
+    end
+    subgraph S4["④ windowed anchor draw — each batch interleaves slices from several resident chunks (which stay whole, reused)"]
+        direction TB
+        subgraph B1["batch #1"]
+            direction LR
+            b1a["c2"]:::cC
+            b1b["c0"]:::cA
+            b1c["c3"]:::cD
+        end
+        subgraph B2["batch #2"]
+            direction LR
+            b2a["c0"]:::cA
+            b2b["c3"]:::cD
+            b2c["c2"]:::cC
+        end
+        Bn["… batch #n"]:::batch
+    end
+    S1 -.->|"plan the reads<br/>dedup + draw order"| S2
+    S2 ==>|"scheduler fetches + decodes<br/>one per tile — the movement"| S3
+    S3 -->|"gather by (chunk_id, within)<br/>draw rows"| S4
+    classDef cA fill:#cfe0f7,stroke:#5b7aa6;
+    classDef cB fill:#f7cfd8,stroke:#a65b6e;
+    classDef cC fill:#f7e0cf,stroke:#a6805b;
+    classDef cD fill:#d3f0d8,stroke:#5ba66e;
+    classDef plan fill:#ffffff,stroke:#666,stroke-dasharray:5 3,color:#333;
+    classDef batch fill:#ededed,stroke:#888;
+```
+
+**"Exactly once" means every *valid* anchor.** `order` is built to handle the edges: a **short
+final chunk** emits `within` only up to its real length, and windowed sampling drops anchors
+whose `anchor+offset` would read off the array (incomplete windows — correct to skip for
+training; the inference path validates the range and raises instead). Guaranteed by
+`test_order_covers_every_sample_exactly_once`, `test_order_handles_partial_final_chunk`, and
+the decode-once suite.
+
+**The tail is ragged per block, not per epoch.** Batches do not span shuffle blocks: the
+producer batches `order` within each block's row range and restarts at the boundary. So when a
+block's sample count (`≈ block_chunks × spc`, minus edges) is not a multiple of `batch_size` —
+the common case — the **last batch of every block is short**. No sample is lost or duplicated
+(sample-once holds), but an epoch yields *several* short batches, and steps-per-epoch is
+`Σ ⌈block_samples / bs⌉`, not `⌈N / bs⌉` — worth knowing for BatchNorm on a small tail or
+step-count math. There is deliberately no `drop_last` today; whether to add one is an open
+question (see Known limitations in
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#known-limitations--defects)).
 
 ## Transforms — three stages, placed by cost
 
