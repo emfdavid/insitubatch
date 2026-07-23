@@ -283,26 +283,26 @@ shuffle-block order, *not* bytes — so the plan (dashed) is kept visually disti
 from the movement (thick). Inner chunking on the other axes is supported but not drawn.
 
 ```mermaid
-flowchart LR
-    subgraph S1["① immutable archive<br/>chunks along the sample axis"]
-        direction TB
+flowchart TB
+    subgraph S1["① immutable archive — chunks along the sample axis"]
+        direction LR
         A0["chunk 0"]:::cA
         A1["chunk 1"]:::cB
         A2["chunk 2"]:::cC
         A3["chunk 3"]:::cD
     end
-    subgraph S2["② read plan<br/>deduped, shuffle-block order"]
-        direction TB
-        P["what to fetch, in what order<br/>read 2 · 0 · 3 · 1 · …<br/><i>tile keys — not bytes</i>"]:::plan
+    subgraph S2["② read plan — deduped, shuffle-block order"]
+        direction LR
+        P["what to fetch, in what order · read 2 · 0 · 3 · 1 · … · <i>tile keys — not bytes</i>"]:::plan
     end
-    subgraph S3["③ ChunkPool<br/>block_chunks tiles resident &amp; intact"]
-        direction TB
+    subgraph S3["③ ChunkPool — block_chunks tiles resident &amp; intact"]
+        direction LR
         R2["chunk 2"]:::cC
         R0["chunk 0"]:::cA
         R3["chunk 3"]:::cD
     end
-    subgraph S4["④ windowed anchor draw<br/>chunks stay whole, reused"]
-        direction TB
+    subgraph S4["④ windowed anchor draw — chunks stay whole, reused"]
+        direction LR
         D1["batch #1"]:::batch
         D2["batch #2"]:::batch
         Dn["batch #n"]:::batch
