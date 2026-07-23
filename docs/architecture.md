@@ -121,6 +121,15 @@ and amortized across every sample that touches it; **read concurrency
 total memory is the budget + the prefetch queue (depth `d`) + the in-flight tiles —
 every term a tunable cap, none scaling with batch size or epoch length.
 
+The batch buffers themselves are **not** pooled: `gather` allocates a fresh array per
+batch (the DLPack export aliases it into the consumer's tensor, so safe reuse would
+need lifetime tracking against the prefetch window), and host memory is **not pinned**
+yet, so host→device copies are pageable. Both are one deferred fix — a small ring of
+pre-pinned buffers (depth ≈ `prefetch_depth`) reused round-robin, which kills the
+per-batch allocation *and* enables `non_blocking` transfer together. See Known
+limitations in
+[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#known-limitations--defects).
+
 ### Event-loop ownership (fsspec backends)
 
 A genuinely-async fsspec backend (gcsfs, s3fs) binds its aiohttp session to the *first
@@ -873,7 +882,10 @@ pretending to be a general compute graph.
   non-sample axis; there is no spatial patching/cropping in the read yet, so a giant
   field is assembled whole (crop it in a `batch_transform`). Native patch geometry —
   and memory-optimal partial-field residency — is a reserved extension (see the
-  axis-role contract).
+  axis-role contract). The shipped random-crop example (`examples/wb2_dataloader.py`)
+  does exactly this — crops in a `batch_transform` over the whole-field cache, so the
+  crop re-randomizes each epoch for free — but its crop is a per-sample Python loop,
+  illustrative rather than vectorized.
 - **Not a compute framework.** No general task graph, no cross-chunk reductions on
   the hot path, no lazy dask-style evaluation — by design (dask on the hot path is
   the thing we route around). Reductions like fitting a scaler run *over the loader*
