@@ -280,7 +280,10 @@ The coloured blocks are chunks **along the sample axis**; colour tracks the *byt
 which survive the archive → pool move intact (a chunk is held and reused, never
 shredded). Between them, the **read plan** is metadata — deduped tile keys in
 shuffle-block order, *not* bytes — so the plan (dashed) is kept visually distinct
-from the movement (thick). Inner chunking on the other axes is supported but not drawn.
+from the movement (thick). In stage ④ each batch is a row of colour-coded slices —
+samples drawn across several resident chunks (same colours as ③), so one chunk feeds
+many batches yet is never broken up (contrast Fig 1C, where the chunk ceases to
+exist). Inner chunking on the other axes is supported but not drawn.
 
 ```mermaid
 flowchart TB
@@ -301,11 +304,21 @@ flowchart TB
         R0["chunk 0"]:::cA
         R3["chunk 3"]:::cD
     end
-    subgraph S4["④ windowed anchor draw — chunks stay whole, reused"]
-        direction LR
-        D1["batch #1"]:::batch
-        D2["batch #2"]:::batch
-        Dn["batch #n"]:::batch
+    subgraph S4["④ windowed anchor draw — each batch interleaves slices from several resident chunks (which stay whole, reused)"]
+        direction TB
+        subgraph B1["batch #1"]
+            direction LR
+            b1a["c2"]:::cC
+            b1b["c0"]:::cA
+            b1c["c3"]:::cD
+        end
+        subgraph B2["batch #2"]
+            direction LR
+            b2a["c0"]:::cA
+            b2b["c3"]:::cD
+            b2c["c2"]:::cC
+        end
+        Bn["… batch #n"]:::batch
     end
     S1 -.->|"plan the reads<br/>dedup + draw order"| S2
     S2 ==>|"scheduler fetches + decodes<br/>one per tile — the movement"| S3
