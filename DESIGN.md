@@ -55,6 +55,7 @@ arrive DLPack-ready with no labeled-array machinery in the loop. (xarray is stil
 | Neighbor | Why insitubatch is different                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 |---|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **MosaicML Streaming / WebDataset** | They require **resharding** into a sample-oriented format (MDS/tar) — a full ETL copy, and a "sample" becomes an opaque blob. insitubatch trains **in place** on the existing ndim Zarr; splits/shuffle/batches live in **coordinate space**.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **annbatch (scverse)** | The nearest neighbor and the sharpest mirror — same premise (loaders are the bottleneck; large contiguous reads feed the GPU), **opposite bet on where randomness comes from**. annbatch runs a **preshuffler** that rewrites a randomized Zarr copy, then streams big contiguous slices through an in-memory shuffle buffer that **breaks chunk structure** (a chunk's rows scatter across batches). Clean global shuffle, paid for with a **rewrite** — which also freezes the sampling policy into byte order (their noted limit: weighted sampling needs re-writing). insitubatch trains **in place**: bounded block-shuffle over windowed anchors on the native grid, chunks kept **resident and reused**. Two points on one spectrum — annbatch owns *rewrite-is-fine, 1-D obs rows, local disk* (single-cell anndata); insitubatch owns *immutable, remote, PB-scale, n-D-windowed, multi-variable*. Both carry one bounded-randomness knob (their buffer `m` ≈ our `block_chunks`); the difference is the currency spent — a one-time rewrite vs. read locality. |
 | **xbatcher + DataLoader (worker stack)** | xbatcher (an xarray-contrib community project) is the standard, elegant way to *define* ndim batches — **xarray-native**, yielding `xr.DataArray`. Its torch-worker engine (N **processes**) is strongest at the GRIB / one-sample-per-chunk end, and elsewhere pays worker cold start, memory ∝ workers, and per-sample decode on the uncached path. insitubatch keeps the same ndim batch semantics but stays at the **numpy/tensor** level on a *different engine* — one async loop — winning **cold start** (inference) and **memory** across the chunk spectrum (training). The caches differ in kind: insitu's in-place decoded-chunk pool (deduped, no second copy) vs xbatcher's opt-in **materialized-batch** zarr store; both now persist across runs (insitu via `persist=True`). Complementary tools; pick by regime (and we tune xbatcher well before any comparison). |
 | **Earth2Studio (NVIDIA)** | An **xarray-centric** inference framework: its `DataSource` yields `xr.DataArray`, and xarray is load-bearing down to `prep_data_array`. insitubatch doesn't build xarray — *inside* their loop the win is an obstore store-swap (an obstore contribution, not ours); *around* their models it feeds `(tensor, coords)` batches straight to `model.create_iterator`, where `coords` is a light metadata dict, not the xarray machinery.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | **zarrs / tensorstore / zarr-python** | **Substrate, not peers.** These are zarr *implementations* — chunk-granular read + codec pipelines. We consume one (zarr-python's, over an obstore/arraylake/fsspec `Store`) and build the sample-oriented layer above it: dedup, splits, shuffle, residency, batch assembly. A faster implementation underneath is a *win we inherit*, not a competitor — see the zarrs codec-pipeline spike in Open questions.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -81,8 +82,8 @@ a bounded decode/shuffle buffer. Torch runs `num_workers=0`, `batch_size=None`.
 ## The central abstraction: the read plan
 
 The unit of work is neither *sample* nor *chunk* — it's a **read plan**:
-required samples → **deduplicated** set of chunk reads + a gather map back to
-samples. This makes the whole spectrum one code path:
+required samples → **deduplicated** set of chunk reads, gathered back to samples
+(the index recomputed at gather, not stored). This makes the whole spectrum one code path:
 
 ```
 fat chunks  ──────────────────────────────► GRIB-per-timestep (degenerate)
@@ -93,6 +94,13 @@ shared-cache + intra-chunk shuffle win       async fan-out is the whole game
 
 `build_stored_chunk_reads()` is vectorized: Python touches **O(reads)**, never
 O(samples).
+
+The plan buys two orthogonal guarantees — **read-once** (a stored tile fetched and
+decoded once, however many samples touch it) and **sample-once** (each valid sample in
+exactly one batch, tracked by the `order` ledger, with the fancy index recomputed in
+`gather` and never stored) — both independent of batch size. The mechanism, the edge
+cases (short final chunk, dropped windowed edges), and the ragged per-block tail are the
+live contract: see [Read-once and sample-once](docs/architecture.md#read-once-and-sample-once).
 
 ## Sample geometry — how the ladder evolved
 
@@ -220,19 +228,21 @@ blocks (safest for time series); optional chunk-shuffle for exchangeable samples
 
 ## Shuffle (the interesting compromise)
 
-Global shuffle ⊥ chunk-aligned reads. Two-level approximation, after MosaicML
-Streaming's `py1e`/`py1br`:
+Global shuffle ⊥ chunk-aligned reads: an *exact* global shuffle wants a random chunk
+per sample, which defeats the whole point of reading a chunk once and gathering every
+sample in it. The compromise, after MosaicML Streaming's `py1e`/`py1br`, is two-level —
+permute *which* chunks are scheduled each epoch (keyed on `(seed, epoch)`:
+hardware-independent, resumable), then shuffle all samples within a window of
+`block_chunks` chunks. Over epochs the permutation re-pairs chunks, so it converges
+toward a global shuffle at `O(block_chunks)` memory, not `O(dataset)`.
 
-1. **Chunk permutation** — shuffle the order chunks are scheduled per epoch,
-   keyed on `(seed, epoch)` only (canonical: hardware-independent, resumable).
-2. **Shuffle-block buffer** — hold a window of `block_chunks` decoded chunks and
-   draw batches across the window.
-
-`block_chunks ≳ 10×` samples-per-chunk ≈ global quality; `block_chunks` is the
-single **quality ↔ memory** knob. `shuffle_quality()` scores a draw order so the
-knob can be tuned empirically. `shuffle=False` (eval / inference / reconstruction)
-swaps in `sequential_order` — chunks and samples in order, no permutation. Both
-order functions size a short final chunk correctly (no out-of-range draws).
+That is the road taken; the **mechanism, the convergence argument, and the
+archive → batch figure are the live contract** in
+[docs/architecture.md](docs/architecture.md#why-the-block-local-shuffle-is-enough). The
+bet it encodes — approximate-but-in-place over exact-but-resharded — is the same one the
+[annbatch contrast](#what-it-is-by-contrast) turns on: they pre-shuffle to disk and
+dissolve chunks into scattered rows; we keep chunks whole and resident and pay with an
+approximate shuffle instead.
 
 ## Memory model
 
@@ -389,6 +399,30 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
 
 Things wrong or missing in *our* code today, with the reasoning that sets their priority.
 (Things simply *not built yet* are milestones — see Roadmap.)
+
+- **Per-block ragged batches (possible wart).** Batches never span shuffle blocks, so a
+  block's sample count not dividing `batch_size` yields a short final batch *per block*, not
+  one per epoch — behaviour and step-count impact in
+  [Read-once and sample-once](docs/architecture.md#read-once-and-sample-once). Correct
+  (sample-once holds), but it can surprise consumers assuming a uniform batch size. No
+  `drop_last` today. Options if users want uniformity: (a) opt-in `drop_last`; (b) carry a
+  block's remainder into the next block's first batch (extends that block's pin lifetime past
+  its own batches); (c) a whole-epoch re-batch (cheap — `order` is already materialized — but
+  mixes chunks across block boundaries, diluting the block-local residency guarantee).
+  **Priority pending user feedback** — no correctness impact, so we hold until someone hits it.
+
+- **Batch buffers are fresh per batch, and host memory is not pinned.** `pool.gather`
+  allocates a new array per batch rather than reusing one — the DLPack export aliases the
+  buffer into the consumer's tensor, so reuse needs lifetime tracking against the
+  `prefetch_depth` window — and nothing pins host memory for GPU transfer, so H2D copies
+  are pageable. The unified fix is a small **ring of pre-pinned buffers** (depth
+  ≈ `prefetch_depth`+1) handed out round-robin (a buffer is safe to reuse once its batch
+  has left the prefetch window): it removes the per-batch allocation *and* enables
+  `non_blocking` H2D transfer in one change — pinning fresh per batch would be worse
+  (`cudaHostAlloc` is expensive). Value scales with payload: negligible for small weather
+  fields (µs transfers, already hidden by prefetch), real for ViT/microscopy batches — so
+  **profile the H2D ceiling first** (pinned vs pageable bandwidth; is the copy on the
+  critical path or already overlapped?). Ties into the GPU `device_transform` stage (M2).
 
 - **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
   shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
