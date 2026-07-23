@@ -82,8 +82,8 @@ a bounded decode/shuffle buffer. Torch runs `num_workers=0`, `batch_size=None`.
 ## The central abstraction: the read plan
 
 The unit of work is neither *sample* nor *chunk* — it's a **read plan**:
-required samples → **deduplicated** set of chunk reads + a gather map back to
-samples. This makes the whole spectrum one code path:
+required samples → **deduplicated** set of chunk reads, gathered back to samples
+(the index recomputed at gather, not stored). This makes the whole spectrum one code path:
 
 ```
 fat chunks  ──────────────────────────────► GRIB-per-timestep (degenerate)
@@ -95,41 +95,12 @@ shared-cache + intra-chunk shuffle win       async fan-out is the whole game
 `build_stored_chunk_reads()` is vectorized: Python touches **O(reads)**, never
 O(samples).
 
-### Two invariants: read-once vs sample-once
-
-The plan guarantees **read-once**; a separate structure guarantees **sample-once** —
-and they are orthogonal, which is why batch size touches neither.
-
-`order` is the ledger: an `(N, 2)` array of `[chunk_id, within]`, one row per drawn
-sample (`shuffle.py`). It is a *partition* of every valid anchor, permuted — so each
-sample appears in exactly one row. The read plan is derived from it (which chunks),
-but the **sample-level fancy index is never stored**: `pool.gather` recomputes it per
-batch from the rows (`anchor = chunk_id*spc + within`; `sample = anchor + offset`;
-scatter `slot.data[within[mask]]` per unique read chunk). So:
-
-- **read-once** — a tile is fetched + decoded once, however many samples, batches, or
-  blocks reference it — is a property of the read plan + `ChunkPool`.
-- **sample-once** — each valid sample lands in exactly one batch — is a property of
-  `order`.
-
-Batch size is independent of both. `shuffle.py` emits `order` correctly for a **short
-final chunk** (`_chunk_rows` clamps `within` to the chunk's real length), and
-`_drop_edge_anchors` removes anchors whose windowed read `anchor+offset` would fall
-off the array — so "exactly once" means *every valid anchor*. Asserted by
-`test_order_covers_every_sample_exactly_once`, `test_order_handles_partial_final_chunk`,
-and the decode-once suite (`test_chunk_decoded_once_per_epoch_without_cache`,
-`test_pool_aliased_labels_decode_once`).
-
-**Ragged batches are per-block, not per-epoch — under evaluation.** Batches do not span
-shuffle blocks: the producer batches `order` within each block's row range, restarting
-at every block boundary (`source.py`). So when a block's sample count
-(`≈ block_chunks × spc`, minus short-chunk and dropped-edge anchors) is not a multiple
-of `batch_size` — the common case — the **last batch of every block is short**. There
-is deliberately no `drop_last` and no carry into the next block; no sample is lost or
-duplicated (sample-once holds). The consequence is that an epoch yields *several* short
-batches, not one at the end — which can surprise consumers that assume a uniform batch
-size (BatchNorm on a tiny tail, steps-per-epoch math). Whether to keep this is **open
-pending user feedback** — see Known limitations.
+The plan buys two orthogonal guarantees — **read-once** (a stored tile fetched and
+decoded once, however many samples touch it) and **sample-once** (each valid sample in
+exactly one batch, tracked by the `order` ledger, with the fancy index recomputed in
+`gather` and never stored) — both independent of batch size. The mechanism, the edge
+cases (short final chunk, dropped windowed edges), and the ragged per-block tail are the
+live contract: see [Read-once and sample-once](docs/architecture.md#read-once-and-sample-once).
 
 ## Sample geometry — how the ladder evolved
 
@@ -257,89 +228,21 @@ blocks (safest for time series); optional chunk-shuffle for exchangeable samples
 
 ## Shuffle (the interesting compromise)
 
-Global shuffle ⊥ chunk-aligned reads. Two-level approximation, after MosaicML
-Streaming's `py1e`/`py1br`:
+Global shuffle ⊥ chunk-aligned reads: an *exact* global shuffle wants a random chunk
+per sample, which defeats the whole point of reading a chunk once and gathering every
+sample in it. The compromise, after MosaicML Streaming's `py1e`/`py1br`, is two-level —
+permute *which* chunks are scheduled each epoch (keyed on `(seed, epoch)`:
+hardware-independent, resumable), then shuffle all samples within a window of
+`block_chunks` chunks. Over epochs the permutation re-pairs chunks, so it converges
+toward a global shuffle at `O(block_chunks)` memory, not `O(dataset)`.
 
-1. **Chunk permutation** — shuffle the order chunks are scheduled per epoch,
-   keyed on `(seed, epoch)` only (canonical: hardware-independent, resumable).
-2. **Shuffle-block buffer** — hold a window of `block_chunks` decoded chunks and
-   draw batches across the window.
-
-`block_chunks ≳ 10×` samples-per-chunk ≈ global quality; `block_chunks` is the
-single **quality ↔ memory** knob. `shuffle_quality()` scores a draw order so the
-knob can be tuned empirically. `shuffle=False` (eval / inference / reconstruction)
-swaps in `sequential_order` — chunks and samples in order, no permutation. Both
-order functions size a short final chunk correctly (no out-of-range draws).
-
-The pipeline, staged to line up against [annbatch's Fig 1C](https://arxiv.org/abs/2604.01949) (whose preshuffler
-rewrites a randomized Zarr copy, then an in-memory buffer *breaks chunk structure*
-into scattered rows). insitubatch moves the shuffle **off disk into the schedule**
-and keeps chunks **intact and resident**:
-
-The coloured blocks are chunks **along the sample axis**; colour tracks the *bytes*,
-which survive the archive → pool move intact (a chunk is held and reused, never
-shredded). Between them, the **read plan** is metadata — deduped tile keys in
-shuffle-block order, *not* bytes — so the plan (dashed) is kept visually distinct
-from the movement (thick). In stage ④ each batch is a row of colour-coded slices —
-samples drawn across several resident chunks (same colours as ③), so one chunk feeds
-many batches yet is never broken up (contrast Fig 1C, where the chunk ceases to
-exist). Inner chunking on the other axes is supported but not drawn.
-
-```mermaid
-flowchart TB
-    subgraph S1["① immutable archive — chunks along the sample axis"]
-        direction LR
-        A0["chunk 0"]:::cA
-        A1["chunk 1"]:::cB
-        A2["chunk 2"]:::cC
-        A3["chunk 3"]:::cD
-    end
-    subgraph S2["② read plan — deduped, shuffle-block order"]
-        direction LR
-        P["what to fetch, in what order · read 2 · 0 · 3 · 1 · … · <i>tile keys — not bytes</i>"]:::plan
-    end
-    subgraph S3["③ ChunkPool — block_chunks tiles resident &amp; intact"]
-        direction LR
-        R2["chunk 2"]:::cC
-        R0["chunk 0"]:::cA
-        R3["chunk 3"]:::cD
-    end
-    subgraph S4["④ windowed anchor draw — each batch interleaves slices from several resident chunks (which stay whole, reused)"]
-        direction TB
-        subgraph B1["batch #1"]
-            direction LR
-            b1a["c2"]:::cC
-            b1b["c0"]:::cA
-            b1c["c3"]:::cD
-        end
-        subgraph B2["batch #2"]
-            direction LR
-            b2a["c0"]:::cA
-            b2b["c3"]:::cD
-            b2c["c2"]:::cC
-        end
-        Bn["… batch #n"]:::batch
-    end
-    S1 -.->|"plan the reads<br/>dedup + draw order"| S2
-    S2 ==>|"scheduler fetches + decodes<br/>one per tile — the movement"| S3
-    S3 -->|"gather by (chunk_id, within)<br/>draw rows"| S4
-    classDef cA fill:#cfe0f7,stroke:#5b7aa6;
-    classDef cB fill:#f7cfd8,stroke:#a65b6e;
-    classDef cC fill:#f7e0cf,stroke:#a6805b;
-    classDef cD fill:#d3f0d8,stroke:#5ba66e;
-    classDef plan fill:#ffffff,stroke:#666,stroke-dasharray:5 3,color:#333;
-    classDef batch fill:#ededed,stroke:#888;
-```
-
-Two divergences from Fig 1C carry the whole design: the shuffle lives in the
-**schedule** — permutation is expressed entirely in the **read plan** (a deduped,
-priority-ordered list of tile reads) over a bounded `block_chunks` window, so the
-archive is **never rewritten**; and a chunk is **never broken into scattered rows**
-— it stays resident and is reused. There is no per-batch chunk list: each batch's
-chunk set is resolved at gather time from its `(chunk_id, within)` draw rows against
-the resident pool. The single `block_chunks` knob trades shuffle quality against
-resident memory; annbatch's buffer size `m` is that same knob spent in the rewrite
-regime.
+That is the road taken; the **mechanism, the convergence argument, and the
+archive → batch figure are the live contract** in
+[docs/architecture.md](docs/architecture.md#why-the-block-local-shuffle-is-enough). The
+bet it encodes — approximate-but-in-place over exact-but-resharded — is the same one the
+[annbatch contrast](#what-it-is-by-contrast) turns on: they pre-shuffle to disk and
+dissolve chunks into scattered rows; we keep chunks whole and resident and pay with an
+approximate shuffle instead.
 
 ## Memory model
 
@@ -497,16 +400,16 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
 Things wrong or missing in *our* code today, with the reasoning that sets their priority.
 (Things simply *not built yet* are milestones — see Roadmap.)
 
-- **Per-block ragged batches (possible wart).** Batches never span shuffle blocks, so
-  `block_chunks × spc` not dividing `batch_size` yields a short final batch *per block*,
-  not one per epoch (see "Two invariants" above). Correct — sample-once is unaffected — but
-  it can surprise consumers assuming a uniform batch size: BatchNorm on a small tail, and
-  steps-per-epoch is `Σ ⌈block_samples / bs⌉`, not `⌈N / bs⌉`. No `drop_last` today. Options
-  if users want uniformity: (a) opt-in `drop_last`; (b) carry a block's remainder into the
-  next block's first batch (extends that block's pin lifetime past its own batches); (c) a
-  whole-epoch re-batch (cheap — `order` is already materialized — but mixes chunks across
-  block boundaries, diluting the block-local residency guarantee). **Priority pending user
-  feedback** — no correctness impact, so we hold until someone hits it.
+- **Per-block ragged batches (possible wart).** Batches never span shuffle blocks, so a
+  block's sample count not dividing `batch_size` yields a short final batch *per block*, not
+  one per epoch — behaviour and step-count impact in
+  [Read-once and sample-once](docs/architecture.md#read-once-and-sample-once). Correct
+  (sample-once holds), but it can surprise consumers assuming a uniform batch size. No
+  `drop_last` today. Options if users want uniformity: (a) opt-in `drop_last`; (b) carry a
+  block's remainder into the next block's first batch (extends that block's pin lifetime past
+  its own batches); (c) a whole-epoch re-batch (cheap — `order` is already materialized — but
+  mixes chunks across block boundaries, diluting the block-local residency guarantee).
+  **Priority pending user feedback** — no correctness impact, so we hold until someone hits it.
 
 - **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
   shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
