@@ -212,6 +212,23 @@ on the synthetic store, and running the *same code* against WeatherBench2 ARCO E
   ERA5/radio field needs the pool to hold only a crop's tiles. That is a residency change,
   not a `Batch`-contract change — which is what keeps it an *additive* future.
 
+  Mechanics (worked through, so the shape is known when a real issue arrives). The omission
+  is **chunk-granular**: tiles fully outside the crop are never fetched or decoded; a tile
+  straddling the crop edge is decoded *whole* then clipped (zarr's IO/decode unit is the
+  chunk). `tile_placement` generalizes from full-field to a clamped box — `crop[dst] =
+  tile[src]` with `dst` crop-relative, `src` chunk-local, both the `chunk ∩ crop` rectangle;
+  the crop buffer stays dense/rectangular and partial zero-copy holds. **Deterministic /
+  strided origins are the honest win**: adjacent patches share inner tiles, so the batched
+  union + **decode-once dedup across patch footprints is exactly the planner primitive that
+  stays ours** — the sampler emits origins, the planner unions and dedups their tile sets.
+  **Random origins are the trap**: pushed into the read, scattered footprints degrade toward
+  the whole field again (the sample-axis read-amplification, now on the inner dims), so
+  random crop stays an in-memory `batch_transform` — over a *bounded* read window if we want
+  to cap IO — never unbounded random origins in the read. `zarr-indexing`'s box path can
+  resolve one patch's `(tiles, chunk_sel, out_sel)` (a modest placement convenience, not the
+  engine — see "Upstream capabilities"). **Gate: build this only when a concrete user issue
+  demands it** — a giant-field crop workload with real numbers, not a speculative rung.
+
 GRIB / NetCDF are consumed via a **virtual-zarr** view (virtualizarr / kerchunk /
 icechunk) so the engine only ever speaks zarr-async — we never parse GRIB.
 
