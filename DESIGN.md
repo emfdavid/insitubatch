@@ -565,15 +565,49 @@ capabilities already under design there. This section records **the design depen
 what we would build versus what we would inherit. It deliberately does *not* track issue
 status, reviewers, or dates; that state lives outside this repo and goes stale here.
 
-- **Lazy indexing / `IndexTransform`** (zarr-python
-  [#3906](https://github.com/zarr-developers/zarr-python/pull/3906)) — a composable,
-  serializable description of "which elements of an array do I want", resolved lazily
-  rather than materialized. That is the same object our planner builds by hand, so a
-  shared upstream primitive is the natural foundation for `plan.py`: we would dogfood
-  their resolver against our planner and contribute the serialization-performance and
-  multi-window requirements. **What stays ours regardless:** the *batched* union of many
-  per-anchor windows into one deduplicated read set, in draw/priority order — that is
-  loader orchestration, not indexing, and it is the thing this project exists to do.
+- **Lazy indexing / `IndexTransform`** (the `zarr-indexing` package, zarr-python
+  [#4196](https://github.com/zarr-developers/zarr-python/pull/4196), split out of the
+  [#3906](https://github.com/zarr-developers/zarr-python/pull/3906) work) — a standalone,
+  NumPy-only implementation of TensorStore-style index transforms plus chunk resolution
+  against a `DimensionGridLike` protocol. We have **dogfooded it as a correctness oracle**:
+  with `ArrayGeometry` supplying a `DimensionGridLike` per axis, `iter_chunk_transforms`
+  resolves the *exact* stored-chunk set `plan.py` produces, across offset windows,
+  coarser/finer variable grids, short final chunks, inner grids, and a non-zero sample axis
+  (`tests/test_zarr_indexing_parity.py`). But an oracle is not an engine, and the honest
+  scope of the fit is small: our overlapping logic is `range(lo//spc, hi//spc+1)` — trivial
+  integer arithmetic, not complexity worth outsourcing — and consuming `iter_chunk_transforms`
+  on the hot path would *add* surface (a `DimensionGridLike` adapter, a per-selection
+  transform allocation) while forcing us to discard its `out_indices` scatter map, which is
+  the exact thing our scatter-into-slots design removes. So today it changes nothing.
+
+  **There is no adoption trigger from sample indexing — the fancy path is the anti-pattern,
+  not a future engine.** It is tempting to read the package's `ArrayMap` `oindex`/`vindex`
+  resolver as the thing we would inherit once sample geometry generalizes to *scattered*
+  (arbitrary, cross-chunk) sample indices. It is not, and the reason is the whole thesis:
+  `iter_chunk_transforms` resolves *which chunks a selection touches and how it scatters*, but
+  does nothing about **read amplification**. "One sample from every chunk" destroys TTFB
+  because you fetch and decode every touched chunk to use one row — an IO-locality property
+  the index math sits upstream of. Making the coordinate math free buys nothing on the axis
+  that hurts; the coordinate math was never our bottleneck. That access pattern is precisely
+  the reshard/random-access mode we traded away for the block-shuffle approximation
+  (`tests/test_zarr_indexing_parity.py::test_scattered_sample_read_amplification` quantifies
+  it: 5 wanted samples force reading all 12 in the touched chunks). Every legitimate sampling
+  feature we do want — block shuffle, weighted/stratified draws — resolves to *a set of whole
+  chunks* (our union-of-windows planner already owns this) followed by *in-memory numpy row
+  selection of already-decoded data* (no chunk resolution needed). The fancy per-sample
+  machinery has no home here.
+
+  The only `zarr-indexing` pieces that could ever touch us are the *cheap* ones, and they
+  stay conveniences, not engines: **irregular/varying chunk grids** (`index_to_chunk` becomes
+  a `searchsorted` rather than a `//`, and the `DimensionGridLike` abstraction saves us
+  writing/testing it) and **inner-axis patch/box crops** (the deferred sliding-window
+  feature — but that is `box`/`slice` resolution, the trivial-arithmetic part again, and the
+  hard part of patching is the draw space, not the index resolution). Both are the box/grid
+  surface, never the fancy `ArrayMap` path.
+
+  **What stays ours regardless:** the *batched* union of many per-anchor windows into one
+  deduplicated read set, in draw/priority order — that is loader orchestration, not indexing,
+  and it is the thing this project exists to do.
 - **Batched zero-copy `out=` decode** (zarr-python
   [#3060](https://github.com/zarr-developers/zarr-python/issues/3060), under the
   codec-pipeline umbrella [#2904](https://github.com/zarr-developers/zarr-python/issues/2904))
