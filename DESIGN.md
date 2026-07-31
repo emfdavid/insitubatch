@@ -429,11 +429,15 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   **Priority pending user feedback** — no correctness impact, so we hold until someone hits it.
 
 - ✅ **SHIPPED — batch buffer reuse + pinning** (`buffers.BatchBuffers`,
-  `frameworks.as_torch(device=...)`; branch `batch-buffer-ring`). `pool.gather` lends a
-  reused, 128-byte-aligned buffer per variable and reclaims it once the consumer's view is
-  unreferenced; `as_torch(device=...)` swaps in page-locked buffers *and* owns the H2D copy.
-  Kept here as the record of what was measured and why it is shaped this way. **Profiled**
-  with
+  `frameworks.as_torch(device=...)` / `pin_host_buffers`; branch `batch-buffer-ring`).
+  `pool.gather` lends a reused, 128-byte-aligned buffer per variable and reclaims it once the
+  consumer's view is unreferenced; `as_torch(device=...)` swaps in page-locked buffers *and*
+  owns the H2D copy. **End-to-end results and how to read them:
+  [docs/benchmarks.md](docs/benchmarks.md#batch-buffers--reuse-removes-a-cliff-pinning-buys-24).**
+  Headline: reuse removes a payload-size cliff (+16% at 32 MiB) and costs 2–3% below it, which
+  does not surface in a compute-bound GPU loop; pinning is worth **+2–4%** end to end at
+  0.5–8 MiB payloads and rises with payload. Kept here as the record of what was measured and
+  why the design is shaped this way. **Profiled** with
   `bench/probe_batch_buffers.py` (L4, PCIe Gen4 x8 — a wider link makes the pinned column
   better, so read these as a floor):
 
@@ -467,7 +471,23 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
 
   So this removes a cliff rather than adding speed, and **small batches pay ~2–3%** — a real
   trade-off, not noise (reproduced in both arms at both sizes). Weather sits in the losing
-  region; it is a fraction of a percent of a WB2 step, but it is a cost, not a wash. *Pinning* is a smooth gradient that helps at every size, and up to ~37 MiB it hides
+  region; it is a fraction of a percent of a WB2 step, but it is a cost, not a wash.
+
+  That cost does **not** reach a real training loop: in the advection GPU benchmark, four
+  alternating runs (with/without the pool, 5 epochs × 7 repeats) held the 128² geometry at
+  99.2 / 99.3 / 99.4 / 99.3 % of ceiling — 0.2 points of spread and no arm signal. Producer-side
+  work is what prefetch exists to hide. **Pinning, measured the same way, is worth +5.0 / +3.9 /
+  +2.3% absolute throughput at 0.5 / 2 / 8 MiB payloads**, with the compute ceiling rising by
+  the same amount (the ceiling loop issues the same per-step copy) — which is what identifies
+  the transfer as the thing that changed.
+
+  Two metric traps, both of which caught us: `% of ceiling` is right for the *reuse* check
+  (it normalizes away a compute ceiling that drifted up to 9.7% between sessions on unchanged
+  code) and wrong for *pinning* (which speeds up a copy both sides perform, so it barely
+  moves); and the ceiling is sampled once per geometry per run, so `% of ceiling` resolves
+  only ~1 point no matter how many repeats. See the benchmarks page for the full caveats.
+
+  In isolation, *pinning* is a smooth gradient that helps at every size, and up to ~37 MiB it hides
   the copy **completely** — the pinned arm sits on the compute floor. A pageable copy costs
   more than its own transfer time (1.5 MiB transfers in 0.4 ms but adds 1.5 ms of wall)
   because it cannot overlap at all: it stages through a driver bounce buffer and stalls the

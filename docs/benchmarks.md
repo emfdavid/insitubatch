@@ -374,8 +374,77 @@ again in the cold fill: TTFB rises as chunks shrink (0.41 → 0.73 s) or fan int
 <iframe src="../figures/advection_chunk.html" width="100%" height="420" frameborder="0"></iframe>
 <iframe src="../figures/advection_inner.html" width="100%" height="420" frameborder="0"></iframe>
 
+## Batch buffers — reuse removes a cliff, pinning buys 2–4%
+
+The loader reuses its batch output buffers rather than allocating one per batch, and
+`as_torch(..., device=...)` / `pin_host_buffers` put those buffers in page-locked memory and
+own the H2D copy. The two are separate changes with separate payoffs, and each is only
+visible on the axis it acts on.
+
+### Reuse: a payload-size cliff, not a speedup
+
+Above glibc's 32 MiB `mmap` threshold a fresh batch is `mmap`ed and `munmap`ed **every
+batch** — a syscall trace shows 12 full-buffer pairs per 12-batch epoch without reuse and 2
+with it — so the kernel re-zeroes the whole buffer each time. Below that threshold the freed
+block is recycled on the heap and reuse is a small cost instead.
+
+Synthetic sweep (`bench/batch_buffer_sweep.py`, L4, `--inner 256,256`, arms alternated):
+
+| MiB/batch | 8 | 16 | 32 | 64 | 128 |
+|---|--:|--:|--:|--:|--:|
+| no reuse (samples/s) | 5404 | 5186 | 4435 | 4585 | 4765 |
+| reuse | 5240 | 5060 | 5148 | 5173 | 5266 |
+| delta | −3.0% | −2.4% | **+16.1%** | **+12.8%** | **+10.5%** |
+
+**Read the shape, not a headline number.** Reuse holds throughput flat across a 16× payload
+range while fresh allocation falls off a cliff; the small-batch end pays 2–3%. Weather-shaped
+batches sit in the losing region — a fraction of a percent of a step, but a cost, not a wash.
+
+That cost does **not** surface in the GPU training loop above: across four alternating runs
+(with and without reuse, 5 epochs × 7 repeats), the 128² geometry held 99.2 / 99.3 / 99.4 /
+99.3 % of ceiling — 0.2 points of spread, with no arm signal. Producer-side work is what
+prefetch is for, and a compute-bound loop absorbs it.
+
+### Pinning: +2–4% end to end, and it shows in the ceiling too
+
+Same checkout, same box, back-to-back, `--pin` the only difference:
+
+| geometry | payload | without | with | delta |
+|---|--:|--:|--:|--:|
+| 64² | 0.5 MiB | 4448.7 | 4672.2 | **+5.0%** |
+| 128² | 2 MiB | 583.1 | 605.8 | **+3.9%** |
+| 256² | 8 MiB | 145.2 | 148.5 | **+2.3%** |
+
+Pinned is the maximum at every geometry and outside the range of the four unpinned runs in
+all three. The compute ceiling rises by almost exactly the same amount (+6.1 / +3.6 / +2.1%)
+because the ceiling loop preloads batches into RAM but still issues the same per-step H2D
+copy — loader and ceiling moving in lockstep is the evidence that what changed is *the
+transfer*. The larger field gains least: its compute per sample is 4× heavier, so the copy is
+a smaller share of the step.
+
+This matches the isolated prediction. `bench/probe_batch_buffers.py --arms overlap` put a
+1.5 MiB pinned copy at 0.785 ms saved against a 25 ms step (3.0%); the real loop returns 3.9%
+at 2 MiB.
+
+!!! warning "Use the right metric for each"
+    **`% of ceiling` is the wrong metric for pinning** — it measures loader efficiency against
+    compute, and pinning speeds up a copy both sides perform, so it barely moves (it fell 0.9
+    points at 64² while absolute throughput rose 5%). Read absolute throughput for pinning,
+    and only between back-to-back runs: the compute ceiling drifted up to **9.7%** between
+    sessions on an unchanged checkout. Conversely `% of ceiling` *is* the right metric for the
+    reuse regression check, since it normalizes that drift away.
+
+    The ceiling is sampled **once per geometry per run** (`do_ceiling = ceiling and r == 0`)
+    while insitu gets every repeat, so `% of ceiling` inherits a single measurement's noise and
+    resolves only ~1 point however many repeats you add. The 64² row is the least reliable:
+    fastest, shortest, and it drifted monotonically (95.2 → 94.4 → 94.2 → 93.0) across
+    alternating arms. Prefer 128².
+
 ## Deferred
 
+- **Pinning at large payloads** — measured only at 0.5–8 MiB here, where the probe says the
+  win is smallest. Microscopy-scale batches (≥32 MiB) are where both halves should be worth
+  the most, and neither has been run end to end at that size.
 - **GPU baseline head-to-head** — the section above establishes insitu stays GPU-fed
   (94–98% of the compute ceiling); the matching `compute_ms` sweep of the **worker stacks**
   stalling once IO-bound is still to run.
