@@ -47,6 +47,38 @@ def test_retained_view_is_never_reused() -> None:
     assert np.all(held == 1.0)  # the retained batch is untouched
 
 
+def test_a_derived_view_keeps_its_buffer() -> None:
+    """A *slice* of a lent batch must hold the buffer, not just the lent array itself.
+
+    numpy collapses base chains: ``lent[..., i:j].base`` is the ultimate data owner, **not**
+    ``lent``. So tracking liveness by the lent object alone frees the buffer the moment a
+    consumer keeps a crop and drops the original -- which is precisely what a cropping
+    ``batch_transform`` does (``examples/wb2_arraylake.py``, and the guidance in
+    docs/architecture.md), and it corrupts training data silently.
+    """
+    pool = BatchBuffers()
+    lent = pool.take(4, (8, 8), np.dtype("f4"))
+    lent[:] = 1.0
+    crop = lent[..., 0:4, 0:4]  # a transform's output, aliasing the buffer
+    del lent  # the consumer keeps only the crop
+
+    other = pool.take(4, (8, 8), np.dtype("f4"))
+    other[:] = 9.0
+    assert np.all(crop == 1.0), "the pool recycled a buffer a live view still aliases"
+
+
+def test_a_derived_view_of_a_ragged_prefix_keeps_its_buffer() -> None:
+    """Same, for the short final batch -- a prefix view is where the tail lives."""
+    pool = BatchBuffers()
+    lent = pool.take(3, (8, 8), np.dtype("f4"))
+    lent[:] = 2.0
+    crop = lent[..., 2:6, 2:6]
+    del lent
+
+    pool.take(3, (8, 8), np.dtype("f4"))[:] = 7.0
+    assert np.all(crop == 2.0)
+
+
 def test_pool_grows_to_the_in_flight_count_then_stops() -> None:
     """No depth parameter: allocate-on-miss converges on however many are live at once."""
     pool = BatchBuffers()

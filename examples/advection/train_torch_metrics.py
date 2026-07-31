@@ -101,7 +101,9 @@ def train(
     """
     dev = torch.device(device)
     log = log or MetricsLog(None)
-    if pin:
+    if pin and dev.type == "cuda":
+        # Pinning is a CUDA allocation; on a CPU run it would raise from the producer thread.
+        # The sweep passes --pin unconditionally, and the examples default to --device cpu.
         pin_host_buffers(ds.train)
 
     def loader_epoch(epoch: int) -> Iterable[Batch]:
