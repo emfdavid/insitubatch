@@ -150,14 +150,41 @@ def probe_h2d(case: Case, iters: int) -> tuple[float, float]:
     return timed(pageable), timed(pinned)
 
 
-def probe_overlap(case: Case, iters: int, compute_ms: float) -> tuple[float, float]:
-    """``(pageable_ms, pinned_ms)`` wall time for a copy *issued alongside compute*.
+class Load(NamedTuple):
+    """A fixed synthetic training step: ``reps`` matmuls of ``a @ b`` on the GPU.
 
-    The copy goes on a side stream while a matmul occupies the default stream, sized to
-    roughly ``compute_ms`` -- a stand-in for the training step the loader is meant to
-    hide behind. A pinned source DMAs straight off the page-locked pages and overlaps; a
-    pageable one is staged through a driver bounce buffer and serializes. If both arms
-    land at the compute time alone, the transfer is already hidden and pinning is moot.
+    Built **once** and shared by every case so the compute baseline is identical across
+    rows. Sizing it per case would let the measured single-matmul time jitter change
+    ``reps`` between rows, drifting the baseline and making the absolute wall times
+    incomparable (the within-row page-vs-pin delta would stay valid, but nothing else).
+    """
+
+    a: torch.Tensor
+    b: torch.Tensor
+    reps: int
+
+
+def make_load(compute_ms: float) -> Load:
+    """Size the synthetic compute load to roughly ``compute_ms`` per step."""
+    import torch
+
+    a = torch.randn(2048, 2048, device="cuda")
+    b = torch.randn(2048, 2048, device="cuda")
+    return Load(a, b, max(1, round(compute_ms / _gpu_ms(lambda: a @ b))))
+
+
+def probe_overlap(case: Case, iters: int, load: Load) -> tuple[float, float, float]:
+    """``(compute_only_ms, pageable_ms, pinned_ms)`` wall time for a copy *issued
+    alongside compute*.
+
+    The copy goes on a side stream while ``load``'s matmuls occupy the default stream --
+    a stand-in for the training step the loader is meant to hide behind. A pinned source
+    DMAs straight off the page-locked pages and overlaps; a pageable one is staged
+    through a driver bounce buffer and serializes.
+
+    ``compute_only_ms`` is the floor: the same step with no copy at all. An arm sitting
+    at the floor has its transfer fully hidden, so pinning cannot help it -- that
+    comparison is the point of the arm, and it needs the floor reported, not assumed.
     """
     import torch
 
@@ -166,17 +193,13 @@ def probe_overlap(case: Case, iters: int, compute_ms: float) -> tuple[float, flo
     pinned = torch.empty(case.shape, dtype=dtype, pin_memory=True)
     stream = torch.cuda.Stream()
 
-    # Size the synthetic load once so both arms contend with the same compute.
-    a = torch.randn(2048, 2048, device="cuda")
-    b = torch.randn(2048, 2048, device="cuda")
-    reps = max(1, round(compute_ms / _gpu_ms(lambda: a @ b)))
-
-    def run(src: torch.Tensor) -> float:
+    def run(src: torch.Tensor | None) -> float:
         def once() -> None:
-            with torch.cuda.stream(stream):
-                src.to("cuda", non_blocking=True)
-            for _ in range(reps):
-                a @ b
+            if src is not None:
+                with torch.cuda.stream(stream):
+                    src.to("cuda", non_blocking=True)
+            for _ in range(load.reps):
+                load.a @ load.b
             torch.cuda.synchronize()
 
         torch.cuda.synchronize()
@@ -184,7 +207,7 @@ def probe_overlap(case: Case, iters: int, compute_ms: float) -> tuple[float, flo
 
     run(pageable)
     run(pinned)
-    return run(pageable), run(pinned)
+    return run(None), run(pageable), run(pinned)
 
 
 def _gpu_ms(fn: Callable[[], object]) -> float:
@@ -287,17 +310,20 @@ def main() -> None:
         )
 
     if "overlap" in arms:
+        load = make_load(args.compute_ms)  # once, so every row shares one baseline
         rows = []
         for case in CASES:
-            page_ms, pin_ms = probe_overlap(case, max(10, args.iters // 5), args.compute_ms)
+            base_ms, page_ms, pin_ms = probe_overlap(case, max(10, args.iters // 5), load)
             pct = 100 * (page_ms - pin_ms) / page_ms if page_ms else 0.0
             rows.append(
-                f"{case.name:<28}{case.mib:>9.1f}{page_ms:>10.3f}{pin_ms:>10.3f}"
-                f"{page_ms - pin_ms:>10.3f}{pct:>7.1f}%"
+                f"{case.name:<28}{case.mib:>9.1f}{base_ms:>10.3f}{page_ms:>10.3f}"
+                f"{pin_ms:>10.3f}{page_ms - pin_ms:>10.3f}{pct:>7.1f}%"
             )
         _report(
-            f"overlap -- copy issued against ~{args.compute_ms:.0f}ms of compute (wall time)",
-            f"{'case':<28}{'MiB':>9}{'page ms':>10}{'pin ms':>10}{'saved':>10}{'saved':>8}",
+            f"overlap -- copy issued against ~{args.compute_ms:.0f}ms of compute (wall time);"
+            " an arm at 'compute' has its copy fully hidden",
+            f"{'case':<28}{'MiB':>9}{'compute':>10}{'page ms':>10}{'pin ms':>10}"
+            f"{'saved':>10}{'saved':>8}",
             rows,
         )
 
