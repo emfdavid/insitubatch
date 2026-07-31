@@ -11,11 +11,16 @@ surfaces end to end depends on whether IO is hiding it.
 fresh allocation falls off a cliff at 32 MiB. A single headline percentage hides that the
 small-batch end is a ~2-3% *regression*, which is a real trade-off rather than noise.
 
-``minor_faults`` is here because faulting a fresh page set is part of what a per-batch
-``mmap`` costs, but treat it as **environment-dependent**: it matched prediction closely on
-one host (678k vs 1039k for a 12-batch epoch of 128 MiB batches, ~328k predicted) and did not
-separate at all on another under the same nominal config. If it stays flat while throughput
-moves, believe the throughput and check the syscalls directly::
+What the cliff actually costs is the kernel **re-zeroing** the buffer: a fresh anonymous
+mapping arrives zeroed, so 12 batches of 128 MiB means 1.5 GiB zeroed per epoch that the pool
+never pays. On an L4 that predicted ~125 ms against a measured 122 ms gap -- consistent from
+an independent direction, and it scales with payload as observed.
+
+``minor_faults`` is recorded in the JSONL but **not printed**, because it counts *faults* and
+the kernel's folio size is host-dependent: the same 1.5 GiB read as a 360k-fault difference on
+a 6.8 kernel (4 KiB pages) and a 3.7k one on 6.17 (~512 KiB folios), with identical syscalls
+in both. Presenting it beside throughput is how this benchmark's mechanism was first
+misdiagnosed. To measure the mechanism, trace the syscalls::
 
     strace -f -e trace=mmap,munmap -o t.txt <child cmd>
     grep -c 'mmap(NULL, <batch_bytes+4096>, PROT_READ|PROT_WRITE' t.txt
@@ -230,16 +235,19 @@ def main() -> None:
             row = _run_child(_child_cmd(args, batch_size, ""), cfg, repeat, out_path)
             rows.append((batch_size, mib, row))
 
-    print(f"\n{'batch':>7}{'MiB':>9}{'samples/s':>12}{'minor faults':>14}{'rss anon MB':>13}")
+    # minor_faults stays in the JSONL but is deliberately *not* printed: it counts faults, and
+    # the kernel's folio size varies by host, so the same work reads as 393k faults on one
+    # machine and 4k on another. Presenting it next to throughput invited exactly the wrong
+    # mechanism conclusion once already. Use the strace recipe above to measure the mechanism.
+    print(f"\n{'batch':>7}{'MiB':>9}{'samples/s':>12}{'rss anon MB':>13}")
     for batch_size in args.batch_sizes:
         got = [r for bs, _m, r in rows if bs == batch_size and r]
         if not got:
             continue
         mib = batch_mib(batch_size, args.inner)
         sps = float(np.median([r["samples_per_s"] for r in got]))
-        flt = float(np.median([r.get("minor_faults", 0) for r in got]))
         rss = float(np.median([r.get("rss_anon_mb", 0.0) for r in got]))
-        print(f"{batch_size:>7}{mib:>9.1f}{sps:>12.1f}{flt:>14.0f}{rss:>13.1f}")
+        print(f"{batch_size:>7}{mib:>9.1f}{sps:>12.1f}{rss:>13.1f}")
     print(f"\n{len(rows)} rows -> {out_path}")
     if tmpdir is not None:
         tmpdir.cleanup()
