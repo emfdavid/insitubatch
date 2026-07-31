@@ -53,7 +53,13 @@ def to_torch(batch: Batch) -> dict[str, torch.Tensor]:
 
 
 def to_jax(batch: Batch) -> dict[str, Any]:
-    """Convert a numpy ``Batch`` to a dict of ``jax.Array`` (DLPack)."""
+    """Convert a numpy ``Batch`` to a dict of ``jax.Array`` (DLPack).
+
+    Zero-copy only when the batch buffer sits on a 128-byte boundary: XLA:CPU requires that
+    alignment and silently falls back to a copy otherwise. numpy guarantees only 16, so with
+    today's per-batch ``np.empty`` roughly half of batches are copied (measured 20/40 —
+    ``bench/probe_batch_buffers.py --arms jax``). Correct either way, just not free.
+    """
     try:
         import jax.numpy as jnp
     except ImportError as exc:  # pragma: no cover - jax-less installs
@@ -70,7 +76,8 @@ def to_tf(batch: Batch) -> dict[str, Any]:
     of the prefetch decode threads it double-frees that buffer and aborts the process
     (SIGABRT, no message). ``convert_to_tensor`` copies into a TF-owned tensor instead, so TF
     never touches insitu-managed memory; the batch is already an owned array, so this is a
-    single CPU copy. (torch/JAX stay zero-copy; this is a TF-DLPack limitation, not ours.)
+    single CPU copy. (torch stays zero-copy, JAX when aligned -- see :func:`to_jax`; TF's is a
+    DLPack limitation, not ours.)
     """
     try:
         import tensorflow as tf

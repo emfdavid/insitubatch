@@ -6,7 +6,7 @@ pre-pinned buffers fixes both at once -- but only if either half is on the criti
 path. This probe measures the **ceiling** for both, before any engine change, so the
 decision is a number and not an instinct.
 
-Four arms, each isolating one claim:
+Five arms, each isolating one claim:
 
 * **alloc** (no GPU needed) -- fresh ``np.empty`` vs a reused buffer, running
   ``gather``'s exact inner loop (one coalesced fancy-index per chunk). ``np.empty``
@@ -29,10 +29,16 @@ Four arms, each isolating one claim:
   adapter, and every batch would travel ``pinned tensor -> .numpy() -> base[:k] view ->
   DLPack -> .to(cuda)``. This asks whether pinning actually survives that path. It is the
   gate on the whole design: if it fails, pinning needs a torch-owned buffer instead.
+* **jax** (needs JAX) -- the same soundness question for the other zero-copy adapter.
+  ``to_jax`` aliases pool memory just as torch does, so reuse is safe only if JAX holds the
+  source alive; and JAX exposes no event to poll, so an async device transfer would be
+  unguardable. (TF needs no arm: ``to_tf`` copies into TF-owned memory -- its experimental
+  DLPack mishandles buffer ownership -- so it never touches the pool.)
 
 Read the result as: *alloc* says whether buffer reuse alone pays, *h2d* bounds the pinning
-prize, *overlap* says whether that prize is real or already collected, and *roundtrip* says
-whether we can collect it without putting torch in the core.
+prize, *overlap* says whether that prize is real or already collected, *roundtrip* says
+whether we can collect it without putting torch in the core, and *jax* says how far the
+answer generalises past torch.
 
     uv run python -m bench.probe_batch_buffers                 # host arm only
     uv run python -m bench.probe_batch_buffers --arms all      # on a GPU box
@@ -56,7 +62,7 @@ if TYPE_CHECKING:
 # contiguous memcpy. Page-fault cost is the same either way; keep the shape honest.
 CHUNKS = 4
 
-ARMS = ("alloc", "h2d", "overlap", "roundtrip")
+ARMS = ("alloc", "h2d", "overlap", "roundtrip", "jax")
 
 
 class Case(NamedTuple):
@@ -227,6 +233,113 @@ def probe_roundtrip(case: Case, iters: int) -> Roundtrip:
     )
 
 
+XLA_ALIGN = 128  # XLA:CPU's zero-copy alignment requirement, in bytes
+
+
+def aligned_empty(shape: tuple[int, ...], dtype: np.dtype, align: int = XLA_ALIGN) -> np.ndarray:
+    """``np.empty(shape, dtype)`` whose data pointer is a multiple of ``align``.
+
+    Over-allocate a byte buffer, skip to the next boundary, then view/reshape. numpy makes
+    no alignment promise beyond its own 16-byte floor, which is why this is needed at all.
+    """
+    n = int(np.prod(shape)) * dtype.itemsize
+    raw = np.empty(n + align, dtype=np.uint8)
+    off = (-raw.__array_interface__["data"][0]) % align
+    return raw[off : off + n].view(dtype).reshape(shape)
+
+
+class JaxCheck(NamedTuple):
+    """Whether the pool's liveness poll is sound for the JAX adapter too."""
+
+    backend: str
+    device: str  # where `from_dlpack` actually placed the array
+    trials: int
+    default_zero_copy: int  # of `trials` np.empty buffers, how many JAX aliased
+    aligned_zero_copy: int  # ...and of `trials` 128-byte-aligned ones
+    keeps_alive: bool  # when it DOES alias, JAX holds the source alive (what the poll needs)
+    race_observed: bool | None  # None = no GPU backend present to test
+
+
+def probe_jax(trials: int) -> JaxCheck:
+    """Does JAX behave like torch under the pool -- alias, and hold the source alive?
+
+    ``to_jax`` uses ``jnp.from_dlpack``, so a JAX consumer aliases pool memory exactly as a
+    torch one does, and reuse is only safe if JAX keeps the source array alive. Two things
+    make this worth checking rather than assuming torch's answer carries over: JAX arrays are
+    advertised as **immutable**, so an aliased buffer we later recycle would mutate one
+    silently; and JAX exposes no event we can poll, so unlike ``to_torch(device=...)`` there
+    is no way to guard an in-flight device transfer.
+
+    JAX's zero-copy is **conditional on alignment** -- XLA:CPU needs the buffer on a 128-byte
+    boundary and silently copies otherwise -- and numpy only guarantees 16, so whether any
+    given batch is zero-copy is down to the allocator's luck. Both arms are measured because
+    the difference is a lever: a pool that allocates aligned makes JAX zero-copy *reliably*,
+    which plain per-batch ``np.empty`` cannot.
+
+    The last check probes the unguardable gap: ``device_put`` to the GPU, immediately scribble
+    the host buffer, then read the device array back. Seeing the scribble means the transfer
+    was still reading our memory after ``device_put`` returned -- an async copy we cannot
+    guard, which would rule out pinning on the JAX path. It is a **race** detector, so a clean
+    run is "not observed in N trials", never proof of safety.
+    """
+    import weakref
+
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:  # pragma: no cover - jax-less installs
+        raise SystemExit("the jax arm needs JAX: uv sync --extra jax") from exc
+
+    shape, dtype = (8, 4), np.dtype("f4")
+
+    def zero_copy_hits(alloc: Callable[[], np.ndarray]) -> int:
+        """How many of ``trials`` fresh buffers JAX aliased rather than copied."""
+        hits = 0
+        for _ in range(trials):
+            base = alloc()
+            base[0, 0] = 0.0
+            arr = jnp.from_dlpack(base[: shape[0]])
+            base[0, 0] = 99.0  # a host write shows through only if JAX aliased
+            hits += float(arr[0, 0]) == 99.0
+        return hits
+
+    default_hits = zero_copy_hits(lambda: np.empty(shape, dtype))
+    aligned_hits = zero_copy_hits(lambda: aligned_empty(shape, dtype))
+
+    # Soundness is only meaningful on a buffer JAX actually aliased, so force alignment.
+    base = aligned_empty(shape, dtype)
+    view = base[: shape[0]]
+    ref = weakref.ref(view)
+    arr = jnp.from_dlpack(view)
+    del view
+    keeps_alive = ref() is not None
+    device = str(next(iter(arr.devices())))
+
+    gpus = [d for d in jax.devices() if d.platform == "gpu"]
+    race: bool | None = None
+    if gpus:
+        # Big buffer: the wider the copy, the wider the window a race can be seen in.
+        big = Case("jax-race", 8, (2, 32, 512, 512), np.dtype("f4"))
+        race = False
+        for _ in range(trials):
+            host = aligned_empty(big.shape, big.dtype)
+            host.fill(0.0)
+            on_device = jax.device_put(jnp.from_dlpack(host[: big.batch]), gpus[0])
+            host.fill(7.0)  # scribble the source the instant device_put returns
+            if float(on_device[0, 0, 0, 0]) == 7.0:
+                race = True
+                break
+    return JaxCheck(
+        backend=jax.default_backend(),
+        device=device,
+        trials=trials,
+        default_zero_copy=default_hits,
+        aligned_zero_copy=aligned_hits,
+        keeps_alive=keeps_alive,
+        race_observed=race,
+    )
+
+
 class Load(NamedTuple):
     """A fixed synthetic training step: ``reps`` matmuls of ``a @ b`` on the GPU.
 
@@ -323,7 +436,8 @@ def _device_name() -> str:
 
 def _report(header: str, columns: str, rows: list[str]) -> None:
     print(header)
-    print(columns)
+    if columns:  # the jax arm reports labelled lines, not a table
+        print(columns)
     for row in rows:
         print(row)
     print()
@@ -337,7 +451,7 @@ def main() -> None:
     ap.add_argument(
         "--arms",
         default="alloc",
-        help="comma-separated: alloc,h2d,overlap,roundtrip (or 'all'). Default: alloc.",
+        help="comma-separated: alloc,h2d,overlap,roundtrip,jax (or 'all'). Default: alloc.",
     )
     ap.add_argument("--iters", type=int, default=50, help="timed repetitions per measurement")
     ap.add_argument(
@@ -352,7 +466,7 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"unknown arm(s): {sorted(unknown)}; choose from {list(ARMS)}")
 
-    if arms - {"alloc"}:
+    if arms & {"h2d", "overlap", "roundtrip"}:  # the jax arm brings its own backend
         print(f"device: {_device_name()}\n")
 
     if "alloc" in arms:
@@ -419,6 +533,28 @@ def main() -> None:
             f"{'case':<28}{'MiB':>9}{'alias':>7}{'pinned':>8}{'ragged':>8}"
             f"{'via ms':>10}{'pin ms':>10}{'page ms':>10}  verdict",
             rows,
+        )
+
+    if "jax" in arms:
+        jc = probe_jax(args.iters)
+        if jc.race_observed is None:
+            transfer = "no GPU backend present -- device transfer untested"
+        elif jc.race_observed:
+            transfer = "ASYNC RACE OBSERVED -- device_put keeps reading our buffer"
+        else:
+            transfer = f"no race in {jc.trials} trials (absence of evidence, not safety)"
+        _report(
+            "jax -- does the pool's liveness poll hold for the JAX adapter?",
+            "",
+            [
+                f"  backend                 {jc.backend}  (from_dlpack placed on {jc.device})",
+                f"  zero-copy, np.empty     {jc.default_zero_copy}/{jc.trials}"
+                "   <- alignment luck, not a guarantee",
+                f"  zero-copy, {XLA_ALIGN}-aligned  {jc.aligned_zero_copy}/{jc.trials}"
+                "   <- what an aligned pool would give",
+                f"  keeps source alive      {jc.keeps_alive}   <- what the poll needs",
+                f"  device transfer         {transfer}",
+            ],
         )
 
 
