@@ -257,7 +257,8 @@ class JaxCheck(NamedTuple):
     default_zero_copy: int  # of `trials` np.empty buffers, how many JAX aliased
     aligned_zero_copy: int  # ...and of `trials` 128-byte-aligned ones
     keeps_alive: bool  # when it DOES alias, JAX holds the source alive (what the poll needs)
-    race_observed: bool | None  # None = no GPU backend present to test
+    race_observed: bool | None  # device_put still reading our buffer after it returned
+    poll_insufficient: bool | None  # ...*and* the weakref already dead -> reuse unsafe
 
 
 def probe_jax(trials: int) -> JaxCheck:
@@ -278,10 +279,18 @@ def probe_jax(trials: int) -> JaxCheck:
 
     The last check probes the unguardable gap: ``device_put`` to the GPU, immediately scribble
     the host buffer, then read the device array back. Seeing the scribble means the transfer
-    was still reading our memory after ``device_put`` returned -- an async copy we cannot
-    guard, which would rule out pinning on the JAX path. It is a **race** detector, so a clean
-    run is "not observed in N trials", never proof of safety.
+    was still reading our memory after ``device_put`` returned -- an async copy we have no
+    event to wait on. It is a **race** detector, so a clean run is "not observed in N trials",
+    never proof of safety.
+
+    An async copy alone only rules out *pinning*. What decides whether **reuse** is safe is
+    whether JAX holds the source alive for the duration of its own transfer: the trial drops
+    every reference the consumer would have dropped and checks the weakref *before* forcing
+    the copy to finish. Racing while the weakref is already dead (``poll_insufficient``) means
+    the pool's liveness poll can hand a buffer back mid-DMA, and the JAX path must opt out of
+    reuse entirely rather than merely skip pinning.
     """
+    import gc
     import weakref
 
     try:
@@ -317,19 +326,33 @@ def probe_jax(trials: int) -> JaxCheck:
 
     gpus = [d for d in jax.devices() if d.platform == "gpu"]
     race: bool | None = None
+    poll_insufficient: bool | None = None
     if gpus:
         # Big buffer: the wider the copy, the wider the window a race can be seen in.
         big = Case("jax-race", 8, (2, 32, 512, 512), np.dtype("f4"))
-        race = False
+        race = poll_insufficient = False
         for _ in range(trials):
             host = aligned_empty(big.shape, big.dtype)
             host.fill(0.0)
-            on_device = jax.device_put(jnp.from_dlpack(host[: big.batch]), gpus[0])
-            host.fill(7.0)  # scribble the source the instant device_put returns
+            src = host[: big.batch]
+            ref = weakref.ref(src)
+            on_device = jax.device_put(jnp.from_dlpack(src), gpus[0])
+
+            # Drop every reference *we* hold, exactly as the consumer loop does when it
+            # moves on. If JAX keeps the source alive for the duration of its own transfer,
+            # the weakref survives here and the pool's poll is sound; if it dies while the
+            # copy is still reading, the poll would hand the buffer back mid-DMA.
+            del src
+            gc.collect()
+            released_early = ref() is None
+
+            host.fill(7.0)  # scribble the source the instant device_put returned
             # ravel: the case is (batch, *inner) and so rank 5 -- read element 0 without
             # having to spell every axis. The read is what forces the transfer to finish.
-            if float(on_device.ravel()[0]) == 7.0:
-                race = True
+            raced = float(on_device.ravel()[0]) == 7.0
+            race |= raced
+            poll_insufficient |= raced and released_early
+            if poll_insufficient:
                 break
     return JaxCheck(
         backend=jax.default_backend(),
@@ -339,6 +362,7 @@ def probe_jax(trials: int) -> JaxCheck:
         aligned_zero_copy=aligned_hits,
         keeps_alive=keeps_alive,
         race_observed=race,
+        poll_insufficient=poll_insufficient,
     )
 
 
@@ -541,10 +565,17 @@ def main() -> None:
         jc = probe_jax(args.iters)
         if jc.race_observed is None:
             transfer = "no GPU backend present -- device transfer untested"
+            reuse_verdict = "untested"
         elif jc.race_observed:
-            transfer = "ASYNC RACE OBSERVED -- device_put keeps reading our buffer"
+            transfer = "ASYNC RACE -- device_put keeps reading our buffer after returning"
+            reuse_verdict = (
+                "UNSAFE -- weakref died mid-DMA; JAX must opt out of reuse"
+                if jc.poll_insufficient
+                else "ok -- JAX holds the source alive for its own transfer (pinning still out)"
+            )
         else:
             transfer = f"no race in {jc.trials} trials (absence of evidence, not safety)"
+            reuse_verdict = "ok -- no async read observed"
         _report(
             "jax -- does the pool's liveness poll hold for the JAX adapter?",
             "",
@@ -556,6 +587,7 @@ def main() -> None:
                 "   <- what an aligned pool would give",
                 f"  keeps source alive      {jc.keeps_alive}   <- what the poll needs",
                 f"  device transfer         {transfer}",
+                f"  reuse under the poll    {reuse_verdict}",
             ],
         )
 
