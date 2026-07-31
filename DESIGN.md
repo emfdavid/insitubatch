@@ -447,10 +447,13 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   **The two halves do *not* share a crossover** — an earlier reading said they did, off a
   drifting compute baseline. Only *reuse* has one, at ~32 MiB, and it is an allocator
   artifact: below it glibc recycles the freed block on the heap; above it every batch is
-  `mmap`/`munmap`'d, paying a fresh page set plus `munmap`'s TLB work. Confirmed by syscall
-  trace rather than inferred — a 12-batch epoch of 128 MiB batches issues **12** full-buffer
-  `mmap`/`munmap` pairs without the pool and **2** with it, the count tracking batches rather
-  than dataset size.
+  `mmap`/`munmap`'d. Confirmed by syscall trace on two hosts rather than inferred — a 12-batch
+  epoch of 128 MiB batches issues **12** full-buffer `mmap`/`munmap` pairs without the pool and
+  **2** with it, the count tracking batches rather than dataset size. The cost is the kernel
+  **re-zeroing** each fresh anonymous mapping: 1.5 GiB per epoch that the pool never pays,
+  predicting ~125 ms against a measured 122 ms gap. Page-fault *counts* are a bad proxy for
+  this — the same 1.5 GiB reads as a 360k-fault delta on a 6.8 kernel and 3.7k on 6.17, where
+  larger folios change the unit but not the work.
 
   End to end (`bench/batch_buffer_sweep.py`, L4, `--inner 256,256`, ABBA-ordered arms), the
   shape matters more than any single number — **the pool holds throughput flat across a 16×
