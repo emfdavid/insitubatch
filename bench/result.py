@@ -48,6 +48,23 @@ def rss_breakdown_mb() -> tuple[float, float]:
     return anon, file
 
 
+def minor_faults() -> int:
+    """Minor page faults this process has taken (``ru_minflt``).
+
+    The direct measure of batch-buffer allocation churn, and a far more sensitive one than
+    wall time: a freshly allocated batch faults in its whole page set on the scatter-write,
+    while a reused buffer faults once ever. Above glibc's 32 MiB dynamic mmap threshold --
+    where every batch is ``mmap``/``munmap``'d rather than recycled on the heap -- the
+    difference is large and shows even when IO is hiding the time saved.
+
+    Process-wide and **cumulative**, so it is only meaningful per fresh process. That is why
+    the batch-buffer sweep runs one child per config: glibc's threshold is itself stateful
+    (it rises once a large block is freed), so configs measured in one process would
+    contaminate each other.
+    """
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_minflt)
+
+
 @dataclass
 class Result:
     engine: str  # insitu | naive | memory | workers | xbatcher
@@ -69,6 +86,7 @@ class Result:
     peak_rss_mb: float  # ru_maxrss high-water (monotonic, process-wide)
     rss_anon_mb: float = 0.0  # heap/stack at row time (Linux); the real memory bound
     rss_file_mb: float = 0.0  # file-backed mmap at row time (mmap cache .npy; reclaimable)
+    minor_faults: int = 0  # ru_minflt: page faults served without IO -- see minor_faults()
     host: str = field(default_factory=socket.gethostname)
     platform: str = field(default_factory=platform.platform)
     ts: float = field(default_factory=time.time)

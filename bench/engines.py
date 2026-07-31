@@ -34,7 +34,7 @@ from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry
 
 from .backend import build_store
-from .result import Result, peak_rss_mb, rss_breakdown_mb
+from .result import Result, minor_faults, peak_rss_mb, rss_breakdown_mb
 
 
 @dataclass
@@ -113,6 +113,7 @@ def _result(
         peak_rss_mb=peak_rss_mb(),
         rss_anon_mb=anon,
         rss_file_mb=file,
+        minor_faults=minor_faults(),
     )
 
 
