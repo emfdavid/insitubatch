@@ -113,6 +113,23 @@ def pinned_allocator(budget_bytes: int | None = None) -> HostAllocator:
     return allocate
 
 
+def pin_host_buffers(view: _SplitView, *, budget_bytes: int | None = None) -> None:
+    """Switch a split's batch buffers to page-locked memory, for the duration of the dataset.
+
+    Only safe when **we** issue the H2D copy -- that is, when every batch goes through
+    :func:`to_torch` with ``device=`` (or :func:`as_torch`, which calls this for you). Pinning
+    is what makes a ``non_blocking`` copy genuinely asynchronous, and Python refcounts cannot
+    see an in-flight DMA, so pinned buffers under a *caller's own* ``non_blocking`` copy would
+    let the pool recycle a buffer mid-transfer. With ``to_torch(..., device=...)`` the source
+    is held until its event fires and the hazard is closed.
+
+    Call before iterating. ``as_torch(view, device=...)`` is the one-liner for the
+    ``DataLoader`` path; this is the equivalent for code that iterates the dataset itself and
+    converts per batch.
+    """
+    view._use_host_allocator(pinned_allocator(budget_bytes))
+
+
 class _InFlight:
     """Sources held until their asynchronous H2D copy has actually landed.
 
@@ -155,6 +172,10 @@ def to_torch(batch: Batch, device: str | torch.device | None = None) -> dict[str
     if device is None:
         return tensors
     out = {k: v.to(device, non_blocking=True) for k, v in tensors.items()}
+    if torch.device(device).type != "cuda":
+        # No async DMA to guard: a CPU target copies synchronously (or not at all), and
+        # torch.cuda.Event() raises outright on a machine without a driver.
+        return out
     event = torch.cuda.Event()
     event.record()
     _in_flight.hold(batch.arrays, event)
@@ -228,7 +249,7 @@ def as_torch(
         def __init__(self, stream: _SplitView) -> None:
             self._stream = stream
             if device is not None:
-                stream._use_host_allocator(pinned_allocator(pin_budget_bytes))
+                pin_host_buffers(stream, budget_bytes=pin_budget_bytes)
 
         def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
             for batch in self._stream:

@@ -51,11 +51,15 @@ class AdvectionCNN(nn.Module):
 def _forecast(model: AdvectionCNN, batch: Batch, device: torch.device) -> torch.Tensor:
     """t2m(t+24h) forecast for one batch: persistence + the model's predicted tendency.
 
-    ``to_torch`` is a zero-copy DLPack hand-off on CPU; moving to ``device`` is the H2D
-    copy -- placement is the training loop's job, not the dataset's (it speaks numpy)."""
-    d = to_torch(batch)  # {label: (B, H, W) tensor}, CPU via DLPack
-    x = torch.stack([d["t2m"], d["u10"], d["v10"]], dim=1).to(device)  # (B, 3, H, W)
-    return d["t2m"][:, None].to(device) + model(x)  # (B, 1, H, W)
+    ``to_torch(..., device=...)`` hands the batch over by DLPack and issues the H2D copy in
+    one step. Stacking happens **after** the transfer, on the device: stacking first would
+    build a fresh (B, 3, H, W) CPU tensor -- a copy of the whole batch into memory the loader
+    does not own, which is both wasted work and unpinnable, so it would defeat page-locked
+    buffers for the one tensor that matters most.
+    """
+    d = to_torch(batch, device=device)  # {label: (B, H, W)}, already on device
+    x = torch.stack([d["t2m"], d["u10"], d["v10"]], dim=1)  # (B, 3, H, W), on device
+    return d["t2m"][:, None] + model(x)  # (B, 1, H, W)
 
 
 def train(ds: InSituDataset, *, epochs: int, device: str = "cpu") -> tuple[float, float]:
@@ -68,7 +72,7 @@ def train(ds: InSituDataset, *, epochs: int, device: str = "cpu") -> tuple[float
         model.train()
         last = 0.0
         for batch in ds.train:
-            target = to_torch(batch)["target"][:, None].to(dev)
+            target = to_torch(batch, device=dev)["target"][:, None]
             loss = nn.functional.mse_loss(_forecast(model, batch, dev), target)
             opt.zero_grad()
             loss.backward()
