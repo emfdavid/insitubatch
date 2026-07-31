@@ -52,6 +52,17 @@ DEFAULT_BATCH_SIZES = (32, 64, 128, 256, 512)
 DEFAULT_INNER = (256, 256)
 
 
+def effective_batch(batch_size: int, block_chunks: int, sample_chunk: int) -> int:
+    """Rows a batch actually gets: a batch never crosses a shuffle-block boundary.
+
+    ``source.py`` draws ``order[start : min(start + bs, rstop)]`` within one block, so a
+    ``batch_size`` larger than ``block_chunks * sample_chunk`` is silently clipped to it --
+    and this sweep's whole axis is batch *bytes*, so an unnoticed clip would collapse several
+    configs onto the same point while still labelling them apart.
+    """
+    return min(batch_size, block_chunks * sample_chunk)
+
+
 def batch_mib(batch_size: int, inner: tuple[int, ...], itemsize: int = 4) -> float:
     """MiB per batch -- the axis that actually decides whether reuse pays."""
     return batch_size * int(np.prod(inner)) * itemsize / 2**20
@@ -139,7 +150,9 @@ def main() -> None:
     p.add_argument("--inner", type=_inner, default=DEFAULT_INNER, help="per-sample shape")
     p.add_argument("--n-samples", type=int, default=4096)
     p.add_argument("--sample-chunk", type=int, default=8)
-    p.add_argument("--block-chunks", type=int, default=16)
+    # Must cover the largest batch: a batch never crosses a shuffle block, so a small value
+    # here silently clips the sweep's biggest configs onto one another.
+    p.add_argument("--block-chunks", type=int, default=64)
     p.add_argument("--prefetch-depth", type=int, default=2)
     p.add_argument("--compute-ms", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=1)
@@ -185,6 +198,16 @@ def main() -> None:
                 sample_chunk=args.sample_chunk,
                 variables=["t2m"],
             )
+
+    block_rows = args.block_chunks * args.sample_chunk
+    clipped = [b for b in args.batch_sizes if b > block_rows]
+    if clipped:
+        raise SystemExit(
+            f"--batch-sizes {clipped} exceed the shuffle block ({args.block_chunks} chunks x "
+            f"{args.sample_chunk} = {block_rows} rows). A batch never crosses a block, so these "
+            f"would all be clipped to {block_rows} rows and land on one point in the sweep. "
+            f"Raise --block-chunks to at least {max(args.batch_sizes) // args.sample_chunk}."
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
