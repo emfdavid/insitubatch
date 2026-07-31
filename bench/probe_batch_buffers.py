@@ -32,8 +32,10 @@ Five arms, each isolating one claim:
 * **jax** (needs JAX) -- the same soundness question for the other zero-copy adapter.
   ``to_jax`` aliases pool memory just as torch does, so reuse is safe only if JAX holds the
   source alive; and JAX exposes no event to poll, so an async device transfer would be
-  unguardable. (TF needs no arm: ``to_tf`` copies into TF-owned memory -- its experimental
-  DLPack mishandles buffer ownership -- so it never touches the pool.)
+  unguardable. **Run this one as ``--arms all``**: the async read only reproduces with the
+  GPU under load from the other arms, and on an idle device the transfer lands before the
+  probe can observe it. (TF needs no arm: ``to_tf`` copies into TF-owned memory -- its
+  experimental DLPack mishandles buffer ownership -- so it never touches the pool.)
 
 Read the result as: *alloc* says whether buffer reuse alone pays, *h2d* bounds the pinning
 prize, *overlap* says whether that prize is real or already collected, *roundtrip* says

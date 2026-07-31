@@ -481,9 +481,18 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   the poll defers reclaim while a tensor is live (verified). TF never touches pool memory at
   all — `to_tf` copies, because its experimental DLPack double-frees the exported buffer
   under the decode threads — so it is safe by construction and gains nothing from either
-  half. A JAX detail worth a test: `jax.Array` is advertised as **immutable**, and a host
-  write through an aliased buffer *is* visible through it, so for JAX the poll is not an
-  optimization guard but what stops a documented-immutable array changing underneath.
+  half.
+
+  The JAX case is the one that needed proving, and it is **not** a nicety: JAX documents that
+  a `from_dlpack` buffer mutated in place by an external process is **undefined behaviour**
+  (dlpack buffers cannot be marked immutable), so the poll is what keeps a recycled pool
+  buffer out of UB. `jax.device_put` is documented as always asynchronous, and the probe
+  reproduces an async read of our buffer after it returns — but only with the GPU under load
+  from the other arms, which is why the `jax` arm is only meaningful run as `--arms all`.
+  JAX nevertheless keeps the source **referenced** across that transfer (deterministic check,
+  no race involved), so the poll cannot reclaim mid-DMA. That last part is an observed XLA
+  implementation detail, not a documented guarantee — assert it in a test so a regression
+  surfaces here rather than as corrupted training data.
 
   An aligned pool is also a small **win** for JAX. XLA:CPU zero-copies only from a 128-byte
   boundary and silently copies otherwise; numpy guarantees 16, so today's per-batch
@@ -511,11 +520,17 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   pageable copy and the whole win evaporates with no error. **That gate passed** on an L4:
   `is_pinned()` survives, the ragged `base[:k]` prefix too, and the H2D time through the
   full path matches a native pinned tensor to three decimals (43.502 vs 43.501 ms at
-  512 MiB) — the round-trip is the same memory at no cost. Pinning stays **torch-only**
-  regardless: `to_torch(device=...)` gives us `Event.query()` to guard reuse against, and
-  JAX's `device_put` exposes no equivalent, so we would be handing JAX pinned memory with no
-  way to know when recycling it is safe. Left out of scope until measured (the `jax` arm's
-  race check needs a GPU-backend JAX to run).
+  512 MiB) — the round-trip is the same memory at no cost.
+
+  Pinning stays **torch-only**, for a documented reason rather than a measured one:
+  [jax#22346](https://github.com/jax-ml/jax/issues/22346) — JAX's DLPack path rejects pinned
+  host memory (`KeyError: kDLCPUPinned`), blocked upstream on both sides
+  ([pytorch#136250](https://github.com/pytorch/pytorch/issues/136250)). We dodge it in
+  practice, since we export from numpy and numpy reports `kDLCPU` however the pages were
+  allocated — verified, `jnp.from_dlpack` accepts a view of a pinned torch buffer — so a
+  pinned pool stays consumable by JAX. But JAX has no way to *use* the pinning and no event
+  to guard recycling against, so `to_torch(device=...)` remains the only path that owns its
+  transfer.
 
 - **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
   shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
