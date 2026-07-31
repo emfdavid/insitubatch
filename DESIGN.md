@@ -476,6 +476,21 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   converges to the true in-flight count on its own. A `batch_transform` returning new arrays
   (e.g. `_subregion_crop`) drops its pooled view immediately and gets no benefit.
 
+  **The pool is sound for every adapter, for three different reasons.** torch and JAX both
+  alias pool memory through `from_dlpack` *and* hold a strong reference to the source, so
+  the poll defers reclaim while a tensor is live (verified). TF never touches pool memory at
+  all — `to_tf` copies, because its experimental DLPack double-frees the exported buffer
+  under the decode threads — so it is safe by construction and gains nothing from either
+  half. A JAX detail worth a test: `jax.Array` is advertised as **immutable**, and a host
+  write through an aliased buffer *is* visible through it, so for JAX the poll is not an
+  optimization guard but what stops a documented-immutable array changing underneath.
+
+  An aligned pool is also a small **win** for JAX. XLA:CPU zero-copies only from a 128-byte
+  boundary and silently copies otherwise; numpy guarantees 16, so today's per-batch
+  `np.empty` is zero-copy by luck — measured 20/40, versus 40/40 from a 128-aligned
+  allocation. Pool buffers should be aligned, which makes `to_jax` reliably zero-copy for
+  the first time. (Pinned host memory is page-aligned, so the pinned path gets this free.)
+
   Pinning needs us to **own the transfer** — refcounts cannot see an in-flight
   `non_blocking` DMA, so recycling a buffer whose copy is still draining corrupts it. That
   does *not* require M2's `device_transform`, which is a pipeline stage (user GPU callables,
@@ -493,8 +508,14 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   1.5 GB), so pinning needs a cap the reuse-only pool does not, interacting with the memory
   budget. **Gate: the `roundtrip` arm** — pinning must survive `pinned tensor → .numpy() →
   base[:k] → DLPack → .to(cuda)`, or `non_blocking` silently degrades to a synchronous
-  pageable copy and the whole win evaporates with no error. If it fails, pinning needs a
-  torch-owned buffer instead of an injected allocator.
+  pageable copy and the whole win evaporates with no error. **That gate passed** on an L4:
+  `is_pinned()` survives, the ragged `base[:k]` prefix too, and the H2D time through the
+  full path matches a native pinned tensor to three decimals (43.502 vs 43.501 ms at
+  512 MiB) — the round-trip is the same memory at no cost. Pinning stays **torch-only**
+  regardless: `to_torch(device=...)` gives us `Event.query()` to guard reuse against, and
+  JAX's `device_put` exposes no equivalent, so we would be handing JAX pinned memory with no
+  way to know when recycling it is safe. Left out of scope until measured (the `jax` arm's
+  race check needs a GPU-backend JAX to run).
 
 - **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
   shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
