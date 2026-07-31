@@ -35,6 +35,7 @@ from collections.abc import Callable, Iterator, Sequence
 import numpy as np
 from zarr.abc.store import Store
 
+from .buffers import HostAllocator
 from .pool import ChunkPool, output_geometry
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
@@ -487,3 +488,14 @@ class _SplitView:
 
     def __iter__(self) -> Iterator[Batch]:
         return self._dataset._iterate(self._split, self._shuffle)
+
+    def _use_host_allocator(self, allocator: HostAllocator) -> None:
+        """Point the batch-buffer pool at a different host allocator (adapter-internal).
+
+        How ``frameworks.as_torch(..., device=...)`` installs page-locked buffers without the
+        core importing torch. Deliberately not public and deliberately not a constructor
+        argument: pinning is only *safe* alongside an adapter that owns the H2D copy, so the
+        two arrive together or not at all -- pinned buffers under a caller's own
+        ``non_blocking`` copy would reintroduce exactly the use-after-recycle this avoids.
+        """
+        self._dataset._pool._buffers.set_allocator(allocator)

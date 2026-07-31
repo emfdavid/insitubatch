@@ -25,11 +25,18 @@ nothing and a missing framework raises a clear, actionable error. ``sample_indic
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
+from .buffers import HostAllocator, aligned_empty
 from .source import _SplitView
 from .types import Batch
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # annotations only; these are optional at runtime
     import tensorflow as tf
@@ -43,13 +50,115 @@ def _missing(name: str, extra: str) -> ImportError:
     )
 
 
-def to_torch(batch: Batch) -> dict[str, torch.Tensor]:
-    """Convert a numpy ``Batch`` to a dict of torch tensors (DLPack; zero-copy on CPU)."""
+_DEFAULT_PIN_FRACTION = 8  # of physical RAM
+_FALLBACK_PIN_BUDGET = 1 << 30  # where physical RAM is not discoverable
+
+
+def _default_pin_budget() -> int:
+    """An eighth of physical RAM, or 1 GiB where that cannot be read.
+
+    Page-locked memory is a *global* resource the kernel cannot reclaim, so over-pinning
+    degrades the whole machine rather than just this process. The default is sized to never
+    fire for weather or ViT payloads and to catch a microscopy-sized pool on a small host.
+    """
+    try:
+        total: int = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):  # pragma: no cover - non-POSIX
+        return _FALLBACK_PIN_BUDGET
+    return total // _DEFAULT_PIN_FRACTION
+
+
+def pinned_allocator(budget_bytes: int | None = None) -> HostAllocator:
+    """A host allocator handing out page-locked buffers, up to ``budget_bytes``.
+
+    Past the budget it returns ordinary aligned heap memory instead. Degrading rather than
+    raising or blocking is deliberate: blocking could deadlock (a consumer legitimately holds
+    batches, so the producer could wait forever), raising would turn a performance feature
+    into a crash, and the degraded state is simply what the loader shipped before pinning
+    existed. It warns once so "pinning did nothing" is diagnosable rather than mysterious.
+    """
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - torch-less installs
         raise _missing("PyTorch", "torch") from exc
-    return {k: torch.from_dlpack(v) for k, v in batch.arrays.items()}
+
+    budget = _default_pin_budget() if budget_bytes is None else int(budget_bytes)
+    used = 0
+    warned = False
+
+    def allocate(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+        nonlocal used, warned
+        nbytes = int(np.prod(shape)) * dtype.itemsize
+        if used + nbytes > budget:
+            if not warned:
+                warned = True
+                logger.warning(
+                    "pinned-buffer budget exhausted (%.0f MiB used, %.0f MiB needed for the "
+                    "next buffer, budget %.0f MiB) -- further batch buffers are pageable, so "
+                    "H2D transfers stop overlapping. Raise pin_budget_bytes or lower "
+                    "batch_size/prefetch_depth.",
+                    used / 2**20,
+                    nbytes / 2**20,
+                    budget / 2**20,
+                )
+            return aligned_empty(shape, dtype)
+        # numpy view of a page-locked tensor: aliases (never copies), and CUDA still
+        # recognises the pages through the DLPack round-trip back into torch, which is what
+        # keeps `non_blocking` genuinely asynchronous. Page-locked memory is page-aligned, so
+        # the pool's 128-byte XLA alignment comes free.
+        pinned = torch.empty(tuple(shape), dtype=getattr(torch, str(dtype)), pin_memory=True)
+        used += nbytes
+        return pinned.numpy()
+
+    return allocate
+
+
+class _InFlight:
+    """Sources held until their asynchronous H2D copy has actually landed.
+
+    The reclaim hazard pinning introduces: a ``non_blocking`` copy returns before it has
+    finished reading its source, and Python refcounts cannot see an in-flight DMA, so a buffer
+    whose view the consumer has dropped could be recycled and overwritten mid-copy. Pageable
+    memory hides this (the driver stages through a bounce buffer, so the copy is effectively
+    synchronous with respect to the host) -- pinning is what makes it real.
+
+    The guard needs no new machinery in the pool: holding the *source arrays* until
+    ``event.query()`` keeps their views referenced, so the pool's existing liveness poll
+    defers reclaim on its own. Nothing crosses into the core, and ``Batch`` is untouched.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[tuple[dict[str, np.ndarray], torch.cuda.Event]] = []
+
+    def hold(self, arrays: dict[str, np.ndarray], event: torch.cuda.Event) -> None:
+        self._pending.append((arrays, event))
+        self._pending[:] = [(a, e) for a, e in self._pending if not e.query()]
+
+
+_in_flight = _InFlight()
+"""Process-wide, because CUDA streams are. Bounded: pruned on every hand-out."""
+
+
+def to_torch(batch: Batch, device: str | torch.device | None = None) -> dict[str, torch.Tensor]:
+    """Convert a numpy ``Batch`` to a dict of torch tensors (DLPack; zero-copy on CPU).
+
+    With ``device`` set, the copy is issued here rather than by the caller, and the batch's
+    source arrays are held until it lands. That is what makes pinned batch buffers safe to
+    recycle -- see :class:`_InFlight`. Without it the behaviour is unchanged: CPU tensors
+    aliasing the batch, and the caller's own ``.to(...)`` afterwards.
+    """
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - torch-less installs
+        raise _missing("PyTorch", "torch") from exc
+    tensors = {k: torch.from_dlpack(v) for k, v in batch.arrays.items()}
+    if device is None:
+        return tensors
+    out = {k: v.to(device, non_blocking=True) for k, v in tensors.items()}
+    event = torch.cuda.Event()
+    event.record()
+    _in_flight.hold(batch.arrays, event)
+    return out
 
 
 def to_jax(batch: Batch) -> dict[str, Any]:
@@ -86,11 +195,29 @@ def to_tf(batch: Batch) -> dict[str, Any]:
     return {k: tf.convert_to_tensor(v) for k, v in batch.arrays.items()}
 
 
-def as_torch(view: _SplitView) -> IterableDataset:
+def as_torch(
+    view: _SplitView,
+    *,
+    device: str | torch.device | None = None,
+    pin_budget_bytes: int | None = None,
+) -> IterableDataset:
     """Wrap a split view (e.g. ``ds.train``) as a torch ``IterableDataset`` for ``DataLoader``.
 
     Each yielded item is a ``dict[str, torch.Tensor]`` (via :func:`to_torch`). Use
     ``DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)``.
+
+    Passing ``device`` moves batches here instead of in the training loop, and switches the
+    batch buffers to **page-locked** memory. The two are one option rather than two on
+    purpose: pinning is what makes an H2D copy genuinely asynchronous, so it is only safe
+    when whoever issues the copy also knows when it landed. A ``pin_memory=True`` flag the
+    caller could set without ``device`` would hand out pinned buffers under the caller's own
+    ``non_blocking`` copy and reintroduce a use-after-recycle we would then have to document
+    instead of prevent.
+
+    Worth it only above ~32 MiB per batch. Measured on an L4, pinning takes a 37 MiB batch's
+    transfer from +4.0 ms to +0.3 ms against a 25 ms step, and a weather-sized batch from
+    +1.5 ms to +0.7 ms -- real but marginal. ``pin_budget_bytes`` caps the page-locked total
+    (default: an eighth of RAM); past it buffers are pageable again, with a warning.
     """
     try:
         from torch.utils.data import IterableDataset
@@ -100,10 +227,12 @@ def as_torch(view: _SplitView) -> IterableDataset:
     class _TorchStream(IterableDataset):
         def __init__(self, stream: _SplitView) -> None:
             self._stream = stream
+            if device is not None:
+                stream._use_host_allocator(pinned_allocator(pin_budget_bytes))
 
         def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
             for batch in self._stream:
-                yield to_torch(batch)
+                yield to_torch(batch, device=device)
 
     return _TorchStream(view)
 
