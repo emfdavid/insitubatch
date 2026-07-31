@@ -30,8 +30,8 @@ Five arms, each isolating one claim:
   DLPack -> .to(cuda)``. This asks whether pinning actually survives that path. It is the
   gate on the whole design: if it fails, pinning needs a torch-owned buffer instead.
 * **jax** (needs JAX) -- the same soundness question for the other zero-copy adapter.
-  ``to_jax`` aliases pool memory just as torch does, so reuse is safe only if JAX holds the
-  source alive; and JAX exposes no event to poll, so an async device transfer would be
+  ``to_jax`` aliases pool memory just as torch does, so reuse is safe only if JAX keeps a
+  reference to that memory; and JAX exposes no event to poll, so an async device transfer would be
   unguardable. **Run this one as ``--arms all``**: the async read only reproduces with the
   GPU under load from the other arms, and on an idle device the transfer lands before the
   probe can observe it. (TF needs no arm: ``to_tf`` copies into TF-owned memory -- its
@@ -258,7 +258,7 @@ class JaxCheck(NamedTuple):
     trials: int
     default_zero_copy: int  # of `trials` np.empty buffers, how many JAX aliased
     aligned_zero_copy: int  # ...and of `trials` 128-byte-aligned ones
-    keeps_alive: bool  # when it DOES alias, JAX holds the source alive (what the poll needs)
+    keeps_alive: bool  # when it DOES alias, JAX holds the lent array itself (see probe_jax)
     race_observed: bool | None  # device_put still reading our buffer after it returned
     holds_source: bool | None  # JAX itself keeps the source referenced across the transfer
 
@@ -275,8 +275,15 @@ def probe_jax(trials: int) -> JaxCheck:
     """Does JAX behave like torch under the pool -- alias, and hold the source alive?
 
     ``to_jax`` uses ``jnp.from_dlpack``, so a JAX consumer aliases pool memory exactly as a
-    torch one does, and reuse is only safe if JAX keeps the source array alive. Two things
-    make this worth checking rather than assuming torch's answer carries over: JAX arrays are
+    torch one does, and reuse is only safe if JAX keeps *something* referencing that memory.
+    This asserts the stronger property -- that JAX holds the lent array itself -- which is
+    sufficient but not what the pool requires: :class:`insitubatch.buffers._Buffer` counts
+    references to the data *owner*, so a framework holding either the lent array or the owner
+    is equally safe. A ``False`` here would therefore be worth investigating rather than
+    trusting: it could mean the memory is genuinely unheld, or merely held one level down.
+
+    Two things make this worth checking rather than assuming torch's answer carries over: JAX
+    arrays are
     advertised as **immutable**, so an aliased buffer we later recycle would mutate one
     silently; and JAX exposes no event we can poll, so unlike ``to_torch(device=...)`` there
     is no way to guard an in-flight device transfer.
@@ -611,7 +618,7 @@ def main() -> None:
                 "   <- alignment luck, not a guarantee",
                 f"  zero-copy, {XLA_ALIGN}-aligned  {jc.aligned_zero_copy}/{jc.trials}"
                 "   <- what an aligned pool would give",
-                f"  keeps source alive      {jc.keeps_alive}   <- what the poll needs",
+                f"  keeps source alive      {jc.keeps_alive}   <- holds the lent array itself",
                 f"  device transfer         {transfer}",
                 f"  JAX holds the source    {holds}   <- deterministic, unlike the race",
                 f"  reuse under the poll    {reuse_verdict}",

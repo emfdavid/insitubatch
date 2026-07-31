@@ -39,7 +39,7 @@ pinned path, since page-locked memory is page-aligned.
 
 from __future__ import annotations
 
-import weakref
+import sys
 from collections.abc import Callable
 
 import numpy as np
@@ -66,24 +66,40 @@ def aligned_empty(shape: tuple[int, ...], dtype: np.dtype, align: int = XLA_ALIG
 
 
 class _Buffer:
-    """One owned base array plus a weak handle on the view most recently lent from it."""
+    """One allocation, tracked by how many arrays still reference its data owner."""
 
-    __slots__ = ("base", "lent")
+    __slots__ = ("base", "owner", "_idle_refs")
 
     def __init__(self, base: np.ndarray) -> None:
         self.base = base
-        self.lent: weakref.ref[np.ndarray] | None = None
+        # Every array viewing this memory -- the batch we lend, a transform's crop of it, a
+        # torch/JAX tensor's hold on either -- keeps a strong reference to the object that
+        # *owns* the data. numpy collapses base chains to that owner rather than chaining, so
+        # a lent view is NOT referenced by a slice taken from it; the owner is. Probing with a
+        # throwaway slice is what identifies it, since it differs by allocator (heap arrays
+        # own their own data; a page-locked one is a view of a torch tensor's buffer).
+        probe = base[:1]
+        self.owner = base if probe.base is None else probe.base
+        del probe  # the probe is itself a reference; the idle baseline must not include it
+        self._idle_refs = 0
+        self._idle_refs = self._refs()
+
+    def _refs(self) -> int:
+        """References to the data owner. Must be reached through exactly one call frame so
+        the idle baseline and the live count are measured identically."""
+        return sys.getrefcount(self.owner)
 
     @property
     def free(self) -> bool:
-        """True when nobody holds the last view we lent -- so the memory is ours to rewrite.
+        """True when nothing outside this pool references the memory, so it is ours to rewrite.
 
-        ``lent() is None`` is the whole safety argument: CPython drops a view on its last
-        decref, and every zero-copy export we support (``torch.from_dlpack``,
-        ``jnp.from_dlpack``) takes a strong reference to that view, so a live tensor keeps
-        this False.
+        Counting references to the *owner* rather than weak-referencing the lent array is what
+        makes this survive a derived view: CPython drops each array on its last decref, and
+        every zero-copy export we support (``torch.from_dlpack``, ``jnp.from_dlpack``) holds
+        the array it was given, which in turn holds the owner. A crop the consumer kept after
+        discarding the batch therefore still counts.
         """
-        return self.lent is None or self.lent() is None
+        return self._refs() <= self._idle_refs
 
 
 class BatchBuffers:
@@ -114,15 +130,13 @@ class BatchBuffers:
 
     @staticmethod
     def _lend(buf: _Buffer, n: int) -> np.ndarray:
-        """Hand out a fresh view of ``buf`` and record a weak handle on it.
+        """Hand out a view of ``buf``'s first ``n`` rows.
 
-        The view must be a new object each time -- that is what the weakref tracks. Slicing
-        always builds one, and slicing the full length is what lets a ragged batch and a full
-        batch share the same base.
+        Slicing is what lets a ragged final batch and a full one share an allocation; the
+        returned array references the buffer's owner, which is how :attr:`_Buffer.free`
+        sees it.
         """
-        view = buf.base[:n]
-        buf.lent = weakref.ref(view)
-        return view
+        return buf.base[:n]
 
     @property
     def nbytes(self) -> int:

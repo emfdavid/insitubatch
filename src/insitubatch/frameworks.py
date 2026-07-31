@@ -176,8 +176,12 @@ def to_torch(batch: Batch, device: str | torch.device | None = None) -> dict[str
         # No async DMA to guard: a CPU target copies synchronously (or not at all), and
         # torch.cuda.Event() raises outright on a machine without a driver.
         return out
-    event = torch.cuda.Event()
-    event.record()
+    # Bind the event to the *target* device: torch.cuda.Event() and record() attach to the
+    # current device's current stream, so for `cuda:1` without a set_device the event would
+    # belong to device 0, query True immediately, and release a buffer mid-DMA.
+    with torch.cuda.device(device):
+        event = torch.cuda.Event()
+        event.record()
     _in_flight.hold(batch.arrays, event)
     return out
 
@@ -248,7 +252,10 @@ def as_torch(
     class _TorchStream(IterableDataset):
         def __init__(self, stream: _SplitView) -> None:
             self._stream = stream
-            if device is not None:
+            # Only a CUDA target: page-locking is a CUDA allocation, so pinning for a CPU
+            # device would raise "no NVIDIA driver" from inside the producer thread on the
+            # first gather -- and buys nothing even where a driver exists.
+            if device is not None and torch.device(device).type == "cuda":
                 pin_host_buffers(stream, budget_bytes=pin_budget_bytes)
 
         def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
