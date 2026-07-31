@@ -297,10 +297,10 @@ def probe_jax(trials: int) -> JaxCheck:
         hits = 0
         for _ in range(trials):
             base = alloc()
-            base[0, 0] = 0.0
+            base.flat[0] = 0.0
             arr = jnp.from_dlpack(base[: shape[0]])
-            base[0, 0] = 99.0  # a host write shows through only if JAX aliased
-            hits += float(arr[0, 0]) == 99.0
+            base.flat[0] = 99.0  # a host write shows through only if JAX aliased
+            hits += float(arr.ravel()[0]) == 99.0
         return hits
 
     default_hits = zero_copy_hits(lambda: np.empty(shape, dtype))
@@ -326,7 +326,9 @@ def probe_jax(trials: int) -> JaxCheck:
             host.fill(0.0)
             on_device = jax.device_put(jnp.from_dlpack(host[: big.batch]), gpus[0])
             host.fill(7.0)  # scribble the source the instant device_put returns
-            if float(on_device[0, 0, 0, 0]) == 7.0:
+            # ravel: the case is (batch, *inner) and so rank 5 -- read element 0 without
+            # having to spell every axis. The read is what forces the transfer to finish.
+            if float(on_device.ravel()[0]) == 7.0:
                 race = True
                 break
     return JaxCheck(
