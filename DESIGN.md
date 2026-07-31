@@ -446,9 +446,25 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
 
   **The two halves do *not* share a crossover** — an earlier reading said they did, off a
   drifting compute baseline. Only *reuse* has one, at ~32 MiB, and it is an allocator
-  artifact: below it glibc recycles the freed block on the heap so the fresh allocation
-  re-faults nothing; above it every batch is `mmap`/`munmap`'d and re-faults its whole page
-  set. *Pinning* is a smooth gradient that helps at every size, and up to ~37 MiB it hides
+  artifact: below it glibc recycles the freed block on the heap; above it every batch is
+  `mmap`/`munmap`'d, paying a fresh page set plus `munmap`'s TLB work. Confirmed by syscall
+  trace rather than inferred — a 12-batch epoch of 128 MiB batches issues **12** full-buffer
+  `mmap`/`munmap` pairs without the pool and **2** with it, the count tracking batches rather
+  than dataset size.
+
+  End to end (`bench/batch_buffer_sweep.py`, L4, `--inner 256,256`, ABBA-ordered arms), the
+  shape matters more than any single number — **the pool holds throughput flat across a 16×
+  payload range while fresh allocation falls off a cliff:**
+
+  | MiB/batch | 8 | 16 | 32 | 64 | 128 |
+  |---|---|---|---|---|---|
+  | no pool (samples/s) | 5404 | 5186 | 4435 | 4585 | 4765 |
+  | pool | 5240 | 5060 | 5148 | 5173 | 5266 |
+  | delta | −3.0% | −2.4% | **+16.1%** | **+12.8%** | **+10.5%** |
+
+  So this removes a cliff rather than adding speed, and **small batches pay ~2–3%** — a real
+  trade-off, not noise (reproduced in both arms at both sizes). Weather sits in the losing
+  region; it is a fraction of a percent of a WB2 step, but it is a cost, not a wash. *Pinning* is a smooth gradient that helps at every size, and up to ~37 MiB it hides
   the copy **completely** — the pinned arm sits on the compute floor. A pageable copy costs
   more than its own transfer time (1.5 MiB transfers in 0.4 ms but adds 1.5 ms of wall)
   because it cannot overlap at all: it stages through a driver bounce buffer and stalls the
