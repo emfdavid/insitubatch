@@ -128,7 +128,13 @@ def _child(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="batch-buffer reuse sweep (payload-size crossover)")
-    p.add_argument("--url", default=None, help="existing store; omitted -> a temp one is built")
+    p.add_argument("--url", default=None, help="existing store; omitted -> one is built")
+    p.add_argument(
+        "--data-dir",
+        default=None,
+        help="where to build the store (point at NVMe). Reused across runs if the geometry "
+        "matches; omitted -> a temp dir, rebuilt every run",
+    )
     p.add_argument("--batch-sizes", type=_ints, default=list(DEFAULT_BATCH_SIZES))
     p.add_argument("--inner", type=_inner, default=DEFAULT_INNER, help="per-sample shape")
     p.add_argument("--n-samples", type=int, default=4096)
@@ -156,15 +162,29 @@ def main() -> None:
 
     tmpdir: tempfile.TemporaryDirectory[str] | None = None
     if args.url is None:
-        tmpdir = tempfile.TemporaryDirectory()
-        args.url = f"file://{tmpdir.name}/bb.zarr"
-        make_dataset(
-            args.url,
-            n_samples=args.n_samples,
-            inner=args.inner,
-            sample_chunk=args.sample_chunk,
-            variables=["t2m"],
-        )
+        # Name the store after its geometry so a rerun reuses it rather than rewriting GBs.
+        # Reuse is what makes an A/B valid, not merely fast: both arms must read the *same*
+        # store, or the comparison also contains whatever differs between two datasets.
+        shape = "x".join(str(x) for x in args.inner)
+        name = f"bb_n{args.n_samples}_{shape}_c{args.sample_chunk}.zarr"
+        if args.data_dir:
+            directory = Path(args.data_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+        else:
+            tmpdir = tempfile.TemporaryDirectory()
+            directory = Path(tmpdir.name)
+        store = directory / name
+        args.url = f"file://{store}"
+        if store.exists():
+            print(f"reusing {args.url}")
+        else:
+            make_dataset(
+                args.url,
+                n_samples=args.n_samples,
+                inner=args.inner,
+                sample_chunk=args.sample_chunk,
+                variables=["t2m"],
+            )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
