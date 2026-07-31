@@ -434,25 +434,36 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   `bench/probe_batch_buffers.py` (L4, PCIe Gen4 x8 — a wider link makes the pinned column
   better, so read these as a floor):
 
-  | payload | reuse saves | pinned vs pageable H2D | copy hidden behind ~20 ms compute? |
+  | payload | reuse saves | H2D page → pin | cost added to a 25 ms step: pageable → pinned |
   |---|---|---|---|
-  | wb2 `16×3×128×64` (1.5 MiB) | 2% | 3.8 → 10.3 GB/s | fully — pinning saves nothing |
-  | vit `32×3×224×224` (18 MiB) | 2% | 5.8 → 11.4 GB/s | mostly — 4.7% |
-  | vit `64×3×224×224` (37 MiB) | 33% | 6.3 → 11.4 GB/s | no — 16% |
-  | microscopy `8×2×32×512×512` (512 MiB) | 22% | 6.4 → 11.5 GB/s | no — 53% |
+  | wb2 `16×3×128×64` (1.5 MiB) | 2% | 3.8 → 10.3 GB/s | +1.5 ms → +0.7 ms |
+  | vit `32×3×224×224` (18 MiB) | 2% | 5.8 → 11.4 GB/s | +1.6 ms → **+0.0 ms** |
+  | vit `64×3×224×224` (37 MiB) | 33% | 6.3 → 11.4 GB/s | +4.0 ms → **+0.3 ms** |
+  | microscopy `8×2×32×512×512` (512 MiB) | 22% | 6.4 → 11.5 GB/s | +71.7 ms → +18.3 ms |
 
-  Both halves have the same **~32 MiB crossover**, for unrelated reasons: below it glibc
-  recycles the freed block on the heap (so the fresh allocation re-faults nothing) and the
-  copy disappears into the step. Above it every batch is `mmap`/`munmap`'d and re-faults its
-  whole page set, and the transfer surfaces on the critical path. **Weather gains nothing
-  from either half** — validate this work on microscopy/ViT payloads, and do not expect the
-  advection numbers to move.
+  **The two halves do *not* share a crossover** — an earlier reading said they did, off a
+  drifting compute baseline. Only *reuse* has one, at ~32 MiB, and it is an allocator
+  artifact: below it glibc recycles the freed block on the heap so the fresh allocation
+  re-faults nothing; above it every batch is `mmap`/`munmap`'d and re-faults its whole page
+  set. *Pinning* is a smooth gradient that helps at every size, and up to ~37 MiB it hides
+  the copy **completely** — the pinned arm sits on the compute floor. A pageable copy costs
+  more than its own transfer time (1.5 MiB transfers in 0.4 ms but adds 1.5 ms of wall)
+  because it cannot overlap at all: it stages through a driver bounce buffer and stalls the
+  stream. Past ~512 MiB even pinned is exposed, but only because the copy (43 ms) now
+  exceeds the step (25 ms) — that residue is arithmetic, not a pinning failure.
+
+  So **weather gains nothing from reuse, and ~3% from pinning** — real but small, and the
+  wb2 row is near this harness's resolution (stream-context overhead is comparable to the
+  effect). Validate on microscopy/ViT; do not expect the advection numbers to move. The
+  percentages are all against a synthetic 25 ms step, so the transferable quantity is the
+  millisecond column, not the ratio.
 
   They are **two fixes, not one.** Reuse saves producer-thread time, which is hidden
   whenever the pipeline is IO-bound; pinning's win is consumer-side wall time by
-  construction, and is the larger of the two above the crossover. Build the **buffer pool
-  first** anyway — it is the prerequisite for pinning (`cudaHostAlloc` per batch is worse
-  than not pinning, so a fixed set of buffers must exist to pre-pin) and it pays on its own.
+  construction, and it is the larger and more certain of the two nearly everywhere. Build
+  the **buffer pool first** anyway — it is the prerequisite for pinning (`cudaHostAlloc` per
+  batch is worse than not pinning, so a fixed set of buffers must exist to pre-pin) and it
+  pays on its own above the allocator cliff.
 
   Pool design: own the base allocations permanently, hand out **views** (`base[:k]`, which
   is also the ragged-tail answer), keep a `weakref` per lent view, and **poll liveness at the
@@ -465,12 +476,25 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   converges to the true in-flight count on its own. A `batch_transform` returning new arrays
   (e.g. `_subregion_crop`) drops its pooled view immediately and gets no benefit.
 
-  Pinning waits on M2's GPU `device_transform`, and not just for sequencing: refcounts cannot
-  see an in-flight `non_blocking` DMA, so recycling a buffer whose copy is still draining
-  corrupts it. Owning the transfer (`as_torch(device=...)`) closes that by making the reclaim
-  predicate two-part — *view dead **and** recorded H2D event complete*. Pinning also needs a
-  cap the pool otherwise does not: page-locked memory is a scarce global resource (512 MiB
-  buffers at depth 3 lock 1.5 GB), so it interacts with the memory budget.
+  Pinning needs us to **own the transfer** — refcounts cannot see an in-flight
+  `non_blocking` DMA, so recycling a buffer whose copy is still draining corrupts it. That
+  does *not* require M2's `device_transform`, which is a pipeline stage (user GPU callables,
+  composition, a third entry in the transform contract); it requires only
+  `to_torch(batch, device=...)` issuing the copy itself. And the guard needs no new
+  machinery: the adapter holds the source arrays until `event.query()`, which keeps their
+  weakrefs alive, so the pool's existing liveness poll defers reclaim on its own. No event
+  crosses into the core, `Batch` is unchanged, and `to_torch(batch)` without a device is
+  exactly today's behaviour.
+
+  Two costs specific to pinning. The core cannot call `torch.empty(pin_memory=True)`, so the
+  buffers arrive from a **host allocator injected by the adapter** (default `np.empty`);
+  `as_torch(view, device=...)` implies pinning, so there is no separate flag to get wrong.
+  And page-locked memory is a scarce global resource (512 MiB buffers at depth 3 lock
+  1.5 GB), so pinning needs a cap the reuse-only pool does not, interacting with the memory
+  budget. **Gate: the `roundtrip` arm** — pinning must survive `pinned tensor → .numpy() →
+  base[:k] → DLPack → .to(cuda)`, or `non_blocking` silently degrades to a synchronous
+  pageable copy and the whole win evaporates with no error. If it fails, pinning needs a
+  torch-owned buffer instead of an injected allocator.
 
 - **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
   shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
