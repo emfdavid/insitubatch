@@ -131,6 +131,24 @@ def test_warning_is_emitted_once_not_per_batch(caplog: pytest.LogCaptureFixture)
     assert caplog.text.count("budget exhausted") == 1
 
 
+def test_to_torch_with_a_cpu_device_needs_no_cuda() -> None:
+    """``device="cpu"`` must work on a machine with no driver.
+
+    The guard only exists for an async DMA, and ``torch.cuda.Event()`` raises outright where
+    there is no NVIDIA driver -- so a CPU target has to skip it rather than construct one.
+    Examples default to ``--device cpu``, which is how this surfaced.
+    """
+    from insitubatch.frameworks import to_torch
+    from insitubatch.types import Batch
+
+    pool = BatchBuffers()
+    view = pool.take(4, (3,), np.dtype("f4"))
+    view[:] = 2.0
+    out = to_torch(Batch(arrays={"x": view}), device="cpu")
+    assert out["x"].device.type == "cpu"
+    assert np.array_equal(out["x"].numpy(), view)
+
+
 def test_set_allocator_drops_old_buffers_and_uses_the_new_one() -> None:
     """Swapping allocators must not leave the pool half pinned and half not.
 

@@ -401,7 +401,7 @@ gcloud compute instances create "$GPU_INSTANCE" \
   --machine-type=g2-standard-16 \
   --accelerator=type=nvidia-l4,count=1 \
   --maintenance-policy=TERMINATE \
-  --image-family=common-cu123-debian-11 --image-project=deeplearning-platform-release \
+  --image-family=common-cu129-ubuntu-2404-nvidia-580 --image-project=deeplearning-platform-release \
   --local-ssd=interface=NVME \
   --scopes=cloud-platform \
   --boot-disk-size=100GB

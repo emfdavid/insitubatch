@@ -92,6 +92,7 @@ def _command(
     epochs: int,
     n_steps: int,
     ceiling: bool,
+    pin: bool = False,
 ) -> list[str]:
     """Build the child ``train_torch_metrics`` command for one config (``--metrics-out`` is
     appended per run by :func:`_run_config`)."""
@@ -119,6 +120,11 @@ def _command(
         cmd += ["--max-inflight", str(cfg["max_inflight"])]
     if ceiling:
         cmd += ["--ceiling"]
+    if pin:
+        # Unconditional, including on the runs that also collect the ceiling: `--ceiling`
+        # *adds* a second fit rather than replacing the insitu one, so gating on it would
+        # leave the first repeat of every geom unpinned while the rest were pinned.
+        cmd += ["--pin"]
     return cmd
 
 
@@ -158,6 +164,11 @@ def main() -> None:
     p.add_argument(
         "--wb2-range", default="0,4000", metavar="START,STOP", help="WB2 time window for --inflight"
     )
+    p.add_argument(
+        "--pin",
+        action="store_true",
+        help="page-lock batch buffers in the insitu runs (not the ceiling); A/B for pinning",
+    )
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = p.parse_args()
 
@@ -188,6 +199,7 @@ def main() -> None:
                 cmd = _command(
                     cfg,
                     url_prefix=args.url_prefix,
+                    pin=args.pin,
                     device=args.device,
                     epochs=args.epochs,
                     n_steps=args.n_steps,

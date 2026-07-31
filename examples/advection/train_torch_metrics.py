@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from insitubatch import Batch, InSituDataset, to_torch
+from insitubatch.frameworks import pin_host_buffers
 
 from .._forecast_metrics import MetricsLog, StallTimer, preload_epoch
 from .data import build_datasets, build_parser, evaluate
@@ -52,7 +53,7 @@ def _fit(
             torch.cuda.reset_peak_memory_stats(dev)
         timer = StallTimer()
         for batch in timer.wrap(epochs_source(epoch)):
-            target = to_torch(batch)["target"][:, None].to(dev)
+            target = to_torch(batch, device=dev)["target"][:, None]
             loss = nn.functional.mse_loss(_forecast(model, batch, dev), target)
             opt.zero_grad()
             loss.backward()
@@ -87,14 +88,21 @@ def train(
     source: str = "synthetic",
     batch_size: int = 32,
     ceiling: bool = False,
+    pin: bool = False,
     log: MetricsLog | None = None,
 ) -> tuple[float, float]:
     """Train the CNN and record stall/throughput metrics to ``log``; return the val skill.
 
     With ``ceiling=True`` it then trains a second, identical model on a RAM-preloaded epoch
-    (no IO) -- the compute-only ceiling the ``insitu`` run is scored against."""
+    (no IO) -- the compute-only ceiling the ``insitu`` run is scored against. ``pin`` puts the
+    batch buffers in page-locked memory so the H2D copies this loop already issues through
+    ``to_torch(..., device=...)`` can overlap compute instead of serialising on a driver
+    bounce buffer; it is A/B-able because everything else about the loop is unchanged.
+    """
     dev = torch.device(device)
     log = log or MetricsLog(None)
+    if pin:
+        pin_host_buffers(ds.train)
 
     def loader_epoch(epoch: int) -> Iterable[Batch]:
         ds.set_epoch(epoch)
@@ -127,7 +135,7 @@ def train(
 
 
 def cli() -> argparse.Namespace:
-    """The shared example CLI plus the two benchmark-only flags."""
+    """The shared example CLI plus the benchmark-only flags."""
     p = build_parser()
     p.add_argument(
         "--ceiling",
@@ -139,6 +147,11 @@ def cli() -> argparse.Namespace:
         default=None,
         metavar="PATH",
         help="append per-(run,epoch) JSONL metrics here (default: print only, no file)",
+    )
+    p.add_argument(
+        "--pin",
+        action="store_true",
+        help="page-lock the batch buffers so this loop's H2D copies can overlap compute",
     )
     return p.parse_args()
 
@@ -154,6 +167,7 @@ def main() -> None:
         source=args.source,
         batch_size=args.batch_size,
         ceiling=args.ceiling,
+        pin=args.pin,
         log=log,
     )
     log.summary()
