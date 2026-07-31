@@ -1,12 +1,18 @@
 """Reusable batch-output buffers.
 
-``pool.gather`` used to allocate a fresh array per variable per batch. ``np.empty`` itself is
-nearly free -- it reserves address space without touching pages -- so the cost was never the
-allocation but the **first-touch page faults** on the scatter-write that follows, plus the
-``mmap``/``munmap`` churn glibc falls back to above its 32 MiB dynamic threshold. Below that
-threshold the freed block is recycled on the heap and reuse buys nothing; above it, reuse saves
-22-33% of assembly time (``bench/probe_batch_buffers.py --arms alloc``). Weather-sized batches
-are far below; ViT and microscopy batches are far above.
+``pool.gather`` used to allocate a fresh array per variable per batch. The cost is not the
+allocation call -- ``np.empty`` only reserves address space -- but what glibc does with a
+request above its 32 MiB dynamic ``mmap`` threshold: it ``mmap``s the batch and ``munmap``s it
+on free, **every batch**. A syscall trace confirms it directly (128 MiB batches, 12-batch
+epoch): 12 ``mmap``/``munmap`` pairs of the full buffer without the pool, 2 with it, and the
+count tracks batches rather than dataset size. Paid per batch, that is a fresh page set to
+fault in plus ``munmap``'s TLB work.
+
+Below the threshold the freed block is recycled on the heap instead and reuse buys nothing --
+it costs about 2-3%. End to end (``bench/batch_buffer_sweep.py``) the pool is *flat* across a
+16x payload range while fresh allocation falls off a cliff at 32 MiB: 8 MiB -2.4%, 32 MiB
++16%, 64 MiB +13%, 128 MiB +10%. So this removes a cliff rather than adding speed. Weather
+batches sit well below it; ViT and microscopy batches sit above.
 
 **Hand-out is by view, reclaim is by liveness.** A buffer is lent as a view of a base array the
 pool owns forever, and comes back only once that view is unreferenced. The check happens

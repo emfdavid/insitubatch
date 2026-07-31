@@ -1,19 +1,28 @@
 """Benchmark: what batch-buffer reuse is worth, as a function of payload size.
 
-``pool.gather`` lends a reused buffer per variable instead of allocating one per batch. The
-saving is not the allocation -- ``np.empty`` only reserves address space -- but the
-**first-touch page faults** on the scatter-write that follows. glibc recycles a freed block on
-the heap below its 32 MiB dynamic ``mmap`` threshold and ``mmap``/``munmap``s above it, so
-reuse is worth nothing for small batches and a third of assembly time for large ones. This
-sweeps batch size across that boundary on a real pipeline, which the isolated measurement in
+``pool.gather`` lends a reused buffer per variable instead of allocating one per batch. Above
+glibc's 32 MiB dynamic ``mmap`` threshold a fresh batch is ``mmap``ed and ``munmap``ed *every
+batch*; below it the freed block is recycled on the heap and reuse buys nothing. This sweeps
+batch size across that boundary on a real pipeline, which the isolated measurement in
 ``probe_batch_buffers.py`` cannot do: reuse saves *producer-thread* time, and whether that
-shows up end to end depends on whether IO is hiding it.
+surfaces end to end depends on whether IO is hiding it.
 
-Two columns matter, and the second is the sensitive one. ``samples_per_s`` is the headline but
-goes quiet whenever the pipeline is IO-bound; ``minor_faults`` measures the mechanism directly
-and moves whether or not the time is visible. A run where faults drop sharply and throughput
-does not is not a null result -- it means this workload's assembly was already hidden behind
-IO, which is worth knowing and is *not* what a wall-clock-only benchmark would report.
+**Read the shape, not one number.** Reuse holds throughput flat across payload size while
+fresh allocation falls off a cliff at 32 MiB. A single headline percentage hides that the
+small-batch end is a ~2-3% *regression*, which is a real trade-off rather than noise.
+
+``minor_faults`` is here because faulting a fresh page set is part of what a per-batch
+``mmap`` costs, but treat it as **environment-dependent**: it matched prediction closely on
+one host (678k vs 1039k for a 12-batch epoch of 128 MiB batches, ~328k predicted) and did not
+separate at all on another under the same nominal config. If it stays flat while throughput
+moves, believe the throughput and check the syscalls directly::
+
+    strace -f -e trace=mmap,munmap -o t.txt <child cmd>
+    grep -c 'mmap(NULL, <batch_bytes+4096>, PROT_READ|PROT_WRITE' t.txt
+
+That count scales with batch count without the pool and stays flat with it, which is the
+mechanism measured rather than inferred. Ignore same-sized ``PROT_NONE ... MAP_NORESERVE``
+mappings -- those are allocator arena reservations and track thread count, not batches.
 
 **One child process per config, always.** ``ru_minflt`` is cumulative, and glibc's threshold
 is itself stateful -- it rises once a large block has been freed -- so configs sharing a
