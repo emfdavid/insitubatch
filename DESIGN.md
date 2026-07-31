@@ -429,17 +429,48 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   **Priority pending user feedback** — no correctness impact, so we hold until someone hits it.
 
 - **Batch buffers are fresh per batch, and host memory is not pinned.** `pool.gather`
-  allocates a new array per batch rather than reusing one — the DLPack export aliases the
-  buffer into the consumer's tensor, so reuse needs lifetime tracking against the
-  `prefetch_depth` window — and nothing pins host memory for GPU transfer, so H2D copies
-  are pageable. The unified fix is a small **ring of pre-pinned buffers** (depth
-  ≈ `prefetch_depth`+1) handed out round-robin (a buffer is safe to reuse once its batch
-  has left the prefetch window): it removes the per-batch allocation *and* enables
-  `non_blocking` H2D transfer in one change — pinning fresh per batch would be worse
-  (`cudaHostAlloc` is expensive). Value scales with payload: negligible for small weather
-  fields (µs transfers, already hidden by prefetch), real for ViT/microscopy batches — so
-  **profile the H2D ceiling first** (pinned vs pageable bandwidth; is the copy on the
-  critical path or already overlapped?). Ties into the GPU `device_transform` stage (M2).
+  allocates a new array per batch rather than reusing one, and nothing pins host memory
+  for GPU transfer, so H2D copies are pageable. **Profiled** with
+  `bench/probe_batch_buffers.py` (L4, PCIe Gen4 x8 — a wider link makes the pinned column
+  better, so read these as a floor):
+
+  | payload | reuse saves | pinned vs pageable H2D | copy hidden behind ~20 ms compute? |
+  |---|---|---|---|
+  | wb2 `16×3×128×64` (1.5 MiB) | 2% | 3.8 → 10.3 GB/s | fully — pinning saves nothing |
+  | vit `32×3×224×224` (18 MiB) | 2% | 5.8 → 11.4 GB/s | mostly — 4.7% |
+  | vit `64×3×224×224` (37 MiB) | 33% | 6.3 → 11.4 GB/s | no — 16% |
+  | microscopy `8×2×32×512×512` (512 MiB) | 22% | 6.4 → 11.5 GB/s | no — 53% |
+
+  Both halves have the same **~32 MiB crossover**, for unrelated reasons: below it glibc
+  recycles the freed block on the heap (so the fresh allocation re-faults nothing) and the
+  copy disappears into the step. Above it every batch is `mmap`/`munmap`'d and re-faults its
+  whole page set, and the transfer surfaces on the critical path. **Weather gains nothing
+  from either half** — validate this work on microscopy/ViT payloads, and do not expect the
+  advection numbers to move.
+
+  They are **two fixes, not one.** Reuse saves producer-thread time, which is hidden
+  whenever the pipeline is IO-bound; pinning's win is consumer-side wall time by
+  construction, and is the larger of the two above the crossover. Build the **buffer pool
+  first** anyway — it is the prerequisite for pinning (`cudaHostAlloc` per batch is worse
+  than not pinning, so a fixed set of buffers must exist to pre-pin) and it pays on its own.
+
+  Pool design: own the base allocations permanently, hand out **views** (`base[:k]`, which
+  is also the ragged-tail answer), keep a `weakref` per lent view, and **poll liveness at the
+  next `__next__`** — a dead view is nobody's, so it returns to the free list; a live one
+  (a retained batch, an exported DLPack tensor — `torch.from_dlpack` holds a strong
+  reference to the source) stays out. A miss allocates. Consequences: releasing
+  unconditionally at the yield point would be *less* safe than today (it would overwrite a
+  batch the consumer legitimately kept), holding a reference is already the way to retain
+  one so no `retain()` API is needed, and **there is no depth parameter** — allocate-on-miss
+  converges to the true in-flight count on its own. A `batch_transform` returning new arrays
+  (e.g. `_subregion_crop`) drops its pooled view immediately and gets no benefit.
+
+  Pinning waits on M2's GPU `device_transform`, and not just for sequencing: refcounts cannot
+  see an in-flight `non_blocking` DMA, so recycling a buffer whose copy is still draining
+  corrupts it. Owning the transfer (`as_torch(device=...)`) closes that by making the reclaim
+  predicate two-part — *view dead **and** recorded H2D event complete*. Pinning also needs a
+  cap the pool otherwise does not: page-locked memory is a scarce global resource (512 MiB
+  buffers at depth 3 lock 1.5 GB), so it interacts with the memory budget.
 
 - **`window_factor` sizes residency by span, not by the offset set.** `source.py` sizes the
   shuffle/residency working set with `window_factor = 2 + ceil(span/spc)` where
