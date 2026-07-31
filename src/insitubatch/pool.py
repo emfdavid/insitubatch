@@ -72,6 +72,7 @@ from typing import TextIO
 
 import numpy as np
 
+from .buffers import BatchBuffers
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk
 
 try:  # optional: stronger transform fingerprint (closures + globals). `--extra cache`.
@@ -292,6 +293,11 @@ class ChunkPool:
                 )
             self._load_log()
             self._open_log()
+        # Batch *output* buffers, distinct from the chunk slots below: gather lends one per
+        # variable per batch and reclaims it once the consumer's view is unreferenced. Driven
+        # only from the single producer thread that gathers (as the rest of gather already
+        # assumes), so it needs no lock of its own.
+        self._buffers = BatchBuffers()
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
         self._bytes = 0
         # OrderedDict in recency order (LRU front -> MRU back). Eviction targets only
@@ -682,7 +688,7 @@ class ChunkPool:
             spc = geom.sample_chunk_size  # the variable's own grid (may differ from ref)
             read_cid = sample // spc
             within = sample % spc
-            out = np.empty((n, *out_geom.inner_shape), dtype=out_geom.dtype)
+            out = self._buffers.take(n, out_geom.inner_shape, out_geom.dtype)
             for cid in np.unique(read_cid):
                 mask = read_cid == cid  # rows that read this chunk -> one coalesced index
                 out[mask] = self._slots[(geom.path, int(cid))].data[within[mask]]
@@ -863,6 +869,7 @@ class ChunkPool:
                 self._free(slot, keep_file=self._persistent and slot.ready)
             self._bytes = 0
             self._pinned.clear()
+            self._buffers.clear()  # batch outputs too; a big-payload pool holds GBs of them
 
     def __del__(self) -> None:
         # Safety net for a pool dropped without an explicit close() -- release the open log

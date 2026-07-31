@@ -428,9 +428,11 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   mixes chunks across block boundaries, diluting the block-local residency guarantee).
   **Priority pending user feedback** — no correctness impact, so we hold until someone hits it.
 
-- **Batch buffers are fresh per batch, and host memory is not pinned.** `pool.gather`
-  allocates a new array per batch rather than reusing one, and nothing pins host memory
-  for GPU transfer, so H2D copies are pageable. **Profiled** with
+- **Host memory is not pinned** (batch buffer *reuse* ✅ shipped — `buffers.BatchBuffers`,
+  branch `batch-buffer-ring`; pinning is what remains). `pool.gather` now lends a reused,
+  128-byte-aligned buffer per variable and reclaims it once the consumer's view is
+  unreferenced, but nothing page-locks that memory, so H2D copies are still pageable.
+  **Profiled** with
   `bench/probe_batch_buffers.py` (L4, PCIe Gen4 x8 — a wider link makes the pinned column
   better, so read these as a floor):
 
