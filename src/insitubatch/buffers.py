@@ -123,6 +123,19 @@ class BatchBuffers:
         """Total host memory the pool owns. Converges once the pipeline reaches steady state."""
         return sum(buf.base.nbytes for pool in self._pools.values() for buf in pool)
 
+    def set_allocator(self, allocator: HostAllocator) -> None:
+        """Swap where buffers come from, dropping any already allocated.
+
+        The one injection point for page-locked memory: the core cannot call
+        ``torch.empty(pin_memory=True)`` without importing a framework, so the torch adapter
+        supplies it. Existing buffers are dropped rather than mixed, so the pool does not end
+        up half pinned and half not for no visible reason. Call before iterating -- swapping
+        mid-epoch is legal (outstanding batches keep their own memory by refcount) but wastes
+        whatever the pool had already warmed.
+        """
+        self._alloc = allocator
+        self.clear()
+
     def clear(self) -> None:
         """Drop every owned buffer (pool teardown).
 
