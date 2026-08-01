@@ -24,9 +24,19 @@ The sweeps, and the claim each one confirms:
 * **payload** -- bytes per batch (``batch_size`` over one 256^2 store: 8 -> 64 MiB per variable
   buffer, 4x that per step). The axis the batch-buffer work acts on, and the one the ``size``
   sweep cannot reach: reuse only pays above glibc's 32 MiB ``mmap`` threshold, which applies
-  per allocation, and pinning's saved transfer time scales with bytes moved. Run it twice, back
-  to back, with and without ``--pin`` -- absolute throughput is only comparable within a
-  session (see the metric warning in docs/benchmarks.md).
+  per allocation, and pinning's saved transfer time scales with bytes moved.
+
+**Comparing arms across sessions: use the ceilings, not samples/s.** Absolute throughput
+drifts with the box -- measured, two unpinned sessions 14 h apart differed by 0.6%. The
+ceiling is the instrument that survives that, because it replays RAM batches through the same
+model with no IO at all, so across arms it varies only by what the arm changed. Two readings
+back that up: the pinned ceiling ran 2.0-2.3% above both unpinned ones (8 minutes apart, so
+drift cannot explain it -- pinning is real at ~2.2%), while reuse vs no-reuse came out within
++-0.2 pp of ceiling with the sign flipping (a null: the loop is at 99.5-100% of compute
+ceiling, so allocation cost has nowhere to show up). Score each arm against **its own**
+in-session ceiling and the drift divides out; compare raw samples/s across sessions and it
+does not. The earlier "+2.3% from pinning" was first read off raw samples/s and was not
+established until the third session bracketed the drift.
 
 The compute-only ceiling depends only on the field geometry (the conv cost), not on
 inflight / chunking / cache, so ``--ceiling`` is run exactly once per distinct ``geom`` and the
@@ -365,7 +375,9 @@ def main() -> None:
     p.add_argument(
         "--pin",
         action="store_true",
-        help="page-lock batch buffers in the insitu runs (not the ceiling); A/B for pinning",
+        help="page-lock the batch buffers; A/B for pinning. Applies to the ceiling too -- it "
+        "preloads through the same pool -- which is what makes the ceiling the cleanest "
+        "pinning contrast (RAM replay, no IO) and what pins a whole epoch of host memory",
     )
     p.add_argument(
         "--child-package",
