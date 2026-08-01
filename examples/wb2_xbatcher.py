@@ -53,6 +53,8 @@ from typing import Any, cast
 
 import numpy as np
 
+from ._logging import add_log_level, configure_logging
+
 # The public WeatherBench2 ERA5 used by the Earthmover demo (zarr v2, consolidated).
 WB2_URL = (
     "gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr"
@@ -246,7 +248,9 @@ def main() -> None:
     p.add_argument("--max-batches", type=int, default=0, help="cap batches per epoch (0 = all)")
     p.add_argument("--no-shuffle", action="store_true")
     p.add_argument("--request-payer", action="store_true")
+    add_log_level(p)
     a = p.parse_args()
+    configure_logging(a.log_level)
 
     url, var = (WB2_URL, WB2_VAR) if a.wb2 else (a.url, a.var)
     common = dict(

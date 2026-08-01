@@ -432,7 +432,7 @@ class InSituDataset:
                 self.cache_hits = pool.hits
                 self.cache_misses = pool.misses
                 self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
-                self._log_epoch_summary(pool)
+                self._log_epoch_summary(pool, split)
                 # Persistence was asked for but served nothing, and the cache *was*
                 # consulted (entries existed and every revive failed) -> almost certainly
                 # a stale cache_dir or changed data/transforms. Loud once per epoch; a
@@ -448,8 +448,12 @@ class InSituDataset:
                         pool.revive_missing,
                     )
 
-    def _log_epoch_summary(self, pool: ChunkPool) -> None:
-        """One INFO line per epoch: what the chunk cache and the batch buffers did.
+    def _log_epoch_summary(self, pool: ChunkPool, split: SplitName | None) -> None:
+        """One INFO line per epoch *per split*: what the chunk cache and the batch buffers did.
+
+        Tagged with the split because a training run iterates more than one of them per epoch
+        (train, then val) over the same pools, and two lines reading "epoch 1" with different
+        numbers is a puzzle rather than a report.
 
         Enabled the standard way -- ``logging.getLogger("insitubatch").setLevel(logging.INFO)``
         -- rather than through a constructor flag, so there is nothing to thread through the
@@ -468,9 +472,10 @@ class InSituDataset:
         buffers = pool._buffers
         reads = pool.hits + pool.misses
         logger.info(
-            "epoch %d: chunks %d/%d hit (%.0f%%), peak resident %d%s; "
+            "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s; "
             "batch buffers %d x %s = %.1f MiB, %d lent, %d allocated",
             self._epoch,
+            split or "all",
             pool.hits,
             reads,
             100 * pool.hits / reads if reads else 0.0,

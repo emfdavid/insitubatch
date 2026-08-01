@@ -55,6 +55,8 @@ from insitubatch import (
 from insitubatch.source import InSituDataset
 from insitubatch.types import Batch
 
+from ._logging import add_log_level, configure_logging
+
 # The public WeatherBench2 ERA5 used by the Earthmover demo (zarr v2, consolidated).
 WB2_URL = (
     "gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr"
@@ -238,7 +240,9 @@ def main() -> None:
         default="obstore",
         help="store backend: obstore (default, Rust) or fsspec/gcsfs (GCS Rapid/requester-pays)",
     )
+    add_log_level(p)
     a = p.parse_args()
+    configure_logging(a.log_level)
     url, var = (WB2_URL, WB2_VAR) if a.wb2 else (a.url, a.var)
     run_demo(
         url=url,

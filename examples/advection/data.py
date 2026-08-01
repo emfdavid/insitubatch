@@ -38,6 +38,8 @@ from insitubatch import (
     split_by_chunk,
 )
 
+from .._logging import add_log_level, configure_logging
+
 # The public WeatherBench2 ERA5 (6-hourly) ARCO store the wb2_* examples use.
 WB2_URL = (
     "gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr"
@@ -346,6 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="spill the decoded-chunk cache here (e.g. NVMe) for cross-epoch reuse",
     )
+    add_log_level(p)
     p.add_argument(
         "--max-inflight",
         type=int,
@@ -356,8 +359,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cli() -> argparse.Namespace:
-    """Parse the shared CLI for the three canonical training files."""
-    return build_parser().parse_args()
+    """Parse the shared CLI for the three canonical training files, and set logging up."""
+    args = build_parser().parse_args()
+    configure_logging(args.log_level)
+    return args
 
 
 def build_datasets(args: argparse.Namespace) -> InSituDataset:

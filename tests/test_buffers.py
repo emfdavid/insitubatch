@@ -382,7 +382,7 @@ def test_epoch_summary_reports_buffer_state(write_zarr, caplog) -> None:  # type
 
     lines = [r.getMessage() for r in caplog.records if "batch buffers" in r.getMessage()]
     assert len(lines) == 2, lines  # one per epoch
-    assert "epoch 1:" in lines[1] and "heap" in lines[1]
+    assert "epoch 1 (train):" in lines[1] and "heap" in lines[1]
 
     def counts(line: str) -> tuple[int, int]:
         m = re.search(r"(\d+) lent, (\d+) allocated", line)

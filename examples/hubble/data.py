@@ -44,6 +44,8 @@ from insitubatch import (
     split_by_chunk,
 )
 
+from .._logging import add_log_level, configure_logging
+
 SCI_VAR = "SCI"
 BUCKET = "stpubdata"
 S3_PREFIX = "s3://stpubdata"
@@ -307,4 +309,7 @@ def cli(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--sigma", type=float, default=NOISE_SIGMA)
     p.add_argument("--n-frames", type=int, default=12, help="synthetic frame count")
     p.add_argument("--size", type=int, default=128, help="synthetic frame size (Y=X)")
-    return p.parse_args(argv)
+    add_log_level(p)
+    args = p.parse_args(argv)
+    configure_logging(args.log_level)
+    return args

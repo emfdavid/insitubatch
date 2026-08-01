@@ -39,6 +39,8 @@ from insitubatch import (
     split_by_chunk,
 )
 
+from .._logging import add_log_level, configure_logging
+
 # A public OME-NGFF (zarr v0.1) image in the EMBL-EBI Image Data Repository: a 3D two-channel
 # confocal stack with an expert instance-segmentation label. Read anonymously off the IDR S3.
 IDR_URL = "s3://idr/zarr/v0.1/6001240.zarr"
@@ -338,12 +340,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="throttle read-ahead depth (lower = lower cold TTFB over a high-latency network)",
     )
+    add_log_level(p)
     return p
 
 
 def cli() -> argparse.Namespace:
     """Parse the shared CLI."""
-    return build_parser().parse_args()
+    args = build_parser().parse_args()
+    configure_logging(args.log_level)
+    return args
 
 
 def build_datasets(args: argparse.Namespace) -> InSituDataset:
