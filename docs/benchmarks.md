@@ -405,17 +405,19 @@ store (`--sweeps payload`, 5 epochs × 5 repeats), with the no-reuse arm run fro
 identical but for the `gather` call site, and each arm scored against **its own** in-session
 ceiling:
 
-| MiB per variable buffer | 8 | 16 | 32 |
-|---|--:|--:|--:|
-| reuse (% of ceiling) | 99.69 | 99.92 | 99.74 |
-| no reuse | 99.49 | 99.72 | 99.92 |
-| delta (points) | +0.21 | +0.20 | −0.18 |
+| MiB per variable buffer | 8 | 16 | 32 | 64 |
+|---|--:|--:|--:|--:|
+| reuse (% of ceiling) | 99.69 | 99.92 | 99.74 | 98.74 |
+| no reuse | 99.49 | 99.72 | 99.92 | 99.03 |
+| delta (points) | +0.21 | +0.20 | −0.18 | −0.29 |
 
-Inside ±0.2 points with the sign flipping — a null. The loop runs at 99.5–100% of its compute
-ceiling with 0.1–0.3% stall, so producer-side allocation has nowhere to surface, **including
-at 32 MiB where the `mmap` path demonstrably engages** (0 faults per allocation at 8 and 16
-MiB, 100% of pages at 32 and 64). Both arms returned a persistence RMSE of `0.588030696`,
-bit-identical, so the two paths provably deliver the same bytes.
+Inside ±0.3 points with the sign flipping twice — a null across an 8× payload range. The loop
+runs at 98.7–100% of its compute ceiling, so producer-side allocation has nowhere to surface,
+**including above 32 MiB where the `mmap` path demonstrably engages** (0 faults per allocation
+at 8 and 16 MiB, 100% of pages at 32 and 64). At 64 MiB the two arms' absolute throughput
+agrees to **0.04%** (138.52 vs 138.57 samples/s) — there the 0.29-point gap is the two
+sessions' *ceilings* differing, not the loader. Every arm returned a persistence RMSE of
+`0.588030696`, bit-identical, so the paths provably deliver the same bytes.
 
 So reuse removes a cliff that a compute-bound loop was already hiding. It earns its place on
 the loops that *aren't* — where allocation is not absorbed by a GPU step — and the synthetic

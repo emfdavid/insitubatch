@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -149,6 +150,17 @@ class _InFlight:
 
     def __init__(self) -> None:
         self._pending: list[tuple[dict[str, np.ndarray], torch.cuda.Event]] = []
+        # Prune-then-append is a read-modify-write, and this object is process-wide: two
+        # threads converting batches at once (two DataLoaders, `zip(ds.train, ds.val)`) both
+        # run it. Without the lock a thread can finish its comprehension, be preempted before
+        # the slice assignment lands, and then overwrite a hold another thread appended in the
+        # gap -- releasing a buffer whose DMA is still reading it. The window is only the few
+        # bytecodes between the comprehension and the store, and it does not reproduce
+        # unaided (the comprehension iterates the live list by index, so it picks up a
+        # concurrent append); widened with a sleep at exactly that point it loses a live hold
+        # 20 times out of 20. One uncontended acquire per batch against a megabyte-scale copy
+        # is not a cost worth reasoning about, and the failure it prevents is silent.
+        self._lock = threading.Lock()
 
     def hold(self, arrays: dict[str, np.ndarray], event: torch.cuda.Event) -> None:
         """Retire finished holds, then take this one -- in that order, never the reverse.
@@ -161,13 +173,25 @@ class _InFlight:
         who wins. Retiring first means a fresh hold always survives until at least the next
         transfer, so the guarantee is structural rather than probabilistic. The cost is
         deferring one buffer's reclaim by one hand-out.
+
+        Both steps happen under the lock, because together they are one atomic replacement of
+        the pending set -- see :meth:`__init__`.
         """
-        self._pending[:] = [(a, e) for a, e in self._pending if not e.query()]
-        self._pending.append((arrays, event))
+        with self._lock:
+            self._pending[:] = [(a, e) for a, e in self._pending if not e.query()]
+            self._pending.append((arrays, event))
 
 
 _in_flight = _InFlight()
-"""Process-wide, because CUDA streams are. Bounded: pruned on every hand-out."""
+"""Process-wide, because CUDA streams are.
+
+Bounded: every hand-out retires the holds whose copies have landed, so the set is whatever is
+genuinely in flight plus the one deliberately-deferred entry. The tail is that single entry --
+after the last transfer of a run, one batch's source arrays stay referenced until either the
+next transfer prunes them or the process exits. Bounded at one batch, and not reachable from
+``InSituDataset.close()``: this lives in the torch adapter, the core cannot import it, and
+draining a process-wide set on one dataset's close would be wrong anyway.
+"""
 
 
 def to_torch(batch: Batch, device: str | torch.device | None = None) -> dict[str, torch.Tensor]:

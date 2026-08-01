@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from insitubatch.buffers import XLA_ALIGN, BatchBuffers, aligned_empty
+from insitubatch.frameworks import _InFlight
 
 torch = pytest.importorskip("torch")
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
@@ -192,3 +193,58 @@ def test_set_allocator_drops_old_buffers_and_uses_the_new_one() -> None:
     assert pool.nbytes == 0  # the un-swapped buffers are gone, not mixed in
     pool.take(4, (3, 2), np.dtype("f4"))
     assert calls == [(4, 3, 2)]
+
+
+def test_concurrent_holds_never_drop_a_live_one() -> None:
+    """Two threads converting batches at once must not lose each other's holds.
+
+    ``_InFlight`` is process-wide -- two DataLoaders, or ``zip(ds.train, ds.val)``, run this
+    concurrently -- and prune-then-append is a read-modify-write. Dropping a hold releases a
+    buffer whose DMA is still reading it, so the pool can recycle it mid-copy: silent
+    corruption, exactly the class the pool's own lock exists to prevent.
+
+    This is a guard, not a reproducer, and the distinction is worth stating. The unguarded
+    window is only the few bytecodes between the comprehension and the slice assignment, and
+    it does not reproduce unaided at any thread count -- the comprehension iterates the live
+    list by index, so a concurrent append lands where it is still picked up. Widening that
+    exact gap with a sleep loses a live hold 20/20. So this test asserts the invariant under
+    real contention; the lock is what makes it hold by construction rather than by luck.
+    """
+    import threading
+
+    class NeverDone:
+        """An event whose copy is still in flight -- its hold must never be retired."""
+
+        def query(self) -> bool:
+            return False
+
+    flight = _InFlight()
+    n = 8
+    start = threading.Barrier(n)
+
+    def hold(name: str) -> None:
+        start.wait()
+        flight.hold({name: np.empty(1, dtype="float32")}, NeverDone())
+
+    threads = [threading.Thread(target=hold, args=(f"b{i}",)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    held = {name for arrays, _ in flight._pending for name in arrays}
+    expected = {f"b{i}" for i in range(n)}
+    assert held == expected, f"lost holds: {sorted(expected - held)}"
+
+
+def test_finished_holds_are_retired_so_the_set_stays_bounded() -> None:
+    # The other half of the invariant: completed copies must not accumulate, or a long run
+    # would pin every batch it ever transferred. One deferred entry is the intended tail.
+    class Done:
+        def query(self) -> bool:
+            return True
+
+    flight = _InFlight()
+    for i in range(50):
+        flight.hold({f"b{i}": np.empty(1, dtype="float32")}, Done())
+    assert len(flight._pending) == 1  # the newest, deliberately retained until the next hold
