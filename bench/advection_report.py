@@ -195,7 +195,7 @@ def main() -> None:
     args = p.parse_args()
 
     df = load(args.inp)
-    for sweep in ["inflight", "size", "chunk", "inner"]:
+    for sweep in _KNOB:  # every registered sweep; adding one to _KNOB is all it takes
         if not (df["cfg_sweep"] == sweep).any():
             continue
         agg = summarize(df, sweep)
