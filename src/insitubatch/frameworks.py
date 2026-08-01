@@ -148,8 +148,19 @@ class _InFlight:
         self._pending: list[tuple[dict[str, np.ndarray], torch.cuda.Event]] = []
 
     def hold(self, arrays: dict[str, np.ndarray], event: torch.cuda.Event) -> None:
-        self._pending.append((arrays, event))
+        """Retire finished holds, then take this one -- in that order, never the reverse.
+
+        Pruning after appending lets a hold evaporate in the microseconds between issuing the
+        copy and testing it: a small or fast DMA can already be complete, and the batch we were
+        asked to protect is released before the caller has done anything with it. Even when
+        that is *safe* (a complete event means the copy landed) it makes reuse depend on a
+        race, which is untestable by construction -- the buffer is retained or not depending on
+        who wins. Retiring first means a fresh hold always survives until at least the next
+        transfer, so the guarantee is structural rather than probabilistic. The cost is
+        deferring one buffer's reclaim by one hand-out.
+        """
         self._pending[:] = [(a, e) for a, e in self._pending if not e.query()]
+        self._pending.append((arrays, event))
 
 
 _in_flight = _InFlight()
