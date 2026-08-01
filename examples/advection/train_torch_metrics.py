@@ -26,7 +26,7 @@ from insitubatch.frameworks import pin_host_buffers
 
 from .._forecast_metrics import MetricsLog, StallTimer, preload_epoch
 from .._logging import configure_logging
-from .data import build_datasets, build_parser, evaluate
+from .data import build_datasets, build_parser, evaluate, format_skill
 from .train_torch import AdvectionCNN, _forecast
 
 
@@ -182,10 +182,7 @@ def main() -> None:
     )
     log.summary()
     log.flush()
-    print(
-        f"\n24 h forecast RMSE on held-out data: model {model_rmse:.3f}  vs  "
-        f"persistence {persistence_rmse:.3f}  ({persistence_rmse / model_rmse:.1f}x better)"
-    )
+    print(format_skill(model_rmse, persistence_rmse))
 
 
 if __name__ == "__main__":
