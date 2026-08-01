@@ -16,10 +16,14 @@ corrupted batches in a training run.
 
 from __future__ import annotations
 
+import threading
+import time
+from typing import Any
+
 import numpy as np
 import pytest
 
-from insitubatch.buffers import XLA_ALIGN, BatchBuffers, aligned_empty
+from insitubatch.buffers import XLA_ALIGN, BatchBuffers, HostAllocator, aligned_empty
 
 
 def _ptr(a: np.ndarray) -> int:
@@ -142,6 +146,38 @@ def test_aligned_empty_is_a_real_writable_array() -> None:
     assert _ptr(a) % XLA_ALIGN == 0
 
 
+@pytest.mark.parametrize(
+    "allocator",
+    [
+        pytest.param(lambda shape, dtype: np.empty(shape, dtype), id="owns-its-data"),
+        pytest.param(lambda shape, dtype: aligned_empty(shape, dtype), id="view-of-a-buffer"),
+    ],
+)
+def test_liveness_holds_however_the_allocator_owns_its_memory(
+    allocator: HostAllocator,
+) -> None:
+    """Reuse safety must not depend on *how* the allocator's array holds its memory.
+
+    The liveness poll compares the data owner's refcount against a baseline recorded when the
+    buffer was built. Whether the owner is the array itself (``np.empty``) or something it
+    views (``aligned_empty``) decides which transient references are live at that moment, so a
+    baseline taken carelessly is right for one allocator and silently too high for the other --
+    and a baseline that is too high means every buffer always looks free, so the pool lends one
+    allocation to every batch at once and each overwrites the last.
+
+    This is not hypothetical for the pinned path: ``torch.empty(pin_memory=True).numpy()`` is
+    an owner-is-the-array allocation (``tests/test_pinned.py`` covers it on a CUDA box).
+    """
+    pool = BatchBuffers(allocator=allocator)
+    first = pool.take(4, (16,), np.dtype("f4"))
+    first[:] = 1.0
+    second = pool.take(4, (16,), np.dtype("f4"))
+    second[:] = 2.0
+
+    assert _ptr(first) != _ptr(second), "the pool lent one allocation to two live batches"
+    assert np.all(first == 1.0), "a live batch was overwritten by the next one"
+
+
 def test_a_custom_allocator_is_used_for_every_buffer() -> None:
     """The injection point pinning arrives through (the torch adapter supplies a pinned one)."""
     calls: list[tuple[tuple[int, ...], np.dtype]] = []
@@ -238,6 +274,72 @@ def test_early_break_leaves_no_buffer_stranded(write_zarr) -> None:  # type: ign
     # 8 batches per epoch, 4 epochs since the break: a pool that stranded anything would
     # have grown with the iteration. It is bounded by what is in flight instead.
     assert ds._pool._buffers.nbytes < 8 * (5 * 2 * 2 * 4)
+
+
+class _SlowSlice(np.ndarray):
+    """An array whose slicing pauses, to widen the check-then-lend window in ``take``.
+
+    ``take`` decides a buffer is free and *then* slices it to lend it. That gap is a handful
+    of bytecodes wide, so a plain thread stress test hits it only by luck and would be
+    flaky-red rather than red. Slowing the slice makes the existing gap observable without
+    touching the code under test -- it arrives through the public allocator hook, so the
+    production path (check, lend, hand out) is exactly the one being exercised.
+    """
+
+    delay = 0.0005
+
+    def __getitem__(self, key: Any) -> Any:
+        time.sleep(self.delay)
+        return super().__getitem__(key)
+
+
+def _slow_slice_allocator(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    # Constructed, not ``.view()``-ed, so the array owns its own data: a view would insert an
+    # extra level into the base chain and the pool would track the wrong owner (see
+    # ``test_an_allocator_whose_views_escape_liveness_tracking_is_rejected``).
+    return _SlowSlice(shape, dtype)
+
+
+def test_concurrent_take_never_lends_one_buffer_twice() -> None:
+    """Two producers must never be handed the same memory at the same time.
+
+    ``source._iterate`` starts a producer thread *per active iteration* against the one shared
+    ``ChunkPool``, and nothing stops there being two: ``zip(ds.train, ds.val)``, or two
+    ``DataLoader``s over one dataset, run two producers into the same :class:`BatchBuffers`.
+    Check-then-lend is not atomic, so both can observe one buffer as free, lend it, and write
+    their batches into the same memory -- silent cross-contamination of training data. The
+    pre-pool ``np.empty`` path was thread-safe by construction, so this has to hold.
+    """
+    pool = BatchBuffers(allocator=_slow_slice_allocator)
+    live: dict[int, int] = {}  # address -> id of the thread currently holding it
+    guard = threading.Lock()
+    failures: list[str] = []
+    start = threading.Barrier(4)
+
+    def worker(tid: int) -> None:
+        start.wait()
+        for _ in range(50):
+            view = pool.take(4, (16,), np.dtype("f4"))
+            addr = _ptr(view)
+            with guard:
+                if addr in live:
+                    failures.append(f"thread {tid} lent {addr:#x}, already held by {live[addr]}")
+                live[addr] = tid
+            view[:] = float(tid)  # what gather does: write this batch into its buffer
+            time.sleep(0.0002)  # ...while another producer assembles its own
+            if not np.all(view == float(tid)):
+                failures.append(f"thread {tid} found another producer's data in {addr:#x}")
+            with guard:
+                if live.get(addr) == tid:
+                    del live[addr]
+            del view
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not failures, failures[:5]
 
 
 def test_exported_torch_tensor_holds_the_buffer() -> None:

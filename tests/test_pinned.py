@@ -54,6 +54,29 @@ def test_a_ragged_prefix_is_still_pinned() -> None:
 
 
 @needs_cuda
+def test_two_live_pinned_batches_never_share_a_buffer() -> None:
+    """Reuse must stay liveness-aware when the buffers are page-locked.
+
+    ``torch.empty(pin_memory=True).numpy()`` hands back an array that *is* its own data owner,
+    unlike the aligned-heap default which views one. That difference decides which references
+    are live when the pool records a buffer's idle refcount, and getting it wrong makes every
+    pinned buffer look permanently free -- so the pool lends one allocation to every batch and
+    each overwrites the last, silently, on the pinned path only. The CPU-side analogue is
+    ``tests/test_buffers.py::test_liveness_holds_however_the_allocator_owns_its_memory``.
+    """
+    from insitubatch.frameworks import pinned_allocator
+
+    pool = BatchBuffers(allocator=pinned_allocator())
+    first = pool.take(4, (16,), np.dtype("f4"))
+    first[:] = 1.0
+    second = pool.take(4, (16,), np.dtype("f4"))
+    second[:] = 2.0
+
+    assert _ptr(first) != _ptr(second), "the pinned pool lent one buffer to two live batches"
+    assert np.all(first == 1.0), "a live pinned batch was overwritten by the next one"
+
+
+@needs_cuda
 def test_in_flight_transfer_holds_the_source_buffer() -> None:
     """A batch whose async copy is still draining must not be recycled underneath it.
 

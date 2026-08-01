@@ -40,6 +40,7 @@ pinned path, since page-locked memory is page-aligned.
 from __future__ import annotations
 
 import sys
+import threading
 from collections.abc import Callable
 
 import numpy as np
@@ -81,8 +82,35 @@ class _Buffer:
         probe = base[:1]
         self.owner = base if probe.base is None else probe.base
         del probe  # the probe is itself a reference; the idle baseline must not include it
-        self._idle_refs = 0
+        self._idle_refs = 0  # provisional -- calibrate() sets the real one
+
+    def calibrate(self) -> None:
+        """Record the refcount that means *nothing is lent*, and check the buffer is trackable.
+
+        Split from ``__init__`` because the baseline is only meaningful once the allocation's
+        transient references are gone. Where the owner is the array itself -- which is what
+        ``torch.empty(pin_memory=True).numpy()`` gives us, so this is the *pinned* path, not a
+        corner case -- the allocator's return value is still on the caller's stack during
+        ``__init__``. Counting it makes the baseline permanently too high, every buffer then
+        looks free forever, and the pool hands one allocation to every batch at once, each
+        overwriting the last. So the caller drops its reference first, then calls this.
+
+        The probe below is the guard that keeps that class of bug loud: a buffer whose lent
+        view does not raise the owner's refcount cannot be tracked at all, and reusing it would
+        corrupt batches silently. Once per allocation, never per batch.
+        """
         self._idle_refs = self._refs()
+        lent = self.base[:1]
+        trackable = not self.free
+        del lent
+        if not trackable:
+            raise RuntimeError(
+                "batch buffer liveness is untrackable: a view of this allocation does not "
+                "reference the data owner, so the pool cannot tell when a batch is still in "
+                "use. The host allocator must return an array that either owns its data or "
+                "directly views the object that does (one level, as numpy collapses base "
+                f"chains) -- got {type(self.base).__name__} over {type(self.owner).__name__}."
+            )
 
     def _refs(self) -> int:
         """References to the data owner. Must be reached through exactly one call frame so
@@ -105,28 +133,44 @@ class _Buffer:
 class BatchBuffers:
     """Pool of reusable batch-output arrays, keyed by ``(inner_shape, dtype)``.
 
-    Not thread-safe by itself: it is driven from the single producer thread that assembles
-    batches (``ChunkPool.gather``), which is also the only thread that may write a lent buffer.
+    **Hand-out is locked because there can be more than one producer.** Each active iteration
+    gets its own producer thread (``source._iterate``) over the one shared ``ChunkPool``, so
+    ``zip(ds.train, ds.val)`` or two ``DataLoader``s over one dataset run two of them into this
+    pool. Deciding a buffer is free and lending it must therefore be one atomic step: otherwise
+    both producers observe the same buffer as free and write their batches into it. The lock is
+    held only across that decision -- never across a gather -- so it costs one uncontended
+    acquire per variable per batch, against a gather that copies megabytes.
+
+    Writing a lent buffer stays lock-free and always was: a buffer is lent to exactly one
+    producer, which is the only thread that touches it.
     """
 
     def __init__(self, *, allocator: HostAllocator | None = None) -> None:
         self._alloc: HostAllocator = allocator or aligned_empty
         self._pools: dict[tuple[tuple[int, ...], np.dtype], list[_Buffer]] = {}
+        self._lock = threading.Lock()
 
     def take(self, n: int, inner_shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
         """Lend an ``(n, *inner_shape)`` array of ``dtype``, reusing a free buffer if there is
         one. The returned view's contents are undefined -- the caller overwrites every row.
         """
         key = (tuple(inner_shape), dtype)
-        buffers = self._pools.setdefault(key, [])
-        for buf in buffers:
-            # A free buffer big enough along the batch axis serves this batch; a short final
-            # batch takes a prefix of a full-size one.
-            if buf.free and buf.base.shape[0] >= n:
-                return self._lend(buf, n)
-        buf = _Buffer(self._alloc((n, *inner_shape), dtype))
-        buffers.append(buf)
-        return self._lend(buf, n)
+        with self._lock:
+            buffers = self._pools.setdefault(key, [])
+            for buf in buffers:
+                # A free buffer big enough along the batch axis serves this batch; a short
+                # final batch takes a prefix of a full-size one. The lend must happen under the
+                # lock too: it is what makes the buffer *look* taken to the next caller (the
+                # returned view is what raises the owner's refcount), so releasing between the
+                # check and the slice would hand the same memory to two producers.
+                if buf.free and buf.base.shape[0] >= n:
+                    return self._lend(buf, n)
+            allocated = self._alloc((n, *inner_shape), dtype)
+            buf = _Buffer(allocated)
+            del allocated  # load-bearing: the idle baseline must not count this reference
+            buf.calibrate()
+            buffers.append(buf)
+            return self._lend(buf, n)
 
     @staticmethod
     def _lend(buf: _Buffer, n: int) -> np.ndarray:
@@ -141,7 +185,8 @@ class BatchBuffers:
     @property
     def nbytes(self) -> int:
         """Total host memory the pool owns. Converges once the pipeline reaches steady state."""
-        return sum(buf.base.nbytes for pool in self._pools.values() for buf in pool)
+        with self._lock:  # a concurrent take may be appending to one of these lists
+            return sum(buf.base.nbytes for pool in self._pools.values() for buf in pool)
 
     def set_allocator(self, allocator: HostAllocator) -> None:
         """Swap where buffers come from, dropping any already allocated.
@@ -153,8 +198,9 @@ class BatchBuffers:
         mid-epoch is legal (outstanding batches keep their own memory by refcount) but wastes
         whatever the pool had already warmed.
         """
-        self._alloc = allocator
-        self.clear()
+        with self._lock:
+            self._alloc = allocator
+            self._pools.clear()
 
     def clear(self) -> None:
         """Drop every owned buffer (pool teardown).
@@ -164,4 +210,5 @@ class BatchBuffers:
         lifetime *on purpose* -- that is what makes the next epoch free -- so this belongs at
         close, never at an epoch boundary.
         """
-        self._pools.clear()
+        with self._lock:
+            self._pools.clear()
