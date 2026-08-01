@@ -53,8 +53,11 @@ def _fit(
             torch.cuda.reset_peak_memory_stats(dev)
         timer = StallTimer()
         for batch in timer.wrap(epochs_source(epoch)):
-            target = to_torch(batch, device=dev)["target"][:, None]
-            loss = nn.functional.mse_loss(_forecast(model, batch, dev), target)
+            # One transfer per step, all four variables. Converting again inside `_forecast`
+            # would double this loop's H2D traffic -- and a pinning A/B measured on a loop that
+            # moves twice what it needs overstates what pinning is worth to an efficient one.
+            d = to_torch(batch, device=dev)
+            loss = nn.functional.mse_loss(_forecast(model, d), d["target"][:, None])
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -77,7 +80,9 @@ def _fit(
 def _val_rmse(model: AdvectionCNN, ds: InSituDataset, dev: torch.device) -> tuple[float, float]:
     model.eval()
     with torch.no_grad():
-        return evaluate(ds.val, lambda b: _forecast(model, b, dev).detach().cpu().numpy())
+        return evaluate(
+            ds.val, lambda b: _forecast(model, to_torch(b, device=dev)).detach().cpu().numpy()
+        )
 
 
 def train(
