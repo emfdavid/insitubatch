@@ -16,8 +16,10 @@ docs/benchmarks.md).
 The figure metric is chosen **per sweep**, because they don't share a signal (if plotly is
 present, one interactive HTML each):
 
-* ``size`` -- a *compute* knob (field size sets the conv cost), so it moves **steady
-  throughput**: bars = samples/s (+IQR), line = steady stall %.
+* ``size`` / ``payload`` -- *compute* knobs (field size and batch size both set the conv cost
+  per step), so they move **steady throughput**: bars = samples/s (+IQR), line = steady stall %.
+  ``payload`` carries the batch-buffer claims, and each of its batch sizes is its own ``geom``
+  precisely so it is scored against a ceiling measured at that same step size.
 * ``inflight`` / ``chunk`` / ``inner`` -- *IO* knobs. Once the cross-epoch cache is warm every
   read is served from RAM, so steady throughput is flat **by construction**; the knob only
   acts on the **cold first-fill**. So these plot bars = epoch-0 time-to-first-batch (ms), line
@@ -38,9 +40,16 @@ _KNOB = {
     "size": "size",
     "chunk": "sample_chunk",
     "inner": "inner_chunk",
+    "payload": "batch_size",
 }
 # Which signal the figure follows: steady throughput vs the cold first-fill (see module docstring).
-_FIG_KIND = {"size": "throughput", "inflight": "cold", "chunk": "cold", "inner": "cold"}
+_FIG_KIND = {
+    "size": "throughput",
+    "payload": "throughput",
+    "inflight": "cold",
+    "chunk": "cold",
+    "inner": "cold",
+}
 
 
 def load(path: str | Path) -> pd.DataFrame:
