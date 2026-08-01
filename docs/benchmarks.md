@@ -374,7 +374,7 @@ again in the cold fill: TTFB rises as chunks shrink (0.41 → 0.73 s) or fan int
 <iframe src="../figures/advection_chunk.html" width="100%" height="420" frameborder="0"></iframe>
 <iframe src="../figures/advection_inner.html" width="100%" height="420" frameborder="0"></iframe>
 
-## Batch buffers — reuse removes a cliff, pinning buys 2–4%
+## Batch buffers — reuse removes a cliff, pinning buys 1–2%
 
 The loader reuses its batch output buffers rather than allocating one per batch, and
 `as_torch(..., device=...)` / `pin_host_buffers` put those buffers in page-locked memory and
@@ -400,39 +400,61 @@ Synthetic sweep (`bench/batch_buffer_sweep.py`, L4, `--inner 256,256`, arms alte
 range while fresh allocation falls off a cliff; the small-batch end pays 2–3%. Weather-shaped
 batches sit in the losing region — a fraction of a percent of a step, but a cost, not a wash.
 
-That cost does **not** surface in the GPU training loop above: across four alternating runs
-(with and without reuse, 5 epochs × 7 repeats), the 128² geometry held 99.2 / 99.3 / 99.4 /
-99.3 % of ceiling — 0.2 points of spread, with no arm signal. Producer-side work is what
-prefetch is for, and a compute-bound loop absorbs it.
+That cliff does **not** surface in the GPU training loop. Sweeping batch size over one 256²
+store (`--sweeps payload`, 5 epochs × 5 repeats), with the no-reuse arm run from a checkout
+identical but for the `gather` call site, and each arm scored against **its own** in-session
+ceiling:
 
-### Pinning: +2–4% end to end, and it shows in the ceiling too
+| MiB per variable buffer | 8 | 16 | 32 |
+|---|--:|--:|--:|
+| reuse (% of ceiling) | 99.69 | 99.92 | 99.74 |
+| no reuse | 99.49 | 99.72 | 99.92 |
+| delta (points) | +0.21 | +0.20 | −0.18 |
 
-Same checkout, same box, back-to-back, `--pin` the only difference:
+Inside ±0.2 points with the sign flipping — a null. The loop runs at 99.5–100% of its compute
+ceiling with 0.1–0.3% stall, so producer-side allocation has nowhere to surface, **including
+at 32 MiB where the `mmap` path demonstrably engages** (0 faults per allocation at 8 and 16
+MiB, 100% of pages at 32 and 64). Both arms returned a persistence RMSE of `0.588030696`,
+bit-identical, so the two paths provably deliver the same bytes.
 
-| geometry | payload | without | with | delta |
-|---|--:|--:|--:|--:|
-| 64² | 0.5 MiB | 4448.7 | 4672.2 | **+5.0%** |
-| 128² | 2 MiB | 583.1 | 605.8 | **+3.9%** |
-| 256² | 8 MiB | 145.2 | 148.5 | **+2.3%** |
+So reuse removes a cliff that a compute-bound loop was already hiding. It earns its place on
+the loops that *aren't* — where allocation is not absorbed by a GPU step — and the synthetic
+sweep above is what measures those.
 
-Pinned is the maximum at every geometry and outside the range of the four unpinned runs in
-all three. The compute ceiling rises by almost exactly the same amount (+6.1 / +3.6 / +2.1%)
-because the ceiling loop preloads batches into RAM but still issues the same per-step H2D
-copy — loader and ceiling moving in lockstep is the evidence that what changed is *the
-transfer*. The larger field gains least: its compute per sample is 4× heavier, so the copy is
-a smaller share of the step.
+### Pinning: +1 to +2%, and drift is half the signal
 
-This matches the isolated prediction. `bench/probe_batch_buffers.py --arms overlap` put a
-1.5 MiB pinned copy at 0.785 ms saved against a 25 ms step (3.0%); the real loop returns 3.9%
-at 2 MiB.
+| geometry | payload/step | estimate | method |
+|---|--:|--:|---|
+| 256² batch 128 | 128 MiB | **+1.5%** (bounds +0.8 … +2.2%) | A/B/A bracket |
+| 256² batch 32–128 | 32–128 MiB | **+2.0 … +2.3%** | cross-session ceilings |
 
-!!! warning "Use the right metric for each"
-    **`% of ceiling` is the wrong metric for pinning** — it measures loader efficiency against
-    compute, and pinning speeds up a copy both sides perform, so it barely moves (it fell 0.9
-    points at 64² while absolute throughput rose 5%). Read absolute throughput for pinning,
-    and only between back-to-back runs: the compute ceiling drifted up to **9.7%** between
-    sessions on an unchanged checkout. Conversely `% of ceiling` *is* the right metric for the
-    reuse regression check, since it normalizes that drift away.
+Both agree on the sign; they disagree on magnitude by about 1.5×, and the gap *is* the
+measurement error. An A/B/A at batch 128 — unpinned, pinned, unpinned, back to back — read
+145.4 / 146.6 / 143.4 samples/s. The two **identical** unpinned blocks differ by 1.4% some 20
+minutes apart, systematically (each block's own repeats agreed to ±0.3). Fitting that as a 1.0
+samples/s per-block decline puts the unpinned baseline at 144.4 in the pinned slot against an
+actual 146.6, hence +1.5%; taking `b−a` or `b−c` instead gives +0.8% or +2.2%.
+
+Round it to **+1 to +2%** and do not quote a third digit. The honest reading is that pinning
+is a real but small win whose size is not resolved by ~0.7%-per-block drift, and that closing
+that gap needs `--pin` alternated *per repeat* inside one sweep rather than more hand-run
+blocks.
+
+!!! warning "Use the right metric for each — they differ"
+    **`% of ceiling` is right for reuse and wrong for pinning.** Reuse changes only the loader,
+    so scoring against the in-session ceiling isolates it and divides drift out. Pinning
+    changes a copy **both** sides perform: `--pin` reaches the ceiling too, because
+    `pin_host_buffers` runs before `preload_epoch`, which is `list(ds.train)`. The ceiling then
+    moves with the loader (+2.0–2.3% in lockstep) and `% of ceiling` cancels the effect —
+    it sat at ~99.8% across a pinned A/B while absolute throughput moved 2.2%. For pinning,
+    read bracketed absolute throughput and nothing else.
+
+    Run the control arm **twice, before and after** the treatment, and read the treatment
+    against their interpolation. A single back-to-back pair carries roughly ±0.7% of drift on
+    an unchanged checkout — the same size as these effects.
+
+    Reproduce the no-reuse arm with `INSITUBATCH_NO_BUFFER_REUSE=1` rather than a second
+    checkout; the epoch log stamps `REUSE OFF` so those rows stay identifiable.
 
     The ceiling is sampled **once per geometry per run** (`do_ceiling = ceiling and r == 0`)
     while insitu gets every repeat, so `% of ceiling` inherits a single measurement's noise and

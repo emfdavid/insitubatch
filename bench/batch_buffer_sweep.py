@@ -40,8 +40,12 @@ process would contaminate each other in exactly the dimension under measurement.
     # the real run: 8 MiB -> 128 MiB per batch, crossing the cliff
     uv run python -m bench.batch_buffer_sweep
 
-An A/B against a checkout without the pool needs no change here -- point ``--child-package``
-at another worktree and the same sweep measures it (see ``docs/benchmarks.md``).
+**Run the no-reuse arm with** ``INSITUBATCH_NO_BUFFER_REUSE=1``, which switches ``take`` to a
+fresh allocation per call. That is the better control than the ``--child-package`` worktree
+this used to need: identical code on both sides, only the reuse decision differing, so a
+second checkout cannot silently drift from the one under test. Rows taken that way are
+identifiable afterwards -- the epoch log stamps ``REUSE OFF``. ``--child-package`` stays for
+what it is actually for, A/B-ing a *different* version of the library.
 """
 
 from __future__ import annotations

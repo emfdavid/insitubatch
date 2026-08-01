@@ -26,17 +26,35 @@ The sweeps, and the claim each one confirms:
   sweep cannot reach: reuse only pays above glibc's 32 MiB ``mmap`` threshold, which applies
   per allocation, and pinning's saved transfer time scales with bytes moved.
 
-**Comparing arms across sessions: use the ceilings, not samples/s.** Absolute throughput
-drifts with the box -- measured, two unpinned sessions 14 h apart differed by 0.6%. The
-ceiling is the instrument that survives that, because it replays RAM batches through the same
-model with no IO at all, so across arms it varies only by what the arm changed. Two readings
-back that up: the pinned ceiling ran 2.0-2.3% above both unpinned ones (8 minutes apart, so
-drift cannot explain it -- pinning is real at ~2.2%), while reuse vs no-reuse came out within
-+-0.2 pp of ceiling with the sign flipping (a null: the loop is at 99.5-100% of compute
-ceiling, so allocation cost has nowhere to show up). Score each arm against **its own**
-in-session ceiling and the drift divides out; compare raw samples/s across sessions and it
-does not. The earlier "+2.3% from pinning" was first read off raw samples/s and was not
-established until the third session bracketed the drift.
+**Drift is the dominant error term -- bracket it or do not quote the number.** Absolute
+throughput moves with the box on an unchanged checkout: an A/B/A at batch 128 (unpinned,
+pinned, unpinned, back to back) read 145.4 / 146.6 / 143.4 samples/s, so the two *identical*
+unpinned blocks differed by 1.4% about 20 minutes apart -- systematically, since each block's
+own repeats agreed to +-0.3. Any single back-to-back pair therefore carries roughly +-0.7% of
+drift, which is the same size as the effects being measured. Run the control arm **twice,
+before and after**, and read the treatment against their interpolation.
+
+That is how the two published numbers were arrived at, and it is worth seeing what it costs:
+
+* **Pinning: +1 to +2%.** The A/B/A above fits a 1.0 samples/s per-block decline, putting the
+  unpinned baseline at 144.4 in the pinned slot against an actual 146.6 -- **+1.5%**, with the
+  drift-model bounds running +0.8% (``b-a``) to +2.2% (``b-c``). A separate cross-session
+  ceiling comparison read +2.0-2.3%. Both agree on the sign and disagree on magnitude by about
+  1.5x, which is what an uncontrolled 0.7% drift term buys you. Quote the range.
+* **Reuse: null.** Scored against each arm's own in-session ceiling, reuse and no-reuse came in
+  at 99.69/99.92/99.74% versus 99.49/99.72/99.92% for 8/16/32 MiB per buffer -- inside +-0.2 pp
+  with the sign flipping. The loop sits at 99.5-100% of compute ceiling, so allocation cost has
+  nowhere to surface, *including* at 32 MiB where the ``mmap`` path demonstrably engages.
+
+Note the two use different instruments, and the reason matters. Reuse changes only the loader,
+so ``% of ceiling`` isolates it and divides the drift out. Pinning changes a copy **both** the
+loader and the ceiling perform -- ``--pin`` reaches the ceiling too, since ``pin_host_buffers``
+runs before ``preload_epoch`` -- so ``% of ceiling`` cancels the very effect being measured and
+only bracketed absolute throughput will do.
+
+The no-reuse arm no longer needs ``--child-package`` and a hand-reverted checkout: set
+``INSITUBATCH_NO_BUFFER_REUSE=1`` on the run instead. Identical code both sides, and the epoch
+log stamps ``REUSE OFF`` so the rows cannot be mistaken for a normal run later.
 
 The compute-only ceiling depends only on the field geometry (the conv cost), not on
 inflight / chunking / cache, so ``--ceiling`` is run exactly once per distinct ``geom`` and the
