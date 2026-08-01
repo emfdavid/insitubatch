@@ -17,7 +17,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from insitubatch import Batch, InSituDataset, to_torch
+from insitubatch import InSituDataset, to_torch
 
 from .data import build_datasets, cli, evaluate
 
@@ -48,16 +48,29 @@ class AdvectionCNN(nn.Module):
         return self.net(xn)
 
 
-def _forecast(model: AdvectionCNN, batch: Batch, device: torch.device) -> torch.Tensor:
-    """t2m(t+24h) forecast for one batch: persistence + the model's predicted tendency.
+def _forecast(model: AdvectionCNN, d: dict[str, torch.Tensor]) -> torch.Tensor:
+    """t2m(t+24h) forecast for one already-transferred batch: persistence + predicted tendency.
 
-    ``to_torch(..., device=...)`` hands the batch over by DLPack and issues the H2D copy in
-    one step. Stacking happens **after** the transfer, on the device: stacking first would
-    build a fresh (B, 3, H, W) CPU tensor -- a copy of the whole batch into memory the loader
-    does not own, which is both wasted work and unpinnable, so it would defeat page-locked
-    buffers for the one tensor that matters most.
+    Takes **device tensors, not a** ``Batch``: the H2D copy belongs to the caller, once per
+    step. Passing the batch in and converting here would move every variable a second time,
+    since the loop also needs ``target`` -- twice the traffic the step actually requires, which
+    is exactly the kind of overhead a pinning measurement would then misattribute to pinning.
+
+    Stacking happens **after** the transfer, on the device: stacking first would build a fresh
+    (B, 3, H, W) CPU tensor -- a copy of the whole batch into memory the loader does not own,
+    which is both wasted work and unpinnable, so it would defeat page-locked buffers for the
+    one tensor that matters most.
+
+    That trade is not free, and the cost is device memory. Counting a (B, H, W) variable as one
+    unit: stacking on the host holds 5 units on the GPU (the stack, plus t2m and target moved
+    separately) and copies 5 across PCIe; stacking here holds **7** (four transferred variables
+    plus the stack) and copies 4. So it is +2 units of GPU memory for one fewer variable-copy
+    per step -- 224 MiB vs 160 MiB at a 32 MiB payload, against conv activations that are
+    larger still. A loop tight on device memory would instead transfer straight into the slices
+    of a preallocated ``x``, which needs an ``out=``-style device target this adapter does not
+    have yet (it would also have to hold the source until the copy lands, which is exactly what
+    ``to_torch(..., device=...)`` does for us here).
     """
-    d = to_torch(batch, device=device)  # {label: (B, H, W)}, already on device
     x = torch.stack([d["t2m"], d["u10"], d["v10"]], dim=1)  # (B, 3, H, W), on device
     return d["t2m"][:, None] + model(x)  # (B, 1, H, W)
 
@@ -72,8 +85,8 @@ def train(ds: InSituDataset, *, epochs: int, device: str = "cpu") -> tuple[float
         model.train()
         last = 0.0
         for batch in ds.train:
-            target = to_torch(batch, device=dev)["target"][:, None]
-            loss = nn.functional.mse_loss(_forecast(model, batch, dev), target)
+            d = to_torch(batch, device=dev)  # the step's one H2D transfer, all variables
+            loss = nn.functional.mse_loss(_forecast(model, d), d["target"][:, None])
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -81,7 +94,9 @@ def train(ds: InSituDataset, *, epochs: int, device: str = "cpu") -> tuple[float
         print(f"epoch {epoch}  train mse {last:.4f}")
     model.eval()
     with torch.no_grad():
-        return evaluate(ds.val, lambda b: _forecast(model, b, dev).detach().cpu().numpy())
+        return evaluate(
+            ds.val, lambda b: _forecast(model, to_torch(b, device=dev)).detach().cpu().numpy()
+        )
 
 
 def main() -> None:
