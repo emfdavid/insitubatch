@@ -31,6 +31,21 @@ The sweeps, and the claim each one confirms:
 The compute-only ceiling depends only on the field geometry (the conv cost), not on
 inflight / chunking / cache, so ``--ceiling`` is run exactly once per distinct ``geom`` and the
 report matches every insitu config to its geom's ceiling.
+
+``--child-package`` A/Bs a change to the *library* by putting another checkout's ``src/`` ahead
+of the installed one, so both arms share this checkout's example code, interpreter and torch --
+only insitubatch differs. **Point it at a checkout that differs solely in the change under
+test.** Pointing it at ``main`` does not work and is not what it is for: main predates the
+examples' own API (``to_torch(..., device=...)``, ``pin_host_buffers``), so the child fails to
+import, and even where it imports, main differs in several changes at once. For the batch-buffer
+reuse arm, branch off this checkout and revert only the ``gather`` call site::
+
+    git worktree add -b bench/no-reuse-arm ../ib-noreuse batch-buffer-ring
+    # in that worktree, pool.gather: out = np.empty((n, *out_geom.inner_shape), ...)
+    uv run python -m bench.advection_sweep --sweeps payload --child-package ../ib-noreuse ...
+
+Every row records ``child_package``, so the two files an A/B produces cannot be confused after
+the fact.
 """
 
 from __future__ import annotations
@@ -38,6 +53,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -191,10 +207,63 @@ def _command(
     return cmd
 
 
-def _run_config(cmd: list[str], cfg: dict[str, Any], repeat: int, out_fh: Any) -> None:
+def child_env(child_package: str | None) -> dict[str, str] | None:
+    """Environment for the child, optionally importing insitubatch from another checkout.
+
+    Swapping the library by ``PYTHONPATH`` rather than by running the child in its own uv
+    environment (which is how ``batch_buffer_sweep.py`` does it) is deliberate: the arms of an
+    A/B differ *only* in insitubatch. An ephemeral environment would resolve its own torch, and
+    a benchmark whose two arms ran different torch builds would be measuring that instead. Here
+    the interpreter, torch, numpy and the example code are all shared; ``src/`` simply precedes
+    site-packages, so ``import insitubatch`` finds the other checkout.
+    """
+    if not child_package:
+        return None
+    src = Path(child_package).expanduser().resolve() / "src"
+    if not (src / "insitubatch" / "__init__.py").exists():
+        raise SystemExit(f"--child-package {child_package}: no insitubatch package under {src}")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(src), env.get("PYTHONPATH", "")) if p)
+    return env
+
+
+def _check_arm(out: Path, arm: dict[str, Any], p: argparse.ArgumentParser) -> None:
+    """Refuse to append one arm's rows onto another's.
+
+    Output is opened in append mode so a sweep can be resumed or extended, which also means two
+    arms written to one path silently merge -- and because both number their repeats from zero,
+    the report then medians across arms and prints a blend that looks like a clean result. That
+    happened once; the cost was a full A/B. An arm is identified by what distinguishes it
+    (``--pin``, ``--child-package``), and rows carry it, so the mismatch is detectable.
+    """
+    if not out.exists() or out.stat().st_size == 0:
+        return
+    with out.open() as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            existing = {"pin": row.get("pin", False), "child_package": row.get("child_package", "")}
+            if existing != arm:
+                p.error(
+                    f"{out} already holds rows from a different arm ({existing}); this run is "
+                    f"{arm}. Two arms in one file merge on repeat index and the report medians "
+                    f"across them. Write this arm to its own --out."
+                )
+            break  # one row settles it; the guard above keeps a file single-armed
+
+
+def _run_config(
+    cmd: list[str],
+    cfg: dict[str, Any],
+    repeat: int,
+    out_fh: Any,
+    env: dict[str, str] | None = None,
+    arm: dict[str, Any] | None = None,
+) -> None:
     """Run one child, tag its rows with the config + repeat, append to the combined file."""
     with tempfile.NamedTemporaryFile("r+", suffix=".jsonl") as tmp:
-        subprocess.run([*cmd, "--metrics-out", tmp.name], check=True)
+        subprocess.run([*cmd, "--metrics-out", tmp.name], check=True, env=env)
         tmp.seek(0)
         for line in tmp:
             if not line.strip():
@@ -202,6 +271,9 @@ def _run_config(cmd: list[str], cfg: dict[str, Any], repeat: int, out_fh: Any) -
             row = json.loads(line)
             row["config"] = cfg
             row["repeat"] = repeat
+            # Stamped on every row: an A/B lives in two files that are indistinguishable
+            # afterwards otherwise, and mixing them up is silent.
+            row.update(arm or {})
             out_fh.write(json.dumps(row) + "\n")
     out_fh.flush()
 
@@ -231,6 +303,15 @@ def main() -> None:
         "--pin",
         action="store_true",
         help="page-lock batch buffers in the insitu runs (not the ceiling); A/B for pinning",
+    )
+    p.add_argument(
+        "--child-package",
+        default=None,
+        metavar="PATH",
+        help="run the children against another insitubatch checkout by putting its src/ ahead of "
+        "the installed one. The A/B arm for changes to the library itself -- identical example "
+        "code, interpreter and torch on both sides. Point it at a checkout differing only in the "
+        "change under test, NOT at main (whose API predates the examples' calls)",
     )
     p.add_argument(
         "--payload-batch-sizes",
@@ -270,6 +351,20 @@ def main() -> None:
                 f"would be clipped to {block_rows} and land on another config's payload"
             )
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    arm = {"pin": bool(args.pin), "child_package": args.child_package or ""}
+    _check_arm(args.out, arm, p)
+    env = child_env(args.child_package)
+    # Print which insitubatch the children will actually import, before spending an hour on
+    # runs. A PYTHONPATH swap that silently did not take would produce two identical arms and
+    # an A/B that reads as "no effect".
+    which = subprocess.run(
+        [sys.executable, "-c", "import insitubatch; print(insitubatch.__file__)"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    print(f"children import insitubatch from: {which}\n")
     seen_geom: set[str] = set()
     with args.out.open("a") as out_fh:
         for i, cfg in enumerate(configs):
@@ -296,7 +391,7 @@ def main() -> None:
                     extra["MiB/buffer"] = round(buffer_mib(cfg["size"], cfg["batch_size"]), 1)
                     extra["MiB/step"] = round(step_mib(cfg["size"], cfg["batch_size"]), 1)
                 print(f"=== {label} repeat {r + 1}/{args.repeats} {extra} ceiling={do_ceiling} ===")
-                _run_config(cmd, cfg, r, out_fh)
+                _run_config(cmd, cfg, r, out_fh, env=env, arm=arm)
     print(f"\nwrote sweep rows -> {args.out}")
     print(f"aggregate with: uv run python -m bench.advection_report --in {args.out}")
 
