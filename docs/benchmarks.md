@@ -374,12 +374,33 @@ again in the cold fill: TTFB rises as chunks shrink (0.41 → 0.73 s) or fan int
 <iframe src="../figures/advection_chunk.html" width="100%" height="420" frameborder="0"></iframe>
 <iframe src="../figures/advection_inner.html" width="100%" height="420" frameborder="0"></iframe>
 
-## Batch buffers — reuse removes a cliff, pinning buys 1–2%
+## Batch buffers — what they're worth is a range, and your loop picks the point
 
 The loader reuses its batch output buffers rather than allocating one per batch, and
 `as_torch(..., device=...)` / `pin_host_buffers` put those buffers in page-locked memory and
 own the H2D copy. The two are separate changes with separate payoffs, and each is only
 visible on the axis it acts on.
+
+**Read every number below as a point in a range, not a headline.** Both optimizations remove
+*loader-side* cost, so their end-to-end value is bounded above by what an isolated probe
+measures with that cost fully exposed, and below by **zero** — because a loop whose compute
+step already hides the loader gets nothing, which is prefetch doing its job. Where a given
+workload falls is decided by one thing: how much compute it spends per byte delivered.
+
+| | upper bound (loader cost exposed) | our GPU training loop | lower bound |
+|---|---|---|---|
+| **reuse** | +10 … +16% above 32 MiB | **≈ 0** (±0.3 pt) | 0 |
+| **pinning** | copy hidden entirely below ~37 MiB | **+1 … +2%** | 0 |
+
+The advection loop runs at 98.7–100% of its compute ceiling, so for reuse it *is* the lower
+bound rather than an interior point — a well-fed GPU is the hardest case for a loader
+optimization to show up in, by construction. These land differently because they act on
+different sides: reuse saves producer-thread time, which prefetch is built to hide, while
+pinning shortens a copy on the consumer's critical path, which prefetch cannot.
+
+So the workloads that collect the top of these ranges are the ones spending less compute per
+byte — **inference rather than training**, shallow models, cold caches, IO-bound epochs. A
+saturated training GPU is where you should expect the least.
 
 ### Reuse: a payload-size cliff, not a speedup
 
@@ -388,7 +409,8 @@ batch** — a syscall trace shows 12 full-buffer pairs per 12-batch epoch withou
 with it — so the kernel re-zeroes the whole buffer each time. Below that threshold the freed
 block is recycled on the heap and reuse is a small cost instead.
 
-Synthetic sweep (`bench/batch_buffer_sweep.py`, L4, `--inner 256,256`, arms alternated):
+**The upper bound**, with allocation cost fully exposed (`bench/batch_buffer_sweep.py`, L4,
+`--inner 256,256`, arms alternated):
 
 | MiB/batch | 8 | 16 | 32 | 64 | 128 |
 |---|--:|--:|--:|--:|--:|
@@ -400,8 +422,8 @@ Synthetic sweep (`bench/batch_buffer_sweep.py`, L4, `--inner 256,256`, arms alte
 range while fresh allocation falls off a cliff; the small-batch end pays 2–3%. Weather-shaped
 batches sit in the losing region — a fraction of a percent of a step, but a cost, not a wash.
 
-That cliff does **not** surface in the GPU training loop. Sweeping batch size over one 256²
-store (`--sweeps payload`, 5 epochs × 5 repeats), with the no-reuse arm run from a checkout
+**The lower bound** is a GPU training loop, where the cliff does not surface at all. Sweeping
+batch size over one 256² store (`--sweeps payload`, 5 epochs × 5 repeats), with the no-reuse arm run from a checkout
 identical but for the `gather` call site, and each arm scored against **its own** in-session
 ceiling:
 
@@ -419,11 +441,12 @@ agrees to **0.04%** (138.52 vs 138.57 samples/s) — there the 0.29-point gap is
 sessions' *ceilings* differing, not the loader. Every arm returned a persistence RMSE of
 `0.588030696`, bit-identical, so the paths provably deliver the same bytes.
 
-So reuse removes a cliff that a compute-bound loop was already hiding. It earns its place on
-the loops that *aren't* — where allocation is not absorbed by a GPU step — and the synthetic
-sweep above is what measures those.
+So a saturated GPU sits at the bottom of reuse's range, and that is the expected place for it:
+prefetch exists to hide exactly this cost. The value is real at the other end — the +10–16%
+above — and it is collected by loops that do less compute per byte, plus the guarantee that
+growing your batch past 32 MiB cannot walk you off a cliff.
 
-### Pinning: +1 to +2%, and drift is half the signal
+### Pinning: +1 to +2% end to end, and drift is half the signal
 
 | geometry | payload/step | estimate | method |
 |---|--:|--:|---|
@@ -441,6 +464,14 @@ Round it to **+1 to +2%** and do not quote a third digit. The honest reading is 
 is a real but small win whose size is not resolved by ~0.7%-per-block drift, and that closing
 that gap needs `--pin` alternated *per repeat* inside one sweep rather than more hand-run
 blocks.
+
+Unlike reuse, this is an *interior* point in its range rather than the floor. In isolation
+(`bench/probe_batch_buffers.py --arms overlap`) a pinned copy below ~37 MiB is hidden
+completely — the pinned arm sits on the compute floor, while a pageable one costs more than
+its own transfer time, because it stages through a driver bounce buffer and cannot overlap at
+all. Pinning survives a compute-bound loop where reuse does not because it shortens work on
+the **consumer's** critical path; prefetch can hide producer-thread cost, but it cannot hide
+the step's own copy.
 
 !!! warning "Use the right metric for each — they differ"
     **`% of ceiling` is right for reuse and wrong for pinning.** Reuse changes only the loader,

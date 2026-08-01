@@ -473,19 +473,37 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   trade-off, not noise (reproduced in both arms at both sizes). Weather sits in the losing
   region; it is a fraction of a percent of a WB2 step, but it is a cost, not a wash.
 
-  That cost does **not** reach a real training loop: in the advection GPU benchmark, four
-  alternating runs (with/without the pool, 5 epochs × 7 repeats) held the 128² geometry at
-  99.2 / 99.3 / 99.4 / 99.3 % of ceiling — 0.2 points of spread and no arm signal. Producer-side
-  work is what prefetch exists to hide. **Pinning, measured the same way, is worth +5.0 / +3.9 /
-  +2.3% absolute throughput at 0.5 / 2 / 8 MiB payloads**, with the compute ceiling rising by
-  the same amount (the ceiling loop issues the same per-step copy) — which is what identifies
-  the transfer as the thing that changed.
+  **Both figures above are the top of a range whose bottom is zero**, and how compute-bound a
+  loop is decides where in that range it lands. The isolated sweeps measure loader cost fully
+  exposed; a step that already hides the loader collects none of it. That is not a
+  disappointment, it is prefetch working — so the numbers to publish are the bounds and the
+  rule for predicting a point between them, never a single headline.
 
-  Two metric traps, both of which caught us: `% of ceiling` is right for the *reuse* check
-  (it normalizes away a compute ceiling that drifted up to 9.7% between sessions on unchanged
-  code) and wrong for *pinning* (which speeds up a copy both sides perform, so it barely
-  moves); and the ceiling is sampled once per geometry per run, so `% of ceiling` resolves
-  only ~1 point no matter how many repeats. See the benchmarks page for the full caveats.
+  The GPU training loop is the bottom of reuse's range, and measurably so. Sweeping batch size
+  over one 256² store, each arm against its own in-session ceiling, reuse vs no-reuse comes in
+  at **+0.21 / +0.20 / −0.18 / −0.29 points** at 8 / 16 / 32 / 64 MiB per buffer: inside ±0.3,
+  sign flipping twice, across an 8× range spanning the threshold, with the two arms agreeing to
+  0.04% absolute at 64 MiB. (An earlier "four alternating runs" null was taken at 128²/2 MiB —
+  *below* the cliff — so it tested nothing.) **Pinning lands in the middle of its own range at
+  +1 to +2%**, bracketed against drift; an earlier +5.0 / +3.9 / +2.3% came from runs since
+  voided, measured under the double-lend bug *and* doubled H2D traffic.
+
+  The asymmetry is structural, not luck: reuse saves **producer-thread** time, which is exactly
+  what prefetch is built to hide, while pinning shortens a copy on the **consumer's** critical
+  path, which prefetch cannot touch. So reuse is worth most where the loader is not already
+  free — inference rather than training, shallow compute per byte, cold caches, IO-bound epochs
+  — and its floor value is the guarantee that growing a batch past 32 MiB cannot walk you off
+  a cliff.
+
+  Three metric traps, all of which caught us. `% of ceiling` is right for the *reuse* check —
+  it normalizes away session drift — and wrong for *pinning*, because `--pin` reaches the
+  ceiling too (`pin_host_buffers` precedes `preload_epoch`, which is `list(ds.train)`), so the
+  ceiling moves in lockstep and the metric cancels the effect. The ceiling is sampled once per
+  geometry per run, so `% of ceiling` resolves only ~1 point however many repeats you take.
+  And **drift is the dominant error term**: an A/B/A on an unchanged checkout read 145.4 /
+  146.6 / 143.4 samples/s, so two *identical* unpinned blocks differed 1.4% twenty minutes
+  apart — half the size of the effect being measured. Run the control arm twice, bracketing the
+  treatment, and interpolate; a single back-to-back pair is not enough. See the benchmarks page.
 
   In isolation, *pinning* is a smooth gradient that helps at every size, and up to ~37 MiB it hides
   the copy **completely** — the pinned arm sits on the compute floor. A pageable copy costs
@@ -494,7 +512,7 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   stream. Past ~512 MiB even pinned is exposed, but only because the copy (43 ms) now
   exceeds the step (25 ms) — that residue is arithmetic, not a pinning failure.
 
-  So **weather gains nothing from reuse, and ~3% from pinning** — real but small, and the
+  So **weather gains nothing from reuse, and +1–2% from pinning** — real but small, and the
   wb2 row is near this harness's resolution (stream-context overhead is comparable to the
   effect). Validate on microscopy/ViT; do not expect the advection numbers to move. The
   percentages are all against a synthetic 25 ms step, so the transferable quantity is the
@@ -508,10 +526,22 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   pays on its own above the allocator cliff.
 
   Pool design: own the base allocations permanently, hand out **views** (`base[:k]`, which
-  is also the ragged-tail answer), keep a `weakref` per lent view, and **poll liveness at the
-  next `__next__`** — a dead view is nobody's, so it returns to the free list; a live one
-  (a retained batch, an exported DLPack tensor — `torch.from_dlpack` holds a strong
-  reference to the source) stays out. A miss allocates. Consequences: releasing
+  is also the ragged-tail answer), and **poll liveness at the next hand-out** — an
+  unreferenced buffer is nobody's, so it is reused; a live one (a retained batch, an exported
+  DLPack tensor — `torch.from_dlpack` holds a strong reference to the source) stays out. A
+  miss allocates.
+
+  *As built, liveness is a refcount on the buffer's data **owner**, not a `weakref` on the
+  lent view.* The plan above said weakref; implementation showed it cannot work. numpy
+  collapses base chains to the owning array rather than chaining them, so a crop taken from a
+  lent view does **not** reference that view — a consumer who keeps `batch["x"][:, :2]` and
+  drops the batch would have its memory recycled underneath it. Every array viewing the
+  memory does reference the owner, so `sys.getrefcount(owner)` against a calibrated idle
+  baseline sees derived views, DLPack exports and retained batches alike. The baseline is the
+  load-bearing part: it must be recorded after the allocation's own transient references are
+  gone, or every buffer looks permanently free and the pool lends one allocation to every
+  batch at once — which is exactly the bug that shipped and was caught by a persistence-RMSE
+  drift, not by throughput or forecast skill. Consequences: releasing
   unconditionally at the yield point would be *less* safe than today (it would overwrite a
   batch the consumer legitimately kept), holding a reference is already the way to retain
   one so no `retain()` API is needed, and **there is no depth parameter** — allocate-on-miss
@@ -547,8 +577,11 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   does *not* require M2's `device_transform`, which is a pipeline stage (user GPU callables,
   composition, a third entry in the transform contract); it requires only
   `to_torch(batch, device=...)` issuing the copy itself. And the guard needs no new
-  machinery: the adapter holds the source arrays until `event.query()`, which keeps their
-  weakrefs alive, so the pool's existing liveness poll defers reclaim on its own. No event
+  machinery: the adapter holds the source arrays until `event.query()`, which keeps them
+  referencing the owner, so the pool's existing liveness poll defers reclaim on its own. That
+  hold set is process-wide (CUDA streams are), so retiring landed copies and taking a new hold
+  must be one locked step — unlocked, a thread can overwrite a hold another appended and free
+  a buffer mid-DMA. No event
   crosses into the core, `Batch` is unchanged, and `to_torch(batch)` without a device is
   exactly today's behaviour.
 

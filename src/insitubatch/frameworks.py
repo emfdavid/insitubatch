@@ -69,6 +69,26 @@ def _default_pin_budget() -> int:
     return total // _DEFAULT_PIN_FRACTION
 
 
+def _torch_dtype(dtype: np.dtype) -> torch.dtype:
+    """The torch dtype for a numpy one, asked of torch rather than guessed from its name.
+
+    ``getattr(torch, str(dtype))`` works for every dtype either library will actually accept
+    -- checked across the float/int/uint/bool/complex range, where it agrees with this, and
+    where the two also fail together (``float128``, ``datetime64``, structured dtypes, and
+    ``uint16`` on a torch too old to have it). So this is not a bug fix.
+
+    It is a *second mechanism* removed. The pool hands out a buffer created here, and
+    :func:`to_torch` creates the tensor that views it through ``torch.from_dlpack`` -- torch's
+    own numpy mapping. Two answers to one question is one more than there should be: were they
+    ever to diverge, the buffer's dtype and the tensor's would disagree with nothing to catch
+    it. Deriving ours from the same converter makes divergence unrepresentable, and the
+    zero-element probe costs microseconds once per *allocation*, not per batch.
+    """
+    import torch  # already imported by every caller; this is a sys.modules lookup
+
+    return torch.from_numpy(np.empty(0, dtype=dtype)).dtype
+
+
 def pinned_allocator(budget_bytes: int | None = None) -> HostAllocator:
     """A host allocator handing out page-locked buffers, up to ``budget_bytes``.
 
@@ -107,7 +127,7 @@ def pinned_allocator(budget_bytes: int | None = None) -> HostAllocator:
         # recognises the pages through the DLPack round-trip back into torch, which is what
         # keeps `non_blocking` genuinely asynchronous. Page-locked memory is page-aligned, so
         # the pool's 128-byte XLA alignment comes free.
-        pinned = torch.empty(tuple(shape), dtype=getattr(torch, str(dtype)), pin_memory=True)
+        pinned = torch.empty(tuple(shape), dtype=_torch_dtype(dtype), pin_memory=True)
         used += nbytes
         return pinned.numpy()
 
@@ -277,10 +297,22 @@ def as_torch(
     ``non_blocking`` copy and reintroduce a use-after-recycle we would then have to document
     instead of prevent.
 
-    Worth it only above ~32 MiB per batch. Measured on an L4, pinning takes a 37 MiB batch's
-    transfer from +4.0 ms to +0.3 ms against a 25 ms step, and a weather-sized batch from
-    +1.5 ms to +0.7 ms -- real but marginal. ``pin_budget_bytes`` caps the page-locked total
-    (default: an eighth of RAM); past it buffers are pageable again, with a warning.
+    What it is worth runs between two measured bounds, and how compute-bound the loop is
+    decides where you land. In isolation (``bench/probe_batch_buffers.py --arms overlap``) a
+    pinned copy below ~37 MiB is hidden *completely* -- the pinned arm sits on the compute
+    floor, while a pageable one costs more than its own transfer time because it stages
+    through a driver bounce buffer and cannot overlap at all. Against a compute step that
+    already hides the copy, it is worth nothing. **A real GPU training loop lands in between:
+    +1 to +2%**, roughly flat over a 4x payload range (32 to 128 MiB per step) rather than
+    switching on above a threshold.
+
+    Expect no more precision than that range. An A/B/A bracket on an unchanged checkout drifts
+    ~0.7% per block -- half the signal -- so the bound is +0.8% to +2.2% depending on how the
+    drift is modelled. See docs/benchmarks.md, which also explains why ``% of ceiling`` cannot
+    measure this at all.
+
+    ``pin_budget_bytes`` caps the page-locked total (default: an eighth of RAM, since the
+    kernel cannot reclaim it); past that buffers are pageable again, with one warning.
     """
     try:
         from torch.utils.data import IterableDataset
