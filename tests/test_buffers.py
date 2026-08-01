@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from insitubatch.buffers import XLA_ALIGN, BatchBuffers, HostAllocator, aligned_empty
+from insitubatch.buffers import NO_REUSE_ENV, XLA_ALIGN, BatchBuffers, HostAllocator, aligned_empty
 
 
 def _ptr(a: np.ndarray) -> int:
@@ -425,3 +425,40 @@ def test_exported_jax_array_holds_the_buffer() -> None:
     del view
     assert _ptr(pool.take(4, (3, 2), np.dtype("f4"))) != addr
     assert bool((arr == 5.0).all())
+
+
+def test_no_reuse_env_hands_out_a_fresh_buffer_every_time(monkeypatch) -> None:
+    # The escape hatch, and the A/B control that replaces a hand-reverted second checkout.
+    # Every take must be its own allocation: nothing pooled, nothing tracked, nothing reclaimed.
+    monkeypatch.setenv(NO_REUSE_ENV, "1")
+    pool = BatchBuffers()
+    first = pool.take(4, (2, 2), np.dtype("float32"))
+    first[:] = 1.0
+    del first  # under reuse this frees the buffer; here it must still not be handed out again
+    second = pool.take(4, (2, 2), np.dtype("float32"))
+    second[:] = 2.0
+    third = pool.take(4, (2, 2), np.dtype("float32"))
+
+    assert not np.shares_memory(second, third)
+    assert pool.n_buffers == 0 and pool.nbytes == 0  # nothing retained
+    assert pool.lends == 3 and pool.allocations == 3  # every lend is an allocation
+    assert "REUSE OFF" in pool.kind  # the epoch line must give the run away
+
+
+def test_reuse_is_on_unless_the_env_says_otherwise(monkeypatch) -> None:
+    for value in ("", "0", "false", "NO", "  "):
+        monkeypatch.setenv(NO_REUSE_ENV, value)
+        assert BatchBuffers().kind == "heap", f"{value!r} should leave reuse on"
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv(NO_REUSE_ENV, value)
+        assert "REUSE OFF" in BatchBuffers().kind, f"{value!r} should switch reuse off"
+    monkeypatch.delenv(NO_REUSE_ENV)
+    assert BatchBuffers().kind == "heap"
+
+
+def test_no_reuse_keeps_the_alignment_guarantee(monkeypatch) -> None:
+    # It bypasses the pool, not the allocator: XLA:CPU's 128-byte DLPack requirement is a
+    # property of aligned_empty, so it must survive the escape hatch.
+    monkeypatch.setenv(NO_REUSE_ENV, "1")
+    buf = BatchBuffers().take(3, (5, 7), np.dtype("float32"))
+    assert buf.__array_interface__["data"][0] % XLA_ALIGN == 0

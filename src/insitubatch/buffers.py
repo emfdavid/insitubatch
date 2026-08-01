@@ -9,10 +9,17 @@ count tracks batches rather than dataset size. Paid per batch, that is a fresh p
 fault in plus ``munmap``'s TLB work.
 
 Below the threshold the freed block is recycled on the heap instead and reuse buys nothing --
-it costs about 2-3%. End to end (``bench/batch_buffer_sweep.py``) the pool is *flat* across a
-16x payload range while fresh allocation falls off a cliff at 32 MiB: 8 MiB -2.4%, 32 MiB
-+16%, 64 MiB +13%, 128 MiB +10%. So this removes a cliff rather than adding speed. Weather
-batches sit well below it; ViT and microscopy batches sit above.
+it costs about 2-3%. Allocation-bound (``bench/batch_buffer_sweep.py``) the pool is *flat*
+across a 16x payload range while fresh allocation falls off a cliff at 32 MiB: 8 MiB -2.4%,
+32 MiB +16%, 64 MiB +13%, 128 MiB +10%.
+
+**In a compute-bound loop it is worth nothing, and that is the expected result.** The GPU
+advection sweep A/B'd reuse against no-reuse at 8/16/32 MiB per buffer and came back inside
++-0.2 points of ceiling with the sign flipping -- because that loop runs at 99.5-100% of its
+compute ceiling, so producer-side allocation has nowhere to surface even at 32 MiB where the
+``mmap`` path demonstrably engages. So this removes a cliff for the loops that are *not*
+already compute-bound; it does not make a fed GPU faster. Weather batches sit below the
+threshold anyway; ViT and microscopy batches sit above it.
 
 **Hand-out is by view, reclaim is by liveness.** A buffer is lent as a view of a base array the
 pool owns forever, and comes back only once that view is unreferenced. The check happens
@@ -39,6 +46,7 @@ pinned path, since page-locked memory is page-aligned.
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from collections.abc import Callable
@@ -47,6 +55,35 @@ import numpy as np
 
 XLA_ALIGN = 128
 """Alignment XLA:CPU requires to import a DLPack buffer without copying."""
+
+NO_REUSE_ENV = "INSITUBATCH_NO_BUFFER_REUSE"
+"""Set truthy to allocate a fresh buffer per batch, bypassing reuse and its liveness tracking.
+
+An escape hatch, deliberately not a tuning parameter. Reuse is safe by construction against
+everything the transform API can do -- a transform that returns a derived array frees its
+buffer early, one that returns a view keeps it tracked, one that retains simply makes the pool
+allocate elsewhere -- so there is no knob here worth asking a user to reason about. What this
+covers is the residue: memory escaping Python object semantics (``arr.ctypes.data`` handed to
+a C extension that stores the pointer), a platform where ``sys.getrefcount`` does not mean
+what we assume, and the possibility that we are wrong. One sentence of documentation:
+*if batches contain data from a previous batch, set this and open an issue.*
+
+It is also the A/B control. Reuse was first measured against a second checkout with the
+``gather`` call site hand-reverted -- a worktree, a branch and a divergence risk, to answer a
+one-line question. This flag is the better instrument: identical code on both sides, only the
+reuse decision differs.
+
+Costs, when set: above glibc's 32 MiB ``mmap`` threshold every batch is ``mmap``ed and
+``munmap``ed again (which is the cliff reuse exists to remove), and under a *pinned* allocator
+every batch becomes its own ``cudaHostAlloc`` -- far more expensive than the pooled case. This
+is a diagnostic, not a supported production configuration.
+"""
+
+
+def _reuse_enabled() -> bool:
+    """Read :data:`NO_REUSE_ENV` once, at pool construction -- never on the hot path."""
+    return os.environ.get(NO_REUSE_ENV, "").strip().lower() in ("", "0", "false", "no")
+
 
 HostAllocator = Callable[[tuple[int, ...], np.dtype], np.ndarray]
 """How the pool gets host memory. The default is aligned heap; the torch adapter swaps in a
@@ -149,6 +186,7 @@ class BatchBuffers:
         self._alloc: HostAllocator = allocator or aligned_empty
         self._pools: dict[tuple[tuple[int, ...], np.dtype], list[_Buffer]] = {}
         self._lock = threading.Lock()
+        self._reuse = _reuse_enabled()
         # Per-epoch observability, reset at the epoch boundary like the chunk cache's
         # hits/misses. `allocations` is the one that matters: it should fall to zero once the
         # pool has converged on the in-flight count, so a nonzero count in a later epoch means
@@ -160,6 +198,14 @@ class BatchBuffers:
         """Lend an ``(n, *inner_shape)`` array of ``dtype``, reusing a free buffer if there is
         one. The returned view's contents are undefined -- the caller overwrites every row.
         """
+        if not self._reuse:
+            # The escape hatch: pre-pool behaviour exactly -- one fresh allocation per call,
+            # no _Buffer, no liveness poll, nothing to reclaim. Allocated outside the lock,
+            # which is only guarding the counters here.
+            with self._lock:
+                self.lends += 1
+                self.allocations += 1
+            return self._alloc((n, *inner_shape), dtype)
         key = (tuple(inner_shape), dtype)
         with self._lock:
             self.lends += 1
@@ -209,8 +255,13 @@ class BatchBuffers:
         Read off a label the allocator carries rather than inspected from the memory, because
         the core cannot ask CUDA anything. It reports *intent*: a pinned allocator that has
         exhausted its budget hands out pageable buffers and says so through its own warning.
+
+        Says so when reuse is switched off, because the epoch line is where someone reads back
+        what a run actually did, and a benchmark taken with the escape hatch set must not be
+        mistakable for a normal one afterwards.
         """
-        return str(getattr(self._alloc, "label", "heap"))
+        label = str(getattr(self._alloc, "label", "heap"))
+        return label if self._reuse else f"{label}, REUSE OFF ({NO_REUSE_ENV})"
 
     def reset_counters(self) -> None:
         """Zero the per-epoch counters (called at the epoch boundary, with the cache's)."""
