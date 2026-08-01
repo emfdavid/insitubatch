@@ -110,6 +110,10 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pre-commit>=3.7",
+    # Test-only: the parity oracle in tests/test_zarr_indexing_parity.py checks our
+    # read planner against zarr's standalone index-transform package. Pure Python
+    # (numpy only), never imported by src/ -- it is not a runtime dependency.
+    "zarr-indexing>=0.1",
 ]
 
 [build-system]
