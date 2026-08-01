@@ -60,6 +60,7 @@ import os
 import sys
 import threading
 from collections.abc import Callable
+from typing import NamedTuple
 
 import numpy as np
 
@@ -90,14 +91,44 @@ is a diagnostic, not a supported production configuration.
 """
 
 
+_FALSY = ("", "0", "false", "no", "off")
+"""Values of :data:`NO_REUSE_ENV` that leave reuse on. ``off`` belongs here: the variable is
+named for the thing it *enables*, so ``=off`` reads as "no-reuse off" and must not disable
+reuse -- the inverted-intent bug that omitting it creates is silent apart from the log stamp."""
+
+
 def _reuse_enabled() -> bool:
     """Read :data:`NO_REUSE_ENV` once, at pool construction -- never on the hot path."""
-    return os.environ.get(NO_REUSE_ENV, "").strip().lower() in ("", "0", "false", "no")
+    return os.environ.get(NO_REUSE_ENV, "").strip().lower() in _FALSY
 
 
 HostAllocator = Callable[[tuple[int, ...], np.dtype], np.ndarray]
 """How the pool gets host memory. The default is aligned heap; the torch adapter swaps in a
 page-locked one, which is how pinning arrives without the core importing a framework."""
+
+
+class BufferStats(NamedTuple):
+    """One consistent reading of the pool, for the per-epoch log line."""
+
+    n_buffers: int
+    nbytes: int
+    kind: str  # "heap" or "pinned" -- allocator intent, see BatchBuffers.kind
+    reuse: bool
+    lends: int
+    allocations: int
+
+    def summary(self) -> str:
+        """The log fragment: ``17 x pinned = 544.0 MiB, 100 lent, 0 allocated``.
+
+        Formatted here rather than in the caller so the field names in a docstring and the
+        words in the line cannot drift, and so the reuse-off case reads as a sentence instead
+        of an interjection inside the arithmetic.
+        """
+        line = (
+            f"{self.n_buffers} x {self.kind} = {self.nbytes / 2**20:.1f} MiB, "
+            f"{self.lends} lent, {self.allocations} allocated"
+        )
+        return line if self.reuse else f"{line} (reuse OFF via {NO_REUSE_ENV})"
 
 
 def aligned_empty(shape: tuple[int, ...], dtype: np.dtype, align: int = XLA_ALIGN) -> np.ndarray:
@@ -246,6 +277,23 @@ class BatchBuffers:
         """
         return buf.base[:n]
 
+    def stats(self) -> BufferStats:
+        """A consistent snapshot of what the pool holds, under one lock acquisition.
+
+        Reading the properties individually takes the lock once each, so a producer allocating
+        between them yields a line whose count and byte total disagree. Cheap to avoid, and a
+        report that cannot be self-contradictory is worth more than three getters.
+        """
+        with self._lock:  # a concurrent take may be appending to one of these lists
+            return BufferStats(
+                n_buffers=sum(len(pool) for pool in self._pools.values()),
+                nbytes=sum(buf.base.nbytes for pool in self._pools.values() for buf in pool),
+                kind=str(getattr(self._alloc, "label", "heap")),
+                reuse=self._reuse,
+                lends=self.lends,
+                allocations=self.allocations,
+            )
+
     @property
     def nbytes(self) -> int:
         """Total host memory the pool owns. Converges once the pipeline reaches steady state."""
@@ -266,12 +314,12 @@ class BatchBuffers:
         the core cannot ask CUDA anything. It reports *intent*: a pinned allocator that has
         exhausted its budget hands out pageable buffers and says so through its own warning.
 
-        Says so when reuse is switched off, because the epoch line is where someone reads back
-        what a run actually did, and a benchmark taken with the escape hatch set must not be
-        mistakable for a normal one afterwards.
+        Reports the allocator alone; whether reuse is switched off is a separate field, which
+        :meth:`BufferStats.summary` renders alongside it -- the epoch line is where someone
+        reads back what a run actually did, and a benchmark taken with the escape hatch set
+        must not be mistakable for a normal one afterwards.
         """
-        label = str(getattr(self._alloc, "label", "heap"))
-        return label if self._reuse else f"{label}, REUSE OFF ({NO_REUSE_ENV})"
+        return str(getattr(self._alloc, "label", "heap"))
 
     def reset_counters(self) -> None:
         """Zero the per-epoch counters (called at the epoch boundary, with the cache's)."""

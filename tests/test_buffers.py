@@ -24,7 +24,14 @@ from typing import Any
 import numpy as np
 import pytest
 
-from insitubatch.buffers import NO_REUSE_ENV, XLA_ALIGN, BatchBuffers, HostAllocator, aligned_empty
+from insitubatch.buffers import (
+    NO_REUSE_ENV,
+    XLA_ALIGN,
+    BatchBuffers,
+    BufferStats,
+    HostAllocator,
+    aligned_empty,
+)
 
 
 def _ptr(a: np.ndarray) -> int:
@@ -442,18 +449,20 @@ def test_no_reuse_env_hands_out_a_fresh_buffer_every_time(monkeypatch) -> None:
     assert not np.shares_memory(second, third)
     assert pool.n_buffers == 0 and pool.nbytes == 0  # nothing retained
     assert pool.lends == 3 and pool.allocations == 3  # every lend is an allocation
-    assert "REUSE OFF" in pool.kind  # the epoch line must give the run away
+    assert "reuse OFF" in pool.stats().summary()  # the epoch line gives the run away
 
 
 def test_reuse_is_on_unless_the_env_says_otherwise(monkeypatch) -> None:
-    for value in ("", "0", "false", "NO", "  "):
+    # "off" is load-bearing: the variable is named for what it enables, so `=off` means
+    # "no-reuse off" and must leave reuse ON. Omitting it inverts the user's intent silently.
+    for value in ("", "0", "false", "NO", "off", "OFF", "  "):
         monkeypatch.setenv(NO_REUSE_ENV, value)
-        assert BatchBuffers().kind == "heap", f"{value!r} should leave reuse on"
-    for value in ("1", "true", "YES", "on"):
+        assert BatchBuffers().stats().reuse, f"{value!r} should leave reuse on"
+    for value in ("1", "true", "YES", "on", "disabled"):
         monkeypatch.setenv(NO_REUSE_ENV, value)
-        assert "REUSE OFF" in BatchBuffers().kind, f"{value!r} should switch reuse off"
+        assert not BatchBuffers().stats().reuse, f"{value!r} should switch reuse off"
     monkeypatch.delenv(NO_REUSE_ENV)
-    assert BatchBuffers().kind == "heap"
+    assert BatchBuffers().stats().reuse
 
 
 def test_no_reuse_keeps_the_alignment_guarantee(monkeypatch) -> None:
@@ -462,3 +471,37 @@ def test_no_reuse_keeps_the_alignment_guarantee(monkeypatch) -> None:
     monkeypatch.setenv(NO_REUSE_ENV, "1")
     buf = BatchBuffers().take(3, (5, 7), np.dtype("float32"))
     assert buf.__array_interface__["data"][0] % XLA_ALIGN == 0
+
+
+def test_epoch_summary_line_matches_its_documented_shape() -> None:
+    """Pin the exact wording of the buffer fragment.
+
+    The line is the operator-facing contract -- tuning.md quotes it, and the guidance is to
+    watch `allocated` and the `x pinned` term. Its docstring and its format string drifted
+    apart once already (`alloc` / `kind=pinned` documented, `allocated` / `x pinned` emitted),
+    which nothing caught because every other test greps a substring. Formatting lives on
+    BufferStats so there is one place to change; this asserts what that place produces.
+    """
+    stats = BufferStats(
+        n_buffers=17, nbytes=544 * 2**20, kind="pinned", reuse=True, lends=100, allocations=0
+    )
+    assert stats.summary() == "17 x pinned = 544.0 MiB, 100 lent, 0 allocated"
+
+    # Reuse off reads as a trailing clause, not an interjection inside the arithmetic, and
+    # names the variable so a stray benchmark row can be traced back to its cause.
+    off = stats._replace(reuse=False, n_buffers=0, nbytes=0, kind="heap", allocations=100)
+    assert off.summary() == (
+        f"0 x heap = 0.0 MiB, 100 lent, 100 allocated (reuse OFF via {NO_REUSE_ENV})"
+    )
+
+
+def test_buffer_stats_is_one_consistent_snapshot() -> None:
+    # Reading n_buffers/nbytes/kind as separate properties takes the lock once each, so a
+    # producer allocating between them yields a line whose count and byte total disagree.
+    pool = BatchBuffers()
+    held = [pool.take(4, (8, 8), np.dtype("float32")) for _ in range(3)]
+    stats = pool.stats()
+    assert stats.n_buffers == 3
+    assert stats.nbytes == 3 * 4 * 8 * 8 * 4
+    assert (stats.lends, stats.allocations, stats.kind, stats.reuse) == (3, 3, "heap", True)
+    del held

@@ -460,20 +460,18 @@ class InSituDataset:
         API and nothing to leave switched on by accident. It is off by default because
         libraries do not configure logging for their callers.
 
-        The two numbers worth watching are ``alloc`` and the hit rate. Allocations should fall
-        to zero once the pool has converged on the in-flight batch count; a nonzero count in a
-        later epoch means buffers are not coming back -- retained batches (which is legitimate,
-        but it is a memory floor) or a changing batch geometry. ``kind=pinned`` is the only
-        confirmation available from a training log that page-locked buffers are actually in
-        use, since the fallback to pageable memory is otherwise silent here.
+        The two numbers worth watching are ``allocated`` and the hit rate. Allocations should
+        fall to zero once the pool has converged on the in-flight batch count; a nonzero count
+        in a later epoch means buffers are not coming back -- retained batches (which is
+        legitimate, but it is a memory floor) or a changing batch geometry. The ``x pinned``
+        term is the only confirmation available from a training log that page-locked buffers
+        are actually in use, since the fallback to pageable memory is otherwise silent here.
         """
         if not logger.isEnabledFor(logging.INFO):
-            return  # skip the property reads (each takes the buffer pool's lock)
-        buffers = pool._buffers
+            return  # skip the snapshot, which takes the buffer pool's lock
         reads = pool.hits + pool.misses
         logger.info(
-            "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s; "
-            "batch buffers %d x %s = %.1f MiB, %d lent, %d allocated",
+            "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s; batch buffers %s",
             self._epoch,
             split or "all",
             pool.hits,
@@ -481,11 +479,7 @@ class InSituDataset:
             100 * pool.hits / reads if reads else 0.0,
             pool.max_resident,
             f", {len(self.bad_chunks)} bad chunks" if self.bad_chunks else "",
-            buffers.n_buffers,
-            buffers.kind,
-            buffers.nbytes / 2**20,
-            buffers.lends,
-            buffers.allocations,
+            pool.buffer_stats().summary(),
         )
 
     def close(self) -> None:
@@ -539,4 +533,4 @@ class _SplitView:
         two arrive together or not at all -- pinned buffers under a caller's own
         ``non_blocking`` copy would reintroduce exactly the use-after-recycle this avoids.
         """
-        self._dataset._pool._buffers.set_allocator(allocator)
+        self._dataset._pool.set_host_allocator(allocator)

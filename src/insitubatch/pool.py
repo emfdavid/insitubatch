@@ -72,7 +72,7 @@ from typing import TextIO
 
 import numpy as np
 
-from .buffers import BatchBuffers
+from .buffers import BatchBuffers, BufferStats, HostAllocator
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk
 
 try:  # optional: stronger transform fingerprint (closures + globals). `--extra cache`.
@@ -294,9 +294,12 @@ class ChunkPool:
             self._load_log()
             self._open_log()
         # Batch *output* buffers, distinct from the chunk slots below: gather lends one per
-        # variable per batch and reclaims it once the consumer's view is unreferenced. Driven
-        # only from the single producer thread that gathers (as the rest of gather already
-        # assumes), so it needs no lock of its own.
+        # variable per batch and reclaims it once the consumer's view is unreferenced. It
+        # carries its own lock, and needs it -- one ChunkPool is shared by every active
+        # iteration, so `zip(ds.train, ds.val)` or two DataLoaders put two producer threads
+        # through `gather` at once. Do not remove that lock on the assumption that gather is
+        # single-threaded: two producers deciding the same buffer is free is a silent
+        # wrong-data bug. See BatchBuffers' own docstring.
         self._buffers = BatchBuffers()
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
         self._bytes = 0
@@ -474,6 +477,20 @@ class ChunkPool:
             for key in keys:
                 self._unpin_one(key)
             self._cv.notify_all()
+
+    def buffer_stats(self) -> BufferStats:
+        """One consistent reading of the batch-output pool, for the per-epoch summary."""
+        return self._buffers.stats()
+
+    def set_host_allocator(self, allocator: HostAllocator) -> None:
+        """Point the batch-output pool at a different host allocator.
+
+        How the torch adapter installs page-locked buffers without the core importing a
+        framework. A method rather than letting callers reach ``pool._buffers`` directly, so
+        the buffer pool stays this class's private business and there is one place to look for
+        who can change it.
+        """
+        self._buffers.set_allocator(allocator)
 
     def unpin_all(self) -> None:
         """Epoch boundary reset: clear every pin and drop abandoned partials.
