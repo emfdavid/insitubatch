@@ -582,11 +582,13 @@ capabilities already under design there. This section records **the design depen
 what we would build versus what we would inherit. It deliberately does *not* track issue
 status, reviewers, or dates; that state lives outside this repo and goes stale here.
 
-- **Lazy indexing / `IndexTransform`** (the `zarr-indexing` package, zarr-python
-  [#4196](https://github.com/zarr-developers/zarr-python/pull/4196), split out of the
-  [#3906](https://github.com/zarr-developers/zarr-python/pull/3906) work) — a standalone,
-  NumPy-only implementation of TensorStore-style index transforms plus chunk resolution
-  against a `DimensionGridLike` protocol. We have **dogfooded it as a correctness oracle**:
+- **Lazy indexing / `IndexTransform`** (the
+  [`zarr-indexing`](https://github.com/zarr-developers/zarr-python/releases/tag/zarr_indexing-v0.1.0)
+  package, zarr-python [#4196](https://github.com/zarr-developers/zarr-python/pull/4196),
+  split out of the [#3906](https://github.com/zarr-developers/zarr-python/pull/3906) work) —
+  a standalone, NumPy-only implementation of TensorStore-style index transforms plus chunk
+  resolution against a `DimensionGridLike` protocol. We **dogfood it as a correctness oracle**
+  (a test-only dependency; nothing under `src/` imports it):
   with `ArrayGeometry` supplying a `DimensionGridLike` per axis, `iter_chunk_transforms`
   resolves the *exact* stored-chunk set `plan.py` produces, across offset windows,
   coarser/finer variable grids, short final chunks, inner grids, and a non-zero sample axis

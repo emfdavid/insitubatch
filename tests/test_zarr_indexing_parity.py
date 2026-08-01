@@ -1,7 +1,8 @@
 """Dogfood parity: our read planner vs zarr's new ``zarr-indexing`` package.
 
-`zarr-indexing` (zarr-developers/zarr-python#4196, the leaf split of the #3906
-IndexTransform work) is a standalone, NumPy-only package implementing
+`zarr-indexing` (released as ``zarr_indexing-v0.1.0`` from zarr-python#4196, the
+leaf split of the #3906 IndexTransform work) is a standalone, NumPy-only package
+implementing
 TensorStore-style index transforms + chunk resolution against a
 ``DimensionGridLike`` protocol. This test dogfoods it as a *correctness oracle*
 for :func:`insitubatch.plan.build_stored_chunk_reads`: it asserts that
@@ -31,9 +32,8 @@ the waste (5 samples wanted -> all 12 in the touched chunks read), so the bounda
 stays visible if anyone is later tempted to read the fancy resolver as a "future
 engine" for insitubatch. It is not one -- see DESIGN.md, "Upstream capabilities".
 
-The package is not a dependency; the test skips unless it is importable. To run it::
-
-    uv run --with path/to/packages/zarr-indexing pytest tests/test_zarr_indexing_parity.py
+``zarr-indexing`` is a *test-only* dependency (the ``dev`` group), never a runtime
+one: nothing under ``src/`` imports it. It runs in every CI job.
 """
 
 from __future__ import annotations
@@ -43,11 +43,10 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 import pytest
+import zarr_indexing as zi
 
-zi = pytest.importorskip("zarr_indexing")
-
-from insitubatch.plan import _read_chunks, build_stored_chunk_reads  # noqa: E402
-from insitubatch.types import ArrayGeometry  # noqa: E402
+from insitubatch.plan import _read_chunks, build_stored_chunk_reads
+from insitubatch.types import ArrayGeometry
 
 
 @dataclass(frozen=True)
