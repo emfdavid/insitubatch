@@ -41,6 +41,8 @@ from insitubatch import (
 )
 from insitubatch.source import InSituDataset
 
+from ._logging import add_log_level, configure_logging
+
 try:
     from sklearn.preprocessing import StandardScaler
 except ImportError as exc:  # pragma: no cover - example-only dep
@@ -191,7 +193,9 @@ def main() -> None:
         help="comma list; must share the sample axis + chunking. --wb2 default: two "
         "surface fields. Synthetic/other URLs default to every variable in the store.",
     )
+    add_log_level(p)
     a = p.parse_args()
+    configure_logging(a.log_level)
     url = WB2 if a.wb2 else a.url
     if a.variables:
         variables = a.variables.split(",")

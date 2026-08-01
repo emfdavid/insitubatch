@@ -25,6 +25,7 @@ from insitubatch import Batch, InSituDataset, to_torch
 from insitubatch.frameworks import pin_host_buffers
 
 from .._forecast_metrics import MetricsLog, StallTimer, preload_epoch
+from .._logging import configure_logging
 from .data import build_datasets, build_parser, evaluate
 from .train_torch import AdvectionCNN, _forecast
 
@@ -160,7 +161,9 @@ def cli() -> argparse.Namespace:
         action="store_true",
         help="page-lock the batch buffers so this loop's H2D copies can overlap compute",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    configure_logging(args.log_level)  # `build_parser` added --log-level
+    return args
 
 
 def main() -> None:

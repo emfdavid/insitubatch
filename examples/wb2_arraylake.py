@@ -48,6 +48,8 @@ from insitubatch import SplitName, arraylake_store, open_geometries, split_by_ch
 from insitubatch.source import InSituDataset
 from insitubatch.types import Batch
 
+from ._logging import add_log_level, configure_logging
+
 # The public WeatherBench2 ERA5, as an Arraylake/Icechunk repo. ERA5 is grouped by
 # resolution; 240x121 is a sensible default real workload.
 ARRAYLAKE_REPO = "earthmover-public/weatherbench2"
@@ -229,7 +231,9 @@ def main() -> None:
         help="hold the (subset) train split resident -> epoch 2+ is decode-once (no re-fetch)",
     )
     p.add_argument("--cache-dir", default=None, help="spill cached slots to this NVMe dir (mmap)")
+    add_log_level(p)
     a = p.parse_args()
+    configure_logging(a.log_level)
 
     store = arraylake_store(a.repo, branch=a.branch)
     run(
