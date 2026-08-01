@@ -253,6 +253,58 @@ def _check_arm(out: Path, arm: dict[str, Any], p: argparse.ArgumentParser) -> No
             break  # one row settles it; the guard above keeps a file single-armed
 
 
+class PersistenceCheck:
+    """Assert that persistence RMSE stays constant per store -- the corruption detector.
+
+    Persistence RMSE is ``rmse(t2m(t), t2m(t+24h))`` over the val split: **no model, no
+    training, no batch size**. It is a property of the bytes the loader delivered, so every
+    run over one store must produce the same number. Measured, it is bit-identical --
+    ``0.588030696`` across batch sizes 32/64/128, pinned and unpinned, every repeat.
+
+    That is what makes it a loader test. A double-lend bug in the batch-buffer pool was
+    invisible in throughput (the same bytes still moved) and invisible in forecast skill (the
+    corrupt run scored +13.6%, above real ERA5's honest +11.4%), but it moved persistence
+    0.682 -> 0.934 and made it vary +-0.307 between repeats of one config. Nothing else in
+    the sweep would have caught it, and nothing did -- for a night.
+
+    Drift warns loudly and immediately but does not abort: the rows are still worth having
+    for diagnosis, and a raise mid-sweep would throw away hours of a long run. :meth:`report`
+    is what makes it non-ignorable, and the caller exits non-zero on it.
+    """
+
+    RTOL = 1e-6  # observed drift was 22%; observed jitter on healthy runs was exactly zero
+
+    def __init__(self) -> None:
+        self.expected: dict[str, float] = {}
+        self.drifted: list[str] = []
+
+    def observe(self, store: str, value: float, label: str) -> None:
+        first = self.expected.setdefault(store, value)
+        if abs(value - first) <= self.RTOL * abs(first):
+            return
+        msg = f"{label}: persistence RMSE {value:.9f} != {first:.9f} (first seen for {store!r})"
+        self.drifted.append(msg)
+        print(
+            f"\n*** LOADER WARNING *** {msg}\n*** persistence is model-independent: the "
+            f"batches differ, not the training ***\n",
+            flush=True,
+        )
+
+    def report(self) -> bool:
+        """Print the verdict; True when every store held its baseline."""
+        if not self.drifted:
+            baselines = ", ".join(f"{s}={v:.6f}" for s, v in sorted(self.expected.items()))
+            print(f"persistence invariant held: {baselines or '(no val rows)'}")
+            return True
+        print(
+            f"\nPERSISTENCE INVARIANT VIOLATED ({len(self.drifted)} runs) -- the loader "
+            f"returned different bytes for the same store:"
+        )
+        for msg in self.drifted:
+            print(f"  {msg}")
+        return False
+
+
 def _run_config(
     cmd: list[str],
     cfg: dict[str, Any],
@@ -260,6 +312,7 @@ def _run_config(
     out_fh: Any,
     env: dict[str, str] | None = None,
     arm: dict[str, Any] | None = None,
+    check: PersistenceCheck | None = None,
 ) -> None:
     """Run one child, tag its rows with the config + repeat, append to the combined file."""
     with tempfile.NamedTemporaryFile("r+", suffix=".jsonl") as tmp:
@@ -275,6 +328,16 @@ def _run_config(
             # afterwards otherwise, and mixing them up is silent.
             row.update(arm or {})
             out_fh.write(json.dumps(row) + "\n")
+            persistence = row.get("val_persistence_rmse")
+            # Only the final row of each run carries it; NaN elsewhere (NaN != NaN filters).
+            if check is not None and isinstance(persistence, float) and persistence == persistence:
+                # Keyed by the store, not the geom: batch size does not change the val set, so
+                # every payload config over one store must agree too.
+                check.observe(
+                    str(cfg.get("store") or cfg["geom"]),
+                    persistence,
+                    f"{cfg['geom']} repeat {repeat} [{row.get('run', '?')}]",
+                )
     out_fh.flush()
 
 
@@ -366,6 +429,7 @@ def main() -> None:
     ).stdout.strip()
     print(f"children import insitubatch from: {which}\n")
     seen_geom: set[str] = set()
+    check = PersistenceCheck()
     with args.out.open("a") as out_fh:
         for i, cfg in enumerate(configs):
             # One ceiling per geom (compute identity); the report joins every config to it.
@@ -391,9 +455,12 @@ def main() -> None:
                     extra["MiB/buffer"] = round(buffer_mib(cfg["size"], cfg["batch_size"]), 1)
                     extra["MiB/step"] = round(step_mib(cfg["size"], cfg["batch_size"]), 1)
                 print(f"=== {label} repeat {r + 1}/{args.repeats} {extra} ceiling={do_ceiling} ===")
-                _run_config(cmd, cfg, r, out_fh, env=env, arm=arm)
+                _run_config(cmd, cfg, r, out_fh, env=env, arm=arm, check=check)
     print(f"\nwrote sweep rows -> {args.out}")
     print(f"aggregate with: uv run python -m bench.advection_report --in {args.out}")
+    if not check.report():
+        # Non-zero so an unattended sweep cannot hand back numbers measured on bad batches.
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

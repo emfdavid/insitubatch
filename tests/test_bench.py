@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from bench.advection_sweep import PersistenceCheck
 from bench.engines import Cfg, run
 from bench.make_dataset import make_dataset
 from bench.run import run_suite
@@ -153,3 +154,35 @@ def test_run_forwards_store_kwargs(tmp_path) -> None:
     cfg = Cfg(engine="insitu", url=url, storage="file", sample_chunk=8, batch_size=8, epochs=1)
     rows = run(cfg, store_kwargs={"skip_signature": True})
     assert rows and rows[0].n_samples > 0
+
+
+def test_persistence_check_flags_the_drift_that_hid_the_double_lend() -> None:
+    # Replays the real 2026-07-31 numbers. The corrupt pinned arm scored +13.6% forecast
+    # skill -- better than real ERA5's honest +11.4% -- so skill could not catch it. What
+    # gave it away is that persistence RMSE, which involves no model, moved between repeats
+    # of one config while the healthy arm reproduced its value exactly.
+    check = PersistenceCheck()
+    for r, healthy in enumerate((0.682, 0.682, 0.682)):
+        check.observe("synth128", healthy, f"synth128 repeat {r}")
+    assert check.report()  # bit-identical across repeats -> silent
+
+    check = PersistenceCheck()
+    for r, corrupt in enumerate((0.682, 0.934, 0.627)):
+        check.observe("synth128", corrupt, f"synth128 repeat {r}")
+    assert not check.report()
+    assert len(check.drifted) == 2  # both departures from the first value
+
+
+def test_persistence_check_ties_every_batch_size_to_one_store() -> None:
+    # Batch size does not change the val set: measured, all of 32/64/128 returned
+    # 0.588030696 over the synth256 store. Keying on the store (not the geom) is what makes
+    # a payload sweep cross-check its own arms instead of each config trusting itself.
+    check = PersistenceCheck()
+    for bs in (32, 64, 128):
+        check.observe("synth256", 0.588030696, f"synth256b{bs}")
+    assert check.report()
+
+    check.observe("synth256", 0.588030696 * (1 + 1e-9), "fp jitter")  # under RTOL -> ignored
+    assert check.report()
+    check.observe("synth256", 0.594, "the buggy reuse arm")
+    assert not check.report()

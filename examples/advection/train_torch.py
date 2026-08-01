@@ -19,7 +19,7 @@ from torch import nn
 
 from insitubatch import InSituDataset, to_torch
 
-from .data import build_datasets, cli, evaluate
+from .data import build_datasets, cli, evaluate, format_skill
 
 
 class AdvectionCNN(nn.Module):
@@ -103,10 +103,7 @@ def main() -> None:
     args = cli()
     ds = build_datasets(args)
     model_rmse, persistence_rmse = train(ds, epochs=args.epochs, device=args.device)
-    print(
-        f"\n24 h forecast RMSE on held-out data: model {model_rmse:.3f}  vs  "
-        f"persistence {persistence_rmse:.3f}  ({persistence_rmse / model_rmse:.1f}x better)"
-    )
+    print(format_skill(model_rmse, persistence_rmse))
 
 
 if __name__ == "__main__":

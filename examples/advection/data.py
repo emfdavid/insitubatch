@@ -291,6 +291,50 @@ def evaluate(view: Iterable[Batch], predict: Callable[[Batch], np.ndarray]) -> t
     return rmse(pred, target), rmse(persistence, target)
 
 
+def format_skill(model_rmse: float, persistence_rmse: float) -> str:
+    """The end-of-run verdict line: forecast skill against persistence, with a verdict word.
+
+    Reported as a **signed skill score** (``1 - model/persistence``) rather than a ratio,
+    because the sign is what matters and a ratio hides it. A corrupt-batch run once printed
+    "0.5x better" for a model that was *84% worse* than predicting no change; a reader skims
+    past that, and it went unnoticed for a night. ``-84.2% skill  [FAIL]`` does not.
+
+    **The verdict is the sign of the skill, and nothing else** -- deliberately no "too low"
+    band. Healthy skill is a property of the *data*, not of correctness: measured, this
+    example earns +33% on the 64-cell synthetic grid, +22% at 128, +10% at 256, and +11% on
+    real WeatherBench2 ERA5. A corrupt run scored +13.6% -- above honest ERA5. So no fixed
+    threshold separates working from broken, and any band tight enough to catch corruption
+    would fire on real data. ``skill < 0`` is the one comparison that means the same thing on
+    every dataset: worse than predicting no change.
+
+    The second line is the stronger check, and it catches what the sign test cannot.
+    Persistence RMSE is ``rmse(t2m(t), t2m(t+24h))`` -- **no model is involved**, so it is a
+    fixed property of the validation data and must be identical across runs, repeats, and
+    code paths reading the same store. The +13.6% run above was corrupt precisely because
+    *its* persistence had drifted 0.682 -> 0.934 and varied +-0.307 between repeats of one
+    config, while a healthy arm reproduced 0.682 to the last digit every time. The skill
+    number passed; the invariant did not. So the invariant is printed as an invariant rather
+    than buried as a denominator, and :func:`bench.advection_sweep` asserts it across repeats.
+    """
+    skill = 1.0 - model_rmse / persistence_rmse
+    verdict = "PASS" if skill > 0 else "FAIL"
+    lines = [
+        f"\n24 h forecast skill on held-out data: model RMSE {model_rmse:.3f} vs "
+        f"persistence {persistence_rmse:.3f}  ->  {skill:+.1%} skill  [{verdict}]"
+    ]
+    if verdict == "FAIL":
+        lines.append(
+            "  FAIL: worse than predicting no change at all -- on any dataset that is a broken "
+            "run,\n  and the data path is the first suspect, not the training."
+        )
+    lines.append(
+        f"  persistence RMSE ({persistence_rmse:.3f}) is model-independent -- a fixed property "
+        "of the val data.\n  If it moves between runs over the same store, the loader is "
+        "returning different bytes."
+    )
+    return "\n".join(lines)
+
+
 def _range(s: str) -> tuple[int, int]:
     start, stop = (int(x) for x in s.split(","))
     return (start, stop)
