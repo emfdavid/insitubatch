@@ -432,6 +432,7 @@ class InSituDataset:
                 self.cache_hits = pool.hits
                 self.cache_misses = pool.misses
                 self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
+                self._log_epoch_summary(pool)
                 # Persistence was asked for but served nothing, and the cache *was*
                 # consulted (entries existed and every revive failed) -> almost certainly
                 # a stale cache_dir or changed data/transforms. Loud once per epoch; a
@@ -446,6 +447,41 @@ class InSituDataset:
                         pool.revive_mismatch,
                         pool.revive_missing,
                     )
+
+    def _log_epoch_summary(self, pool: ChunkPool) -> None:
+        """One INFO line per epoch: what the chunk cache and the batch buffers did.
+
+        Enabled the standard way -- ``logging.getLogger("insitubatch").setLevel(logging.INFO)``
+        -- rather than through a constructor flag, so there is nothing to thread through the
+        API and nothing to leave switched on by accident. It is off by default because
+        libraries do not configure logging for their callers.
+
+        The two numbers worth watching are ``alloc`` and the hit rate. Allocations should fall
+        to zero once the pool has converged on the in-flight batch count; a nonzero count in a
+        later epoch means buffers are not coming back -- retained batches (which is legitimate,
+        but it is a memory floor) or a changing batch geometry. ``kind=pinned`` is the only
+        confirmation available from a training log that page-locked buffers are actually in
+        use, since the fallback to pageable memory is otherwise silent here.
+        """
+        if not logger.isEnabledFor(logging.INFO):
+            return  # skip the property reads (each takes the buffer pool's lock)
+        buffers = pool._buffers
+        reads = pool.hits + pool.misses
+        logger.info(
+            "epoch %d: chunks %d/%d hit (%.0f%%), peak resident %d%s; "
+            "batch buffers %d x %s = %.1f MiB, %d lent, %d allocated",
+            self._epoch,
+            pool.hits,
+            reads,
+            100 * pool.hits / reads if reads else 0.0,
+            pool.max_resident,
+            f", {len(self.bad_chunks)} bad chunks" if self.bad_chunks else "",
+            buffers.n_buffers,
+            buffers.kind,
+            buffers.nbytes / 2**20,
+            buffers.lends,
+            buffers.allocations,
+        )
 
     def close(self) -> None:
         """Release the cache pool's backing (mmap handles, cached chunks) and any async
