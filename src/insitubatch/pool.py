@@ -498,6 +498,7 @@ class ChunkPool:
             # is load-time and persists.
             self.hits = self.misses = 0
             self.revive_mismatch = self.revive_missing = 0
+            self._buffers.reset_counters()  # batch outputs too -- same epoch boundary
             self._cv.notify_all()
 
     def _pin(self, key: tuple[str, int]) -> None:  # call under the lock

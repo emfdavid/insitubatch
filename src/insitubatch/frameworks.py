@@ -110,6 +110,9 @@ def pinned_allocator(budget_bytes: int | None = None) -> HostAllocator:
         used += nbytes
         return pinned.numpy()
 
+    # Read back by `BatchBuffers.kind` for the epoch summary: without it there is no way to
+    # confirm from a training log that `--pin` / `as_torch(device=...)` actually took effect.
+    allocate.label = "pinned"  # type: ignore[attr-defined]
     return allocate
 
 

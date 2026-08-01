@@ -16,6 +16,7 @@ corrupted batches in a training run.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Any
@@ -340,6 +341,64 @@ def test_concurrent_take_never_lends_one_buffer_twice() -> None:
     for t in threads:
         t.join()
     assert not failures, failures[:5]
+
+
+def test_counters_separate_reuse_from_allocation() -> None:
+    """``allocations`` vs ``lends`` is the signal that the pool converged; keep them honest."""
+    pool = BatchBuffers()
+    first = pool.take(4, (3,), np.dtype("f4"))
+    second = pool.take(4, (3,), np.dtype("f4"))  # first still live -> a second allocation
+    assert (pool.lends, pool.allocations, pool.n_buffers) == (2, 2, 2)
+
+    del first, second
+    pool.take(4, (3,), np.dtype("f4"))  # both free now -> reuse, no allocation
+    assert (pool.lends, pool.allocations, pool.n_buffers) == (3, 2, 2)
+
+    pool.reset_counters()  # the epoch boundary: counters zero, buffers stay
+    assert (pool.lends, pool.allocations, pool.n_buffers) == (0, 0, 2)
+
+
+def test_epoch_summary_reports_buffer_state(write_zarr, caplog) -> None:  # type: ignore[no-untyped-def]
+    """The per-epoch INFO line is the only place buffer behaviour surfaces in a training log."""
+    import logging
+
+    from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_chunk
+
+    url, _srcs = write_zarr(n=40, spc=8)
+    geom = open_geometries(obstore_store(url))["t2m"]
+    ds = InSituDataset(
+        obstore_store(url),
+        split_by_chunk(geom, fractions=(1.0, 0.0, 0.0)),
+        shuffle=False,
+        batch_size=5,
+        block_chunks=2,
+    )
+
+    with caplog.at_level(logging.INFO, logger="insitubatch.source"):
+        for epoch in range(2):
+            ds.set_epoch(epoch)
+            for _ in ds.train:
+                pass
+
+    lines = [r.getMessage() for r in caplog.records if "batch buffers" in r.getMessage()]
+    assert len(lines) == 2, lines  # one per epoch
+    assert "epoch 1:" in lines[1] and "heap" in lines[1]
+
+    def counts(line: str) -> tuple[int, int]:
+        m = re.search(r"(\d+) lent, (\d+) allocated", line)
+        assert m, line
+        return int(m[1]), int(m[2])
+
+    (lent0, alloc0), (lent1, alloc1) = counts(lines[0]), counts(lines[1])
+    # 10 batches, not 8: a batch never crosses a shuffle block, so 40 rows in blocks of
+    # 16/16/8 give ragged batches. One buffer lent per batch, every epoch.
+    assert lent0 == lent1 == 10
+    # The point of the line. Epoch 0 allocates however many are genuinely in flight -- 3 or 4
+    # here, decided by producer/consumer timing, so it is not a fixed number. What must hold is
+    # that a warm pool stops allocating: were buffers failing to come back, this would climb
+    # toward one per batch and the pool would be a growing memory floor.
+    assert alloc0 >= 1
+    assert alloc1 <= 1, f"warm epoch still allocating: {lines[1]}"
 
 
 def test_exported_torch_tensor_holds_the_buffer() -> None:

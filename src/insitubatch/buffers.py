@@ -149,6 +149,12 @@ class BatchBuffers:
         self._alloc: HostAllocator = allocator or aligned_empty
         self._pools: dict[tuple[tuple[int, ...], np.dtype], list[_Buffer]] = {}
         self._lock = threading.Lock()
+        # Per-epoch observability, reset at the epoch boundary like the chunk cache's
+        # hits/misses. `allocations` is the one that matters: it should fall to zero once the
+        # pool has converged on the in-flight count, so a nonzero count in a later epoch means
+        # buffers are not coming back -- retained batches, or a batch geometry that changes.
+        self.lends = 0
+        self.allocations = 0
 
     def take(self, n: int, inner_shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
         """Lend an ``(n, *inner_shape)`` array of ``dtype``, reusing a free buffer if there is
@@ -156,6 +162,7 @@ class BatchBuffers:
         """
         key = (tuple(inner_shape), dtype)
         with self._lock:
+            self.lends += 1
             buffers = self._pools.setdefault(key, [])
             for buf in buffers:
                 # A free buffer big enough along the batch axis serves this batch; a short
@@ -170,6 +177,7 @@ class BatchBuffers:
             del allocated  # load-bearing: the idle baseline must not count this reference
             buf.calibrate()
             buffers.append(buf)
+            self.allocations += 1
             return self._lend(buf, n)
 
     @staticmethod
@@ -187,6 +195,28 @@ class BatchBuffers:
         """Total host memory the pool owns. Converges once the pipeline reaches steady state."""
         with self._lock:  # a concurrent take may be appending to one of these lists
             return sum(buf.base.nbytes for pool in self._pools.values() for buf in pool)
+
+    @property
+    def n_buffers(self) -> int:
+        """How many buffers the pool owns -- the in-flight count it converged on."""
+        with self._lock:
+            return sum(len(pool) for pool in self._pools.values())
+
+    @property
+    def kind(self) -> str:
+        """What the buffers are made of, for the epoch summary: ``"pinned"`` or ``"heap"``.
+
+        Read off a label the allocator carries rather than inspected from the memory, because
+        the core cannot ask CUDA anything. It reports *intent*: a pinned allocator that has
+        exhausted its budget hands out pageable buffers and says so through its own warning.
+        """
+        return str(getattr(self._alloc, "label", "heap"))
+
+    def reset_counters(self) -> None:
+        """Zero the per-epoch counters (called at the epoch boundary, with the cache's)."""
+        with self._lock:
+            self.lends = 0
+            self.allocations = 0
 
     def set_allocator(self, allocator: HostAllocator) -> None:
         """Swap where buffers come from, dropping any already allocated.
