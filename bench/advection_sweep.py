@@ -346,7 +346,7 @@ def main() -> None:
     p.add_argument(
         "--sweeps",
         default="inflight,size,chunk",
-        help="comma list of: inflight,size,chunk,inner",
+        help="comma list of: inflight,size,chunk,inner,payload",
     )
     p.add_argument(
         "--url-prefix",
