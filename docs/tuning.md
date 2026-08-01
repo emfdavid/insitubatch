@@ -57,6 +57,33 @@ If you set `cache_budget_bytes` above the working set, residency rises to that b
 purpose — that extra memory *is* the cross-epoch cache. Point `cache_dir` at local NVMe to
 spill it to disk instead of RAM.
 
+### The batch queue is a high-water mark
+
+Batch buffers are pooled and held for the dataset's lifetime, so that third bound is the
+largest number of batches ever simultaneously live — not the steady state. A transient burst
+that holds many at once (`list(ds.val)` to materialize a split, gradient accumulation over N
+steps, an exported tensor kept past its batch) permanently raises the resident floor to that
+burst's size.
+
+It cannot raise **peak** memory. The floor is exactly what was simultaneously live at the
+peak, which fresh-allocation-per-batch also held at that instant; pooling only declines to
+give it back afterwards. If the burst fit, the floor fits.
+
+`close()` is the only release, and it drops the cross-epoch chunk cache and store session with
+it — so size the budget for your burst rather than planning to reclaim between phases. The
+per-epoch log line reports the pool directly, and `allocated` staying nonzero after the first
+epoch is the signal that batches are not coming back:
+
+```
+epoch 3 (train): chunks 151/151 hit (100%), peak resident 51;
+                 batch buffers 17 x pinned = 544.0 MiB, 100 lent, 0 allocated
+```
+
+Under `pin_host_buffers` / `as_torch(..., device=...)` the floor is page-locked, which the
+kernel cannot reclaim — so it is bounded separately at RAM/8 by default. Past that the loader
+hands out ordinary pageable memory and warns once, rather than raising or stalling; raise
+`pin_budget_bytes` if you meant to exceed it.
+
 ## Shuffle quality
 
 `block_chunks` is also the shuffle-quality knob. Each batch is drawn from the samples in the
