@@ -2,7 +2,12 @@
 
 This page is practical guidance for setting up `InSituDataset` on your own store. For *why*
 the engine behaves this way — the read plan, the pool, the prefetch pipeline — see
-[Architecture](architecture.md).
+[Architecture](architecture.md); for the measurements behind the numbers here, see
+[Benchmarks](benchmarks.md).
+
+Read [Two operating points](#two-operating-points) first if you are serving inference rather
+than training — several defaults below are chosen for training and are the wrong call for a
+latency-sensitive single pass.
 
 ## The mental model
 
@@ -17,6 +22,37 @@ Hold these two sentences and the rest follows:
 So the loader reads each chunk once, holds a rolling window of them, and serves shuffled
 batches out of that window — concurrency fills the window, the window bounds memory.
 
+## Two operating points
+
+The same knobs point in different directions depending on what you are optimizing, and the
+difference is large enough that guidance for one is actively wrong for the other.
+
+- **Training** optimizes **steady-state throughput per GB of RAM**. It runs for hours, so the
+  first batch costs nothing, and it re-reads the data every epoch, so caching and shuffle
+  quality matter.
+- **Inference / scoring** optimizes **time to first batch**. It is single-pass (no shuffle to
+  protect, nothing to cache across epochs) and often short-lived, so a cold start you could
+  ignore in training is the whole latency budget.
+
+`max_inflight` is where they diverge, and not in the way its name suggests. Sweeping it over
+real WeatherBench2 ERA5 on a GPU loop:
+
+| `max_inflight` | samples/s | stall | peak RSS | **cold TTFB** | warm TTFB |
+|---|--:|--:|--:|--:|--:|
+| 1 | 1332.1 | 3.7% | 1095 MB | **3462 ms** | 87 ms |
+| 4 | 1330.3 | 3.6% | 1121 MB | 656 ms | 85 ms |
+| 16 | 1326.9 | 3.7% | 1198 MB | 347 ms | 88 ms |
+| 32 (default) | 1332.1 | 3.4% | 1246 MB | **317 ms** | 80 ms |
+
+**Steady-state throughput does not move at all** — 1332.1 at either end, stall flat — while
+cold TTFB moves **11×**. On a loop with enough compute per byte, read-ahead is a *cold-start*
+dial, not a throughput dial. Dropping it to 1 buys ~150 MB (12%) for free in training, and
+costs an inference service more than three seconds on its first request.
+
+The corollary for the other two axes: **`block_chunks` is a training knob** (it buys shuffle
+quality, and only `.train` shuffles — eval views are deterministic), and the **cross-epoch
+cache is a training knob** (single-pass scoring never reads a chunk twice).
+
 ## The knobs you set
 
 All of these are `InSituDataset(...)` arguments except the last, which is fixed when the
@@ -26,15 +62,17 @@ store is written.
 |---|---|---|---|
 | batch size | `batch_size` | samples per batch | 32 |
 | shuffle window | `block_chunks` | outer chunks held resident + shuffled across at once | 16 |
-| reads in flight | `max_inflight` | concurrent stored-chunk GETs (the network dial) | 32 |
+| reads in flight | `max_inflight` | concurrent stored-chunk GETs — sets **cold start**; sets throughput only while IO-bound | 32 |
 | batch queue | `prefetch_depth` | assembled batches queued ahead of your training step | 2 |
 | cache | `cache_budget_bytes`, `cache_dir` | decoded data retained across epochs (decode-once) | off |
 | stored-chunk size | `inner_chunks` (write time) | the fetch unit — how each chunk is split for IO | — |
 
 `batch_size` is the ordinary ML knob and barely touches IO. `block_chunks` trades shuffle
-quality against RAM. `max_inflight` is what you turn to saturate the network. The cache is
-how repeated epochs (or repeated scoring passes) skip re-reading. `inner_chunks` is the one
-decision made when the data is written, and it sets how cheap concurrency can be.
+quality against RAM. `max_inflight` saturates the network *while you are IO-bound* — once
+compute is the constraint it stops buying throughput and buys cold start instead, which is
+why the table above matters more than its name suggests. The cache is how repeated epochs (or
+repeated scoring passes) skip re-reading. `inner_chunks` is the one decision made when the
+data is written, and it sets how cheap concurrency can be.
 
 ## The memory model
 
@@ -94,25 +132,53 @@ converges toward a full-dataset shuffle over many epochs — the regime training
 in. [`shuffle_quality`](api.md) scores an emitted order 0–1 (1 ≈ global) if you want to
 measure it; [Architecture](architecture.md) explains why the block-local shuffle converges.
 
+This section is training-only: only `.train` shuffles — `.val`, `.test` and `.all` are
+deterministic — so a scoring pass has no shuffle quality to protect.
+
 ## The recipe
 
 1. **At write time, pick `inner_chunks`** so a stored chunk is ~10–50 MB: small enough that
    many reads in flight stay cheap, large enough that per-request overhead doesn't dominate.
 2. **Start with the defaults** (`max_inflight=32`, `block_chunks=16`). 32 reads in flight
    saturates in-region S3 in most cases.
-3. **Raise `block_chunks`** for better shuffle quality, as far as your RAM allows
-   (`block_chunks × outer_chunk_bytes` ≤ your budget).
-4. **Tune `max_inflight`** if the network isn't saturated — raise it until decoded MB/s
-   stops climbing. From the repo you can measure the knee directly:
+3. **Size `block_chunks` to your RAM budget** (`block_chunks × outer_chunk_bytes` ≤ what you
+   have). Which direction to push it from there is the branch below.
+4. **Tune `max_inflight`** by the metric your operating point cares about — raise it until
+   decoded MB/s stops climbing, *and* check TTFB, because past the IO-bound region only TTFB
+   keeps responding. From the repo you can measure the knee directly:
 
    ```bash
    python -m bench.probe_decode --url <store> --concurrency 1,4,8,16,32
    ```
 
+   If throughput is flat across that range you are compute-bound, and the knob is now buying
+   cold start alone — see the table above before turning it down to reclaim memory.
+
 5. **Sanity-check concurrency cost** (`max_inflight × stored_chunk_bytes`). If it's large,
    your stored chunks are too big — chunk the inner dims (step 1).
-6. **For multi-epoch training**, set `cache_budget_bytes` to hold the split (and `cache_dir`
-   on NVMe to spill); epoch 0 warms it and later epochs read decode-once.
+
+Then branch on what you are running:
+
+**For multi-epoch training**
+
+- Set `cache_budget_bytes` to hold the split (and `cache_dir` on NVMe to spill); epoch 0 warms
+  it and later epochs read decode-once.
+- Raise `block_chunks` as far as RAM allows — it is your shuffle quality.
+- If RAM is tight, **`max_inflight` is the cheapest thing to give up**: measured, dropping it
+  to 1 cost nothing in steady-state throughput and returned ~12% of peak RSS. You pay the cold
+  start once, at the start of a run that lasts hours.
+
+**For inference / single-pass scoring**
+
+- **Leave `max_inflight` high.** It is the cold-start knob, worth ~11× on time to first batch,
+  and the ~150 MB it costs is the cheapest latency you will ever buy. This is the one place
+  not to economize.
+- Keep `block_chunks` small — there is no shuffle to protect (eval views are deterministic),
+  so the window only needs to hold the read plan.
+- Skip the cross-epoch cache unless you score the same data more than once; a single pass
+  never reads a chunk twice, so the budget is pure overhead.
+- If the first batch still dominates, the remaining lever is at write time: smaller
+  `inner_chunks` make the first window's reads finish sooner (step 1).
 
 ## Regimes
 
