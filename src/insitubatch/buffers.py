@@ -9,17 +9,27 @@ count tracks batches rather than dataset size. Paid per batch, that is a fresh p
 fault in plus ``munmap``'s TLB work.
 
 Below the threshold the freed block is recycled on the heap instead and reuse buys nothing --
-it costs about 2-3%. Allocation-bound (``bench/batch_buffer_sweep.py``) the pool is *flat*
-across a 16x payload range while fresh allocation falls off a cliff at 32 MiB: 8 MiB -2.4%,
-32 MiB +16%, 64 MiB +13%, 128 MiB +10%.
+it costs about 2-3%.
 
-**In a compute-bound loop it is worth nothing, and that is the expected result.** The GPU
-advection sweep A/B'd reuse against no-reuse at 8/16/32 MiB per buffer and came back inside
-+-0.2 points of ceiling with the sign flipping -- because that loop runs at 99.5-100% of its
-compute ceiling, so producer-side allocation has nowhere to surface even at 32 MiB where the
-``mmap`` path demonstrably engages. So this removes a cliff for the loops that are *not*
-already compute-bound; it does not make a fed GPU faster. Weather batches sit below the
-threshold anyway; ViT and microscopy batches sit above it.
+**What this is worth is a range, and where a workload lands in it is set by one thing: how
+much of the loader's work the compute step is already hiding.** The range is bounded at both
+ends, and both ends are measured.
+
+*Upper bound -- allocation-bound* (``bench/batch_buffer_sweep.py``, the producer's cost fully
+exposed): the pool is flat across a 16x payload range while fresh allocation falls off a
+cliff at 32 MiB. 8 MiB -2.4%, 32 MiB +16%, 64 MiB +13%, 128 MiB +10%.
+
+*Lower bound -- compute-bound: exactly zero*, and the GPU advection sweep is that case, not a
+midpoint. A/B'd against no-reuse over 8/16/32/64 MiB per buffer it came back at
++0.21/+0.20/-0.18/-0.29 points of ceiling -- sign flipping, and at 64 MiB the two arms agree
+to 0.04% absolute. That loop runs at 98.7-100% of its compute ceiling, so producer-side
+allocation has nowhere to surface *even where the* ``mmap`` *path demonstrably engages*.
+Prefetch hiding this is prefetch working.
+
+So the honest claim is not "faster training" -- it is that the cliff cannot bite you, at a
+cost of 2-3% below the threshold. It pays where the loader is not already free: shallower
+compute per byte, inference rather than training, a cold cache, an IO-bound epoch. Weather
+batches sit below the threshold anyway; ViT and microscopy batches sit above it.
 
 **Hand-out is by view, reclaim is by liveness.** A buffer is lent as a view of a base array the
 pool owns forever, and comes back only once that view is unreferenced. The check happens

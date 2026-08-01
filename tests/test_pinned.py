@@ -248,3 +248,24 @@ def test_finished_holds_are_retired_so_the_set_stays_bounded() -> None:
     for i in range(50):
         flight.hold({f"b{i}": np.empty(1, dtype="float32")}, Done())
     assert len(flight._pending) == 1  # the newest, deliberately retained until the next hold
+
+
+@pytest.mark.parametrize(
+    "name", ["float32", "float64", "float16", "int8", "int16", "int32", "int64", "uint8", "bool"]
+)
+def test_pinned_buffer_dtype_comes_from_torchs_own_mapping(name: str) -> None:
+    """The buffer's dtype must be the one the viewing tensor will have -- no CUDA needed.
+
+    The pool allocates through ``torch.empty(..., pin_memory=True).numpy()`` and ``to_torch``
+    views it with ``torch.from_dlpack``. If the numpy->torch mapping used at allocation ever
+    disagreed with torch's own, the buffer and the tensor would differ with nothing to catch
+    it. Asking torch both times makes that unrepresentable; this pins the round-trip.
+    """
+    from insitubatch.frameworks import _torch_dtype
+
+    dtype = np.dtype(name)
+    resolved = _torch_dtype(dtype)
+    # The whole round trip an allocation makes, minus the page-locking (which needs a device).
+    assert torch.empty((2, 3), dtype=resolved).numpy().dtype == dtype
+    # ...and it agrees with the converter to_torch will use on the way back out.
+    assert torch.from_dlpack(np.empty((2, 3), dtype=dtype)).dtype == resolved
