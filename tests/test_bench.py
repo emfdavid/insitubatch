@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from bench.advection_sweep import PersistenceCheck
+from bench.advection_sweep import PersistenceCheck, store_key
 from bench.engines import Cfg, run
 from bench.make_dataset import make_dataset
 from bench.run import run_suite
@@ -186,3 +186,35 @@ def test_persistence_check_ties_every_batch_size_to_one_store() -> None:
     assert check.report()
     check.observe("synth256", 0.594, "the buggy reuse arm")
     assert not check.report()
+
+
+def test_persistence_check_separates_stores_that_differ_by_chunking() -> None:
+    # Regression: the sweep writes one store per (store, sample_chunk, inner_chunk) --
+    # `..._synth128_c256_i128.zarr` vs `..._synth128_c4_i128.zarr` -- and splits are
+    # chunk-aligned, so a different sample_chunk yields a different val set and a legitimately
+    # different persistence RMSE. Keying the invariant on `store` alone collapsed all four
+    # configs of `--sweeps chunk` onto one baseline and failed a healthy run.
+    check = PersistenceCheck()
+    for spc, value in ((256, 0.588), (64, 0.612), (16, 0.640), (4, 0.671)):
+        check.observe(
+            store_key({"store": "synth128", "size": 128, "sample_chunk": spc, "inner_chunk": None}),
+            value,
+            f"synth128 c{spc}",
+        )
+    assert check.report(), "configs reading different stores must not share a baseline"
+
+    # ...while a real drift within one store is still caught.
+    key = store_key({"store": "synth128", "size": 128, "sample_chunk": 64, "inner_chunk": None})
+    check.observe(key, 0.934, "the corrupt arm")
+    assert not check.report()
+
+
+def test_persistence_check_still_ties_inner_chunk_variants_by_their_own_store() -> None:
+    # The `inner` sweep varies spatial tiling only, which cannot move a sample-axis split --
+    # but each variant is still its own zarr, so it gets its own baseline rather than being
+    # asserted equal to the others by accident.
+    keys = {
+        store_key({"store": "synth128", "size": 128, "sample_chunk": 64, "inner_chunk": ic})
+        for ic in (128, 64, 32)
+    }
+    assert len(keys) == 3

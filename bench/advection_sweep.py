@@ -187,6 +187,26 @@ def _configs(
             yield {**cfg, "sweep": "payload", "batch_size": bs, "geom": f"{cfg['store']}b{bs}"}
 
 
+def store_key(cfg: dict[str, Any]) -> str:
+    """Which zarr a config reads -- the identity both the URL and the persistence check use.
+
+    Deliberately one function rather than two expressions. It is keyed on ``store`` rather than
+    ``geom`` because the payload sweep gives each batch size its own geom (hence its own
+    ceiling) while they all read one store; and it carries ``sample_chunk`` / ``inner_chunk``
+    because those are written into the store, so configs differing in them are *different
+    data*, not the same data read differently.
+
+    That last part was a bug. The check keyed on ``store`` alone while the URL included the
+    chunking, so ``--sweeps chunk`` collapsed four stores onto one baseline. Splits are
+    chunk-aligned, so a different ``sample_chunk`` gives a different val set and a legitimately
+    different persistence RMSE -- the run would have been failed for reading exactly the data
+    it was asked to read. A false alarm is expensive on a check whose only value is being
+    trusted, so URL and key now come from here and cannot drift apart again.
+    """
+    inner = cfg["inner_chunk"] or cfg["size"]
+    return f"{cfg['store']}_c{cfg['sample_chunk']}_i{inner}"
+
+
 def _command(
     cfg: dict[str, Any],
     *,
@@ -211,10 +231,7 @@ def _command(
         str(epochs),
     ]
     if cfg["source"] == "synthetic":
-        inner = cfg["inner_chunk"] or cfg["size"]
-        # Keyed on `store`, not `geom`: the payload sweep gives each batch size its own geom
-        # (its own ceiling) while they all read the one store.
-        url = f"{url_prefix}_{cfg['store']}_c{cfg['sample_chunk']}_i{inner}.zarr"
+        url = f"{url_prefix}_{store_key(cfg)}.zarr"
         cmd += ["--url", url, "--n-steps", str(n_steps)]
         cmd += ["--size", str(cfg["size"]), "--sample-chunk", str(cfg["sample_chunk"])]
         if cfg["inner_chunk"] is not None:
@@ -359,10 +376,12 @@ def _run_config(
             persistence = row.get("val_persistence_rmse")
             # Only the final row of each run carries it; NaN elsewhere (NaN != NaN filters).
             if check is not None and isinstance(persistence, float) and persistence == persistence:
-                # Keyed by the store, not the geom: batch size does not change the val set, so
-                # every payload config over one store must agree too.
+                # The same identity the URL is built from, so configs that read one zarr are
+                # held to one baseline and configs that read different zarrs are not compared.
+                # Batch size is absent from it on purpose: it does not change the val set, so
+                # every payload config over one store must agree.
                 check.observe(
-                    str(cfg.get("store") or cfg["geom"]),
+                    store_key(cfg) if cfg["source"] == "synthetic" else str(cfg["geom"]),
                     persistence,
                     f"{cfg['geom']} repeat {repeat} [{row.get('run', '?')}]",
                 )
