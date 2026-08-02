@@ -398,9 +398,11 @@ def test_epoch_summary_reports_buffer_state(write_zarr, caplog) -> None:  # type
         return int(m[1]), int(m[2])
 
     (lent0, alloc0), (lent1, alloc1) = counts(lines[0]), counts(lines[1])
-    # 10 batches, not 8: a batch never crosses a shuffle block, so 40 rows in blocks of
-    # 16/16/8 give ragged batches. One buffer lent per batch, every epoch.
-    assert lent0 == lent1 == 10
+    # 8 batches: batches are cut over the whole epoch order, so 40 rows at batch_size 5 give
+    # 8 full ones and no remainder -- the blocks (16/16/8 rows) do not each end in a short
+    # batch. One buffer lent per batch, every epoch. This read 10 while batches were cut
+    # per block; see tests/test_source.py's draw-policy section.
+    assert lent0 == lent1 == 8
     # The point of the line. Epoch 0 allocates however many are genuinely in flight -- 3 or 4
     # here, decided by producer/consumer timing, so it is not a fixed number. What must hold is
     # that a warm pool stops allocating: were buffers failing to come back, this would climb

@@ -382,3 +382,134 @@ def test_val_view_is_deterministic_train_shuffles(write_zarr) -> None:
     val5 = np.concatenate([b.sample_indices for b in ds.val])
     np.testing.assert_array_equal(val0, val5)  # val ignores epoch (no shuffle)
     np.testing.assert_array_equal(val0, np.sort(val0))  # and is in order
+
+
+# --- batch draw policy across shuffle-block boundaries -------------------------------------
+#
+# Batches used to be drawn *within* each block (`for start in range(rstart, rstop, bs)`), so
+# every block whose row count was not a multiple of batch_size ended in a short batch -- one
+# per block, not one per epoch, and up to three distinct shapes once the epoch's own short
+# final block is counted. That is a fixed-shape consumer's problem (torch.compile / jax.jit
+# retrace per shape, and the retrace cache never settles) and a silent one: sample-once still
+# held, so nothing failed. Batches are now drawn over the whole epoch order, with block
+# readiness and release driven off a frontier.
+
+_STRADDLE = [
+    # (n, spc, block_chunks, batch_size) -- rows/block deliberately not a multiple of bs
+    pytest.param(160, 4, 8, 12, id="32-rows-per-block-bs12"),
+    pytest.param(160, 4, 4, 10, id="16-rows-per-block-bs10"),
+    pytest.param(120, 8, 2, 7, id="16-rows-per-block-bs7"),
+]
+
+
+def _batch_sizes(url, *, n, spc, block_chunks, batch_size, shuffle=True):  # type: ignore[no-untyped-def]
+    geom = open_geometries(obstore_store(url))["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        batch_size=batch_size,
+        block_chunks=block_chunks,
+        shuffle=shuffle,
+        seed=0,
+    )
+    ds.set_epoch(0)
+    batches = list(ds.train)
+    return ds, batches
+
+
+@pytest.mark.parametrize(("n", "spc", "block_chunks", "batch_size"), _STRADDLE)
+def test_only_the_epochs_final_batch_is_short(
+    write_zarr, n: int, spc: int, block_chunks: int, batch_size: int
+) -> None:
+    """One ragged batch per *epoch*, not per block -- the normal data-loader contract."""
+    url, _ = write_zarr(n=n, spc=spc)
+    _ds, batches = _batch_sizes(url, n=n, spc=spc, block_chunks=block_chunks, batch_size=batch_size)
+    sizes = [len(b.sample_indices) for b in batches]
+
+    short = [i for i, s in enumerate(sizes) if s != batch_size]
+    assert short in ([], [len(sizes) - 1]), f"short batches at {short} of {len(sizes)}: {sizes}"
+    assert len(set(sizes)) <= 2, f"more than two shapes: {sorted(set(sizes))}"
+
+
+@pytest.mark.parametrize(("n", "spc", "block_chunks", "batch_size"), _STRADDLE)
+def test_every_sample_still_appears_exactly_once(
+    write_zarr, n: int, spc: int, block_chunks: int, batch_size: int
+) -> None:
+    """Sample-once is the invariant the whole draw policy exists to preserve."""
+    url, _ = write_zarr(n=n, spc=spc)
+    _ds, batches = _batch_sizes(url, n=n, spc=spc, block_chunks=block_chunks, batch_size=batch_size)
+    idx = np.concatenate([b.sample_indices for b in batches])
+    assert sorted(idx.tolist()) == list(range(n))
+
+
+def test_a_batch_may_span_a_block_boundary(write_zarr) -> None:
+    """The positive statement, so the test above cannot pass by dropping the remainder.
+
+    Sequential order makes blocks contiguous sample ranges: 4 samples/chunk x 8 chunks = 32
+    rows per block, so with batch_size 12 the third batch is rows [24, 36) and must straddle.
+    """
+    url, _ = write_zarr(n=160, spc=4)
+    _ds, batches = _batch_sizes(url, n=160, spc=4, block_chunks=8, batch_size=12, shuffle=False)
+    rows_per_block = 4 * 8
+    spanning = [b for b in batches if len(set(b.sample_indices // rows_per_block)) > 1]
+    assert spanning, "no batch crossed a block boundary"
+    assert len(spanning[0]) == 12
+
+
+@pytest.mark.parametrize(("n", "spc", "block_chunks", "batch_size"), _STRADDLE)
+def test_residency_is_still_bounded_by_two_blocks(
+    write_zarr, n: int, spc: int, block_chunks: int, batch_size: int
+) -> None:
+    """A straddling batch needs two blocks co-resident -- which is already the budget floor.
+
+    `scheduler.py`'s "Budget floor" note sizes the working set at two blocks (current plus
+    one read-ahead), so the frontier costs nothing here. A regression to three would mean a
+    block is being held past its last row.
+    """
+    url, _ = write_zarr(n=n, spc=spc)
+    ds, _batches = _batch_sizes(url, n=n, spc=spc, block_chunks=block_chunks, batch_size=batch_size)
+    assert ds.resident_peak <= 2 * block_chunks
+
+
+def test_batch_len_is_its_row_count(write_zarr) -> None:
+    """`len(batch)` is how a consumer implements drop_last -- it must not need a variable name."""
+    url, _ = write_zarr(n=50, spc=8)
+    _ds, batches = _batch_sizes(url, n=50, spc=8, block_chunks=2, batch_size=8, shuffle=False)
+    assert [len(b) for b in batches] == [len(b.sample_indices) for b in batches]
+    assert len(batches[-1]) == 50 % 8  # the one short batch a caller may choose to drop
+    assert all(len(b) == b.arrays["t2m"].shape[0] for b in batches)
+
+
+@pytest.mark.parametrize(("n", "spc", "block_chunks", "batch_size"), _STRADDLE)
+def test_a_completed_epoch_leaves_no_block_pinned(
+    write_zarr, n: int, spc: int, block_chunks: int, batch_size: int
+) -> None:
+    """The release frontier must drain on its own -- not be rescued by the epoch backstop.
+
+    Release is now conditional (``blocks[freed].rstop <= stop_row``) where it used to be
+    unconditional per block, so "a block never released" is newly reachable: it would not
+    raise, it would starve the next epoch's admission, which parks on a full budget awaiting
+    a release that never comes.
+
+    Asserting that is harder than it looks. ``_iterate`` calls ``pool.unpin_all()`` at the
+    *start* of every epoch precisely to absorb pins an aborted epoch leaked, so any test that
+    merely runs two epochs passes whether the frontier released anything or not -- it exercises
+    the backstop, not the frontier. So this reads the pin table between epochs, where the
+    backstop cannot mask it. Verified to fail if the release condition is weakened to ``<``.
+    """
+    url, _ = write_zarr(n=n, spc=spc)
+    geom = open_geometries(obstore_store(url))["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        batch_size=batch_size,
+        block_chunks=block_chunks,
+        shuffle=True,
+        seed=0,
+    )
+    ds.set_epoch(0)
+    idx = np.concatenate([b.sample_indices for b in ds.train])
+    assert sorted(idx.tolist()) == list(range(n))
+    assert not ds._pool._pinned, f"{len(ds._pool._pinned)} chunks pinned after a full epoch"

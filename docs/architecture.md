@@ -295,9 +295,10 @@ flowchart LR
     Q -.->|"full ⇒ producer blocks<br/>(backpressure)"| ASM
 ```
 
-- **Producer** starts the scheduler over the epoch's chunks, then per shuffle-block
-  waits the block assembled, gathers its batches, and unpins it, pushing batches to
-  a bounded `queue.Queue(maxsize=d)`.
+- **Producer** starts the scheduler over the epoch's chunks, then walks the epoch's
+  batches — waiting each block a batch draws from, gathering, and unpinning a block
+  once a batch has consumed its last row — pushing batches to a bounded
+  `queue.Queue(maxsize=d)`.
 - **Consumer** (`__iter__`) just pops finished batches → the train/infer step
   overlaps with IO+decode+assembly of the next `d` batches.
 - **Backpressure / memory bound** — queue depth `d` + the pool's byte budget cap
@@ -443,15 +444,29 @@ training; the inference path validates the range and raises instead). Guaranteed
 `test_order_covers_every_sample_exactly_once`, `test_order_handles_partial_final_chunk`, and
 the decode-once suite.
 
-**The tail is ragged per block, not per epoch.** Batches do not span shuffle blocks: the
-producer batches `order` within each block's row range and restarts at the boundary. So when a
-block's sample count (`≈ block_chunks × spc`, minus edges) is not a multiple of `batch_size` —
-the common case — the **last batch of every block is short**. No sample is lost or duplicated
-(sample-once holds), but an epoch yields *several* short batches, and steps-per-epoch is
-`Σ ⌈block_samples / bs⌉`, not `⌈N / bs⌉` — worth knowing for BatchNorm on a small tail or
-step-count math. There is deliberately no `drop_last` today; whether to add one is an open
-question (see Known limitations in
-[DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#known-limitations--defects)).
+**The tail is ragged once per epoch.** Batches are cut over the whole epoch `order`, so
+steps-per-epoch is `⌈N / bs⌉` and every batch is full except the last — the ordinary
+data-loader contract. A batch may therefore span a shuffle-block boundary, which the producer
+handles with two monotone frontiers over the block list: wait every block a batch draws from,
+and release a block once a batch has consumed its last row. Peak co-residency stays at **two
+blocks**, which is already the budget floor (the working set is sized at the current block plus
+one read-ahead block) — and when `bs` divides a block's row count no batch straddles at all, so
+the frontier costs nothing.
+
+Batches used to be cut *within* each block's row range, which made the last batch of **every**
+block short whenever `block_chunks × spc` was not a multiple of `batch_size`. Sample-once held
+either way, so nothing failed loudly; what it broke was fixed-shape consumers — `torch.compile`
+and `jax.jit` retrace per shape, and with the epoch's own short final block that was up to
+*three* shapes, so the retrace cache never settled.
+
+There is deliberately no `drop_last`. Dropping the epoch's short tail is the caller's choice
+and `len(batch)` is the whole implementation:
+
+```python
+for batch in ds.train:
+    if len(batch) < ds.batch_size:
+        continue
+```
 
 ## Transforms — three stages, placed by cost
 
