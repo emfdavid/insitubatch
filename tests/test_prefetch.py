@@ -11,6 +11,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 import zarr
 
 from insitubatch import (
@@ -129,7 +130,8 @@ def test_partial_iteration_reaps_producer(tmp_path) -> None:
     ds.close()
 
 
-def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
+@pytest.mark.parametrize("batch_size", [4, 12], ids=["divides-a-block", "straddles-blocks"])
+def test_early_break_then_next_epoch_does_not_deadlock(tmp_path, batch_size: int) -> None:
     """A capped epoch (early break) must not poison the next epoch.
 
     Regression: ``try_admit`` pins each chunk the driver admits; the producer only
@@ -140,6 +142,20 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
     free no room and the driver deadlocks on ``_capacity`` while the consumer hangs
     in ``wait_ready`` (observed on the bench: scheduler loop idle, prefetch thread
     parked, no in-flight work). Pins must not survive an epoch.
+
+    Parametrized on whether a batch can straddle a block boundary: a block is 2 chunks x 8
+    samples = 16 rows, so ``batch_size=4`` divides it and no batch ever crosses, while
+    ``batch_size=12`` makes the second batch span two blocks.
+
+    Be precise about what that buys. Cutting batches over the epoch defers a block's release
+    until a batch consumes its last row, but that extra hold lasts only from the straddling
+    ``wait_ready`` to the release a few statements later, inside one producer step -- a
+    consumer ``break`` cannot land there. The *durable* two-block pin at a break comes from
+    read-ahead, which predates all of this. So the straddling arm does not reach a pinned
+    state the dividing arm cannot; it is coverage that the teardown path works under a
+    straddling draw, not a distinct leak. ``unpin_all`` clears the pin table wholesale, so
+    the count never mattered -- and the assertion below keeps *both* arms from passing on a
+    single-block state that would not exercise the leak at all.
     """
     url = _write(tmp_path, n=160, spc=8)  # 20 chunks; train split ~16
     geom = open_geometries(obstore_store(url))["t2m"]
@@ -147,11 +163,12 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
 
     # budget = 2 * block_chunks chunks; batch_size < one block so a block yields
     # several batches -> breaking after one batch leaves the current block pinned too.
+    block_chunks = 2
     ds = InSituDataset(
         obstore_store(url),
         manifest,
-        batch_size=4,
-        block_chunks=2,
+        batch_size=batch_size,
+        block_chunks=block_chunks,
         prefetch_depth=2,
     )
 
@@ -160,6 +177,12 @@ def test_early_break_then_next_epoch_does_not_deadlock(tmp_path) -> None:
     it = iter(ds.train)
     next(it)
     time.sleep(0.3)  # let read-ahead pin a block or two before we tear down
+    # The precondition the test rests on: the break really is leaving more than one
+    # block's worth of chunks pinned, so epoch 1 is inheriting the state described above.
+    assert len(ds._pool._pinned) > block_chunks, (
+        f"only {len(ds._pool._pinned)} chunks pinned at the break -- "
+        "not the multi-block leak this test exists to clear"
+    )
     it.close()  # deterministic generator teardown (GeneratorExit -> __iter__ finally)
 
     # epoch 1: must run to completion, not deadlock on leaked pins.
