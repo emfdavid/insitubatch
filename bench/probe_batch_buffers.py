@@ -56,6 +56,13 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 
+# The probe measures what the pool does, so it must not carry its own copy of how the pool
+# does it. These were duplicated here when the probe predated the implementation; importing
+# them is what keeps a change to alignment or to the numpy->torch mapping show up in the
+# numbers instead of quietly diverging from them (tests/test_bench.py pins the coupling).
+from insitubatch.buffers import XLA_ALIGN, aligned_empty
+from insitubatch.frameworks import _torch_dtype
+
 if TYPE_CHECKING:
     import torch
 
@@ -159,7 +166,7 @@ def probe_h2d(case: Case, iters: int) -> tuple[float, float]:
     """``(pageable_ms, pinned_ms)`` for one H2D copy of a batch."""
     import torch
 
-    dtype = getattr(torch, str(case.dtype))
+    dtype = _torch_dtype(case.dtype)
     pageable = torch.empty(case.shape, dtype=dtype)
     pinned = torch.empty(case.shape, dtype=dtype, pin_memory=True)
 
@@ -215,7 +222,7 @@ def probe_roundtrip(case: Case, iters: int) -> Roundtrip:
     """
     import torch
 
-    dtype = getattr(torch, str(case.dtype))
+    dtype = _torch_dtype(case.dtype)
     owner = torch.empty(case.shape, dtype=dtype, pin_memory=True)
     base = owner.numpy()  # must alias, not copy
     shares = base.__array_interface__["data"][0] == owner.data_ptr()
@@ -233,21 +240,6 @@ def probe_roundtrip(case: Case, iters: int) -> Roundtrip:
         pageable_ms=_time_h2d(pageable, iters),
         pinned_ms=_time_h2d(owner, iters),
     )
-
-
-XLA_ALIGN = 128  # XLA:CPU's zero-copy alignment requirement, in bytes
-
-
-def aligned_empty(shape: tuple[int, ...], dtype: np.dtype, align: int = XLA_ALIGN) -> np.ndarray:
-    """``np.empty(shape, dtype)`` whose data pointer is a multiple of ``align``.
-
-    Over-allocate a byte buffer, skip to the next boundary, then view/reshape. numpy makes
-    no alignment promise beyond its own 16-byte floor, which is why this is needed at all.
-    """
-    n = int(np.prod(shape)) * dtype.itemsize
-    raw = np.empty(n + align, dtype=np.uint8)
-    off = (-raw.__array_interface__["data"][0]) % align
-    return raw[off : off + n].view(dtype).reshape(shape)
 
 
 class JaxCheck(NamedTuple):
@@ -430,7 +422,7 @@ def probe_overlap(case: Case, iters: int, load: Load) -> tuple[float, float, flo
     """
     import torch
 
-    dtype = getattr(torch, str(case.dtype))
+    dtype = _torch_dtype(case.dtype)
     pageable = torch.empty(case.shape, dtype=dtype)
     pinned = torch.empty(case.shape, dtype=dtype, pin_memory=True)
     stream = torch.cuda.Stream()

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
+import bench.probe_batch_buffers as probe
+import insitubatch.buffers as core_buffers
 from bench.advection_sweep import PersistenceCheck, store_key
 from bench.engines import Cfg, run
 from bench.make_dataset import make_dataset
+from bench.probe_batch_buffers import ARMS, CASES, Case, JaxCheck, Roundtrip
 from bench.run import run_suite
 
 
@@ -218,3 +222,133 @@ def test_persistence_check_still_ties_inner_chunk_variants_by_their_own_store() 
         for ic in (128, 64, 32)
     }
     assert len(keys) == 3
+
+
+# --- probe_batch_buffers -----------------------------------------------------------------
+#
+# The probe is what decided the pool's design, and it is the instrument we go back to when a
+# measurement is disputed -- so it has to keep measuring the thing the core actually does. It
+# predates the implementation, and carried its own copies of `aligned_empty`, `XLA_ALIGN` and
+# the numpy->torch dtype mapping; a change to any of those in `src/` would have left the probe
+# quietly reporting the old design's numbers. These tests pin the coupling (identity, not
+# equality: an equal-looking reimplementation is exactly the drift being prevented) and run the
+# CPU-reachable arms end to end so an API rename breaks CI rather than the next GPU session.
+
+# One tiny case: the arms are exercised for wiring, not timed. The real CASES sweep to 256 MiB
+# per buffer times four source chunks, which is a benchmark, not a test.
+_TOY = (Case("toy", 4, (2, 3), np.dtype("f4")),)
+
+
+def test_probe_shares_the_cores_buffer_primitives() -> None:
+    assert probe.aligned_empty is core_buffers.aligned_empty
+    assert probe.XLA_ALIGN is core_buffers.XLA_ALIGN
+
+
+def test_probe_alloc_arm_times_both_sides() -> None:
+    fresh_ms, reuse_ms = probe.probe_alloc(_TOY[0], iters=3)
+    assert fresh_ms > 0 and reuse_ms > 0
+
+
+def test_probe_main_runs_the_host_arm(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """The default invocation from the module docstring, on a toy payload."""
+    monkeypatch.setattr(probe, "CASES", _TOY)
+    monkeypatch.setattr("sys.argv", ["probe_batch_buffers", "--arms", "alloc", "--iters", "2"])
+    probe.main()
+    out = capsys.readouterr().out
+    assert "fresh np.empty vs reused buffer" in out and "toy" in out
+
+
+def test_probe_rejects_an_unknown_arm(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("sys.argv", ["probe_batch_buffers", "--arms", "aloc"])
+    with pytest.raises(SystemExit, match="unknown arm"):
+        probe.main()
+
+
+def test_probe_cases_are_dtypes_the_core_can_allocate() -> None:
+    """Every swept case must survive the pool's own allocator and torch's own mapping.
+
+    The GPU arms build their tensors with `_torch_dtype`, the same converter `pinned_allocator`
+    uses, so a case whose dtype the core cannot serve is a probe measuring nothing -- and it
+    would only show up on a GPU box. Checked here, on CPU, for the real CASES.
+    """
+    torch = pytest.importorskip("torch")
+    from insitubatch.frameworks import _torch_dtype
+
+    for case in CASES:
+        assert probe.aligned_empty((1, *case.inner), case.dtype).dtype == case.dtype
+        assert torch.empty(0, dtype=_torch_dtype(case.dtype)).numpy().dtype == case.dtype
+
+
+def test_probe_jax_arm_runs_without_a_gpu() -> None:
+    """The soundness question `to_jax` rests on, exercised on whatever backend is present.
+
+    Without a GPU the two device-transfer checks are untestable and must report *unknown*
+    rather than *safe* -- a probe that returns "ok" on a CPU box would retire the question it
+    exists to keep open.
+    """
+    pytest.importorskip("jax")
+    check = probe.probe_jax(trials=2)
+    assert check.keeps_alive, "jnp.from_dlpack must hold the array it was given"
+    assert check.aligned_zero_copy == 2, "128-byte alignment is what makes zero-copy reliable"
+    if not [d for d in __import__("jax").devices() if d.platform == "gpu"]:
+        assert (check.race_observed, check.holds_source, check.poll_insufficient) == (
+            None,
+            None,
+            None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("race", "holds", "insufficient"),
+    [(True, False, True), (True, True, False), (False, False, False), (None, None, None)],
+)
+def test_jax_verdict_needs_both_an_async_copy_and_an_unheld_source(
+    race: bool | None, holds: bool | None, insufficient: bool | None
+) -> None:
+    # Only the pairing condemns reuse: an async transfer JAX holds across is guarded by the
+    # pool's own poll, and a synchronous one has no window at all.
+    check = JaxCheck(
+        backend="cpu",
+        device="cpu",
+        trials=1,
+        default_zero_copy=1,
+        aligned_zero_copy=1,
+        keeps_alive=True,
+        race_observed=race,
+        holds_source=holds,
+    )
+    assert check.poll_insufficient is insufficient
+
+
+@pytest.mark.parametrize(
+    ("shares", "full", "prefix", "ms", "verdict"),
+    [
+        (False, True, True, 1.0, "BROKEN: .numpy() copied"),
+        (True, True, True, 1.0, "ok"),
+        (True, False, True, 1.0, "fast but flag says pageable"),
+        (True, True, True, 9.0, "DEAD: degrades to pageable"),
+        (True, True, False, 1.0, "fast but flag says pageable"),
+    ],
+)
+def test_roundtrip_verdict_requires_the_flag_and_the_clock_to_agree(
+    shares: bool, full: bool, prefix: bool, ms: float, verdict: str
+) -> None:
+    # `is_pinned()` alone is not trustworthy: the failure that matters is a non_blocking copy
+    # silently degrading to a synchronous pageable one, which shows up in the clock.
+    rt = Roundtrip(
+        shares=shares,
+        full_pinned=full,
+        prefix_pinned=prefix,
+        ms=ms,
+        pageable_ms=10.0,
+        pinned_ms=1.0,
+    )
+    assert rt.verdict == verdict
+
+
+def test_every_declared_arm_is_reachable_from_main() -> None:
+    # `--arms all` expands to ARMS, so an arm added to the tuple without a branch in main()
+    # (or renamed in one place only) is a silent no-op.
+    source = probe.main.__code__.co_consts
+    branches = {c for c in source if isinstance(c, str)}
+    assert set(ARMS) <= branches
