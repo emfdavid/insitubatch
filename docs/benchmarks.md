@@ -487,7 +487,11 @@ the step's own copy.
     an unchanged checkout — the same size as these effects.
 
     Reproduce the no-reuse arm with `INSITUBATCH_NO_BUFFER_REUSE=1` rather than a second
-    checkout; the epoch log stamps `REUSE OFF` so those rows stay identifiable.
+    checkout; the epoch log stamps `REUSE OFF` so those rows stay identifiable. Do not combine
+    it with `--pin` for a *timing* row: the pin budget is a monotone counter sized for a pool
+    that converges, so without reuse it is spent within a few batches and the rest of the run
+    silently runs pageable. The pool warns when you do it. It is still the right way to ask
+    whether reuse is corrupting a pinned run — a correctness question, not a throughput one.
 
     The ceiling is sampled **once per geometry per run** (`do_ceiling = ceiling and r == 0`)
     while insitu gets every repeat, so `% of ceiling` inherits a single measurement's noise and

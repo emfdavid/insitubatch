@@ -30,6 +30,7 @@ from insitubatch.buffers import (
     BatchBuffers,
     BufferStats,
     HostAllocator,
+    _Buffer,
     aligned_empty,
 )
 
@@ -493,6 +494,93 @@ def test_epoch_summary_line_matches_its_documented_shape() -> None:
     assert off.summary() == (
         f"0 x heap = 0.0 MiB, 100 lent, 100 allocated (reuse OFF via {NO_REUSE_ENV})"
     )
+
+
+def test_a_baseline_that_over_counts_raises_instead_of_lending_twice() -> None:
+    """Refcount below the idle baseline is not a near-miss -- it is the double-lend, early.
+
+    Every reference counted at calibration is structural and outlives the buffer, so the count
+    can only rise. A *lower* reading therefore means the baseline swallowed a transient, which
+    makes ``free`` permanently true: the pool lends one allocation to every batch at once and
+    each overwrites the last. That is what shipped and had to be found by its symptoms
+    (persistence RMSE), so the condition is now checked on every poll.
+
+    Reproduced the way the original bug arose: calibrate while an extra reference to the owner
+    is live -- exactly what ``torch.empty(pin_memory=True).numpy()`` did by leaving the
+    allocator's return value on the caller's stack -- then drop it.
+    """
+    buf = _Buffer(aligned_empty((4, 16), np.dtype("f4")))
+    extra = buf.owner  # the transient the baseline must not count
+    buf.calibrate()  # ...but does, here
+
+    lent = buf.base[:1]
+    assert not buf.free  # a lent view still reads as taken, so calibrate's own guard passes
+    del lent, extra
+
+    with pytest.raises(RuntimeError, match="liveness baseline is wrong"):
+        _ = buf.free
+
+
+def test_a_correctly_calibrated_buffer_never_reads_below_its_baseline() -> None:
+    """The other half: the guard must not fire in ordinary use, lent or idle."""
+    pool = BatchBuffers()
+    for _ in range(4):
+        lent = pool.take(4, (8, 8), np.dtype("f4"))
+        crop = lent[..., 0:2]  # a transform's derived view, then the batch itself dropped
+        del lent
+        pool.take(4, (8, 8), np.dtype("f4"))  # polls every buffer, including the held one
+        del crop
+    assert pool.n_buffers == 2
+
+
+def _labelled(label: str) -> HostAllocator:
+    """An allocator carrying an allocator-intent label, as ``pinned_allocator`` does."""
+
+    def allocate(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+        return aligned_empty(shape, dtype)
+
+    allocate.label = label  # type: ignore[attr-defined]
+    return allocate
+
+
+def test_pinning_with_reuse_off_warns_and_still_works(monkeypatch, caplog) -> None:  # type: ignore[no-untyped-def]
+    """Loud, but not refused.
+
+    The pairing is bad: each batch takes its own ``cudaHostAlloc``, and the pin budget is a
+    monotone counter sized for a pool that converges, so it is spent within a few batches and
+    the rest of the run is pageable while ``kind`` still says ``pinned``. It stays *reachable*
+    because the double-lend lived on the pinned path and nowhere else -- refusing it would
+    leave a user who suspects reuse corruption unable to test that without also changing the
+    allocator, which is two variables and answers nothing.
+    """
+    monkeypatch.setenv(NO_REUSE_ENV, "1")  # read at construction, so before the pool exists
+    pool = BatchBuffers()
+
+    with caplog.at_level("WARNING", logger="insitubatch.buffers"):
+        pool.set_allocator(_labelled("pinned"))
+    assert NO_REUSE_ENV in caplog.text and "pageable" in caplog.text
+
+    batch = pool.take(4, (3, 2), np.dtype("f4"))  # the control still runs
+    assert batch.shape == (4, 3, 2) and pool.stats().kind == "pinned"
+
+
+@pytest.mark.parametrize(
+    ("no_reuse", "label"),
+    [(False, "pinned"), (True, "heap"), (False, "heap")],
+    ids=["pinned-with-reuse", "heap-without-reuse", "neither"],
+)
+def test_only_the_pinned_and_reuse_off_pairing_warns(
+    monkeypatch,  # type: ignore[no-untyped-def]
+    caplog,  # type: ignore[no-untyped-def]
+    no_reuse: bool,
+    label: str,
+) -> None:
+    """A warning on a supported configuration is a warning people learn to ignore."""
+    monkeypatch.setenv(NO_REUSE_ENV, "1" if no_reuse else "0")
+    pool = BatchBuffers()
+    with caplog.at_level("WARNING", logger="insitubatch.buffers"):
+        pool.set_allocator(_labelled(label))
+    assert caplog.text == ""
 
 
 def test_buffer_stats_is_one_consistent_snapshot() -> None:
