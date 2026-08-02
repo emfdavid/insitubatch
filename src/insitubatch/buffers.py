@@ -56,6 +56,7 @@ pinned path, since page-locked memory is page-aligned.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -63,6 +64,8 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 XLA_ALIGN = 128
 """Alignment XLA:CPU requires to import a DLPack buffer without copying."""
@@ -86,8 +89,9 @@ reuse decision differs.
 
 Costs, when set: above glibc's 32 MiB ``mmap`` threshold every batch is ``mmap``ed and
 ``munmap``ed again (which is the cliff reuse exists to remove), and under a *pinned* allocator
-every batch becomes its own ``cudaHostAlloc`` -- far more expensive than the pooled case. This
-is a diagnostic, not a supported production configuration.
+every batch becomes its own ``cudaHostAlloc`` -- far more expensive than the pooled case, and
+loud about it (:meth:`BatchBuffers.set_allocator` warns). This is a diagnostic, not a supported
+production configuration.
 """
 
 
@@ -204,8 +208,31 @@ class _Buffer:
         every zero-copy export we support (``torch.from_dlpack``, ``jnp.from_dlpack``) holds
         the array it was given, which in turn holds the owner. A crop the consumer kept after
         discarding the batch therefore still counts.
+
+        Dropping *below* the baseline is a different thing entirely, and it raises. Every
+        reference counted at calibration is structural -- ``self.owner``, and the base chain
+        ``self.base`` holds -- so all of them outlive the buffer and the count can only go up.
+        A lower reading means the baseline itself over-counted a transient, which is not a
+        near-miss: it makes ``free`` permanently true, so the pool lends one allocation to
+        every batch at once and each silently overwrites the last. That is exactly the defect
+        :meth:`calibrate` exists to prevent, and it cost a night to find by its symptoms. The
+        comparison is one integer against another on a path that already copies megabytes, so
+        checking forever is free; the only reachable way to hit it is a bug in this file or a
+        platform where ``sys.getrefcount`` does not mean what we assume, and both are better
+        as a loud stop than as corrupted training data. :data:`NO_REUSE_ENV` is the way past
+        it if it ever fires.
         """
-        return self._refs() <= self._idle_refs
+        refs = self._refs()
+        if refs < self._idle_refs:
+            raise RuntimeError(
+                f"batch buffer liveness baseline is wrong: the data owner now has {refs} "
+                f"references, below the {self._idle_refs} recorded when nothing was lent. "
+                "The baseline must count only references that outlive the buffer, so it can "
+                "never be exceeded from below; a higher one makes every buffer look free and "
+                "lends one allocation to every batch at once. Set "
+                f"{NO_REUSE_ENV}=1 to bypass reuse, and please open an issue."
+            )
+        return refs <= self._idle_refs
 
 
 class BatchBuffers:
@@ -336,7 +363,26 @@ class BatchBuffers:
         up half pinned and half not for no visible reason. Call before iterating -- swapping
         mid-epoch is legal (outstanding batches keep their own memory by refcount) but wastes
         whatever the pool had already warmed.
+
+        Pinning with reuse switched off warns rather than raises. The combination is bad
+        enough to be worth saying out loud -- every batch becomes its own ``cudaHostAlloc``,
+        and the pinned allocator's budget is a monotone counter sized for a pool that
+        converges, so once it is spent the run quietly finishes on pageable memory while
+        :attr:`kind` still reports ``pinned`` intent. But it must stay *reachable*: the
+        double-lend that motivated :data:`NO_REUSE_ENV` lived on the pinned path and nowhere
+        else, so refusing this pairing would remove the one control that isolates reuse from
+        pinning, and leave a user suspecting corruption no way to test it without changing
+        two things at once.
         """
+        if not self._reuse and str(getattr(allocator, "label", "heap")) != "heap":
+            logger.warning(
+                "buffer reuse is off (%s) under a %s allocator: every batch takes its own "
+                "page-locked allocation, and the pin budget does not recycle, so it will be "
+                "spent after a few batches and the rest of the run will be pageable. Fine as "
+                "an A/B control against reuse; not a configuration to benchmark or train on.",
+                NO_REUSE_ENV,
+                str(getattr(allocator, "label", "heap")),
+            )
         with self._lock:
             self._alloc = allocator
             self._pools.clear()
