@@ -87,8 +87,9 @@ class InSituDataset:
         for batch in ds.train: ...   # one epoch; ds.set_epoch(e) reshuffles
         for batch in ds.val: ...
 
-    One epoch over a view = permute the split's chunks -> walk shuffle-blocks -> per
-    block, stream-fetch its stored chunks into the pool, gather coalesced batches, evict.
+    One epoch over a view = permute the split's chunks -> walk shuffle-blocks, stream-fetching
+    each block's stored chunks into the pool -> gather coalesced batches cut over the whole
+    epoch (so only the last is short, and one may span a block boundary) -> evict.
     Batches are numpy :class:`Batch`; convert to a framework with
     :mod:`insitubatch.frameworks` (``as_torch`` / ``to_jax`` / ``as_tf_dataset``). A
     different per-split configuration (e.g. train-only augmentation) is a separate dataset.
@@ -337,13 +338,15 @@ class InSituDataset:
         one :class:`ChunkPool` -- so a chunk a windowed read pulls across a split boundary
         is decoded once and reused by both splits.
 
-        A producer thread starts the scheduler over the split's chunks (in draw order),
-        then for each shuffle-block waits the block assembled, gathers its batches, and
-        unpins it; this consumer pops from a bounded queue (depth ``prefetch_depth``) that
-        provides backpressure and inter-batch overlap. The scheduler keeps ``max_inflight``
-        tiles continuously in flight and fetches one block ahead, so block-boundary IO
-        overlaps the per-batch compute. Chunks the pool already holds (cross-epoch or
-        cross-split hits) cost no fetch.
+        A producer thread starts the scheduler over the split's chunks (in draw order), then
+        walks the epoch's batches: waiting each shuffle-block a batch draws from, gathering,
+        and unpinning a block once a batch has consumed its last row. Batches are cut over the
+        whole epoch order, so only the last one is short -- a batch may span a block boundary,
+        and the two frontiers in :func:`produce` are what makes that safe. This consumer pops
+        from a bounded queue (depth ``prefetch_depth``) that provides backpressure and
+        inter-batch overlap. The scheduler keeps ``max_inflight`` tiles continuously in flight
+        and fetches one block ahead, so block-boundary IO overlaps the per-batch compute.
+        Chunks the pool already holds (cross-epoch or cross-split hits) cost no fetch.
         """
         spc = self._ref_spc  # the manifest anchor grid, shared by every variable
         order = self._draw_order(split, shuffle)
@@ -374,28 +377,55 @@ class InSituDataset:
             release[bi].add(key)
 
         def produce(sched: Scheduler) -> None:
+            # Batches are cut over the WHOLE epoch order, not per block. Cutting them per
+            # block (`range(rstart, rstop, bs)`) made every block whose row count was not a
+            # multiple of batch_size end in a short batch -- one per block rather than one
+            # per epoch, and up to *three* distinct shapes once the epoch's own short final
+            # block is counted. Sample-once held either way, so nothing failed; what broke
+            # was any fixed-shape consumer (torch.compile / jax.jit retrace per shape, and
+            # with three shapes the retrace cache never settles).
+            #
+            # Blocks stay exactly what they were -- contiguous row ranges over disjoint
+            # chunks -- and `order` was always one flat array for the epoch, so a batch that
+            # crosses a boundary is just `order[start : start + bs]` not being truncated.
+            # What the boundary needs is bookkeeping, tracked as two monotone frontiers over
+            # the block list: `ready` (waited) and `freed` (released). Both only advance, and
+            # each block passes through each exactly once, so this stays O(blocks) of Python.
             bs = self.batch_size
+            ready = freed = 0
             try:
                 sched.start(ordered_chunks, spc)
-                for bi, (rstart, rstop, _cids) in enumerate(blocks):
-                    # A block's batches draw across its whole read-union, so wait it all
-                    # assembled (and claimed by the driver -- see ChunkPool.wait_ready)
-                    # before gathering; each wait is cheap once ready.
-                    for path, cid in block_keys[bi]:
-                        sched.pool.wait_ready(path, cid)
-                    for start in range(rstart, rstop, bs):
-                        if stop.is_set():
-                            return
-                        rows = order[start : min(start + bs, rstop)]
-                        batch = sched.pool.gather(rows, self.variables, spc)
-                        for transform in self.batch_transforms:
-                            batch = transform(batch)
-                        out_q.put(batch)  # blocks when full -> backpressure
-                    # Release the driver's reference on chunks whose *last* use is this
-                    # block: now LRU-evictable (retained for reuse if budget allows),
-                    # unblocking the read-ahead. Chunks read again later keep their
-                    # reference until then.
-                    sched.unpin_block(release[bi])
+                for start in range(0, len(order), bs):
+                    if stop.is_set():
+                        return
+                    stop_row = min(start + bs, len(order))
+                    # Wait every block this batch draws from. A batch spans at most two
+                    # (bs <= a block's rows in any sane configuration, and the loop is
+                    # correct regardless): a block's batches draw across its whole
+                    # read-union, so it must be assembled -- and claimed by the driver, see
+                    # ChunkPool.wait_ready -- before gathering. Each wait is cheap once ready.
+                    while ready < len(blocks) and blocks[ready][0] < stop_row:
+                        for path, cid in block_keys[ready]:
+                            sched.pool.wait_ready(path, cid)
+                        ready += 1
+                    batch = sched.pool.gather(order[start:stop_row], self.variables, spc)
+                    # Release the driver's reference on chunks whose *last* use is a block now
+                    # fully behind the frontier -- a batch has consumed its last row, so it is
+                    # done. Now LRU-evictable (retained for reuse if budget allows), unblocking
+                    # the read-ahead. Chunks a later block reads again keep their reference.
+                    #
+                    # Here, not after the queue put: `out_q.put` blocks when full, so releasing
+                    # after it keeps a whole block pinned for as long as the consumer is slow,
+                    # and pinned chunks cannot be evicted -- consumer slowness would propagate
+                    # into a read-ahead stall via `try_admit` parking on a full budget. Safe
+                    # this early because `gather` COPIES out of the slots, so the batch never
+                    # aliases chunk memory and the reference is already dead weight.
+                    while freed < len(blocks) and blocks[freed][1] <= stop_row:
+                        sched.unpin_block(release[freed])
+                        freed += 1
+                    for transform in self.batch_transforms:
+                        batch = transform(batch)
+                    out_q.put(batch)  # blocks when full -> backpressure
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
                 out_q.put(exc)
             finally:

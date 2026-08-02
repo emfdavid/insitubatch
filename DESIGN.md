@@ -99,8 +99,9 @@ The plan buys two orthogonal guarantees — **read-once** (a stored tile fetched
 decoded once, however many samples touch it) and **sample-once** (each valid sample in
 exactly one batch, tracked by the `order` ledger, with the fancy index recomputed in
 `gather` and never stored) — both independent of batch size. The mechanism, the edge
-cases (short final chunk, dropped windowed edges), and the ragged per-block tail are the
-live contract: see [Read-once and sample-once](docs/architecture.md#read-once-and-sample-once).
+cases (short final chunk, dropped windowed edges), and the single ragged tail per epoch are
+the live contract: see
+[Read-once and sample-once](docs/architecture.md#read-once-and-sample-once).
 
 ## Sample geometry — how the ladder evolved
 
@@ -417,16 +418,16 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
 Things wrong or missing in *our* code today, with the reasoning that sets their priority.
 (Things simply *not built yet* are milestones — see Roadmap.)
 
-- **Per-block ragged batches (possible wart).** Batches never span shuffle blocks, so a
-  block's sample count not dividing `batch_size` yields a short final batch *per block*, not
-  one per epoch — behaviour and step-count impact in
-  [Read-once and sample-once](docs/architecture.md#read-once-and-sample-once). Correct
-  (sample-once holds), but it can surprise consumers assuming a uniform batch size. No
-  `drop_last` today. Options if users want uniformity: (a) opt-in `drop_last`; (b) carry a
-  block's remainder into the next block's first batch (extends that block's pin lifetime past
-  its own batches); (c) a whole-epoch re-batch (cheap — `order` is already materialized — but
-  mixes chunks across block boundaries, diluting the block-local residency guarantee).
-  **Priority pending user feedback** — no correctness impact, so we hold until someone hits it.
+- ~~**Per-block ragged batches.**~~ **FIXED.** Batches are now cut over the whole epoch
+  `order`, so steps-per-epoch is `⌈N / bs⌉` and only the epoch's last batch is short —
+  option (b), carrying a block's remainder into the next block's first batch. It cost less
+  than the entry assumed: `order` was already one flat array with blocks as contiguous row
+  ranges, and `last_use` already deferred a chunk's release past its own block for windowed
+  reads, so the change is two monotone frontiers (wait / release) in the producer, not new
+  machinery. Peak co-residency stays two blocks — already the budget floor — so option (c)'s
+  worry about "diluting the block-local residency guarantee" does not apply: block-local
+  residency is unchanged, only the *batch* spans a boundary. Still no `drop_last`; the epoch's
+  short tail is the ordinary loader contract and `len(batch)` is how a caller drops it.
 
 - ✅ **SHIPPED — batch buffer reuse + pinning** (`buffers.BatchBuffers`,
   `frameworks.as_torch(device=...)` / `pin_host_buffers`; branch `batch-buffer-ring`).

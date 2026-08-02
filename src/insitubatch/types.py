@@ -243,6 +243,24 @@ class Batch:
     sample_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     offsets: dict[str, int] = field(default_factory=dict)  # label -> sample-axis read offset
 
+    def __len__(self) -> int:
+        """Rows in the batch -- how a caller implements ``drop_last`` for itself.
+
+        Every batch is full except the epoch's last, which is short whenever the split's
+        sample count does not divide ``batch_size``. That is the ordinary data-loader
+        contract, and dropping it is the caller's choice, so the check has to be a one-liner
+        that does not require naming a variable::
+
+            for batch in ds.train:
+                if len(batch) < ds.batch_size:
+                    continue
+
+        Counted off ``sample_indices`` rather than an array's leading axis: it is the anchor
+        row count the engine sets on every batch and the one :meth:`read_indices` already
+        builds on, so this adds a spelling rather than a second notion of how long a batch is.
+        """
+        return len(self.sample_indices)
+
     def read_indices(self, label: str) -> np.ndarray:
         """Global sample index each row of ``label`` was read from: ``anchor + offset``.
 

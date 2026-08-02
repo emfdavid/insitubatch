@@ -33,9 +33,13 @@ poisons the whole pool (``pool.set_error``) so any waiter re-raises instead of
 hanging.
 
 Budget floor: a batch may draw from any chunk in its shuffle-block, so the whole
-block must be co-resident to gather -- the budget must hold at least one block (the
-producer sizes it to two: the current block plus one read-ahead block, so
-block-boundary IO overlaps the current block's compute).
+block must be co-resident to gather -- and since batches are cut over the whole epoch
+order rather than per block, the batch that straddles a boundary needs *two* blocks
+co-resident. The producer already sizes the budget to two (the current block plus one
+read-ahead, so block-boundary IO overlaps the current block's compute), so the
+straddling batch costs nothing beyond that floor -- but the floor is now load-bearing
+for correctness, not only for overlap. Never three: a block is released as soon as a
+batch has consumed its last row.
 """
 
 from __future__ import annotations
