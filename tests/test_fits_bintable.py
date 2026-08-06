@@ -3,22 +3,21 @@
 The SDSS spectra example streams spPlate *images*, but the archival format also carries binary
 tables (per-object spectra, catalogs) as big-endian structured dtypes. Reading those as virtual
 references exercises a fragile path: ``kerchunk.fits`` maps the table to one structured-dtype zarr
-array, and VirtualiZarr must translate the kerchunk refs into a zarr-v3 structured dtype. That
-translation needs the fix in ``zarr-developers/VirtualiZarr#1037`` (pinned in ``[tool.uv.sources]``
-via the ``astronomy`` extra): without it, ``from_kerchunk_refs`` raises on the list-valued field
-specs and base64 fill value.
+array, VirtualiZarr must translate the kerchunk refs into a zarr-v3 structured dtype, and zarr's
+bytes codec must byte-swap the *fields* of that struct on read. Both halves are recent fixes,
+floored by the ``astronomy`` extra: VirtualiZarr >= 2.7.2 (``#1037`` reads the list-valued field
+specs; ``#1047``/``#1048`` record the struct's big-endian byte order) and zarr >= 3.3 (``#4142``
+swaps per field). Below those versions the chain either raises or delivers big-endian bytes under
+native-order labels -- i.e. silently wrong numbers.
 
 This offline test synthesizes a big-endian ``BinTable`` (no network, no SDSS), runs it through the
 whole chain -- kerchunk -> VirtualiZarr -> Icechunk -> insitubatch -- and checks the delivered field
 values against the astropy ground truth. It is the drift guard that keeps FITS binary-table support
-(and the pinned VZ fix) exercised.
+exercised.
 
-Endianness note: VirtualiZarr/icechunk store the struct fields with native (little-endian) *labels*
-while the referenced FITS bytes stay big-endian, so a consumer reinterprets each field with
-``.view('>f4')`` at the numpy boundary before handing native-order data to a framework (DLPack
-rejects both structured dtypes and non-native byte order). That projection is the documented,
-vectorized boundary step -- it is required independently of the zarr codec, so this test does not
-depend on the zarr byte-order pin.
+Endianness note: the delivered fields are now native-order, so no ``.view('>f4')`` reinterpret is
+needed at the numpy boundary; a consumer still projects the structured dtype to plain arrays before
+a framework handoff (DLPack rejects structured dtypes).
 """
 
 from __future__ import annotations
@@ -119,15 +118,18 @@ def test_fits_bintable_roundtrips_through_insitubatch(tmp_path) -> None:
 
     assert len(got) == flux_truth.size
     delivered = np.array([got[i] for i in range(flux_truth.size)])
-    # The referenced bytes are big-endian; reinterpret the field at the numpy boundary.
-    flux = delivered["flux"].view(">f4").astype(np.float32)
+    # The referenced bytes are big-endian; the codec swaps them, so the field arrives native.
+    flux = delivered["flux"]
+    assert flux.dtype == np.dtype("f4")  # native order, ready for a framework handoff
     np.testing.assert_allclose(flux, flux_truth.astype(np.float32))
 
 
-def test_fits_bintable_endianness_note_is_load_bearing(tmp_path) -> None:
-    # Guard the documented endianness behaviour: the native-label field reads as garbage, and the
-    # ``.view('>f4')`` reinterpret is what recovers the values. If a future zarr/VZ release delivers
-    # correctly-swapped native data, THIS test flips -- the signal to drop the workaround.
+def test_fits_bintable_fields_arrive_byte_swapped(tmp_path) -> None:
+    # Guard the endianness contract at the zarr boundary: the big-endian FITS bytes are swapped
+    # per struct field on read (VirtualiZarr >= 2.7.2 records the byte order, zarr >= 3.3 acts on
+    # it), so the native-labelled field holds the true values. Under older versions the field
+    # label lies about the bytes and this reads as garbage -- which is what the `astronomy`
+    # extra's version floors exist to prevent.
     import icechunk
 
     store_path, flux_truth = _build_bintable_store(str(tmp_path))
@@ -145,5 +147,5 @@ def test_fits_bintable_endianness_note_is_load_bearing(tmp_path) -> None:
 
     (var,) = open_geometries(repo.readonly_session("main").store, sample_axis=0)
     raw = zarr.open_array(repo.readonly_session("main").store, path=var, mode="r")[:]
-    assert not np.allclose(raw["flux"].astype("f8"), flux_truth.astype("f8"))  # native label: wrong
-    assert np.allclose(raw["flux"].view(">f4").astype("f8"), flux_truth.astype("f8"))  # reinterpret
+    assert raw.dtype["flux"] == np.dtype("f4")  # native label ...
+    assert np.allclose(raw["flux"].astype("f8"), flux_truth.astype("f8"))  # ... and native bytes

@@ -25,7 +25,8 @@ concurrency:
 
 jobs:
   # Lint + types once, on 3.12 with every extra installed so mypy resolves the real
-  # torch/JAX/TF/icechunk types. No pytest here (that would co-import the frameworks).
+  # torch/JAX/TF/icechunk/VirtualiZarr types. No pytest here (that would co-import the
+  # frameworks).
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -34,7 +35,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
-      - run: uv sync --python 3.12 --extra torch --extra bench --extra jax --extra tf --extra icechunk
+      - run: uv sync --python 3.12 --extra torch --extra bench --extra jax --extra tf --extra icechunk --extra astronomy
       - run: |
           uv run ruff check src tests bench examples
           uv run ruff format --check src tests bench examples
@@ -61,6 +62,13 @@ jobs:
           # TensorFlow alone (JAX absent, so Keras 3 stays on the TF backend).
           - python: "3.12"
             extras: "--extra tf"
+          # The astronomy build-time stack (kerchunk/VirtualiZarr/astropy/icechunk), so the
+          # FITS tests actually run instead of importorskip-skipping. They are offline
+          # (synthetic FITS in tmp_path) and guard the upstream version floors -- notably the
+          # structured big-endian byte order, which reads as plausible garbage if it breaks.
+          # torch comes along so the SDSS train loop is exercised on the same store.
+          - python: "3.12"
+            extras: "--extra torch --extra astronomy"
           # 3.13 re-confirms the torch adapter on the newer interpreter (adapters are
           # interpreter-independent, so no need to pay the JAX/TF installs twice).
           - python: "3.13"
