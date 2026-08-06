@@ -189,8 +189,13 @@ demonstration (one plate = ~640 spectra); the synthetic default carries the beat
 > multi-fiber contiguity the single-plate mode relies on, so decode-amortization and corpus scale
 > are mutually exclusive here — an honest boundary of the FITS byte layout. SDSS spectra also ship
 > as FITS **binary tables** (structured big-endian dtypes); `tests/test_fits_bintable.py` validates
-> that path end-to-end through insitubatch and pins the VirtualiZarr fix it needs
-> ([#1037](https://github.com/zarr-developers/VirtualiZarr/pull/1037)).
+> that path end-to-end through insitubatch. It needs the fixes released in
+> [VirtualiZarr 2.7.2](https://github.com/zarr-developers/VirtualiZarr/releases/tag/v2.7.2)
+> ([#1037](https://github.com/zarr-developers/VirtualiZarr/pull/1037),
+> [#1047](https://github.com/zarr-developers/VirtualiZarr/pull/1047),
+> [#1048](https://github.com/zarr-developers/VirtualiZarr/pull/1048)) and
+> [zarr 3.3](https://github.com/zarr-developers/zarr-python/pull/4142), which the `astronomy`
+> extra floors.
 
 ## The WeatherBench2 cold-start pair (with xbatcher)
 
