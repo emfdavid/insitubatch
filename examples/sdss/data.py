@@ -156,11 +156,18 @@ def _virtual_flux(
     shape: tuple[int, int],
     chunk_shape: tuple[int, int],
     entries: dict[str, dict[str, object]],
+    coeff0: float,
 ) -> xr.Dataset:
     """Assemble a virtual ``flux (fiber, wave)`` dataset from explicit byte-range chunk refs.
 
     Reuses ``template``'s dtype/codec metadata (from the opened plate) and overrides only the shape
     and chunk grid -- the chunks point back into the original FITS bytes, so nothing is copied.
+
+    The FITS header's log-wavelength solution is carried onto the array, because without it the
+    wavelength axis cannot be reconstructed from the store and the spectra are unusable as
+    science data: bin ``i`` is ``10**(COEFF0 + i*COEFF1)`` angstroms. ``coeff0`` is passed in
+    rather than copied because cropping to a common window moves bin 0 (see
+    :func:`_many_plates_common_grid`); ``COEFF1`` is the same for every SDSS plate.
     """
     from virtualizarr.manifests import ChunkManifest, ManifestArray
 
@@ -170,7 +177,8 @@ def _virtual_flux(
         metadata=replace(metadata, shape=shape, chunk_grid=grid),
         chunkmanifest=ChunkManifest(entries=entries),
     )
-    return xr.Dataset({FLUX_VAR: xr.Variable(("fiber", "wave"), array)})
+    attrs = {"COEFF0": coeff0, "COEFF1": _grid_step(template)}
+    return xr.Dataset({FLUX_VAR: xr.Variable(("fiber", "wave"), array, attrs=attrs)})
 
 
 def _single_plate_fiber_chunks(plate: xr.Dataset, fibers_per_chunk: int) -> xr.Dataset:
@@ -193,7 +201,10 @@ def _single_plate_fiber_chunks(plate: xr.Dataset, fibers_per_chunk: int) -> xr.D
         f"{i}.0": {"path": path, "offset": base + i * block_bytes, "length": block_bytes}
         for i in range(n_fiber // fibers_per_chunk)
     }
-    return _virtual_flux(plate, (n_fiber, n_wave), (fibers_per_chunk, n_wave), entries)
+    # Full width, so bin 0 is still the plate's own start wavelength.
+    return _virtual_flux(
+        plate, (n_fiber, n_wave), (fibers_per_chunk, n_wave), entries, _grid_start(plate)
+    )
 
 
 def _many_plates_common_grid(plates: list[xr.Dataset]) -> xr.Dataset:
@@ -231,7 +242,8 @@ def _many_plates_common_grid(plates: list[xr.Dataset]) -> xr.Dataset:
             byte0 = base + f * row_bytes + offset_bins * itemsize
             entries[f"{fiber}.0"] = {"path": path, "offset": byte0, "length": window_bytes}
             fiber += 1
-    return _virtual_flux(plates[0], (fiber, width), (1, width), entries)
+    # The crop moves bin 0 to the shared window start -- carry that, not the template plate's.
+    return _virtual_flux(plates[0], (fiber, width), (1, width), entries, window_lo)
 
 
 def build_store(
@@ -287,6 +299,64 @@ def build_store(
     virtual.vz.to_icechunk(session.store)
     session.commit(f"index {len(plate_urls)} SDSS spPlate frame(s)")
     return store_path
+
+
+PUBLIC_BUCKET = "insitubatch-bench-insitubatch"
+PUBLIC_STORES = {
+    # name -> (repo prefix in the bucket, url prefix the virtual chunks point at)
+    "1plate": (
+        "astronomy/sdss_dr17_p0266_refs",
+        "https://data.sdss.org/",
+    ),
+    "6plate": (
+        "astronomy/sdss_dr17_6plate_refs",
+        "https://data.sdss.org/",
+    ),
+    "6plate-mirror": (
+        "astronomy/sdss_dr17_6plate_mirror_refs",
+        f"https://storage.googleapis.com/{PUBLIC_BUCKET}/astronomy/sdss/dr17/",
+    ),
+}
+
+
+def open_published(name: str = "6plate-mirror") -> Store:
+    """Open one of the *pre-built* public reference stores -- no build step, no credentials.
+
+    :func:`build_store` is the scan-once half of the story; this is use-many. The same
+    Icechunk repos are published read-anonymous in ``gs://insitubatch-bench-insitubatch``, so
+    a reader streams the spectra without the build-time FITS stack
+    (``virtualizarr``/``kerchunk``/``astropy``) and without re-scanning the archive. Only
+    ``icechunk`` is needed.
+
+    The repos are kilobytes of byte-range references; the pixels stay in their original FITS
+    files and are fetched at read time. Which files depends on the store:
+
+    * ``1plate`` -- plate 266, 640 fibers on the full wavelength grid, 64 fibers per chunk
+      (many samples per chunk: the decode-amortization layout). Pixels from ``data.sdss.org``.
+    * ``6plate`` -- 6 plates cropped to their shared log-wavelength window, 3840 fibers on one
+      flat sample axis, one fiber per chunk (the streaming layout). Pixels from
+      ``data.sdss.org``.
+    * ``6plate-mirror`` -- the same geometry as ``6plate``, but the references point at our
+      GCS mirror of the FITS files. Prefer this one: it is a single provider, and on GCP it
+      is in-region.
+    """
+    try:  # validate the name before touching the backend, so a typo says so
+        prefix, url_prefix = PUBLIC_STORES[name]
+    except KeyError:
+        raise ValueError(f"unknown store {name!r}; choose from {sorted(PUBLIC_STORES)}") from None
+
+    import icechunk
+
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(url_prefix, icechunk.http_store())
+    )
+    repo = icechunk.Repository.open(
+        icechunk.gcs_storage(bucket=PUBLIC_BUCKET, prefix=prefix, anonymous=True),
+        config=config,
+        authorize_virtual_chunk_access=icechunk.containers_credentials({url_prefix: None}),
+    )
+    return repo.readonly_session("main").store
 
 
 def open_store(store_path: str | os.PathLike[str] = DEFAULT_STORE) -> Store:
@@ -428,6 +498,8 @@ def build_datasets(args: argparse.Namespace) -> InSituDataset:
         url = f"file://{tempfile.mkdtemp()}/sdss_synth.zarr"
         make_synthetic_store(url, n_plates=args.n_plates, fibers_per_plate=args.fibers)
         store = obstore_store(url)
+    elif args.source == "published":
+        store = open_published(args.published)
     else:
         if args.build:
             plate_urls = load_uris(args.uris)[: args.plates]
@@ -441,9 +513,16 @@ def cli(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SDSS spectral reconstruction -- train in place.")
     p.add_argument(
         "--source",
-        choices=("synthetic", "sdss"),
+        choices=("synthetic", "published", "sdss"),
         default="synthetic",
-        help="offline synthetic spectra | real SDSS spPlate frames (needs --build once)",
+        help="offline synthetic spectra | the pre-built public reference stores (no build, no "
+        "credentials) | real SDSS spPlate frames indexed locally (needs --build once)",
+    )
+    p.add_argument(
+        "--published",
+        choices=tuple(PUBLIC_STORES),
+        default="6plate-mirror",
+        help="which public reference store to stream (--source published)",
     )
     p.add_argument("--uris", default=str(DEFAULT_URIS), help="JSON list of spPlate FITS URLs")
     p.add_argument("--store", default=str(DEFAULT_STORE), help="local Icechunk repo path")

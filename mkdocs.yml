@@ -31,6 +31,7 @@ theme:
 nav:
   - Home: index.md
   - Examples: examples.md
+  - SDSS public dataset: sdss-dataset.md
   - Architecture: architecture.md
   - Tuning: tuning.md
   - Benchmarks: benchmarks.md

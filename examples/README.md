@@ -157,12 +157,22 @@ Hubble's one image per chunk).
 uv sync --extra torch
 uv run python -m examples.sdss.train_torch                       # offline synthetic spectra (default)
 
-# real SDSS spPlate over HTTPS -- indexes it into a virtual-reference store first (needs the
-# `astronomy` build-time stack), then streams and trains:
+# the PRE-BUILT public reference stores -- no build, no credentials, no FITS stack:
 uv sync --extra torch --extra astronomy
+uv run python -m examples.sdss.train_torch --source published                     # 6 plates, 1 fiber/chunk
+uv run python -m examples.sdss.train_torch --source published --published 1plate  # 1 plate, 64 fibers/chunk
+
+# or index the archive yourself (needs the `astronomy` build-time stack):
 uv run python -m examples.sdss.train_torch --source sdss --build             # 1 plate
 uv run python -m examples.sdss.train_torch --source sdss --build --plates 8  # 8 plates, aligned
 ```
+
+`build_store` is the scan-once half; `--source published` is use-many. The same Icechunk repos
+are published read-anonymous in `gs://insitubatch-bench-insitubatch/astronomy/`
+([README](https://storage.googleapis.com/insitubatch-bench-insitubatch/astronomy/README.md)) —
+[`open_published`](sdss/data.py) opens one in a dozen lines of `icechunk`, and the `6plate-mirror`
+default resolves its pixels from our FITS mirror in the same bucket rather than from
+`data.sdss.org`.
 
 One plate (~640 spectra, ~10 MB) fits in memory, so `--plates` scales the real story. The two
 modes trade off along the FITS byte layout, and **both move no pixels — only the chunk manifest is
