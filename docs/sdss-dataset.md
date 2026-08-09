@@ -90,7 +90,17 @@ if you need it. For the two `data.sdss.org`-backed stores, set `PIXELS = "https:
 
 ### Wavelengths
 
-Uniform in log₁₀(λ), the SDSS convention: bin `i` is `10**(COEFF0 + i*COEFF1)` Å.
+Uniform in log₁₀(λ), the SDSS convention: bin `i` is `10**(COEFF0 + i*COEFF1)` Å. Each store
+carries its own solution as array attributes, so read them off `flux.attrs` rather than
+hard-coding the table below:
+
+```python
+import numpy as np
+
+c0, c1, n_bins = 3.5797, 0.0001, 3841      # == flux.attrs["COEFF0"], ["COEFF1"], shape[1]
+wavelength_angstrom = 10.0 ** (c0 + c1 * np.arange(n_bins))
+wavelength_angstrom[[0, -1]]               # array([3799.3, 9198.1])
+```
 
 | Store | `COEFF0` | `COEFF1` | Bins | Range |
 |---|---|---|---|---|
@@ -98,7 +108,8 @@ Uniform in log₁₀(λ), the SDSS convention: bin `i` is `10**(COEFF0 + i*COEFF
 | `6plate`, `6plate-mirror` | 3.5797 | 0.0001 | 3841 | 3799 – 9198 Å |
 
 The six-plate `COEFF0` is the *shared* window start — the largest of the six plates' own start
-wavelengths. Fluxes are in SDSS units of 10⁻¹⁷ erg s⁻¹ cm⁻² Å⁻¹; bad pixels are `NaN`.
+wavelengths, which is also the crop offset into each source frame. Fluxes are in SDSS units of
+10⁻¹⁷ erg s⁻¹ cm⁻² Å⁻¹; bad pixels are `NaN`.
 
 ## Two layouts, one set of bytes
 
