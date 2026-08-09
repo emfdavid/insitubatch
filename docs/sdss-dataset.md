@@ -132,26 +132,42 @@ manifest still measured in kilobytes.
 
 One fiber per chunk means one ranged GET per spectrum, so the six-plate store is latency-bound,
 not bandwidth-bound. A full pass over all 3,840 spectra (59 MB in 3,840 reads), from a VM in
-`us-central1`:
+`us-central1`, medians of five interleaved runs:
 
 | Reader | Concurrency | Full pass | Spectra/s |
 |---|---|---|---|
-| zarr, row at a time | — | ~154 s | 25 |
-| zarr, 64-row slices | 10 *(default)* | 22.3 s | 172 |
-| zarr, 64-row slices | 32 | 12.6 s | 305 |
-| **insitubatch, shuffled batches** | 32 | **10.7 s** | **360** |
+| zarr, 64-row slices | 10 *(default)* | 17.9 s | 215 |
+| zarr, 64-row slices | 32 | 12.2 s | 314 |
+| **insitubatch, shuffled batches** | 32 | **7.3 s** | **530** |
 
-Medians of five interleaved runs. The knee is around 32 concurrent reads for both readers and
-neither improves past it. If you use plain zarr, raise `async.concurrency` — the default of 10
-leaves about half the throughput on the table for a store shaped like this.
+Both readers knee around 32 concurrent reads. If you use plain zarr, raise
+`async.concurrency` — the default of 10 costs about a third of the throughput here.
 
-!!! note "Why the loader is only ~18% ahead here"
+Everything above uses a bare `icechunk.http_store()`, exactly as the recipes on this page do.
+Resist the urge to hand it a tuned connection pool without measuring: capping
+`pool_max_idle_per_host` below your read concurrency makes a sustained reader reconnect
+constantly, which measured 12% *slower* than the default for us.
 
-    One sample per chunk is the geometry where a batch loader has least to offer: nothing to
-    amortize across samples within a chunk, no redundant reads to de-duplicate. What the 18% buys
-    is shuffled, split-aware, transformed batches rather than raw slices. The
-    many-fibers-per-chunk layout (`p0266`) is where amortization actually pays — see
-    [Tuning](tuning.md).
+## Where chunk layout actually shows up
+
+The 1.7× above is the *narrow* case. One sample per chunk is the geometry where a batch loader
+has least to offer — nothing to amortize within a chunk, no redundant reads to de-duplicate.
+
+To isolate what the chunk geometry alone is worth, here is one plate (0266, 640 spectra) built
+both ways from the *same* mirrored bytes, verified to deliver byte-identical arrays:
+
+| Reader | Layout | Full pass | Spectra/s |
+|---|---|---|---|
+| **insitubatch** | **64 fibers/chunk** | **0.11 s** | **5,835** |
+| insitubatch | 1 fiber/chunk | 1.26 s | 507 |
+| raw zarr | 64 fibers/chunk | 0.43 s | 1,484 |
+| raw zarr | 1 fiber/chunk | 1.65 s | 388 |
+
+Same bytes, same provider, same 640 spectra: **11.5× from chunk geometry alone**, against 3.8×
+for raw zarr over the same change. The loader's margin over zarr widens from 1.7× to 3.5×,
+because amortizing per-chunk work across many samples is the thing it is built to do. Use
+`p0266` if that is the regime you want to measure. (These passes are short enough that
+cold-start dominates the spread; the ratio is the durable part.)
 
 ## As training batches
 
