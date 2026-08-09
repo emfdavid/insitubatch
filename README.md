@@ -15,9 +15,17 @@ split-aware data source built to **keep the GPU fed** — **with no reshard**
 
 It is **domain-general**: the sample axis is a *role*, not a fixed dimension. The same engine
 trains on ERA5/weather over time, segments **OME-NGFF microscopy** volumes over `Z`
-([runnable example](examples/microscopy/) — raw image + label mask co-batched with no reshard),
-and maps cleanly onto **radio-astronomy** visibilities — one contract, *any* single sample axis,
-variables that chunk it differently.
+([example](examples/microscopy/) — raw image + label mask co-batched with no reshard), and
+trains on **astronomy straight out of FITS** — Hubble frames ([example](examples/hubble/)) and
+SDSS galaxy spectra ([example](examples/sdss/)) indexed as virtual byte-range references, no
+pixels moved. One contract, *any* single sample axis, variables that chunk it differently.
+(It also maps cleanly onto **radio-astronomy** MSv4 visibilities — a
+[documented mapping](docs/architecture.md), not yet a built example.)
+
+The SDSS reference stores are **published and readable by anyone**, so you can stream real
+spectra without building anything:
+[`gs://insitubatch-bench-insitubatch/astronomy/`](https://storage.googleapis.com/insitubatch-bench-insitubatch/astronomy/README.md)
+(`python -m examples.sdss.train_torch --source published`).
 
 > The IO race is over (obstore/icechunk saturate the NIC). The *loader* race is
 > open. `insitubatch` builds the layer that projects like light-speed-io and
