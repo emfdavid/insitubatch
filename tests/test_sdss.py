@@ -15,8 +15,10 @@ import pytest
 
 from examples.sdss.data import (
     FLUX_VAR,
+    PUBLIC_STORES,
     fit_pca,
     make_synthetic_store,
+    open_published,
     pca_reconstruct,
     recon_mse,
     reconstruct_dataset,
@@ -62,6 +64,18 @@ def test_multi_plate_geometry_streams_a_full_epoch(one_fiber_per_chunk_store, ru
     n_train = len(ds.manifest.chunks["train"])
     assert len(seen) == n_train and len(set(seen.tolist())) == n_train  # each fiber once
     ds.close()
+
+
+def test_published_store_table_is_well_formed() -> None:
+    # Offline guard on the public-bucket coordinates (the suite never hits the network): every
+    # entry must name a repo prefix and the URL prefix its virtual chunks resolve against, and
+    # an unknown name must fail with the choices rather than a KeyError from inside icechunk.
+    assert set(PUBLIC_STORES) == {"1plate", "6plate", "6plate-mirror"}
+    for prefix, url_prefix in PUBLIC_STORES.values():
+        assert prefix.startswith("astronomy/")
+        assert url_prefix.startswith("https://") and url_prefix.endswith("/")
+    with pytest.raises(ValueError, match="unknown store"):
+        open_published("nope")
 
 
 def test_many_fibers_per_chunk(synth_store) -> None:

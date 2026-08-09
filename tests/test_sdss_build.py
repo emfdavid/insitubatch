@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import zarr
 
 pytest.importorskip("virtualizarr")
 pytest.importorskip("kerchunk")
@@ -133,6 +134,35 @@ def test_many_plates_common_grid_aligns_and_concats(tmp_path) -> None:
         np.testing.assert_array_equal(got[6 + f], b[f, off_b : off_b + width])  # plate b fibers
     # both plates now share bin 0 == loglam 3.5803, so the grids are aligned, not merely truncated.
     assert width == min(24 - off_a, 22 - off_b)
+
+
+def test_single_plate_carries_the_wavelength_solution(tmp_path) -> None:
+    # Without COEFF0/COEFF1 on the array the wavelength axis cannot be reconstructed from the
+    # store and the spectra are not usable as science data. Full width -> the plate's own start.
+    _write_plate(str(tmp_path), name="p.fits", n_fiber=6, n_wave=24, coeff0=3.5800, seed=1)
+    plate = _open_plate(str(tmp_path), "p.fits")
+    step = float(plate[FLUX_VAR].attrs["COEFF1"])
+
+    store = _commit_and_open(_single_plate_fiber_chunks(plate, 3), str(tmp_path))
+    attrs = zarr.open_array(store, path=FLUX_VAR, mode="r").attrs
+
+    assert attrs["COEFF0"] == pytest.approx(3.5800)
+    assert attrs["COEFF1"] == pytest.approx(step)
+
+
+def test_many_plates_carry_the_cropped_wavelength_solution(tmp_path) -> None:
+    # The common-window crop moves bin 0, so the store must carry the *cropped* start. Recording
+    # the template plate's start instead would misplace every line by three bins.
+    _write_plate(str(tmp_path), name="a.fits", n_fiber=6, n_wave=24, coeff0=3.5800, seed=1)
+    _write_plate(str(tmp_path), name="b.fits", n_fiber=6, n_wave=22, coeff0=3.5803, seed=2)
+    plates = [_open_plate(str(tmp_path), "a.fits"), _open_plate(str(tmp_path), "b.fits")]
+    step = float(plates[0][FLUX_VAR].attrs["COEFF1"])
+
+    store = _commit_and_open(_many_plates_common_grid(plates), str(tmp_path))
+    attrs = zarr.open_array(store, path=FLUX_VAR, mode="r").attrs
+
+    assert attrs["COEFF0"] == pytest.approx(3.5803)  # the shared window start, not 3.5800
+    assert attrs["COEFF1"] == pytest.approx(step)
 
 
 def test_many_plates_rejects_unaligned_grids(tmp_path) -> None:
