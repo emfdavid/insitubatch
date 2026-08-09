@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: a batch wider than a shuffle-block deadlocked the loader.** A batch draws from
+  every block it spans and holds them until it has gathered, so `batch_size >
+  2 × block_chunks × samples-per-chunk` needed more blocks resident than the budget floor
+  provides: the fetch driver parked on admission, the consumer parked waiting for a chunk that
+  could never be admitted, and **no batch was delivered at all**. It bit one-sample-per-chunk
+  stores at the shipped defaults (`batch_size=64`, `block_chunks=16`) — per-frame and
+  per-spectrum archives — and presented as slow storage rather than an error.
+  `InSituDataset` now raises `block_chunks` to `⌈batch_size / samples-per-chunk⌉` (capped at
+  the array's chunk count) and logs when it does, so a block always holds a batch. Coarsely
+  chunked stores are unaffected: the requested `block_chunks` is a floor, never lowered.
+- **Added: admission starvation raises instead of hanging.** If a working set exceeds its
+  budget anyway, the scheduler now detects the *provably* terminal state — nothing in flight,
+  every resident slot pinned, and a consumer blocked in `wait_ready` — and raises with the
+  residency arithmetic and the offending chunk. The test is structural, not a timeout, so a
+  merely slow consumer is never mistaken for a deadlock.
+
 ## 0.1.0 — 2026-07-06
 
 **The sample-geometry generalization + a stable public API.** insitubatch is no longer

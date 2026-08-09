@@ -40,6 +40,13 @@ read-ahead, so block-boundary IO overlaps the current block's compute), so the
 straddling batch costs nothing beyond that floor -- but the floor is now load-bearing
 for correctness, not only for overlap. Never three: a block is released as soon as a
 batch has consumed its last row.
+
+That "never three" holds only while a batch fits inside a single block -- a wider
+batch spans ``ceil(batch_size / block rows)`` blocks and pins every one of them until
+it has gathered. :class:`~insitubatch.source.InSituDataset` guarantees the fit by
+widening ``block_chunks``; finely chunked archives (one sample per chunk) are where it
+would otherwise bite. Should a working set exceed its budget anyway, admission does not
+hang: :meth:`Scheduler._starvation` proves the stall terminal and raises.
 """
 
 from __future__ import annotations
@@ -64,6 +71,13 @@ from .pool import ChunkPool
 from .types import ArrayGeometry, StoredChunkRead
 
 _T = TypeVar("_T")
+
+STARVATION_POLL_S = 0.25
+"""How often a parked admission re-checks for a *provably* terminal starvation.
+
+Detection latency only: the test is structural (nothing in flight, and a consumer
+blocked in ``wait_ready``), never "we have waited a while", so a slow consumer is
+never mistaken for a deadlock however long it takes."""
 
 
 def _fsspec_io_loop(store: Store) -> asyncio.AbstractEventLoop | None:
@@ -303,13 +317,61 @@ class Scheduler:
         failed admit and the clear, the recheck catches it; otherwise we wait for
         the next unpin. (Admissions are serialized on the loop, so no admit races
         another.)
+
+        The wait is bounded only so we can re-test for a terminal starvation
+        (:meth:`_starvation`); a timeout by itself means nothing and just loops.
         """
         assert self._capacity is not None
         while not self.pool.try_admit(array, chunk_index):
             self._capacity.clear()
             if self.pool.try_admit(array, chunk_index):
                 return
-            await self._capacity.wait()
+            try:
+                await asyncio.wait_for(self._capacity.wait(), STARVATION_POLL_S)
+            except TimeoutError:
+                starved = self._starvation(array, chunk_index)
+                if starved is not None:
+                    # `from None`: the poll timeout is how we got here, not why -- the
+                    # cause is the budget, and chaining it would put a red herring at
+                    # the top of the traceback the consumer re-raises.
+                    raise starved from None
+
+    def _starvation(self, array: str, chunk_index: int) -> RuntimeError | None:
+        """The error for a *provably* unbreakable admission stall, else ``None``.
+
+        Three facts together make the stall terminal, and none of them is a clock:
+
+        * ``try_admit`` just failed -- the budget is full of in-flight or referenced
+          slots, so no eviction can make room.
+        * nothing is in flight -- no scatter is pending, so no slot can become ready
+          and satisfy a waiter on its own.
+        * a consumer is blocked in ``wait_ready`` -- and a blocked consumer never
+          reaches its next ``unpin_block``, so the one thing that could free budget
+          will not happen.
+
+        The consumer is waiting on us and we are waiting on the consumer. Raising
+        poisons the pool (see :meth:`_on_drive_done`), so the waiter re-raises this
+        instead of hanging -- which is the whole point: the pre-fix failure mode was
+        a silent wedge that reads exactly like slow storage.
+
+        A merely slow consumer registers no waiter (it is computing, not blocked) or
+        has work in flight, so it never trips this.
+        """
+        if self._inflight_now:
+            return None
+        waiting = self.pool.blocked_waiters()
+        if not waiting:
+            return None
+        budget = self.pool.budget_bytes
+        return RuntimeError(
+            f"residency budget exhausted: cannot admit chunk {chunk_index} of {array!r}. "
+            f"The pool holds {self.pool.resident_chunks} chunk(s) "
+            f"({self.pool.resident_bytes} of {budget} bytes), every one of them pinned or "
+            f"in flight; no tile is in flight; and the consumer is blocked waiting on "
+            f"{sorted(waiting)[:4]}. Nothing can free a slot, so this would hang. The "
+            f"working set is larger than the budget it was sized for -- raise "
+            f"cache_budget_bytes, or lower batch_size / block_chunks."
+        )
 
     async def _io(self, coro: Coroutine[Any, Any, _T]) -> _T:
         """Await a store coroutine on the loop that store's IO belongs to.

@@ -150,7 +150,28 @@ class InSituDataset:
         self._ref_spc = manifest.sample_chunk_size  # the anchor grid (shuffle/split/gather)
 
         self.batch_size = batch_size
-        self.block_chunks = block_chunks
+        # A batch is cut over the whole epoch order, so it draws from every shuffle-block
+        # it spans -- and a block is released only once a batch has consumed its last row.
+        # The residency floor below covers two blocks (the current one plus a read-ahead),
+        # which is the invariant the scheduler's release bookkeeping is written to, so a
+        # batch has to fit inside one block. Widen the block rather than reject the
+        # configuration: block_chunks is a shuffle-span knob, and a block too narrow to
+        # hold a single batch is not a meaningful span. Finely chunked archives are where
+        # the default bites -- at one sample per chunk (SDSS spPlate fibers, Hubble frames)
+        # 16 chunks is a 16-sample block, and any larger batch would park admission
+        # forever. Capped at the array's chunk count: no batch can span more blocks than
+        # there are chunks.
+        min_block_chunks = min(-(-batch_size // self._ref_spc), manifest.n_chunks)
+        self.block_chunks = max(block_chunks, min_block_chunks)
+        if self.block_chunks != block_chunks:
+            logger.info(
+                "block_chunks widened %d -> %d so a %d-sample batch fits one shuffle-block "
+                "(%d sample(s) per chunk)",
+                block_chunks,
+                self.block_chunks,
+                batch_size,
+                self._ref_spc,
+            )
         self.seed = seed
         self.shuffle = shuffle
         self.prefetch_depth = max(int(prefetch_depth), 1)
@@ -178,6 +199,9 @@ class InSituDataset:
         # variables, must be co-resident (a batch draws across a whole block) -- and
         # a larger budget (cache_budget_bytes) retains drained chunks for cross-epoch
         # decode-once reuse. cache_dir spills slots to NVMe (mmap) instead of heap.
+        # Two blocks is a floor only because a batch fits inside one -- which is what
+        # `self.block_chunks` (widened above) guarantees, and what the scheduler's
+        # release bookkeeping assumes.
         #
         # Windows widen the floor. A windowed read (any nonzero offset) crosses a chunk
         # boundary, so an anchor chunk's read-union spans up to 2 + ceil(span/spc)
@@ -203,7 +227,7 @@ class InSituDataset:
             per_chunk_all_vars = sum(
                 bytes_per_chunk(g, o) for g, o in zip(geoms, out_geoms, strict=True)
             )
-            working_set = 2 * block_chunks * window_factor * per_chunk_all_vars
+            working_set = 2 * self.block_chunks * window_factor * per_chunk_all_vars
             if windowed and self.shuffle:
                 # Shuffle permutes chunk order, so a windowed read can spill into chunks
                 # owned by any other block: a chunk admitted early may be needed late. Until
@@ -223,7 +247,7 @@ class InSituDataset:
                 return n_chunks * bytes_per_chunk(g, o)
 
             pairs = list(zip(geoms, out_geoms, strict=True))
-            window_samples = 2 * block_chunks * self._ref_spc
+            window_samples = 2 * self.block_chunks * self._ref_spc
             working_set = sum(var_bytes(g, o, window_samples) for g, o in pairs)
             if self.shuffle:
                 # Under shuffle a variable chunk can be needed by scattered blocks (a coarse

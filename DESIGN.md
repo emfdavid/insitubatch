@@ -428,6 +428,27 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   worry about "diluting the block-local residency guarantee" does not apply: block-local
   residency is unchanged, only the *batch* spans a boundary. Still no `drop_last`; the epoch's
   short tail is the ordinary loader contract and `len(batch)` is how a caller drops it.
+  **Correction:** "peak co-residency stays two blocks" holds only while a batch fits *inside*
+  a block. It silently assumed `batch_size ≤ block_chunks × samples-per-chunk`, which is false
+  on finely chunked stores — see the entry below.
+
+- ~~**Deadlock when a batch is wider than a shuffle-block.**~~ **FIXED.** A batch cut over the
+  whole epoch draws from every block it spans and pins them all until it has gathered, so it
+  needs `⌈bs / block rows⌉ + 1` blocks resident against a floor sized for two. At one sample
+  per chunk (SDSS spPlate fibers over a common grid; Hubble frames) the shipped default
+  `batch_size=64, block_chunks=16` needs 64 chunks and gets 32: the driver parks in
+  `Scheduler._admit`, the consumer parks in `ChunkPool.wait_ready`, and **no batch is ever
+  delivered**. Exactly `batch_size > 2 × block_chunks × samples-per-chunk`, independent of
+  shuffle. Two changes: (1) `InSituDataset` raises `block_chunks` to
+  `⌈batch_size / samples-per-chunk⌉` (capped at the chunk count), restoring the two-block
+  invariant the scheduler is written to; (2) `Scheduler._starvation` proves a stall terminal —
+  nothing in flight, budget full of pinned slots, and a consumer blocked in `wait_ready`, so
+  no event can ever occur — and raises with the arithmetic instead of hanging. The detector is
+  structural, never a timeout, so a slow consumer is never misread as a deadlock.
+  **The lesson for tests:** every one-sample-per-chunk fixture we had (Hubble 16 samples,
+  microscopy 48, `test_sdss_build` 12) held fewer chunks than the budget, so the budget never
+  filled and the bug was unreachable by construction. A residency guard needs
+  `n_chunks > budget chunks` on purpose — `tests/test_residency.py`.
 
 - ✅ **SHIPPED — batch buffer reuse + pinning** (`buffers.BatchBuffers`,
   `frameworks.as_torch(device=...)` / `pin_host_buffers`; branch `batch-buffer-ring`).
