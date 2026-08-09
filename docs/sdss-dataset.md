@@ -148,10 +148,23 @@ Resist the urge to hand it a tuned connection pool without measuring: capping
 `pool_max_idle_per_host` below your read concurrency makes a sustained reader reconnect
 constantly, which measured 12% *slower* than the default for us.
 
+!!! warning "Read this as parity, not a speed win"
+
+    The only thing tuned on the zarr side is `async.concurrency`. Slice width, access pattern,
+    thread-pool settings and the store backend are all untouched, and any of them could narrow
+    or close the gap — this is two reasonable configurations measured fairly, not a
+    tuned-versus-tuned result. **Parity is the honest reading, and it is enough.** At one
+    sample per chunk there is nothing to amortize within a chunk and no redundant reads to
+    de-duplicate, so a loader has no structural advantage to convert; reading at roughly the
+    speed of a straightforward zarr read is the expected outcome. The case for the loader here
+    is what you get *at* that speed — shuffled, split-aware, chunk-aligned batches with
+    transforms, no reshard, flat memory — not the throughput itself.
+
 ## Where chunk layout actually shows up
 
-The 1.7× above is the *narrow* case. One sample per chunk is the geometry where a batch loader
-has least to offer — nothing to amortize within a chunk, no redundant reads to de-duplicate.
+One sample per chunk is the geometry where a batch loader has least to offer. Chunk layout is a
+much bigger lever than the choice of reader, and that comparison is cleaner because it is the
+same reader against itself.
 
 To isolate what the chunk geometry alone is worth, here is one plate (0266, 640 spectra) built
 both ways from the *same* mirrored bytes, verified to deliver byte-identical arrays:
@@ -163,11 +176,12 @@ both ways from the *same* mirrored bytes, verified to deliver byte-identical arr
 | raw zarr | 64 fibers/chunk | 0.43 s | 1,484 |
 | raw zarr | 1 fiber/chunk | 1.65 s | 388 |
 
-Same bytes, same provider, same 640 spectra: **11.5× from chunk geometry alone**, against 3.8×
-for raw zarr over the same change. The loader's margin over zarr widens from 1.7× to 3.5×,
-because amortizing per-chunk work across many samples is the thing it is built to do. Use
-`p0266` if that is the regime you want to measure. (These passes are short enough that
-cold-start dominates the spread; the ratio is the durable part.)
+Same bytes, same provider, same 640 spectra: **11.5× from the chunk geometry alone** for
+insitubatch, and 3.8× for raw zarr over the identical change. Both readers gain a lot; the
+claim worth standing behind is that **the layout dominates**, not that one reader beats the
+other. Use `p0266` if this is the regime you want to measure. (These passes are short enough
+that cold start dominates the spread, so treat the ratios as the durable part and the absolute
+times as indicative.)
 
 ## As training batches
 
