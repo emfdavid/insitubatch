@@ -9,9 +9,10 @@ data source built to **keep the GPU fed** — **with no reshard** — and a Pyth
 hot path that scales with **chunks, not samples**.
 
 It is **domain-general**: the sample axis is a *role*, not a fixed dimension. The same engine
-forecasts ERA5 weather over time, segments **OME-NGFF microscopy** volumes over `Z`, and
-denoises **Hubble telescope frames** streamed straight out of FITS — each a different
-geometry on a real public store, none of them resharded. See [Examples](examples.md) and the
+forecasts ERA5 weather over time, segments **OME-NGFF microscopy** volumes over `Z`, denoises
+**Hubble telescope frames** streamed straight out of FITS, and reconstructs **SDSS galaxy
+spectra** fiber by fiber — each a different geometry on a real public store, none of them
+resharded. See [Examples](examples.md) and the
 [use-case tables](architecture.md#use-case-support).
 
 !!! quote
@@ -30,7 +31,7 @@ large fields, a tuned pool can edge ahead per byte. Numbers: [Benchmarks](benchm
 
 ## Cross-domain examples
 
-Four runnable showcases, each a *different* geometry on a real public store — and each with
+Five runnable showcases, each a *different* geometry on a real public store — and each with
 an offline synthetic mode so it runs with no network or credentials. Details and commands:
 [Examples](examples.md).
 
@@ -39,6 +40,7 @@ an offline synthetic mode so it runs with no network or credentials. Details and
 | **advection** | WeatherBench2 ERA5 (`gs://`, anonymous) | Input at *t*, target at *t+24 h* as offset views of one array — then the *same* CNN trained in **torch, JAX and TF** |
 | **microscopy** | IDR OME-NGFF `(T,C,Z,Y,X)` on `s3://idr` | Samples a **middle** axis (`Z`); raw image and label mask chunked 1 vs 30 planes deep, co-batched |
 | **hubble** | Hubble WFC3/IR frames on MAST's `s3://stpubdata` | **FITS, not zarr** — virtual byte-range references, streamed and trained in place |
+| **sdss** | SDSS DR17 spectra, or the [public reference stores](sdss-dataset.md) | One archive, **two chunk layouts** by byte arithmetic alone: 64 spectra per chunk, or one per chunk at archive scale |
 | **wb2 pair** | WeatherBench2 ERA5 | The same task on insitu and on an xbatcher worker stack, for the cold-start trade-off |
 
 ## The problem, and the inversion
@@ -101,7 +103,8 @@ tfds = as_tf_dataset(ds.val)                                             # TF:  
 ```
 
 See [Examples](examples.md) for working CNN models built on `InSituDataset` — a three-framework
-ERA5 forecast, OME-NGFF microscopy segmentation over `Z`, and Hubble frame denoising from FITS.
+ERA5 forecast, OME-NGFF microscopy segmentation over `Z`, Hubble frame denoising from FITS, and
+SDSS spectral reconstruction against a PCA baseline.
 
 A runnable, network-free version of this — paralleling the Earthmover
 `dataloader-demo`, with a spatial subregion pulled out by a `batch_transform` —
