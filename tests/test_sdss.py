@@ -32,6 +32,38 @@ def synth_store(tmp_path) -> str:
     return url
 
 
+@pytest.fixture
+def one_fiber_per_chunk_store(tmp_path) -> str:
+    """The *multi-plate* geometry: 128 chunks of a single fiber each.
+
+    ``_many_plates_common_grid`` crops every plate to the shared wavelength window, which
+    breaks multi-fiber contiguity, so a fiber is its own virtual chunk. Sized past the
+    residency floor on purpose: the smaller fixtures in ``test_sdss_build`` hold fewer
+    chunks than the budget, so the budget never fills and cannot be exercised at all.
+    """
+    url = f"file://{tmp_path}/sdss_1fiber.zarr"
+    make_synthetic_store(url, n_plates=128, fibers_per_plate=1, n_wave=64, seed=0)
+    return url
+
+
+def test_multi_plate_geometry_streams_a_full_epoch(one_fiber_per_chunk_store, run_by) -> None:
+    # The example's own default batch_size (64) over one-fiber chunks: this is the shipped
+    # multi-plate configuration, and it used to wedge -- 64 samples span four 16-chunk
+    # shuffle-blocks against a two-block residency floor, so no batch was ever delivered.
+    ds = reconstruct_dataset(obstore_store(one_fiber_per_chunk_store), batch_size=64)
+    ds.set_epoch(0)
+    geom = open_geometries(obstore_store(one_fiber_per_chunk_store), variables=[FLUX_VAR])[FLUX_VAR]
+    assert geom.sample_chunk_size == 1  # one fiber per chunk (the streaming regime)
+
+    def epoch() -> list[np.ndarray]:
+        return [b.sample_indices.copy() for b in ds.train]
+
+    seen = np.concatenate(run_by(30.0, epoch))
+    n_train = len(ds.manifest.chunks["train"])
+    assert len(seen) == n_train and len(set(seen.tolist())) == n_train  # each fiber once
+    ds.close()
+
+
 def test_many_fibers_per_chunk(synth_store) -> None:
     # The spPlate-derived geometry: one plate is one chunk, and a chunk holds many fiber samples
     # (the decode-amortization regime, unlike Hubble's one image per chunk).

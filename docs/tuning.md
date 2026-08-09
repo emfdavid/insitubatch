@@ -61,7 +61,7 @@ store is written.
 | plain name | argument | what it does | default |
 |---|---|---|---|
 | batch size | `batch_size` | samples per batch | 32 |
-| shuffle window | `block_chunks` | outer chunks held resident + shuffled across at once | 16 |
+| shuffle window | `block_chunks` | outer chunks held resident + shuffled across at once | 16, raised if needed to hold one batch |
 | reads in flight | `max_inflight` | concurrent stored-chunk GETs — sets **cold start**; sets throughput only while IO-bound | 32 |
 | batch queue | `prefetch_depth` | assembled batches queued ahead of your training step | 2 |
 | cache | `cache_budget_bytes`, `cache_dir` | decoded data retained across epochs (decode-once) | off |
@@ -125,9 +125,14 @@ hands out ordinary pageable memory and warns once, rather than raising or stalli
 ## Shuffle quality
 
 `block_chunks` is also the shuffle-quality knob. Each batch is drawn from the samples in the
-current window — `block_chunks × samples-per-chunk` of them — so set the window so that pool
-is comfortably larger than `batch_size`; otherwise a batch is just one or two chunks' worth
-of correlated samples. The chunks are re-permuted every epoch, so even a modest window
+current window — `block_chunks × samples-per-chunk` of them — so set the window comfortably
+larger than `batch_size`; otherwise a batch is just one or two chunks' worth of correlated
+samples. A window *smaller* than a batch is not merely poor shuffle, it is unschedulable (the
+batch would need more blocks resident than the residency floor holds), so the loader raises
+`block_chunks` to `ceil(batch_size / samples-per-chunk)` when you ask for less and logs that
+it did. On finely chunked stores — one sample per chunk, like per-frame or per-spectrum
+archives — that floor is what the default 16 becomes. The chunks are re-permuted every epoch,
+so even a modest window
 converges toward a full-dataset shuffle over many epochs — the regime training actually runs
 in. [`shuffle_quality`](api.md) scores an emitted order 0–1 (1 ≈ global) if you want to
 measure it; [Architecture](architecture.md) explains why the block-local shuffle converges.

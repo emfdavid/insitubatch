@@ -312,6 +312,10 @@ class ChunkPool:
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
+        # Keys currently blocked in wait_ready. A blocked consumer is one that cannot
+        # unpin, which is what lets the scheduler prove an admission starvation is
+        # terminal rather than merely slow (see Scheduler._admit).
+        self._waiting: dict[tuple[str, int], int] = {}  # key -> blocked waiter count
 
     # -- observability ------------------------------------------------------
 
@@ -328,6 +332,23 @@ class ChunkPool:
     def resident_bytes(self) -> int:
         with self._cv:
             return self._bytes
+
+    @property
+    def budget_bytes(self) -> int | None:
+        """The residency ceiling, or ``None`` for an unbounded pool."""
+        return self._budget
+
+    def blocked_waiters(self) -> list[tuple[str, int]]:
+        """``(path, chunk_index)`` keys some thread is currently blocked on in
+        :meth:`wait_ready`.
+
+        A blocked consumer is a consumer that cannot reach its next
+        :meth:`unpin_keys`, so it can never free budget. The scheduler pairs this
+        with "no tile in flight" to tell a terminal starvation from a slow consumer
+        -- see :meth:`Scheduler._admit`. Read-only snapshot.
+        """
+        with self._cv:
+            return list(self._waiting)
 
     # -- admission / pinning / eviction -------------------------------------
 
@@ -671,12 +692,23 @@ class ChunkPool:
         """
         key = (array, chunk_index)
         with self._cv:
-            self._cv.wait_for(
-                lambda: (
-                    self._error is not None
-                    or (key in self._slots and self._slots[key].ready and self._slots[key].claimed)
+            self._waiting[key] = self._waiting.get(key, 0) + 1
+            try:
+                self._cv.wait_for(
+                    lambda: (
+                        self._error is not None
+                        or (
+                            key in self._slots
+                            and self._slots[key].ready
+                            and self._slots[key].claimed
+                        )
+                    )
                 )
-            )
+            finally:
+                if self._waiting[key] > 1:
+                    self._waiting[key] -= 1
+                else:
+                    del self._waiting[key]
             if self._error is not None:
                 raise self._error
             error = self._slots[key].error
