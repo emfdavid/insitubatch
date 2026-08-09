@@ -145,12 +145,27 @@ leaves about half the throughput on the table for a store shaped like this.
 ## As training batches
 
 Any loader works on the array above. This is insitubatch, streaming shuffled, chunk-aligned
-splits straight from the store:
+splits straight from the store — complete and standalone, so it runs as-is:
 
 ```python
+import icechunk
 from insitubatch import InSituDataset, open_geometries, split_by_chunk
 
+BUCKET = "insitubatch-bench-insitubatch"
+PREFIX = "astronomy/sdss_dr17_6plate_mirror_refs"
+PIXELS = f"https://storage.googleapis.com/{BUCKET}/astronomy/sdss/dr17/"
+
+config = icechunk.RepositoryConfig.default()
+config.set_virtual_chunk_container(
+    icechunk.VirtualChunkContainer(PIXELS, icechunk.http_store())
+)
+repo = icechunk.Repository.open(
+    icechunk.gcs_storage(bucket=BUCKET, prefix=PREFIX, anonymous=True),
+    config=config,
+    authorize_virtual_chunk_access=icechunk.containers_credentials({PIXELS: None}),
+)
 store = repo.readonly_session("main").store
+
 geoms = open_geometries(store, variables=["flux"], sample_axis=0)
 ds = InSituDataset(
     store,
