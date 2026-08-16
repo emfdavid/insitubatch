@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Fixed: `examples/README.md` mis-stated the entry-point class and the domain count.**
+  The intro wrote `InsituDataset` (lowercase `s`); the class is `InSituDataset`, so the
+  first spelling a reader copies fails on import. It also called `microscopy/` "the
+  cross-domain companion" — singular — underselling that `hubble/` and `sdss/` joined it;
+  now reads "one of three cross-domain companions". Documentation only; no code or tests touched.
+
 - **Added: `insitubatch.print_debug_info()` — one paste instead of a dozen version questions.**
   Reports the storage stack (zarr / obstore / numpy / xarray), whichever framework adapter is
   actually installed, and the **free-threading state** — both the build flag and whether an
