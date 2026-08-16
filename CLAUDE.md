@@ -3,6 +3,8 @@
 Train in place on n-dimensional cloud tensors: the data-loader orchestration
 layer on top of solved async IO (obstore / zarr v3). See [DESIGN.md](DESIGN.md)
 for the thesis and [docs/architecture.md](docs/architecture.md) for the pipeline.
+Contributor-facing rules (scope limits, dev setup, AI policy) live in
+[docs/contributing.md](docs/contributing.md); governance in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Working principles
 
@@ -34,7 +36,9 @@ for the thesis and [docs/architecture.md](docs/architecture.md) for the pipeline
 
 - **`uv`** manages everything (env, deps, running tools).
 - Verify: `uv run ruff check src tests bench examples`, `uv run mypy src bench examples`,
-  `uv run pytest -q`.
+  `uv run pytest -q`. Docs: `uv run --extra docs mkdocs build --strict` (CI runs it, so a
+  broken link fails the build). Pages under `docs/` **cannot** relatively link root files
+  (`DESIGN.md`, `GOVERNANCE.md`) — use the GitHub URL, as the existing pages do.
 - Pre-commit (ruff + mypy): `uv run pre-commit install` once; runs on every commit.
 - Build: `uv build`. Sync env: `uv sync` (extras: `--extra torch`, `--extra gpu`).
 - Python ≥ 3.12, src layout (`src/insitubatch/`), build backend `uv_build`.
@@ -42,6 +46,15 @@ for the thesis and [docs/architecture.md](docs/architecture.md) for the pipeline
   except for genuine third-party passthrough kwargs).
 
 ## Load-bearing invariants (do not break)
+
+> **Paired with [docs/contributing.md](docs/contributing.md).** That page carries the same
+> rule set contributor-facing, *with the reasoning*: this is the terse working copy, that is
+> the published contract, and neither may be weakened alone.
+>
+> The *organization* differs on purpose. Its scannable "hard no" list repeats the
+> frameworks-are-never-a-core-dep rule from the invariants below — the one contributors try
+> hardest to breach — so it has **four** entries where "Do not" has **three**. Same rules, not
+> the same line count; don't reconcile by deleting.
 
 - **`Batch` is numpy.** Frameworks (torch/JAX/TF) are thin DLPack adapters, never
   core dependencies. The core engine imports torch only optionally.
@@ -77,6 +90,21 @@ for the thesis and [docs/architecture.md](docs/architecture.md) for the pipeline
 Single source of truth: [DESIGN.md](DESIGN.md) (Status + Roadmap sections). Do
 not mirror milestone state here — it goes stale.
 
-## Commits
+## Commits & pull requests
 
 Commit only when asked. End commit messages with the Co-Authored-By trailer.
+
+PRs are squash-merged, so the **PR title becomes the commit on `main`** — use a descriptive
+Conventional-Commits-style title. Drafted PR descriptions follow
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md).
+
+- **Never tick the author-attestation checkbox.** It asserts that a human reviewed every
+  change, can explain why each is correct, and has verified the claims in the description.
+  That is the human author's to tick, and an assistant ticking it on their behalf is precisely
+  the failure the policy exists to prevent. Leave it unchecked and say so.
+- **Every PR adds a bullet under `## Unreleased` in CHANGELOG.md.** House style: bold lead-in,
+  then *why it mattered* — what broke, who it bit, how it presented — not just what changed.
+- **Performance claims carry their setup**: hardware (incl. vCPU count), store + region,
+  chunk geometry, loader config, and a **control/NULL run** measured in the same session.
+  Read the baseline's own defaults before publishing a number against it.
+- Anything crossing a load-bearing invariant is an issue for discussion, not a PR.

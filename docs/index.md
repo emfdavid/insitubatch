@@ -142,3 +142,8 @@ non-goal, not a gap — discrete offsets from an anchor already express it.)
 
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) is the single
 source of truth for status, the roadmap, and the scope limits.
+
+Contributions are welcome, and the project is being built to be maintained by more than one
+person: see [Contributing](contributing.md) for the scope limits and the dev setup, and
+[GOVERNANCE.md](https://github.com/emfdavid/insitubatch/blob/main/GOVERNANCE.md) for how
+decisions get made and how the core developer group grows.

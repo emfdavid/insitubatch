@@ -16,6 +16,15 @@ only when called, so importing `insitubatch` never pulls a framework in.
 
 ::: insitubatch.InSituDataset
 
+## Debugging
+
+::: insitubatch.debug
+    options:
+      show_root_heading: false
+      members:
+        - print_debug_info
+        - debug_info
+
 ## Framework adapters
 
 ::: insitubatch.frameworks

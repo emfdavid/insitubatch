@@ -30,6 +30,7 @@ theme:
 
 nav:
   - Home: index.md
+  - Contributing: contributing.md
   - Examples: examples.md
   - SDSS public dataset: sdss-dataset.md
   - Architecture: architecture.md
@@ -41,6 +42,8 @@ nav:
   - Benchmark plan: https://github.com/emfdavid/insitubatch/blob/main/bench/benchmark_plan.md
   - AWS ops runbook: https://github.com/emfdavid/insitubatch/blob/main/bench/ops_aws.md
   - GCP ops runbook: https://github.com/emfdavid/insitubatch/blob/main/bench/ops_gcp.md
+  - Governance: https://github.com/emfdavid/insitubatch/blob/main/GOVERNANCE.md
+  - Code of Conduct: https://github.com/emfdavid/insitubatch/blob/main/CODE_OF_CONDUCT.md
 
 plugins:
   - search

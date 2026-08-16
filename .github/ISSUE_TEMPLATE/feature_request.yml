@@ -1,0 +1,59 @@
+name: Feature request
+description: Propose new functionality, or a change to how something works.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposing here **before** writing the code is the point of this form — insitubatch has
+        a small number of load-bearing scope limits, and a change that crosses one is declined
+        however good the implementation is. Ten minutes here can save a weekend.
+
+        Please check
+        [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) first: its
+        *Known limitations & defects* and *Deferred generalizations* sections record what is
+        already planned and what was deliberately ruled out, with the reasoning.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like insitubatch to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What does it unblock?
+      description: >
+        The concrete situation — dataset, chunk geometry, training loop — where you hit this.
+        A driving use case is what turns a plausible idea into a scoped one.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: invariants
+    attributes:
+      label: Does this touch a load-bearing invariant?
+      description: >
+        See
+        [the list](https://emfdavid.github.io/insitubatch/contributing/#before-you-write-code-what-this-project-will-and-will-not-take).
+        An honest "yes" is not a rejection — it just means the discussion starts with the
+        design rather than the diff.
+      options:
+        - "No — I believe this fits within the current contract"
+        - "Yes — it needs the numpy Batch / no-framework-core rule to change"
+        - "Yes — it needs per-sample work in the Python hot path"
+        - "Yes — it needs samples that cross chunk boundaries, or a reshard"
+        - "Yes — something else on the list"
+        - "I am not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried, or what would you do instead?
+      description: >
+        Workarounds you have used, or other designs you considered. If you would be willing
+        to implement this yourself, say so — it changes how the discussion is scoped.

@@ -1,0 +1,36 @@
+name: Documentation
+description: Something in the docs is wrong, missing, or impossible to follow.
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        "I could not follow this" is a real and useful report — you do not need to know what
+        the right wording would be. Wrong prose is treated as seriously as a wrong result
+        here, because a bug fails a test whereas a plausible-sounding wrong sentence gets
+        believed and repeated.
+
+  - type: input
+    id: where
+    attributes:
+      label: Which page?
+      description: URL, or the path in the repo.
+      placeholder: "https://emfdavid.github.io/insitubatch/tuning/ — the block_chunks section"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong, missing, or unclear?
+      description: >
+        If a documented claim disagrees with what you observed, please include what you ran
+        and what you got — that makes it a correctness report rather than a wording one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording
+      description: Optional. Pull requests for docs are very welcome.
