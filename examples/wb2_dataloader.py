@@ -88,13 +88,24 @@ def _subregion_crop(var: str, subregion: tuple[int, int], seed: int) -> Callable
 
     def crop(batch: Batch) -> Batch:
         a = batch.arrays[var]  # (batch, ..., LAT, LON)
-        lat, lon = a.shape[-2], a.shape[-1]
-        out = np.empty(a.shape[:-2] + (h, w), dtype=a.dtype)
-        for b in range(a.shape[0]):
-            i = int(rng.integers(0, lat - h + 1))
-            j = int(rng.integers(0, lon - w + 1))
-            out[b] = a[b, ..., i : i + h, j : j + w]
-        batch.arrays[var] = out
+        b_size, lat, lon = a.shape[0], a.shape[-2], a.shape[-1]
+        # Draw every sample's offset in one batched pull from the RNG. Each
+        # sample still gets its own independent crop window — batching the
+        # draw changes the order the stream is consumed in, not the
+        # per-sample randomness — and one window per sample still covers
+        # every middle slice, exactly as the per-sample loop did.
+        i = rng.integers(0, lat - h + 1, size=b_size)  # (B,)
+        j = rng.integers(0, lon - w + 1, size=b_size)  # (B,)
+        m = a.size // (b_size * lat * lon)  # middle dims, folded
+        rows = np.repeat(i, m)[:, None] + np.arange(h)  # (B*M, h)
+        cols = np.repeat(j, m)[:, None] + np.arange(w)  # (B*M, w)
+        flat = a.reshape((-1, lat, lon))  # (B*M, LAT, LON)
+        idx = np.arange(flat.shape[0])[:, None, None]
+        # Advanced indices are adjacent and cover every axis of `flat`, so
+        # the result is exactly the broadcast of (idx, rows, cols) — one
+        # gathered (h, w) crop per flattened sample in one operation.
+        out = flat[idx, rows[:, :, None], cols[:, None, :]]  # (B*M, h, w)
+        batch.arrays[var] = out.reshape(a.shape[:-2] + (h, w))
         return batch
 
     return crop
