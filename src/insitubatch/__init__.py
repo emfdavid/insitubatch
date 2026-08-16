@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
+from .debug import debug_info, print_debug_info
 from .frameworks import as_tf_dataset, as_torch, to_jax, to_tf, to_torch
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
@@ -69,10 +70,12 @@ __all__ = [
     "block_shuffled_order",
     "build_stored_chunk_reads",
     "chunk_permutation",
+    "debug_info",
     "ensure_local_dir",
     "fsspec_store",
     "obstore_store",
     "open_geometries",
+    "print_debug_info",
     "sequential_order",
     "shuffle_quality",
     "split_by_chunk",
