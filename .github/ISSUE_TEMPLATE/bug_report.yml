@@ -1,0 +1,90 @@
+name: Bug report
+description: Report incorrect behaviour, a crash, or a hang.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The two fields that most often decide whether this can be
+        fixed without a round-trip are the **environment dump** and the **store geometry** —
+        please do not skip them.
+
+        Slow-but-correct behaviour belongs in the **Performance report** form instead.
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        Output of `python -c "import insitubatch; insitubatch.print_debug_info()"`.
+        This replaces a dozen version questions, and its free-threading line matters here.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you were trying to do, and what went wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: >
+        Smallest script that shows the problem. The PEP 723 header below pins the
+        development branch, so `uv run issue.py` reproduces it on any machine — including
+        ours. If the bug needs a private store, please synthesise one with the same chunk
+        geometry.
+      value: |
+        ```python
+        # /// script
+        # requires-python = ">=3.12"
+        # dependencies = [
+        #   "insitubatch @ git+https://github.com/emfdavid/insitubatch.git@main",
+        # ]
+        # ///
+        import insitubatch
+
+        insitubatch.print_debug_info()
+        # your reproducer here
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: geometry
+    attributes:
+      label: Store and geometry
+      description: >
+        Store URL or scheme (`s3://`, `gs://`, `file://`, icechunk, …), array shape, chunk
+        shape, which axis is the sample axis, and the loader arguments you passed
+        (`batch_size`, `block_chunks`, `max_inflight`, `prefetch_depth`, cache settings).
+      placeholder: |
+        store: s3://my-bucket/era5.zarr (us-east-1)
+        variable "t2m": shape (92040, 721, 1440), chunks (8, 721, 1440), sample_axis=0
+        InSituDataset(batch_size=64, block_chunks=16, max_inflight=32)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Traceback or log output
+      description: Paste the full traceback. For a hang, a `py-spy dump` is worth far more than a description.
+      render: shell
+
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else?

@@ -1,0 +1,17 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question — "how do I do X with insitubatch?"
+    url: https://github.com/emfdavid/insitubatch/discussions
+    about: Usage questions, tuning advice, and "is this the right tool for my data?" belong in Discussions.
+  - name: Contributing guide
+    url: https://emfdavid.github.io/insitubatch/contributing/
+    about: Development setup, the project's scope limits, and how to get a change reviewed.
+  - name: Zarr community chat
+    url: https://ossci.zulipchat.com/
+    about: Questions about zarr-python, the Zarr spec, or the wider ecosystem.
+  - name: Pangeo Discourse
+    url: https://discourse.pangeo.io/
+    about: Wider scientific-data-on-the-cloud discussion.
+  - name: Report a security issue
+    url: https://github.com/emfdavid/insitubatch/security/advisories/new
+    about: Please report vulnerabilities privately, not on the public tracker.

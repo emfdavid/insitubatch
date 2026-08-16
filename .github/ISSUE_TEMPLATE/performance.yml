@@ -1,0 +1,102 @@
+name: Performance report
+description: The loader is slower, or uses more memory, than you expected.
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Throughput here is a function of chunk geometry, the loader's concurrency budget and
+        the box — so a report without those is not actionable, however carefully it is
+        written. Everything below is asked because it has changed a diagnosis at least once.
+
+        Worth checking first: [Tuning](https://emfdavid.github.io/insitubatch/tuning/) and
+        the published [Benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/),
+        which also state where insitubatch is *expected* to lose.
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Output of `python -c "import insitubatch; insitubatch.print_debug_info()"`.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: >
+        Instance type or machine, **vCPU count**, RAM, GPU if any, and whether it is in the
+        same region as the store. vCPU count is the single most common explanation for a
+        surprising number.
+      placeholder: "c6id.8xlarge, 32 vCPU, 64 GiB, us-east-1 (same region as the bucket)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: store
+    attributes:
+      label: Store and geometry
+      description: >
+        Store URL or scheme and region; array shape and chunk shape; which axis is the sample
+        axis; samples per chunk; compressor. If variables chunk the sample axis differently,
+        say so.
+      placeholder: |
+        gs://weatherbench2/.../1959-2022-6h-128x64_equiangular... (us-central1)
+        "2m_temperature": shape (92040, 128, 64), chunks (40, 128, 64) -> 40 samples/chunk
+        sample_axis=0, zstd
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Loader configuration
+      description: "`batch_size`, `block_chunks`, `max_inflight`, `prefetch_depth`, cache budget, `persist`, transforms, and which framework surface."
+      placeholder: |
+        InSituDataset(batch_size=64, block_chunks=16, max_inflight=32, prefetch_depth=2,
+                      cache_budget_bytes=8<<30, persist=False)
+        chunk_transform: kelvin_to_celsius; surface: as_torch
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed vs expected
+      description: >
+        Numbers, with units: samples/s or MB/s, time-to-first-batch, peak RSS. Say whether
+        the run was **cold or warm**, and how many epochs it covered.
+      placeholder: |
+        observed: 410 MB/s steady, TTFB 48 s (cold), peak RSS 12 GiB
+        expected: ~1.2 GB/s — the NIC does that, and a plain obstore get loop reaches it
+    validations:
+      required: true
+
+  - type: textarea
+    id: baseline
+    attributes:
+      label: What did you compare against?
+      description: >
+        If there is a baseline — a worker `DataLoader`, xbatcher, a plain read loop, or an
+        earlier insitubatch version — give **its** configuration too, including the defaults
+        you left alone. A misconfigured baseline is the most common source of a wrong
+        conclusion in either direction.
+
+  - type: checkboxes
+    id: control
+    attributes:
+      label: Control
+      options:
+        - label: >
+            I ran a control/NULL configuration on the same box in the same session
+            (small boxes have an A/B resolution floor of a few percent).
+        - label: I profiled it (`py-spy`, or `probe_decode --profile`) and can attach the output.
+
+  - type: textarea
+    id: profile
+    attributes:
+      label: Profile or logs
+      description: "`py-spy record --native` output, or the loader's own timing logs, if you have them."
+      render: shell

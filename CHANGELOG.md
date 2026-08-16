@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Added: `insitubatch.print_debug_info()` — one paste instead of a dozen version questions.**
+  Reports the storage stack (zarr / obstore / numpy / xarray), whichever framework adapter is
+  actually installed, and the **free-threading state** — both the build flag and whether an
+  import has since switched the GIL back on, which are not the same thing and have explained
+  more than one "works for me". Nothing is imported to report on it (versions come from
+  distribution metadata), because importing torch and JAX in one process crashes — a debug
+  helper that took the process down while someone was reporting a bug would be worse than
+  none. `debug_info()` returns the same facts as a dict. The new bug and performance issue
+  forms ask for its output.
+
 - **Fixed: a batch wider than a shuffle-block deadlocked the loader.** A batch draws from
   every block it spans and holds them until it has gathered, so `batch_size >
   2 × block_chunks × samples-per-chunk` needed more blocks resident than the budget floor
@@ -17,6 +27,19 @@
   every resident slot pinned, and a consumer blocked in `wait_ready` — and raises with the
   residency arithmetic and the offending chunk. The test is structural, not a timeout, so a
   merely slow consumer is never mistaken for a deadlock.
+- **Project: a contributor and governance model, adopted before it is strictly needed.**
+  insitubatch is maintained by one person today and that is a transitional state, so the rules
+  are now written down rather than improvised at the moment they are first contested. A
+  [contributing guide](https://emfdavid.github.io/insitubatch/contributing/) puts the
+  load-bearing scope limits up front — the four things that will not land, and *why* — so a
+  contributor can tell in a minute whether their change is compatible instead of finding out in
+  review. `GOVERNANCE.md` adapts the Zarr Project's affiliated-project template: a merit-based
+  core-developer group, lazy consensus with a vote as last resort, and a stated intent to seek
+  Zarr Affiliated Project status. Plus Contributor Covenant 3.0, a security policy, and
+  issue/PR templates — including a **performance-report form** that asks for the chunk
+  geometry, loader config, hardware and a control run, because a throughput report without
+  those is not actionable. AI-assisted contributions are welcome under an explicit
+  *accountability* rule rather than an authorship one.
 
 ## 0.1.0 — 2026-07-06
 

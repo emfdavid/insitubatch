@@ -243,6 +243,23 @@ the GIL probe needs a realistically-sized chunk (a toy array is dominated by cal
 the **reshaping** path, try `--transform examples/transforms.py:Coarsen` — a chunk-local regrid
 that halves the grid and declares `output_inner`, so the report shows the validated shape change.
 
+## Contributing
+
+insitubatch is maintained by one person today, and that is a transitional state rather than the
+intent — the project is being built to be worked on by several people, with the governance
+written down *before* it is strictly needed so that the next maintainers have a framework to
+build on. Bug reports, performance reports, docs and new-domain examples are all
+real contributions, and the path into the core developer group is merit-based and public.
+
+Start with the [contributing guide](https://emfdavid.github.io/insitubatch/contributing/): it
+covers the dev setup, the scope limits that decide whether a change can land, the
+one-framework-per-environment test caveat, what a performance claim has to carry, and the
+policy on AI-assisted contributions. Then [GOVERNANCE.md](GOVERNANCE.md) for how decisions get
+made, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), which applies to maintainers first.
+
+For anything larger than a bug fix, please
+[open an issue](https://github.com/emfdavid/insitubatch/issues/new/choose) first.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
