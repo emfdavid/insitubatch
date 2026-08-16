@@ -3,11 +3,11 @@
 Runnable examples (not shipped in the wheel). Run from the repo root, e.g.
 `python -m examples.advection.train_torch`.
 
-The InsituDataset is a general purpose, batteries included, tool for batching zarr compatible 
+The InSituDataset is a general purpose, batteries included, tool for batching zarr compatible 
 data into the python ML ecosystem. Most examples are forecasting focused because there are large
 public zarr datasets available and the time shifting on insitu data is an added challenge that
-shows the generalization; [`microscopy/`](#microscopy--ome-ngff-cell-segmentation-over-z) is the
-cross-domain companion — a different geometry (sample over Z, two variables chunked differently)
+shows the generalization; [`microscopy/`](#microscopy--ome-ngff-cell-segmentation-over-z) is one of three
+cross-domain companions — a different geometry (sample over Z, two variables chunked differently)
 on a real bio-imaging store, to show the engine is not weather-specific.
 
 ## advection/ — a 24-hour forecast, one dataset, three frameworks
