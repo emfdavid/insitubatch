@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Under-sizing the budget for concurrent iterations now says so.** One `InSituDataset`
+  owns one chunk pool and every active iteration shares it — `zip(ds.train, ds.val)`, or
+  two `DataLoader`s — but each holds its *own* chunk references, so residency is the sum
+  of their working sets, not the maximum. The auto-sized default covers one iteration and
+  deliberately stays that way: the engine cannot know how many you intend to run, and
+  guessing high would cost memory in the single-iteration case that is almost every case.
+  What was missing was the diagnostic. Starvation previously advised "raise
+  cache_budget_bytes, or lower batch_size / block_chunks" — correct but not actionable
+  when *every* resident chunk is legitimately referenced and the caller has no way to see
+  why. It now names how many iterations are sharing the pool, and the pattern that
+  produces that. Owners count from mint to release rather than from their first pin,
+  because the iteration that starves before it can pin anything is exactly the one that
+  needs naming. `docs/tuning.md` gains the sizing rule.
+
 - **The chunk pool's "safe to take away" predicate is now true, not approximately true.**
   Eviction eligibility was spread across five loosely-coupled fields, and each one could
   lie. `fail()` had to set `ready = True` to wake a waiter — the only lever available —

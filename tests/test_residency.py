@@ -168,3 +168,49 @@ def test_slow_consumer_is_not_mistaken_for_starvation(small_store, run_by) -> No
     with Scheduler(obstore_store(small_store), geoms, pool, SchedulerConfig()) as sched:
         sched.start(list(range(geom.n_chunks)), geom.sample_chunk_size)
         assert run_by(DEADLINE, lambda: drain(sched)) == geom.n_chunks
+
+
+def test_starvation_names_concurrent_iterations_as_the_cause(small_store, run_by) -> None:
+    """Under-sizing for concurrent iterations must say so, not just "raise the budget".
+
+    Sizing for one iteration is the deliberate default (the engine cannot know how many
+    you intend to run), so the *diagnostic* is what has to carry the cost. Every resident
+    chunk here is legitimately referenced -- by one of two iterations -- which is exactly
+    the case a caller cannot infer from "every one of them pinned or in flight".
+
+    Guards the number too: reporting a count means it has to be the count of distinct
+    owners, not of pins or of resident chunks.
+    """
+    geoms = open_geometries(obstore_store(small_store))
+    geom = geoms["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    chunk_bytes = geom.sample_chunk_size * 2 * 2 * 4
+    ds = InSituDataset(
+        obstore_store(small_store),
+        manifest,
+        shuffle=False,
+        batch_size=geom.sample_chunk_size,
+        block_chunks=2,
+        cache_budget_bytes=2 * chunk_bytes,  # fits one iteration, not two
+    )
+    ds.set_epoch(0)
+
+    def interleave() -> None:
+        a, b = iter(ds.train), iter(ds.train)
+        try:
+            for _ in range(geom.n_chunks):
+                next(a)
+                next(b)
+        finally:
+            for it in (a, b):
+                it.close()
+
+    with pytest.raises(RuntimeError, match="residency budget exhausted") as exc:
+        run_by(DEADLINE, interleave)
+
+    msg = str(exc.value)
+    assert "2 iterations are sharing this pool" in msg, (
+        "the diagnostic must name concurrent iterations as the cause -- every chunk is "
+        f"legitimately referenced, so 'raise the budget' alone is not actionable: {msg}"
+    )
+    assert "zip(ds.train, ds.val)" in msg, "point at the pattern that produces this"

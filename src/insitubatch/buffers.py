@@ -246,6 +246,10 @@ class BatchBuffers:
     held only across that decision -- never across a gather -- so it costs one uncontended
     acquire per variable per batch, against a gather that copies megabytes.
 
+    Running two iterations also costs *residency*: each holds its own chunk references, so the
+    pool's budget must cover both working sets. The auto-sized default covers one -- see
+    docs/tuning.md, "Several iterations at once multiply the budget".
+
     Writing a lent buffer stays lock-free and always was: a buffer is lent to exactly one
     producer, which is the only thread that touches it.
     """
