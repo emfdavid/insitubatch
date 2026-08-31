@@ -55,56 +55,71 @@ import asyncio
 import contextlib
 import os
 import threading
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any
 
 import numpy as np
 import zarr.api.asynchronous as za
 from zarr.abc.store import Store
 from zarr.core.array_spec import ArraySpec
 from zarr.core.buffer import default_buffer_prototype
+from zarr.core.chunk_utils import ChunkTransform
+from zarr.core.sync import _get_loop
 
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
 from .types import ArrayGeometry, StoredChunkRead
 
-_T = TypeVar("_T")
-
 STARVATION_POLL_S = 0.25
+
+_DECODE_POOL: ThreadPoolExecutor | None = None
+_DECODE_POOL_LOCK = threading.Lock()
+
+
+def decode_pool(workers: int | None = None) -> ThreadPoolExecutor:
+    """The process-wide decode pool. Created once, never shut down.
+
+    Process-lived on purpose. A per-scheduler pool was rebuilt on every pass (churn), and
+    -- once orchestration moved onto zarr's loop -- shutting one down was actively unsafe:
+    the pool had to be installed as the loop's *default executor* for ``decode_threads`` to
+    mean anything, so closing it left zarr's own ``run_in_executor(None, ...)`` raising
+    ``cannot schedule new futures after shutdown`` for the rest of the process.
+
+    We no longer touch the loop's default executor at all (see :meth:`Scheduler._one`), and
+    this pool outlives every scheduler, so neither failure is reachable.
+
+    ``workers`` sizes it on **first** use only; later callers get the existing pool. Sizing
+    is process-wide because the pool is -- a second dataset does not get a second pool.
+    """
+    global _DECODE_POOL
+    with _DECODE_POOL_LOCK:
+        if _DECODE_POOL is None:
+            n = workers or min(32, (os.cpu_count() or 4) + 4)
+            _DECODE_POOL = ThreadPoolExecutor(max_workers=n, thread_name_prefix="insitu-dec")
+        return _DECODE_POOL
+
+
+def reset_decode_pool() -> None:
+    """Drop the process-wide decode pool so the next use rebuilds it. **Tests only.**
+
+    Not a user-facing knob: production code never wants this (the whole point is that the
+    pool outlives schedulers). Tests need it to size the pool per case, to run a
+    free-threaded arm, and to avoid leaking one case's pool into the next.
+    """
+    global _DECODE_POOL
+    with _DECODE_POOL_LOCK:
+        pool, _DECODE_POOL = _DECODE_POOL, None
+    if pool is not None:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 """How often a parked admission re-checks for a *provably* terminal starvation.
 
 Detection latency only: the test is structural (nothing in flight, and a consumer
 blocked in ``wait_ready``), never "we have waited a while", so a slow consumer is
 never mistaken for a deadlock however long it takes."""
-
-
-def _fsspec_io_loop(store: Store) -> asyncio.AbstractEventLoop | None:
-    """The event loop an fsspec-backed store's IO must run on, if not the caller's.
-
-    A genuinely-async fsspec backend (gcsfs, s3fs) binds its aiohttp session to
-    whichever event loop *first awaits* one of its coroutines, and can never be used
-    from another loop ("Future attached to a different loop"). Neither zarr's
-    ``FsspecStore`` nor gcsfs exposes a knob to pin that loop -- the ``loop=``
-    constructor arg does not bind the session -- and zarr's ``FsspecStore.get``
-    awaits ``fs._cat_file`` on the *calling* loop with no routing of its own.
-
-    zarr drives all of *its* store IO on one process-wide background loop
-    (``zarr.core.sync._get_loop()``); because insitu reads a zarr store opened through
-    zarr (``open_geometries``/``open_array``), the session is created there. So the
-    correct, self-consistent choice is to route insitu's fsspec reads to that same
-    loop: the session lives there, and driving every read there keeps one loop for the
-    store even if nothing opened it first. ``None`` for stores needing no routing --
-    obstore's ``ObjectStore`` bridges its Rust runtime to whatever loop awaits it
-    (no ``.fs``), so the scheduler awaits it inline.
-    """
-    fs = getattr(store, "fs", None)
-    if fs is None or not getattr(fs, "asynchronous", False):
-        return None
-    from zarr.core.sync import _get_loop
-
-    return _get_loop()
 
 
 @dataclass(slots=True)
@@ -132,19 +147,44 @@ class _ArrayCtx:
     """Per-variable handles for the stored-chunk fetch+decode path.
 
     Cached once per array: the store + key encoder address a stored chunk, the
-    codec pipeline + spec decode its bytes (this reconstructs exactly what
+    codec transform + spec decode its bytes (this reconstructs exactly what
     ``arr.getitem`` would stitch, for single-inner and spatially-chunked arrays).
+
+    ``codec`` is a **synchronous** :class:`~zarr.core.chunk_utils.ChunkTransform`, not the
+    array's async ``codec_pipeline`` -- see :func:`_sync_transform` for why that matters.
     """
 
     path: str
-    store: object
+    store: Store
     encode: Callable[[tuple[int, ...]], str]
-    codec: object
+    codec: ChunkTransform
     spec: ArraySpec
     chunk_shape: tuple[int, ...]
     fill_value: object
     dtype: np.dtype
     sample_axis: int  # physical axis to move to the front on decode (0 = no-op)
+
+
+def _sync_transform(meta: Any) -> ChunkTransform:
+    """A **synchronous** full-chain decoder for one array's codecs.
+
+    ``ChunkTransform.decode_chunk`` is pure compute with no IO, so we can call it inside
+    an executor task we dispatch ourselves -- which is what lets us keep our own decode
+    pool without claiming the loop's single default-executor slot. The async
+    ``codec_pipeline.decode`` cannot: it dispatches to the loop default on our behalf.
+
+    Format-agnostic, and v2 is not optional -- **WeatherBench2 ARCO is zarr-v2**, whose
+    pipeline is a single ``V2Codec(filters, compressor)`` rather than v3's
+    ``(BytesCodec, ZstdCodec, ...)``. A v3-only path would silently miss our main weather
+    benchmark. Verified byte-identical to the async pipeline on v3 zstd / uncompressed /
+    gzip and on v2.
+    """
+    codecs = getattr(meta, "codecs", None)
+    if codecs is None:  # zarr-v2: the compressor hangs off V2Codec, not a codec chain
+        from zarr.codecs._v2 import V2Codec
+
+        codecs = (V2Codec(filters=meta.filters, compressor=meta.compressor),)
+    return ChunkTransform(codecs=tuple(codecs))
 
 
 def _bad_fill(ctx: _ArrayCtx) -> object:
@@ -195,12 +235,13 @@ class Scheduler:
         self.inflight_peak = 0
         self._inflight_now = 0
 
-        workers = self._config.decode_threads or min(32, (os.cpu_count() or 4) + 4)
-        self._decode_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="insitu-dec")
-        self._loop = asyncio.new_event_loop()
-        # Set once reads begin: the foreign loop an fsspec store pins its IO to (gcsfs/
-        # s3fs), or None for a loop-agnostic store (obstore). See _fsspec_io_loop / _io.
-        self._foreign_loop: asyncio.AbstractEventLoop | None = None
+        self._decode_pool = decode_pool(self._config.decode_threads)
+        # ONE loop for the whole process: zarr's. An async fsspec backend binds its aiohttp
+        # session to whichever loop first awaits it, and because we read a store opened
+        # through zarr that loop is zarr's -- so being on it is what deletes the bridge
+        # (gcsfs and obstore now take the same inline `await`). obstore is loop-agnostic
+        # and does not care. We are a guest on it: see `close` and `_shutdown`.
+        self._loop = _get_loop()
         self._inflight: asyncio.Semaphore | None = None
         self._capacity: asyncio.Event | None = None  # set on unpin -> wakes a parked admit
         self._open_lock: asyncio.Lock | None = None
@@ -210,47 +251,50 @@ class Scheduler:
         # it cancels unrelated zarr-sync work mid-flight. Mutated only on the loop thread
         # (create_task and the done-callback both run there), so it needs no lock.
         self._tasks: set[asyncio.Task] = set()
-        # Whether this scheduler stood the loop up. A borrowed loop must never be stopped
-        # or closed by us -- doing so leaves zarr's process-global loop dead for the rest
-        # of the process.
-        self._owns_loop = True
-        self._thread: threading.Thread | None = threading.Thread(
-            target=self._run_loop, daemon=True, name="insitu-sched"
-        )
-        self._thread.start()
-        self._ready.wait()
+        self._loop.call_soon_threadsafe(self._setup)
+        self._ready.wait(timeout=10)
 
     # -- loop lifecycle -----------------------------------------------------
 
-    def _run_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.set_default_executor(self._decode_pool)  # decode + scatter -> our pool
+    def _setup(self) -> None:
+        """Create our asyncio primitives **on** the loop. Runs there, once, at construction.
+
+        Deliberately does NOT call ``set_default_executor``: a borrowed loop has exactly one
+        default-executor slot, and claiming it retunes zarr's own concurrency process-wide
+        (then breaks it when we shut our pool down). We pass :attr:`_decode_pool` explicitly
+        instead -- which is possible only because decode is now a *synchronous* call we
+        dispatch ourselves (:meth:`_one`), rather than an async pipeline that dispatches to
+        the loop default on our behalf.
+        """
         self._inflight = asyncio.Semaphore(self._config.max_inflight)
         self._capacity = asyncio.Event()
         self._open_lock = asyncio.Lock()
-        self._loop.call_soon(self._ready.set)
-        self._loop.run_forever()
+        self._ready.set()
 
     def close(self) -> None:
-        """Cancel any in-flight driver, then stop the loop and decode pool.
+        """Cancel this scheduler's in-flight driver. Nothing else.
 
-        Graceful: a consumer may close mid-epoch (early ``break``) while ``_drive``
-        is still streaming. We cancel outstanding tasks and let them unwind *before*
-        stopping the loop, so no coroutine is orphaned (which would surface as
-        ``GeneratorExit`` / "never awaited" warnings on GC).
+        Graceful: a consumer may close mid-epoch (early ``break``) while ``_drive`` is
+        still streaming, so we cancel our outstanding tasks and let them unwind.
+
+        **A scheduler owns no shared resource, so it tears down no shared resource.** The
+        loop is zarr's and lives for the process; the decode pool is process-wide and
+        outlives every scheduler; the chunk pool is caller-owned and persists across epochs
+        as the cache. Closing any of them here would break unrelated work elsewhere in the
+        process -- which is not hypothetical: stopping the loop hangs every later
+        ``zarr.core.sync.sync()`` call, and shutting the decode pool down makes the next
+        scheduler raise ``cannot schedule new futures after shutdown``. Both were observed.
         """
         with contextlib.suppress(Exception):  # loop may already be down
             fut = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
             fut.result(timeout=5)  # resolves while the loop is still running
-        if self._owns_loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)  # ...then stop it
-            if self._thread is not None:
-                self._thread.join(timeout=5)
-                if not self._thread.is_alive():  # exited run_forever -> safe to close
-                    self._loop.close()  # release the self-pipe; don't leave it for __del__
-        self._decode_pool.shutdown(wait=False, cancel_futures=True)
-        # NB: the *chunk* pool is caller-owned (persists across epochs as the cache) -- the
-        # dataset closes it, not us.
+        # NB: we do NOT shut the decode pool down. It is process-wide and outlives every
+        # scheduler (see `decode_pool`); shutting it here would make the *next* scheduler
+        # raise "cannot schedule new futures after shutdown" -- which is precisely the
+        # shared-resource teardown bug this design exists to avoid, and the suite catches
+        # it immediately. Tests that need a fresh pool call `reset_decode_pool()`.
+        # The *chunk* pool is likewise caller-owned (it persists across epochs as the
+        # cache) -- the dataset closes it, not us.
 
     async def _shutdown(self) -> None:
         """Cancel + drain **our** in-flight tasks. Never the loop's other work.
@@ -432,18 +476,6 @@ class Scheduler:
             f"cache_budget_bytes, or lower batch_size / block_chunks.{concurrent}"
         )
 
-    async def _io(self, coro: Coroutine[Any, Any, _T]) -> _T:
-        """Await a store coroutine on the loop that store's IO belongs to.
-
-        obstore is loop-agnostic -> await inline on our loop. An fsspec store's IO must
-        run on its own loop (see :func:`_fsspec_io_loop`); schedule it there and bridge
-        the result back to ours, without blocking either loop -- so read concurrency is
-        preserved across the boundary.
-        """
-        if self._foreign_loop is None:
-            return await coro
-        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._foreign_loop))
-
     async def _ensure_arrays(self) -> None:
         if self._arrays:
             return
@@ -451,16 +483,13 @@ class Scheduler:
         async with self._open_lock:
             if self._arrays:
                 return
-            # Resolve the store's IO loop once, before the first store touch (open reads
-            # metadata) -- an fsspec store crashes if that touch runs on our loop.
-            self._foreign_loop = _fsspec_io_loop(self._store)
             store = self._store
             # Open each distinct array once, keyed by its zarr path: several windowed
             # views (same path, different offset) share one open + one decode path.
             for geom in self._geometries.values():
                 if geom.path in self._arrays:
                     continue
-                aa = await self._io(za.open_array(store=store, path=geom.path, mode="r"))
+                aa = await za.open_array(store=store, path=geom.path, mode="r")
                 # Format-agnostic: zarr-v2 metadata exposes `dtype`/`encode_chunk_key`
                 # where v3 has `data_type`/`chunk_key_encoding.encode_chunk_key` -- so the
                 # engine reads public v2 stores (WeatherBench2 ARCO) as well as v3.
@@ -477,7 +506,7 @@ class Scheduler:
                     path=aa.store_path.path,
                     store=aa.store_path.store,
                     encode=meta.encode_chunk_key,
-                    codec=aa.codec_pipeline,
+                    codec=_sync_transform(meta),
                     spec=spec,
                     chunk_shape=tuple(aa.metadata.chunks),
                     fill_value=aa.metadata.fill_value,
@@ -516,7 +545,13 @@ class Scheduler:
                         self.bad_chunks.append(read)
                         tile = np.full(ctx.chunk_shape, _bad_fill(ctx), dtype=ctx.dtype)
                     try:
-                        await self._loop.run_in_executor(None, w.deliver, tile)
+                        # Delivery used to be a second executor hop, because it was a
+                        # memcpy into the assembled slot. Under chunked slots it is a dict
+                        # assignment and a counter, so the hop is deleted rather than
+                        # fused -- and the decoded tile stops living in this frame across
+                        # it, which is what made tile residency scale with `max_inflight`
+                        # (an IO dial) instead of with the pool doing the work.
+                        w.deliver(tile)
                     except Exception as exc:  # noqa: BLE001 - a delivery failure is a real bug
                         w.fail(exc)
             finally:
@@ -529,11 +564,17 @@ class Scheduler:
         ax = ctx.sample_axis
         phys = read.inner_coord[:ax] + (read.chunk_index,) + read.inner_coord[ax:]
         key = ctx.path + "/" + ctx.encode(phys)
-        buf = await self._io(ctx.store.get(key, prototype=self._proto))  # type: ignore[attr-defined]
+        # One path for every backend. We are on zarr's loop, which is the loop an async
+        # fsspec session is bound to, so gcsfs and obstore are both a plain inline await.
+        buf = await ctx.store.get(key, prototype=self._proto)
         if buf is None:  # absent chunk == all fill_value (zarr's getitem semantics)
             tile = np.full(ctx.chunk_shape, ctx.fill_value, dtype=ctx.dtype)
         else:
-            [decoded] = list(await ctx.codec.decode([(buf, ctx.spec)]))  # type: ignore[attr-defined]
+            # Decode on OUR pool, named explicitly -- never `None`, which would mean the
+            # loop's default executor and would make us a guest that retunes its host.
+            decoded = await self._loop.run_in_executor(
+                self._decode_pool, ctx.codec.decode_chunk, buf, ctx.spec
+            )
             tile = decoded.as_numpy_array()
         # Seam 2: the decoded tile is in physical order; move the sample axis to the front
         # so it matches the sample-first slot the pool scatters into (no-op when ax == 0).

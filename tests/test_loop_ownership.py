@@ -21,6 +21,7 @@ import threading
 import numpy as np
 import pytest
 import zarr
+from zarr.core.sync import _get_loop
 
 from insitubatch import ensure_local_dir, obstore_store, open_geometries
 from insitubatch.pool import ChunkPool
@@ -124,10 +125,17 @@ def test_parked_driver_is_registered_and_cancelled(store_url):
 
 
 def test_borrowed_loop_is_not_stopped_or_closed(store_url):
-    """With ``_owns_loop`` false, ``close()`` leaves the loop running and usable."""
+    """``close()`` leaves zarr's loop running and usable -- it is not ours to close.
+
+    Note there is nothing to "tidy up" afterwards: the loop belongs to zarr and lives for
+    the process. An earlier draft of this test "cleaned up" by closing the loop itself,
+    which stopped zarr's process-global loop and hung every subsequent test in the session
+    on ``zarr.core.sync.sync()``. That is exactly the failure mode this contract exists to
+    prevent, and it is one line away at all times.
+    """
     sched = _sched(store_url)
-    sched._owns_loop = False  # pretend the loop was handed to us (the #30 shape)
     loop = sched._loop
+    assert loop is _get_loop(), "the scheduler must run on zarr's loop, not one of its own"
 
     sched.close()
 
@@ -135,7 +143,3 @@ def test_borrowed_loop_is_not_stopped_or_closed(store_url):
     assert loop.is_running(), "close() stopped a loop it does not own"
     # ...and it still runs work afterwards, which is the property that actually matters.
     assert asyncio.run_coroutine_threadsafe(asyncio.sleep(0, result=7), loop).result(timeout=5) == 7
-
-    # tidy up the loop this test is now responsible for
-    sched._owns_loop = True
-    sched.close()

@@ -39,21 +39,24 @@ def test_fsspec_store_round_trips_an_epoch(write_zarr) -> None:
     np.testing.assert_array_equal(got, srcs["t2m"])
 
 
-def test_fsspec_store_io_routes_to_zarr_loop(tmp_path) -> None:
-    # Regression for the cross-loop crash: a genuinely-async fsspec store (gcsfs, or
-    # the local async wrapper here) binds its session to the loop that first awaits it
-    # -- zarr's -- so the scheduler must drive its IO there, not on its own loop. An
-    # obstore store is loop-agnostic and needs no routing. (The round-trip above already
-    # exercises the routed read end to end; this pins the selection directly.)
+def test_scheduler_drives_both_backends_on_zarr_loop(write_zarr) -> None:
+    # Regression for the cross-loop crash, restated for the consolidated design. A
+    # genuinely-async fsspec store (gcsfs, or the local async wrapper here) binds its
+    # session to the loop that first awaits it -- zarr's -- which used to force a
+    # per-read bridge off our own loop. The scheduler now *runs on* that loop, so both
+    # backends are a plain inline await and there is no routing decision left to make.
+    # This pins the property the bridge used to provide: same loop, either backend.
     from zarr.core.sync import _get_loop
 
-    from insitubatch import obstore_store
-    from insitubatch.scheduler import _fsspec_io_loop
+    from insitubatch import obstore_store, open_geometries
+    from insitubatch.pool import ChunkPool
+    from insitubatch.scheduler import Scheduler, SchedulerConfig
 
-    fss = fsspec_store(f"file://{tmp_path}")  # async fsspec wrapper -> route to zarr's loop
-    assert _fsspec_io_loop(fss) is _get_loop()
-    obs = obstore_store(f"file://{tmp_path}")  # loop-agnostic -> await inline
-    assert _fsspec_io_loop(obs) is None
+    url, _ = write_zarr(n=8, spc=2)
+    for store in (fsspec_store(url), obstore_store(url)):
+        geoms = open_geometries(store)
+        with Scheduler(store, geoms, ChunkPool(geoms), SchedulerConfig()) as sched:
+            assert sched._loop is _get_loop()
 
 
 def test_fsspec_store_writes_local_zarr(tmp_path) -> None:
