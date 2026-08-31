@@ -211,6 +211,25 @@ may sit on a loop shared with the rest of the process.
 the semaphore is held across ①②③, so in-flight tiles, queued decode work and decoded-tile
 residency are all bounded by that one dial.
 
+#### Built on zarr's abstractions
+
+The pool speaks zarr's own vocabulary for "a grid of inner chunks", so the structure stays
+legible to zarr rather than being a private dict of ndarrays:
+
+| ours | zarr |
+|---|---|
+| `ArrayGeometry.tile_placement` | returns a `zarr.core.indexing.ChunkProjection` — `chunk_coords`, `chunk_selection`, `out_selection`, `is_complete_chunk` |
+| the sync decode | `zarr.core.chunk_utils.ChunkTransform.decode_chunk` — so we do not maintain a codec whitelist |
+| `ArrayGeometry` inner grid | conforms to `DimensionGridLike` (proven in `tests/test_zarr_indexing_parity.py`) |
+| a `_Slot` | a **decoded shard** — zarr's word for one addressable unit made of a grid of inner chunks |
+
+Two zarr facilities are deliberately *not* adopted. `FusedCodecPipeline.read_sync` takes
+`ByteGetter`s and therefore **owns the IO**, which would surrender the scheduler,
+`max_inflight` and back-pressure; `decode_chunk` is IO-free, which is why it is the one we
+use. And the process-global `codec_pipeline.path` is never flipped — that retunes the
+substrate under user code — so we build our own `ChunkTransform` from the array's declared
+codecs, which is also what keeps zarr-v2 (`V2Codec(filters, compressor)`) working.
+
 #### Sharing a loop means owning nothing
 
 A scheduler tears down **only what it created**. It cancels the tasks it started (never
