@@ -143,3 +143,50 @@ def test_borrowed_loop_is_not_stopped_or_closed(store_url):
     assert loop.is_running(), "close() stopped a loop it does not own"
     # ...and it still runs work afterwards, which is the property that actually matters.
     assert asyncio.run_coroutine_threadsafe(asyncio.sleep(0, result=7), loop).result(timeout=5) == 7
+
+
+def test_decode_pool_is_process_wide_and_warns_on_a_second_size(caplog):
+    """One pool per process, sized once; a later different request warns and is ignored.
+
+    Thread count is a property of the machine, not of a dataset, so the first value wins
+    rather than the last. Silently ignoring it would be worse than either.
+    """
+    from insitubatch.scheduler import decode_pool, reset_decode_pool
+
+    reset_decode_pool()
+    try:
+        first = decode_pool(3)
+        assert first._max_workers == 3
+
+        with caplog.at_level("WARNING"):
+            again = decode_pool(3)  # same size -> no warning
+        assert again is first
+        assert not caplog.records
+
+        with caplog.at_level("WARNING"):
+            other = decode_pool(9)  # different size -> warn, keep the first pool
+        assert other is first, "a second request must not build a second pool"
+        assert first._max_workers == 3, "the live pool must not be resized underneath users"
+        assert any("decode_threads=9 ignored" in r.getMessage() for r in caplog.records)
+    finally:
+        reset_decode_pool()
+
+
+def test_reset_decode_pool_rebuilds(store_url):
+    """The test seam actually works -- otherwise every test above shares one pool."""
+    from insitubatch.scheduler import decode_pool, reset_decode_pool
+
+    reset_decode_pool()
+    try:
+        a = decode_pool(2)
+        reset_decode_pool()
+        b = decode_pool(4)
+        assert b is not a and b._max_workers == 4
+        # ...and a scheduler built after the reset still works end to end.
+        sched = _sched(store_url)
+        geom = next(iter(sched._geometries.values()))
+        sched.start(np.arange(geom.n_chunks), geom.sample_chunk_size)
+        sched.pool.wait_ready("v", 0, sched.owner)
+        sched.close()
+    finally:
+        reset_decode_pool()

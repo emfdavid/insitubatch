@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import threading
 from collections.abc import Callable, Sequence
@@ -74,7 +75,10 @@ from .types import ArrayGeometry, StoredChunkRead
 
 STARVATION_POLL_S = 0.25
 
+logger = logging.getLogger(__name__)
+
 _DECODE_POOL: ThreadPoolExecutor | None = None
+_DECODE_POOL_WORKERS = 0
 _DECODE_POOL_LOCK = threading.Lock()
 
 
@@ -90,14 +94,29 @@ def decode_pool(workers: int | None = None) -> ThreadPoolExecutor:
     We no longer touch the loop's default executor at all (see :meth:`Scheduler._one`), and
     this pool outlives every scheduler, so neither failure is reachable.
 
-    ``workers`` sizes it on **first** use only; later callers get the existing pool. Sizing
-    is process-wide because the pool is -- a second dataset does not get a second pool.
+    ``workers`` sizes it on **first** use only; later callers get the existing pool and are
+    warned if they asked for a different size. That is the right shape rather than a
+    limitation: how many threads can usefully decode at once is a property of the
+    *machine* -- core count, memory bandwidth -- not of the dataset being read. Two
+    datasets in one process do not want two pools competing for the same cores, and the
+    second one's number is not more correct than the first's.
     """
-    global _DECODE_POOL
+    global _DECODE_POOL, _DECODE_POOL_WORKERS
     with _DECODE_POOL_LOCK:
         if _DECODE_POOL is None:
-            n = workers or min(32, (os.cpu_count() or 4) + 4)
-            _DECODE_POOL = ThreadPoolExecutor(max_workers=n, thread_name_prefix="insitu-dec")
+            _DECODE_POOL_WORKERS = workers or min(32, (os.cpu_count() or 4) + 4)
+            _DECODE_POOL = ThreadPoolExecutor(
+                max_workers=_DECODE_POOL_WORKERS, thread_name_prefix="insitu-dec"
+            )
+        elif workers and workers != _DECODE_POOL_WORKERS:
+            logger.warning(
+                "decode_threads=%d ignored: the decode pool is process-wide and was already "
+                "built with %d threads. Thread count is a property of the machine, not of a "
+                "dataset, so the first value wins. Set decode_threads on the first dataset "
+                "created in this process.",
+                workers,
+                _DECODE_POOL_WORKERS,
+            )
         return _DECODE_POOL
 
 
@@ -108,9 +127,9 @@ def reset_decode_pool() -> None:
     pool outlives schedulers). Tests need it to size the pool per case, to run a
     free-threaded arm, and to avoid leaking one case's pool into the next.
     """
-    global _DECODE_POOL
+    global _DECODE_POOL, _DECODE_POOL_WORKERS
     with _DECODE_POOL_LOCK:
-        pool, _DECODE_POOL = _DECODE_POOL, None
+        pool, _DECODE_POOL, _DECODE_POOL_WORKERS = _DECODE_POOL, None, 0
     if pool is not None:
         pool.shutdown(wait=True, cancel_futures=True)
 
@@ -130,8 +149,13 @@ class SchedulerConfig:
     bounded separately by the pool's byte budget (admission evicts unpinned-LRU)."""
 
     decode_threads: int = 0
-    """Size of the decode/scatter pool (GIL-releasing codec decode + the disjoint
-    scatter memcpy run here). ``0`` = auto = ``min(32, cpu+4)``."""
+    """Size of the decode pool (the GIL-releasing codec decode runs here). ``0`` = auto =
+    ``min(32, cpu+4)``.
+
+    The pool is **process-wide** (see :func:`decode_pool`), so this sizes it once, on the
+    first dataset built in the process; a later, different value is ignored with a warning.
+    Thread count is a property of the machine rather than of the data, so one number per
+    process is the honest shape."""
 
     on_bad_chunk: str = "raise"
     """What to do when a stored chunk fails to fetch/decode (truncated/corrupt --
