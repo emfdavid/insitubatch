@@ -120,6 +120,36 @@ def output_geometry(geom: ArrayGeometry, transforms: Sequence[ChunkTransform]) -
     return rebuild(inner, dt)
 
 
+def slot_charge_bytes(
+    src: ArrayGeometry, out: ArrayGeometry, chunk_index: int = 0, *, assembles: bool
+) -> int:
+    """Peak bytes one cache slot occupies. **The single rule for sizing and charging.**
+
+    A slot holds the array's stored tiles, kept **whole** -- a chunk grid that does not
+    divide the array evenly still stores full-size edge chunks (721 rows chunked at 180
+    occupy 900), and we do not clip them. So residency is ``n_tiles * tile_shape``, which
+    can exceed the assembled logical chunk.
+
+    When the pool assembles (a ``chunk_transform`` is configured) the slot holds the source
+    tiles for its whole fill and only collapses to the assembled output at completion, so
+    the charge is the larger of the two. A transform that *shrinks* the data makes the
+    tiles the binding term; one that grows it makes the output the binding term.
+
+    :func:`InSituDataset` sizes its automatic budget with this too. They must not drift:
+    sizing from the output shape while charging the tiles under-provisions the budget and
+    the pool starves mid-epoch, which is a hang-shaped failure rather than a slow one.
+    """
+    tiles = (
+        src.n_inner_chunks(chunk_index)
+        * int(np.prod(src.tile_shape(), dtype=np.int64))
+        * src.dtype.itemsize
+    )
+    if not assembles:
+        return tiles
+    assembled = int(np.prod(out.slot_shape(chunk_index), dtype=np.int64)) * out.dtype.itemsize
+    return max(tiles, assembled)
+
+
 def _transform_token(fn: ChunkTransform) -> str:
     """A stable identity for one chunk_transform, for the cross-run cache fingerprint.
 
@@ -850,19 +880,12 @@ class ChunkPool:
         not charged, for the same reason the in-flight decode transient is not: it is
         bounded by `max_inflight` and belongs to the fetch, not to residency.
         """
-        n_tiles, tile_shape = self._tile_grid(array, chunk_index)
-        out = self._out_by_path[array]
-        dtype = out.dtype if self._whole_chunks else self._by_path[array].dtype
-        nbytes = n_tiles * int(np.prod(tile_shape, dtype=np.int64)) * dtype.itemsize
-        if not self._whole_chunks:
-            return nbytes
-        src = self._by_path[array]
-        during_fill = (
-            src.n_inner_chunks(chunk_index)
-            * int(np.prod(src.tile_shape(), dtype=np.int64))
-            * src.dtype.itemsize
+        return slot_charge_bytes(
+            self._by_path[array],
+            self._out_by_path[array],
+            chunk_index,
+            assembles=self._whole_chunks,
         )
-        return max(nbytes, during_fill)
 
     def _alloc(
         self, array: str, chunk_index: int, shape: tuple[int, ...], dtype: np.dtype
