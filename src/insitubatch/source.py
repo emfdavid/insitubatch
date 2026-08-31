@@ -257,6 +257,13 @@ class InSituDataset:
                 train_samples = len(self.manifest.chunks[SplitName.TRAIN.value]) * self._ref_spc
                 train_ws = sum(var_bytes(g, o, train_samples) for g, o in pairs)
                 working_set = max(working_set, train_ws)
+        # Sized for ONE iteration, deliberately. Every active iteration shares this pool and
+        # holds its own references, so N concurrent iterations need ~N x this -- but the engine
+        # cannot know N, and guessing high would cost memory in the single-iteration case that
+        # is almost every case. Running several is an explicit choice, so sizing for it is the
+        # caller's: pass `cache_budget_bytes`. Under-sizing is not silent -- admission raises
+        # and names how many iterations are sharing the pool (`Scheduler._starvation`).
+        # See docs/tuning.md, "Several iterations at once multiply the budget".
         self.cache_budget_bytes = max(int(cache_budget_bytes or 0), working_set)
         # persist turns the cache_dir mmap tier into a cross-run cache (files + manifest
         # survive close; reopen revives them as hits). It needs a dir to keep files in;

@@ -95,6 +95,37 @@ If you set `cache_budget_bytes` above the working set, residency rises to that b
 purpose — that extra memory *is* the cross-epoch cache. Point `cache_dir` at local NVMe to
 spill it to disk instead of RAM.
 
+### Several iterations at once multiply the budget
+
+The three bounds above describe **one** iteration. One `InSituDataset` owns one chunk pool,
+and every active iteration shares it — `zip(ds.train, ds.val)`, or two `DataLoader`s over the
+same dataset. That is supported, and chunks a windowed read pulls across a split boundary are
+decoded once and reused by both. But each iteration holds its **own** references to the chunks
+it is working on, so residency is the sum, not the maximum:
+
+```
+cache_budget_bytes  >=  n_concurrent_iterations x (block_chunks x outer_chunk_bytes)
+```
+
+**The auto-sized default is deliberately computed for one iteration, and stays that way.**
+The engine cannot know how many iterations you intend to run, so any automatic multiplier
+would be a guess that silently costs memory for the single-iteration case — which is almost
+every case. Running several is the explicit choice, so sizing for it is yours too.
+
+Run two without raising the budget and the loader stops with `residency budget exhausted: ...`,
+naming how many iterations are sharing the pool. It cannot free a slot, because every resident
+chunk is legitimately referenced by one of them. Raise `cache_budget_bytes` (or lower
+`block_chunks`, which shrinks each iteration's share) — not `max_inflight`, which is a
+concurrency dial and is not what is binding here.
+
+!!! note "This got stricter once pin accounting became owner-scoped"
+
+    Before that fix, starting a second iteration silently released the first one's
+    references. That freed budget by accident and hid the requirement — and the cost was
+    that the first iteration's in-use chunks could be evicted mid-gather, delivering
+    plausible wrong data. A budget that appeared to work for `zip(ds.train, ds.val)` was
+    relying on that bug. Sizing for the sum is the honest requirement.
+
 ### The batch queue is a high-water mark
 
 Batch buffers are pooled and held for the dataset's lifetime, so that third bound is the

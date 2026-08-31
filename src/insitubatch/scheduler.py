@@ -380,6 +380,17 @@ class Scheduler:
         if not waiting:
             return None
         budget = self.pool.budget_bytes
+        # A budget sized for ONE iteration cannot serve several: each holds its own
+        # references, so the requirement multiplies. Name it rather than leave the caller
+        # to rediscover it -- it is the likeliest cause once more than one owner is live.
+        owners = self.pool.active_owners
+        concurrent = (
+            f" NOTE: {owners} iterations are sharing this pool (e.g. `zip(ds.train, "
+            f"ds.val)`, or two DataLoaders); each needs its own working set resident at "
+            f"once, so the budget must cover all {owners}."
+            if owners > 1
+            else ""
+        )
         return RuntimeError(
             f"residency budget exhausted: cannot admit chunk {chunk_index} of {array!r}. "
             f"The pool holds {self.pool.resident_chunks} chunk(s) "
@@ -387,7 +398,7 @@ class Scheduler:
             f"in flight; no tile is in flight; and the consumer is blocked waiting on "
             f"{sorted(waiting)[:4]}. Nothing can free a slot, so this would hang. The "
             f"working set is larger than the budget it was sized for -- raise "
-            f"cache_budget_bytes, or lower batch_size / block_chunks."
+            f"cache_budget_bytes, or lower batch_size / block_chunks.{concurrent}"
         )
 
     async def _io(self, coro: Coroutine[Any, Any, _T]) -> _T:

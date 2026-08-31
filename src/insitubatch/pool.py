@@ -393,6 +393,10 @@ class ChunkPool:
         # single `claimed` bool lets one iteration's claim satisfy another's wait_ready.
         self._pinned: dict[tuple[str, int], dict[int, int]] = {}
         self._owner_seq = 0  # monotonic; owners are opaque tokens minted by new_owner()
+        # Owners live from mint to release_owner, NOT from their first pin: an iteration
+        # that starves before it can pin anything is exactly the case the starvation
+        # diagnostic has to name, and counting pin-holders would miss it.
+        self._owners: set[int] = set()
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
@@ -414,6 +418,7 @@ class ChunkPool:
         """
         with self._cv:
             self._owner_seq += 1
+            self._owners.add(self._owner_seq)
             return self._owner_seq
 
     def _refs(self, key: tuple[str, int]) -> int:  # call under the lock
@@ -451,6 +456,22 @@ class ChunkPool:
     def budget_bytes(self) -> int | None:
         """The residency ceiling, or ``None`` for an unbounded pool."""
         return self._budget
+
+    @property
+    def active_owners(self) -> int:
+        """How many iterations are live on this pool right now.
+
+        Live means minted and not yet released -- *not* "currently holds a pin". An
+        iteration that starves before it can pin anything is precisely the case the
+        starvation diagnostic exists to name, and counting pin-holders would miss it.
+
+        More than one means several iterations share this pool (``zip(ds.train,
+        ds.val)``, two DataLoaders) and each needs its own working set resident at the
+        same time -- the most common reason a budget auto-sized for one cannot admit.
+        Read-only snapshot.
+        """
+        with self._cv:
+            return len(self._owners)
 
     def blocked_waiters(self) -> list[tuple[str, int]]:
         """``(path, chunk_index)`` keys some thread is currently blocked on in
@@ -663,6 +684,7 @@ class ChunkPool:
                 if slot.state is not SlotState.READY and slot.quiescent and self._refs(k) == 0
             ]:
                 self._drop(key)  # an abandoned partial can never be a valid cache entry
+            self._owners.discard(owner)  # this iteration is done; it no longer counts
             self._cv.notify_all()  # freed budget may unpark an admission
 
     def reset_epoch_counters(self) -> None:
