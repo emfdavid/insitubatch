@@ -172,6 +172,7 @@ class Scheduler:
         geometries: dict[str, ArrayGeometry],
         pool: ChunkPool,
         config: SchedulerConfig | None = None,
+        owner: int | None = None,
     ) -> None:
         self._store = store
         self._geometries = geometries
@@ -181,6 +182,11 @@ class Scheduler:
                 f"on_bad_chunk must be 'raise' or 'nan', got {self._config.on_bad_chunk!r}"
             )
         self.pool = pool  # caller-owned: persists across epochs (the cache)
+        # One iteration = one owner: this scheduler's admission pins and its producer's
+        # block pins share a token, so the next epoch's prologue releases exactly this
+        # iteration's references and leaves a concurrent iteration's alone. Minted here
+        # when the caller does not supply one, so a standalone Scheduler still works.
+        self._owner = pool.new_owner() if owner is None else owner
         self.bad_chunks: list[StoredChunkRead] = []  # tiles NaN-filled this run (observability)
         self._proto = default_buffer_prototype()
         self._arrays: dict[str, _ArrayCtx] = {}
@@ -250,6 +256,17 @@ class Scheduler:
 
     # -- public, synchronous surface ---------------------------------------
 
+    @property
+    def owner(self) -> int:
+        """This scheduler's reference token, for the consumer's ``pool.wait_ready``.
+
+        One iteration = one owner: whoever drains this scheduler must wait under the
+        same token the scheduler admits under, or its wait can never be satisfied.
+        ``InSituDataset._iterate`` mints the token and hands it to both sides; a
+        caller driving a ``Scheduler`` directly reads it here.
+        """
+        return self._owner
+
     def start(self, chunk_ids: Sequence[int] | np.ndarray, ref_spc: int) -> Future:
         """Begin streaming the stored chunks of ``chunk_ids`` (priority order).
 
@@ -267,7 +284,7 @@ class Scheduler:
         """Release references on a set of drained ``(path, chunk_index)`` slots
         (thread-safe): the slots that hit refcount 0 become LRU-evictable; wake any
         admit parked on a full budget so it can evict them and proceed."""
-        self.pool.unpin_keys(keys)
+        self.pool.unpin_keys(keys, self._owner)
         if self._capacity is not None:
             self._loop.call_soon_threadsafe(self._capacity.set)
 
@@ -297,7 +314,7 @@ class Scheduler:
                 key = (read.array, read.chunk_index)
                 hit = decided.get(key)
                 if hit is None:
-                    hit = self.pool.pin_if_ready(read.array, read.chunk_index)
+                    hit = self.pool.pin_if_ready(read.array, read.chunk_index, self._owner)
                     if not hit:
                         await self._admit(read.array, read.chunk_index)  # may await an unpin
                     decided[key] = hit
@@ -322,9 +339,9 @@ class Scheduler:
         (:meth:`_starvation`); a timeout by itself means nothing and just loops.
         """
         assert self._capacity is not None
-        while not self.pool.try_admit(array, chunk_index):
+        while not self.pool.try_admit(array, chunk_index, self._owner):
             self._capacity.clear()
-            if self.pool.try_admit(array, chunk_index):
+            if self.pool.try_admit(array, chunk_index, self._owner):
                 return
             try:
                 await asyncio.wait_for(self._capacity.wait(), STARVATION_POLL_S)
@@ -427,13 +444,19 @@ class Scheduler:
                 )
 
     async def _one(self, read: StoredChunkRead) -> None:
-        """Fetch + decode + scatter one stored tile, holding one in-flight slot.
+        """Fetch + decode + deliver one stored tile, holding one in-flight slot.
 
         The in-flight slot is held across all three stages, so ``max_inflight`` is
-        total concurrency. Decode and the scatter memcpy run on the decode pool (GIL
+        total concurrency. Decode and the delivery memcpy run on the decode pool (GIL
         released); the loop only awaits. A *fetch/decode* failure is a bad/truncated
         chunk -> the ``on_bad_chunk`` policy decides (poison, or NaN-fill and carry
-        on). A failure *during scatter* is a genuine bug and always poisons.
+        on). A failure *during delivery* is a genuine bug and always poisons.
+
+        The whole body runs inside ``pool.tile_write``, which owns the obligation to
+        tell the slot this task ended. That matters on the paths that never reach the
+        pool: the ``return`` below, and cancellation at either ``await`` (an early
+        ``break`` closes the scheduler with ``cancel_futures=True``). Without it a
+        slot keeps a writer forever and can never be evicted.
         """
         assert self._inflight is not None
         ctx = self._arrays[read.array]
@@ -441,25 +464,19 @@ class Scheduler:
             self._inflight_now += 1
             self.inflight_peak = max(self.inflight_peak, self._inflight_now)
             try:
-                try:
-                    tile = await self._fetch_decode(read, ctx)
-                except Exception as exc:  # noqa: BLE001 - bad/truncated stored chunk
-                    if self._config.on_bad_chunk != "nan":
-                        self.pool.fail(read.array, read.chunk_index, exc)
-                        return
-                    self.bad_chunks.append(read)
-                    tile = np.full(ctx.chunk_shape, _bad_fill(ctx), dtype=ctx.dtype)
-                try:
-                    await self._loop.run_in_executor(
-                        None,
-                        self.pool.scatter,
-                        read.array,
-                        read.chunk_index,
-                        read.inner_coord,
-                        tile,
-                    )
-                except Exception as exc:  # noqa: BLE001 - a scatter failure is a real bug
-                    self.pool.fail(read.array, read.chunk_index, exc)
+                with self.pool.tile_write(read.array, read.chunk_index, read.inner_coord) as w:
+                    try:
+                        tile = await self._fetch_decode(read, ctx)
+                    except Exception as exc:  # noqa: BLE001 - bad/truncated stored chunk
+                        if self._config.on_bad_chunk != "nan":
+                            w.fail(exc)
+                            return
+                        self.bad_chunks.append(read)
+                        tile = np.full(ctx.chunk_shape, _bad_fill(ctx), dtype=ctx.dtype)
+                    try:
+                        await self._loop.run_in_executor(None, w.deliver, tile)
+                    except Exception as exc:  # noqa: BLE001 - a delivery failure is a real bug
+                        w.fail(exc)
             finally:
                 self._inflight_now -= 1
 

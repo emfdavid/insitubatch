@@ -171,10 +171,13 @@ As built (PR #4), the engine stayed simpler than the original sketch:
   give disjoint train/val labels for any offset (injective translation), and the shared
   boundary timestep is only ever a val *input*, never scored. Task meaningfulness
   (non-degenerate offset choices) is the **user's** responsibility, not the engine's.
-- Residency is **reference-counted** (`pool._pinned: dict[key,int]`, not a boolean set)
-  because a windowed chunk can feed several blocks; a per-epoch `claimed` flag orders
-  pin→consume→release across the epoch boundary (fixes a cross-epoch gather/leak race).
-  Decode-once across views holds (slots key on `path`).
+- Residency is **reference-counted and owner-scoped** (`pool._pinned: dict[key, dict[owner,
+  int]]`, not a boolean set) because a windowed chunk can feed several blocks *and* because
+  one pool serves several concurrent iterations. A reference **is** that owner's claim, which
+  orders pin→consume→release across the epoch boundary (fixes a cross-epoch gather/leak race)
+  and, being per owner, cannot be satisfied by another iteration's claim. One iteration = one
+  owner, minted by `_iterate` and shared with its scheduler. Decode-once across views holds
+  (slots key on `path`).
 - **Splits are iterable views, not a constructor arg.** `InSituDataset` is split-agnostic;
   you iterate `ds.train` / `ds.val` / `ds.test` / `ds.all`, all sharing **one** `ChunkPool`.
   This matters *because* of windows: a windowed read near a split boundary spills into the
@@ -665,7 +668,7 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
 - **Refcount overhead on the non-windowed path (~3.5%, accepted).** Refcounted residency +
   offset-aware `gather` cost ~3.5% at the **GRIB-end local worst case** (one sample/chunk,
   ~36 KB blobs where decode is ≈ free, GIL build) — not residency (`resident` unchanged) and
-  not per-block setup; it is per-batch gather + per-chunk `dict`/`claimed` bookkeeping under
+  not per-block setup; it is per-batch gather + per-chunk reference bookkeeping under
   `pool._cv`. It shrinks toward noise at real chunk sizes and is invisible on blob stores.
   The microscope for this and any future *locking* work is a tiny local store with negligible
   decode under free-threading (`PYTHON_GIL=0`, where `pool._cv` is the only contention

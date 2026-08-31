@@ -47,7 +47,7 @@ def _drain_in_order(sched: Scheduler, geom: ArrayGeometry, var: str, *, unpin: b
     spc = geom.sample_chunk_size
     out = []
     for cid in range(geom.n_chunks):
-        sched.pool.wait_ready(var, cid)
+        sched.pool.wait_ready(var, cid, sched.owner)
         n0 = len(geom.samples_in_chunk(cid))
         rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
         out.append(sched.pool.gather(rows, [var], spc).arrays[var])
@@ -127,7 +127,7 @@ def test_scheduler_windowed_views_decode_once_and_lead(tiled_store):
     with _make(url, geoms) as sched:
         fut = sched.start(range(base.n_chunks), base.sample_chunk_size)
         for cid in range(base.n_chunks):
-            sched.pool.wait_ready(base.path, cid)  # slots are keyed by path
+            sched.pool.wait_ready(base.path, cid, sched.owner)  # slots are keyed by path
         batch = sched.pool.gather(rows, ["now", "next"], spc)
         fut.result(timeout=30)  # surface any driver error
         assert len(sched._arrays) == 1  # opened once: deduped by path
@@ -147,4 +147,4 @@ def test_scheduler_poisons_pool_on_driver_failure(tiled_store):
         with pytest.raises(Exception):  # noqa: B017 - zarr surfaces a store-specific error type
             fut.result(timeout=30)
         with pytest.raises(Exception):  # noqa: B017 - same error re-raised to the consumer
-            sched.pool.wait_ready("ghost", 0)
+            sched.pool.wait_ready("ghost", 0, sched.owner)

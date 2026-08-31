@@ -219,7 +219,7 @@ def test_windowed_partial_iteration_then_clean_epoch(write_zarr) -> None:
 
     # counters/slots clean: all references released, no abandoned not-ready slot.
     assert ds._pool._pinned == {}
-    assert all(slot.ready for slot in ds._pool._slots.values())
+    assert all(ds._pool.is_ready(*k) for k in ds._pool._slots)
     ds.close()
 
 
