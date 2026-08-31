@@ -287,11 +287,18 @@ runs a single budget over it:
 
 - **ReadPlan v2**: deduped stored-chunk reads in draw/priority order.
 - **One semaphore = `max_inflight`** — a slot held from fetch-start to
-  scatter-done, spanning all stages, across inner *and* outer. No nested caps, no
+  delivery, spanning all stages, across inner *and* outer. No nested caps, no
   double sawtooth; total concurrency is dialed directly.
-- **Scatter-assemble**: each decoded tile is copied into its outer chunk's array
-  (pool threads write *disjoint* regions — no data lock, only an atomic completion
-  counter); the tile frees after the copy.
+- **Chunked slots**: a slot's buffer unit is the **stored chunk**. A decoded tile is
+  adopted by reference — no memcpy — and `gather` places each tile into its
+  sub-rectangle of the batch, addressed by zarr's own `ChunkProjection` over a
+  `DimensionGrid`. Stored chunks are kept **whole**, padding included: one buffer unit,
+  one shape. Superseded scatter-assemble (each tile copied into one assembled array)
+  under [#30](https://github.com/emfdavid/insitubatch/issues/30); assembly survives only
+  where something genuinely needs a contiguous array — a `chunk_transform`, which then
+  republishes as a one-tile slot so `gather` still sees a single representation.
+  Argued and merged on **simplicity, not throughput**: the deleted memcpy is 7.7–10.1% of
+  process CPU and wall clock is a null, because it was never the bottleneck.
 - **Two explicit caps**: ≤ `block_chunks` (+read-ahead) outer chunks resident
   (shuffle window); ≤ `max_inflight` inner tiles in flight (pipeline).
 
@@ -299,6 +306,8 @@ Internals are **validated** (`bench/spike_v2_decode.py`, zarr 3.2): key via
 `chunk_key_encoding.encode_chunk_key`, bytes via `store.get`, decode via
 `codec_pipeline.decode([(buf, ArraySpec)])`, scatter into the outer array — matches
 `arr.getitem` exactly for single-inner and spatial layouts incl. partial edge chunks.
+(Decode is now the *synchronous* `ChunkTransform.decode_chunk`, verified byte-identical to
+that pipeline on v3 zstd/none/gzip and on v2; the scatter is gone with chunked slots.)
 The acceptance gate (v1 baseline vs V2, and the flat-residency result that justified
 the rewrite) is recorded in [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -308,8 +317,10 @@ All three steps release the GIL — **fetch** (obstore/tokio, Rust), **decode**
 (numcodecs C), **transform** (vectorized numpy) — so all three run *off* the loop,
 in the bounded pool; the loop only does async fetch + scheduling. Fuse
 decode→transform→scatter into **one** pool task per chunk (one GIL-release window,
-no inter-stage handoff). Transform granularity is the wrinkle, since fetch is at
-*tile* granularity but the `chunk_transform` contract is *per outer chunk*:
+no inter-stage handoff). The scatter half of that is now moot — there is no copy to fuse,
+because the tile *is* the resident buffer. Transform granularity is the wrinkle that
+remains, since fetch is at *tile* granularity but the `chunk_transform` contract is
+*per outer chunk*:
 
 - **elementwise** transforms (e.g. `StandardScaler`) may fuse per tile — earliest
   overlap, lowest peak.
@@ -329,8 +340,9 @@ shuffle_span     = block_chunks
 ```
 
 So `block_chunks` sets shuffle quality + residency; `max_inflight` sets network
-saturation — separately. (Transform output may differ in shape — regrid — so the
-pool slot is sized to the *output*; the input tile frees after.) The honest limit:
+saturation — separately. (Transform output may differ in shape — regrid — so a
+transformed slot is sized to the *output* and publishes as one tile; the source tiles free
+at completion.) The honest limit:
 in-flight memory is `max_inflight × stored_chunk` — cheap when data is inner-chunked
 (small tiles), but for *single-inner* data the stored chunk **is** the outer chunk,
 so concurrency and memory collapse back together (no scheduler escapes it; rechunk
@@ -894,12 +906,15 @@ measurements live in [docs/benchmarks.md](docs/benchmarks.md).
   rests entirely on the **Rapid/zonal gRPC** path obstore cannot reach — still unrun,
   blocked on quota. If it matches or beats obstore there, fsspec earns a core-dep,
   co-equal-fast-path promotion; then the `ops_gcp.md` VERIFY markers come off.
-  Event-loop ownership is shipped and diagrammed in
-  [docs/architecture.md](docs/architecture.md); the follow-up is to run the scheduler's
-  orchestration *on* zarr's loop for all backends and delete the bridge plus the per-pass
-  thread churn. That rewrites the Scheduler concurrency core, so its acceptance gate is a
-  stress test that a consumer-stalled, back-pressured `_drive` sharing zarr's
-  process-global loop cannot starve or deadlock other zarr-sync work.
+  Event-loop consolidation is **done** ([#30](https://github.com/emfdavid/insitubatch/issues/30)):
+  orchestration runs on zarr's loop for all backends, and the bridge, the per-pass thread
+  churn and the second executor hop are deleted — diagrammed in
+  [docs/architecture.md](docs/architecture.md). The acceptance gate (a consumer-stalled,
+  back-pressured `_drive` must not starve other zarr-sync work) passes: ~5,700 unrelated
+  zarr reads complete during the stall at p50 1.69–1.77 ms vs 1.74–1.80 ms on a private
+  loop. The gate as originally written turned out to ask the wrong question — every real
+  failure was in `close()`, not steady state — so it is now also a teardown test
+  (`tests/test_loop_ownership.py`).
 - **M2 — GPU full scale** ⏳ kvikio/cupy/nvCOMP, dlpack→torch; prove GPU saturation with
   bounded host memory. The reference design is to transfer *compressed* bytes and decode on
   the GPU via zarr-python's own GPU codec pipeline rather than hand-rolling nvCOMP; the

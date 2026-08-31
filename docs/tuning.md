@@ -227,9 +227,42 @@ Then branch on what you are running:
 
 ## Advanced: decode threads
 
-`decode_threads` (on `SchedulerConfig`) sizes the pool that runs codec decode and the
-scatter memcpy. It defaults to auto (`min(32, cpu+4)`) and rarely needs changing; on a busy
-box ~8 can beat auto by avoiding oversubscription. It is only reachable when you drive a
-`Scheduler` directly — `InSituDataset` uses the auto default. There is no separate
-inner-fan-out cap: the inner grid is dialed by `max_inflight`, which fetches at stored-chunk
-granularity.
+`decode_threads` (on `SchedulerConfig`) sizes the pool that runs codec decode. It defaults
+to auto (`min(32, cpu+4)`) and rarely needs changing; on a busy box ~8 can beat auto by
+avoiding oversubscription. It is only reachable when you drive a `Scheduler` directly —
+`InSituDataset` uses the auto default. There is no separate inner-fan-out cap: the inner
+grid is dialed by `max_inflight`, which fetches at stored-chunk granularity.
+
+**The decode pool is process-wide.** It is created once and outlives every scheduler, so
+`decode_threads` takes effect on the **first** dataset built in the process; a later,
+different value is ignored and logs a warning. That is deliberate rather than a limitation:
+how many threads can usefully decode at once is a property of the *machine* — cores, memory
+bandwidth — not of the dataset being read, and two datasets in one process should not run
+two pools competing for the same cores. If you want a non-default size, set it on the first
+dataset you create.
+
+## Ragged chunk grids cost more than their arrays
+
+A zarr chunk grid that does not divide the array evenly still stores **full-size chunks at
+the edges**. An ERA5-shaped array of 721 latitudes chunked at 180 occupies five stored
+chunks — 900 rows of storage for 721 rows of data.
+
+The pool holds stored chunks **whole**, padding included, because the buffer unit is the
+stored chunk (one unit, one shape). So resident bytes per chunk are
+`n_tiles × prod(chunk_shape) × itemsize`, which can exceed the logical chunk:
+
+| geometry | logical chunk | actually resident | ratio |
+|---|---|---|---|
+| 720×1440 @ 45×90 (divides evenly) | 63.3 MiB | 63.3 MiB | 1.000× |
+| 2048×2048 @ 256×256 (divides evenly) | 16.0 MiB | 16.0 MiB | 1.000× |
+| **721×1440 @ 180×360** | 3.96 MiB | 4.94 MiB | **1.248×** |
+| **as above, short final outer chunk** | 1.98 MiB | 3.96 MiB | **1.997×** |
+
+The automatic budget accounts for this, and so does `resident_bytes` — the number you are
+told is the number you are using. What it means for you is that **a ragged grid needs a
+proportionally larger `cache_budget_bytes`** if you set one by hand. If your grid divides
+evenly, this section costs you nothing.
+
+Your `chunk_transform` is unaffected: it receives the **logical** chunk, clipped, as a real
+contiguous array. It never sees padding, never masks an edge, and never needs to know the
+chunk grid.

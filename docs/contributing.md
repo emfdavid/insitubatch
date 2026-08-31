@@ -146,7 +146,7 @@ there). Tests for an absent framework `importorskip`-skip, so a core-only run is
 
 **Free-threaded (3.13t).** If you touch `ChunkPool`, the scheduler, or anything that
 publishes chunk readiness across threads, run the free-threaded job too — the pool's
-lock-free disjoint scatter is exactly what it exercises. The full recipe (a separate
+lock discipline and its cross-thread readiness signalling are exactly what it exercises. The full recipe (a separate
 `.venv-ft`, and why you must assert the GIL is actually off before trusting the run) is in
 the [README](https://github.com/emfdavid/insitubatch#free-threaded-313t). CI mirrors it.
 

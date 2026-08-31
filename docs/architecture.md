@@ -130,41 +130,104 @@ per-batch allocation *and* enables `non_blocking` transfer together. See Known
 limitations in
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#known-limitations--defects).
 
-### Event-loop ownership (fsspec backends)
+### One event loop, one decode pool
 
 A genuinely-async fsspec backend (gcsfs, s3fs) binds its aiohttp session to the *first
 event loop that awaits it*, permanently — no constructor knob pins it. For a zarr store
 that first loop is **zarr's** process-wide store-IO loop (`zarr.core.sync._get_loop()`),
 because any zarr sync call (`open_geometries`, `xr.open_zarr`, user code) touches the
 store first. That is the correct owner: the session living on zarr's loop is what keeps
-the store drivable by *any* zarr code — so insitubatch **conforms** (routes its reads
-there) rather than hijacking the session onto its own loop, which would break every other
-zarr-sync consumer in the process. The scheduler keeps its own orchestration loop and
-bridges each fsspec read to zarr's loop (`run_coroutine_threadsafe`); obstore is
-loop-agnostic (Rust runtime) and is awaited inline. Teardown closes the session on its own
-loop (`close_store`), so gcsfs's finalizer — which wrongly targets
-`fsspec.asyn.get_loop()` — becomes a no-op.
+the store drivable by *any* zarr code.
+
+**insitubatch runs its orchestration on that loop too.** There is no second loop, no
+per-read bridge, and no per-pass thread churn: gcsfs and obstore are both a plain inline
+`await`. What made this possible is that
+[`ChunkTransform.decode_chunk`](https://zarr.readthedocs.io/) (zarr 3.3.0) is
+*synchronous*. The async codec pipeline dispatches to the **loop's default executor**, so
+keeping our own decode pool used to mean claiming that slot — which on a loop we share
+retunes zarr's concurrency process-wide, and breaks it when we shut the pool down. Calling
+a sync decode ourselves means we pass our executor explicitly and never touch the default.
 
 ```mermaid
 flowchart TD
-    subgraph proc["insitubatch process (one training run)"]
+    subgraph proc["insitubatch process"]
       OG["any zarr sync call<br/>open_geometries / xr.open_zarr"]
-      SL["Scheduler loop<br/>own loop, new thread per pass<br/>orchestration + decode/scatter pool"]
-      ZL["zarr store-IO loop<br/>zarr.core.sync._get_loop()"]
+      ZL["zarr store-IO loop (zarr_io)<br/>zarr.core.sync._get_loop()<br/><b>scheduler orchestration runs here</b>"]
+      DP["insitu-dec pool<br/>process-wide, N threads<br/>decode (GIL released)"]
       SESS[("gcsfs aiohttp session")]
       OBS["obstore ObjectStore<br/>Rust tokio runtime, loop-agnostic"]
-      FL["fsspec.asyn.get_loop()<br/>NOT where the session lives"]
     end
     OG -->|"first await creates the session here"| ZL
     ZL -->|owns| SESS
-    SL -->|"fsspec read: run_coroutine_threadsafe (bridge)"| ZL
-    SL -->|"obstore read: await inline"| OBS
-    FL -.->|"gcsfs finalizer wrongly targets this;<br/>close_store fixes the mismatch at teardown"| SESS
+    ZL -->|"fsspec read: await inline (no bridge)"| SESS
+    ZL -->|"obstore read: await inline"| OBS
+    ZL -->|"run_in_executor(decode_pool, decode_chunk)"| DP
+    DP -->|"NDBuffer handed back by reference"| ZL
 ```
 
-Collapsing the two loops into one — running the scheduler's orchestration *on* zarr's
-loop for all backends, deleting the bridge and the per-pass thread churn — is planned
-under M-GCS in [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md).
+#### The handoff, per stored tile
+
+`loop.run_in_executor(pool, fn, *args)` submits to the pool and wraps the resulting
+future; the coroutine `await`s it and **suspends**, so the loop is free to service other
+tiles, other in-flight reads, and everyone else's zarr work. The worker resolves the
+future via `call_soon_threadsafe`. What crosses the boundary is a Python object reference
+— no copy, no pickling; it is a thread boundary, not a process one.
+
+```
+insitu-prefetch          zarr_io  (ONE loop, shared with all zarr sync work)   insitu-dec (N)
+     │                       │                                                      │
+     │                  _drive ──► _admit ──► pool.try_admit    [_cv, brief]         │
+     │                  _one, holding one `max_inflight` permit:                     │
+     │                       │                                                      │
+     │                  ① await store.get(key) ──── obstore / gcsfs, inline ──┐      │
+     │                       │   coroutine SUSPENDS, loop runs other tasks    │      │
+     │                       │◄───────────────────────── Buffer ─────────────┘      │
+     │                       │                                                      │
+     │                  ② await run_in_executor(pool, decode_chunk, buf, spec)       │
+     │                       │──── submit ─────────────────────────────────────────►│
+     │                       │   coroutine SUSPENDS                   decode_chunk   │
+     │                       │                                   (GIL RELEASED in    │
+     │                       │                                    numcodecs)         │
+     │                       │◄── call_soon_threadsafe ── NDBuffer ─────────────────│
+     │                       │                                                      │
+     │                  np.moveaxis(tile, ax, 0)   [a VIEW, no copy]                 │
+     │                       │                                                      │
+     │                  ③ deliver:                                                   │
+     │                       │  tiled     → w.deliver(tile) INLINE  [dict + _cv]     │
+     │                       │  assembling→ await run_in_executor(...) ─────────────►│
+     │                       │                              _advance → assemble →    │
+     │                       │                              chunk_transform → persist│
+     │                       │◄────────────────── done ─────────────────────────────│
+     │◄── _cv.notify_all() wakes wait_ready ──┘
+   gather
+```
+
+Delivery is inline on the tiled path because it is a dict write and a counter. It becomes
+an executor hop when the pool **assembles**, because delivering the last tile also runs
+the assembly memcpy, the user `chunk_transform` and the mmap write-back — and none of that
+may sit on a loop shared with the rest of the process.
+
+`max_inflight` is what bounds the executor: a `ThreadPoolExecutor` queue is unbounded, and
+the semaphore is held across ①②③, so in-flight tiles, queued decode work and decoded-tile
+residency are all bounded by that one dial.
+
+#### Sharing a loop means owning nothing
+
+A scheduler tears down **only what it created**. It cancels the tasks it started (never
+`asyncio.all_tasks`, which is the whole loop's set), and it does not stop the loop, close
+it, or shut down the decode pool. Each of those is correct on a private loop and
+destructive on a shared one — cancelling the task set raises `CancelledError` inside
+unrelated zarr reads, stopping the loop hangs every later `zarr.core.sync.sync()` call,
+and shutting the shared pool down makes the next scheduler raise *cannot schedule new
+futures after shutdown*. All three were observed while designing this, are pinned by
+`tests/test_loop_ownership.py`, and are why the acceptance gate for sharing a loop is a
+`close()` test rather than a steady-state one.
+
+Measured: with a consumer-stalled, back-pressured `_drive`, unrelated zarr-sync work
+completes ~5,700 reads during the stall at p50 1.69–1.77 ms, against 1.74–1.80 ms for a
+private per-pass loop — no starvation, no deadlock, and the victim keeps running through
+teardown. Teardown also closes the fsspec session on its own loop (`close_store`), so
+gcsfs's finalizer — which wrongly targets `fsspec.asyn.get_loop()` — becomes a no-op.
 
 ## Sample geometry — the axis-role contract
 
@@ -379,8 +442,9 @@ The pipeline holds two guarantees, and they are **orthogonal** — batch size to
 `order` is the ledger for sample-once: an `(N, 2)` array of `[chunk_id, within]`, one row per
 drawn sample. It is a permutation of every valid anchor, so each sample appears once. The
 **sample-level fancy index is never stored** — `gather` recomputes it per batch from the rows
-(`anchor = chunk_id·spc + within`; `sample = anchor + offset`; scatter `slot.data[within[mask]]`
-per unique read chunk), Python work `O(chunks-in-batch)`, never `O(samples)`.
+(`anchor = chunk_id·spc + within`; `sample = anchor + offset`; then, per unique read chunk,
+one coalesced write per stored tile into its sub-rectangle of the batch), Python work
+`O(chunks-in-batch × tiles-per-chunk)`, never `O(samples)`.
 
 The figure traces one epoch, archive → batch. Colour tracks the *bytes* — a chunk keeps its
 colour from the archive ① through the resident pool ③; the **read plan** ② in between is
