@@ -479,6 +479,18 @@ class ChunkPool:
             return len(self._positions())
 
     @property
+    def assembles(self) -> bool:
+        """True if publishing a chunk does real work (assembly / transform / write-back).
+
+        The scheduler needs this to decide *where* delivery runs. On the plain tiled path a
+        delivery is a dict write and a counter, so it belongs inline on the loop. When a
+        slot must publish a whole array, ``_advance`` also runs the assembly memcpy, the
+        user ``chunk_transform`` and the mmap write-back -- none of which may sit on an
+        event loop we share with the rest of the process.
+        """
+        return self._whole_chunks
+
+    @property
     def resident_bytes(self) -> int:
         with self._cv:
             return self._bytes

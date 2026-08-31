@@ -569,13 +569,22 @@ class Scheduler:
                         self.bad_chunks.append(read)
                         tile = np.full(ctx.chunk_shape, _bad_fill(ctx), dtype=ctx.dtype)
                     try:
-                        # Delivery used to be a second executor hop, because it was a
-                        # memcpy into the assembled slot. Under chunked slots it is a dict
-                        # assignment and a counter, so the hop is deleted rather than
-                        # fused -- and the decoded tile stops living in this frame across
-                        # it, which is what made tile residency scale with `max_inflight`
-                        # (an IO dial) instead of with the pool doing the work.
-                        w.deliver(tile)
+                        # Delivery used to be a second executor hop, because it was a memcpy
+                        # into the assembled slot. On the tiled path it is now a dict
+                        # assignment and a counter, so the hop is deleted rather than fused
+                        # -- and the decoded tile stops living in this frame across it,
+                        # which is what made tile residency scale with `max_inflight` (an IO
+                        # dial) instead of with the pool doing the work.
+                        #
+                        # It stays a hop when the pool assembles, because delivering the
+                        # LAST tile then also runs the assembly memcpy, the user
+                        # `chunk_transform` and the mmap write-back (`ChunkPool._advance`).
+                        # This loop is zarr's, shared with the whole process: running user
+                        # code on it would stall every other zarr caller.
+                        if self.pool.assembles:
+                            await self._loop.run_in_executor(self._decode_pool, w.deliver, tile)
+                        else:
+                            w.deliver(tile)
                     except Exception as exc:  # noqa: BLE001 - a delivery failure is a real bug
                         w.fail(exc)
             finally:

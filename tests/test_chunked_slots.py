@@ -112,3 +112,37 @@ def test_a_transformed_chunk_is_a_one_tile_slot(tmp_path):
         rows = np.array([[0, 0]], dtype=np.int64)
         got = pool.gather(rows, ["v"], geom.sample_chunk_size).arrays["v"]
     np.testing.assert_allclose(got[0], src[0] / 2.0, rtol=1e-6)
+
+
+def test_user_code_never_runs_on_the_shared_event_loop(tmp_path):
+    """A ``chunk_transform`` must not execute on zarr's process-global loop.
+
+    Publishing an assembled chunk runs the assembly memcpy, the user transform and the
+    mmap write-back. The scheduler now shares zarr's loop with the whole process, so doing
+    any of that on the loop thread stalls every other zarr caller -- the exact shared-fate
+    failure the loop consolidation is meant to avoid. Regression: an earlier draft
+    delivered inline unconditionally and ran user code on ``zarr_io``.
+    """
+    import threading
+
+    ran_on: list[str] = []
+
+    class Spy:
+        def __call__(self, chunk):
+            ran_on.append(threading.current_thread().name)
+            return chunk
+
+    url, _ = _store(tmp_path, (2, 8, 8), (1, 4, 4), name="thread.zarr")
+    geoms = open_geometries(obstore_store(url))
+    geom = geoms["v"]
+    pool = ChunkPool(geoms, chunk_transforms=[Spy()])
+    with Scheduler(obstore_store(url), geoms, pool, SchedulerConfig()) as sched:
+        sched.start(range(geom.n_chunks), geom.sample_chunk_size)
+        for cid in range(geom.n_chunks):
+            sched.pool.wait_ready("v", cid, sched.owner)
+
+    assert ran_on, "the transform never ran"
+    assert all(t.startswith("insitu-dec") for t in ran_on), (
+        f"chunk_transform ran on {sorted(set(ran_on))}; it must run on the decode pool, "
+        "never on the shared event loop"
+    )
