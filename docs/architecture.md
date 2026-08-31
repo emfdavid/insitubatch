@@ -94,9 +94,9 @@ flowchart TB
         SKIP -->|"miss"| OBS["obstore get (stored chunk)"]
         OBS --> DEC["decode · GIL released"]
         DEC --> CT["chunk_transform (vectorized)"]
-        CT --> SCAT["scatter tile → outer-chunk slot"]
+        CT --> DLV["deliver: adopt the tile (no copy)"]
     end
-    SCAT --> POOL["ChunkPool — byte budget + pin/LRU<br/>buffer AND cache · heap or mmap NVMe"]
+    DLV --> POOL["ChunkPool — byte budget + pin/LRU<br/>residency AND cache · heap or mmap NVMe"]
     POOL --> GTH["gather + batch_transform"]
     GTH --> PQ["prefetch queue · depth d"]
     PQ --> GPU[("device + device_transform<br/>→ model step")]
@@ -109,9 +109,11 @@ flowchart TB
 
 The unit of work is the **stored chunk** (an `(outer, inner)` tile), and one
 `max_inflight` budget spans every fetch — so read concurrency is one dial, with no
-nested inner/outer caps. Each decoded tile is scattered into its outer chunk's slot
-in the **ChunkPool**, which is the assembly buffer *and* the cache in one: a byte
-budget with pin/unpin + LRU, backed by heap or an mmap'd `.npy` on NVMe. Before
+nested inner/outer caps. Each decoded tile is **adopted by reference** into its outer
+chunk's slot in the **ChunkPool** — the tile *is* the resident buffer, so the fill path
+has no memcpy — and the pool is the residency tier *and* the cache in one: a byte budget
+with pin/unpin + LRU, backed by heap or an mmap'd `.npy` on NVMe. Placement is deferred to
+`gather`, which writes each stored chunk straight into its rectangle of the batch. Before
 fetching, the scheduler asks the pool whether it already holds a chunk — a hit
 (cross-epoch, since the pool persists) skips fetch + decode + transform entirely.
 
@@ -703,7 +705,7 @@ print(ds.bad_chunks)   # the (array, chunk_index, inner_coord) reads that were b
 ```
 
 Granularity is the **stored** chunk (tile), so one corrupt inner tile NaNs only its
-region of the outer chunk, not the whole field. A failure *during scatter* (a genuine
+region of the outer chunk, not the whole field. A failure *during delivery* (a genuine
 bug, not a bad chunk) still poisons — the policy only covers fetch/decode. Dropping
 NaN-containing *samples* is deliberately not automatic (it would break the fixed-shape
 vectorized gather); exclude known-bad chunks at the split/manifest level instead
@@ -795,8 +797,8 @@ object, the `ChunkPool`, parameterized by a byte budget:
 
 | layer | reuse scope | how |
 |---|---|---|
-| read-plan dedup | within a request | a chunk's tiles are fetched once, scattered into one slot |
-| assembly buffer | within an epoch | a small budget (the working set, ~2 blocks) |
+| read-plan dedup | within a request | a chunk's tiles are fetched once, held by one slot |
+| residency | within an epoch | a small budget (the working set, ~2 blocks) |
 | cache | across epochs | a large budget retains drained chunks |
 
 A chunk is **pinned** while the current epoch needs it; once its shuffle-block is
@@ -808,9 +810,9 @@ whose samples scatter across a shuffle block). Raise the budget past the working
 and drained chunks linger, so a still-resident prepped chunk is a cross-epoch hit:
 the same machinery becomes the cache by *"don't evict."*
 
-Backing is **heap or mmap** (`cache_dir` → mmap'd `.npy` on local NVMe): the scatter
-writes straight into the slot either way, so a hit needs no copy out of a separate
-cache. mmap makes the footprint reclaimable kernel page cache, bounded on disk by
+Backing is **heap or mmap** (`cache_dir` → mmap'd `.npy` on local NVMe): a heap slot
+adopts the decoded tile, and the mmap tier writes it straight into its tile-major slice and
+keeps the view — so a hit needs no copy out of a separate cache either way. mmap makes the footprint reclaimable kernel page cache, bounded on disk by
 bytes, so the working set stays bounded. Caching the *prepped* representation is
 strictly stronger than a raw-byte NVMe cache for an ML pipeline. The default budget
 is the working set (read-once); raise `cache_budget_bytes` to cache.

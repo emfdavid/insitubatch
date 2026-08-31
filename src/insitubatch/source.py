@@ -17,9 +17,10 @@ dataset directly (``frameworks.to_jax`` per batch); TF wraps it
 (``frameworks.as_tf_dataset``).
 
 The engine is the fetch scheduler: one event loop streams stored-chunk reads under
-a single ``max_inflight`` budget and scatters decoded tiles into a
-:class:`ChunkPool`. This producer walks the shuffle order, waits on each block's
-assembled chunks, gathers coalesced batches, and unpins the block (making it
+a single ``max_inflight`` budget and delivers decoded tiles into a
+:class:`ChunkPool`, which holds them by reference. This producer walks the shuffle
+order, waits on each block's chunks, gathers coalesced batches, and unpins the block
+(making it
 LRU-evictable / retainable for reuse). Read concurrency (``max_inflight``) and the
 residency budget are independent dials. See [docs/architecture.md] for the pipeline.
 """

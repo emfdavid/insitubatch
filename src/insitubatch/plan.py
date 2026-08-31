@@ -3,9 +3,9 @@
 Expand the outer (sample-axis) chunks a draw order needs into the deduplicated set
 of *stored chunks* (tiles) the scheduler fetches. Python touches O(reads), never
 O(samples) -- the constraint David's S3 benchmark imposed (per-chunk overhead
-bounds throughput; never loop per-sample in Python). The scheduler scatters each
-decoded tile into its outer-chunk slot in the :class:`~insitubatch.pool.ChunkPool`;
-batches gather straight from those slots by ``(chunk_id, within)`` draw rows.
+bounds throughput; never loop per-sample in Python). The scheduler hands each decoded
+tile to the :class:`~insitubatch.pool.ChunkPool`, which holds it by reference; batches
+gather straight from those tiles by ``(chunk_id, within)`` draw rows.
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ def build_stored_chunk_reads(
 ) -> list[StoredChunkRead]:
     """Expand outer chunk ids into deduped stored-chunk reads, in priority order.
 
-    There is no gather map: the scheduler scatters tiles into per-outer-chunk slots
+    There is no gather map: the scheduler delivers tiles into per-outer-chunk slots
     in a :class:`~insitubatch.pool.ChunkPool`, and batches are gathered straight
-    from those assembled slots by ``(chunk_id, within)`` draw rows -- the same
+    from those tiles by ``(chunk_id, within)`` draw rows -- the same
     coordinates the shuffle order already produces. So the result is just *what to
     fetch, in what order*; the scheduler keeps ``max_inflight`` tiles in flight
     across the list.

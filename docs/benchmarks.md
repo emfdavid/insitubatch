@@ -284,11 +284,11 @@ this section as "obstore wins HTTP", not "fsspec is worse".
 ## Free-threading readiness
 
 insitubatch's throughput is **GIL-independent by design**: the heavy work already runs
-outside the GIL — fetch (obstore/Rust), decode (numcodecs zstd, C), scatter/gather
+outside the GIL — fetch (obstore/Rust), decode (numcodecs zstd, C), gather
 (vectorized numpy) — and scheduling is a single asyncio loop, so there is no GIL-held
 hot path for free-threading to accelerate. (Decode even parallelizes *under* the GIL:
 zstd releases it, so the `decode_threads` sweep scales 1→2 on the GIL build too.) On the
-3.13 free-threaded build the engine is **correct** — the scatter is disjoint and readiness
+3.13 free-threaded build the engine is **correct** — deliveries never collide and readiness
 is published under the lock, so the lock, not the GIL, is the happens-before edge — and it
 runs at the **same speed** as the GIL build.
 

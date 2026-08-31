@@ -1,11 +1,17 @@
-"""ChunkPool: the batch-assembly buffer *and* the cache -- one machinery.
+"""ChunkPool: the residency tier *and* the cache -- one machinery.
 
-The scheduler fetches at *stored chunk* (tile) granularity and scatters each
-decoded tile into its outer chunk's pre-allocated array. The pool owns those
-arrays -- the "slots" -- across their whole life: admit (size to the assembled
-chunk, evicting unpinned-LRU for room) -> scatter tiles (disjoint writes from the
-decode pool) -> mark ready (when the last tile lands) -> gather batches (coalesced,
-on the consumer thread) -> unpin (when a shuffle-block is fully drained).
+The scheduler fetches at *stored chunk* (tile) granularity and hands each decoded
+tile to the pool, which **adopts it by reference**: the tile *is* the resident
+buffer, so the fill path has no memcpy and placement is deferred to ``gather``. A
+slot is therefore a grid of stored chunks, not one assembled array. The pool owns
+them across their whole life: admit (charge the tiles it will hold, evicting
+unpinned-LRU for room) -> deliver tiles (from the decode pool) -> mark ready (when
+the last tile lands) -> gather batches (one coalesced write per stored chunk, on
+the consumer thread) -> unpin (when a shuffle-block is fully drained).
+
+A slot that must publish a *whole* array -- only a ``chunk_transform``, which must
+be handed a real array rather than a dict of tiles -- assembles at completion and
+republishes as a **one-tile** slot, so ``gather`` still sees one representation.
 
 Buffer and cache differ only in budget + backing, so they are the same code:
 
@@ -14,9 +20,10 @@ Buffer and cache differ only in budget + backing, so they are the same code:
   pressure evicts them in LRU order. A small budget is read-once (unpinned chunks
   evicted promptly); a large budget retains drained chunks so a still-resident
   prepped chunk is a hit next epoch -- decode-once reuse.
-* a **backing**: heap (``np.empty``) or mmap'd ``.npy`` on NVMe (``open_memmap``),
-  the scatter writing straight into the slot either way; mmap keeps the working set
-  as reclaimable page cache rather than anon heap.
+* a **backing**: heap (the adopted tile itself) or an mmap'd ``.npy`` on NVMe
+  (``open_memmap``), which stores a chunk's tiles **tile-major** -- each contiguous,
+  written straight into its slice, with the slot keeping the view. mmap keeps the
+  working set as reclaimable page cache rather than anon heap.
 
 With ``persist=True`` (requires a ``backing_dir``) the mmap tier becomes a **cross-run
 cache**: slot files survive ``close`` (only budget eviction removes them), an append-only
@@ -36,20 +43,20 @@ See [docs/architecture.md] for where this sits in the pipeline.
 
 Thread-safety / free-threading (the load-bearing invariant)
 -----------------------------------------------------------
-Scatter runs on many decode-pool threads at once -- including two tiles of the
+Delivery runs on many decode-pool threads at once -- including two tiles of the
 *same* outer chunk concurrently (inner-grid parallelism). We never lock the data
-copy; we lock only the Python-level bookkeeping. Two rules make this correct
+write; we lock only the Python-level bookkeeping. Two rules make this correct
 under both the GIL build *and* free-threaded 3.13t (where the GIL is no longer an
 incidental barrier):
 
-1. **Disjoint, fixed-shape writes are lock-free.** Tiles cover disjoint regions
-   of a slot whose shape never changes, so the memcpy ``slot[dst] = tile`` races
-   nothing.
-2. **Readiness is published *through the lock*, after the copy.** Each scatter
-   does its memcpy, *then* takes the lock to decrement the completion counter.
-   The consumer observes ``ready`` under the same lock. That lock release ->
+1. **Deliveries do not collide.** Each tile is its own key in ``slot.tiles``
+   (its ``inner_coord``), and on the mmap tier its own disjoint, fixed-shape slice
+   of the backing. No two writers touch the same bytes, so the write races nothing.
+2. **Readiness is published *through the lock*, after the write.** Each delivery
+   lands its tile, *then* takes the lock to decrement the completion counter.
+   The consumer observes readiness under the same lock. That lock release ->
    acquire pair is the happens-before edge guaranteeing the consumer sees every
-   completed copy -- we do not lean on the GIL for it.
+   completed write -- we do not lean on the GIL for it.
 
 So the GIL build is just the serialized (slower) case; free threading is upside.
 """
@@ -381,8 +388,9 @@ class ChunkPool:
             for p, out in self._out_by_path.items()
         }
         # backing: heap (np.empty) or mmap'd .npy under backing_dir (point at NVMe).
-        # The scatter writes straight into the slot either way; mmap keeps the working
-        # set as reclaimable page cache rather than anon heap. Default heap: scattering
+        # A heap slot adopts the tile; the mmap tier writes it into its tile-major slice
+        # and keeps the view. mmap keeps the working set as reclaimable page cache rather
+        # than anon heap. Default heap: writing
         # into mmap is NVMe write traffic even when never reused, so reach for it to
         # spill a working set past RAM or for cross-epoch reuse, not for plain streaming.
         self._dir = Path(backing_dir) if backing_dir is not None else None
@@ -855,7 +863,7 @@ class ChunkPool:
         self._bytes -= slot.nbytes
         # In persist mode a *ready* eviction is a cache demotion, not a deletion: keep the
         # .npy on disk so a later epoch/run can revive it. It was already recorded in the log at
-        # completion (see scatter -> _record_completed), so eviction touches only the backing.
+        # completion (see _advance -> _record_completed), so eviction touches only the backing.
         # A not-ready partial is garbage either way -> unlink it.
         keep = self._persistent and slot.state is SlotState.READY
         self._free(slot, keep_file=keep)
@@ -981,7 +989,7 @@ class ChunkPool:
     def _advance(self, array: str, chunk_index: int) -> None:
         """The **only** function that moves a slot's state. Called once per tile release.
 
-        Everything the old code spread across ``scatter``'s tail, ``fail`` and
+        Everything the old code spread across the scatter's tail, ``fail`` and
         ``unpin_all`` lives here, so there is exactly one lever:
 
         * still has writers -> nothing to decide yet.

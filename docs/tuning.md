@@ -79,12 +79,16 @@ data is written, and it sets how cheap concurrency can be.
 Peak memory is the sum of three independently-bounded pieces — none grows with epoch length
 or dataset size:
 
-- **Shuffle window:** `block_chunks × outer_chunk_bytes` — the decoded chunks held resident.
+- **Shuffle window:** `block_chunks × resident_chunk_bytes` — the decoded chunks held resident.
 - **Reads in flight:** `max_inflight × stored_chunk_bytes` — the fetch pipeline.
 - **Batch queue:** `prefetch_depth × batch_bytes` — assembled batches awaiting the consumer.
 
-where an outer chunk is `sample_chunk × ∏inner_shape × itemsize` and a stored chunk is
-`sample_chunk × ∏inner_chunk × itemsize`.
+where a stored chunk is `sample_chunk × ∏inner_chunk × itemsize`, and a resident chunk is
+the **stored chunks that compose it**, held whole:
+`n_stored_chunks × stored_chunk_bytes`. That equals the logical
+`sample_chunk × ∏inner_shape × itemsize` exactly when the chunk grid divides the array
+evenly, and exceeds it when it does not — see [Ragged chunk grids](#ragged-chunk-grids-cost-more-than-their-arrays)
+below.
 
 The point to internalize: **raising concurrency costs *stored-chunk*-sized memory, not
 *outer-chunk*-sized** — but only when the data is inner (spatially) chunked. If each outer

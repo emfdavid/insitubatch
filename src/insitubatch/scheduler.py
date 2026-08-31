@@ -1,8 +1,9 @@
 """Scheduler: the fetch driver.
 
-One asyncio event loop streams *stored-chunk* (tile) reads under a single
-``max_inflight`` budget, decodes each tile off the loop (numcodecs C, GIL
-released), and scatters it into its outer chunk's slot in a :class:`ChunkPool`.
+Orchestration runs on **zarr's** process-global event loop, streaming *stored-chunk*
+(tile) reads under a single ``max_inflight`` budget, decoding each tile off the loop
+(``ChunkTransform.decode_chunk``, numcodecs C, GIL released) on a process-wide decode
+pool, and handing it to a :class:`ChunkPool` that **adopts it by reference**.
 
 The point is that the two things you tune are independent: **read concurrency** is
 dialed by ``max_inflight`` alone, while **residency / shuffle span** is governed by
@@ -14,7 +15,8 @@ stitch the inner grid under a second cap is what couples them). See
 Two bounded resources, deliberately distinct:
 
 * **in-flight** (``max_inflight``, an ``asyncio.Semaphore``) -- tiles in flight; a
-  slot is held from fetch-start to scatter-done, spanning fetch + decode + scatter.
+  slot is held from fetch-start to delivery, spanning fetch + decode + deliver. It is
+  also what bounds the decode pool's queue, which is otherwise unbounded.
 * **residency** (the pool's byte budget) -- admission (``pool.try_admit``) evicts
   ready-and-unreferenced LRU to make room and *references* (refcounted pin) the chunk,
   so it stays resident from in-flight fetch through to the consumer's release; when the
@@ -459,7 +461,7 @@ class Scheduler:
 
         * ``try_admit`` just failed -- the budget is full of in-flight or referenced
           slots, so no eviction can make room.
-        * nothing is in flight -- no scatter is pending, so no slot can become ready
+        * nothing is in flight -- no delivery is pending, so no slot can become ready
           and satisfy a waiter on its own.
         * a consumer is blocked in ``wait_ready`` -- and a blocked consumer never
           reaches its next ``unpin_block``, so the one thing that could free budget
@@ -610,5 +612,5 @@ class Scheduler:
             )
             tile = decoded.as_numpy_array()
         # Seam 2: the decoded tile is in physical order; move the sample axis to the front
-        # so it matches the sample-first slot the pool scatters into (no-op when ax == 0).
+        # so it matches the sample-first grid the pool and gather address (no-op when ax == 0).
         return np.moveaxis(tile, ax, 0) if ax else tile
