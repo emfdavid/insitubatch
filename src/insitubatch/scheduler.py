@@ -205,7 +205,18 @@ class Scheduler:
         self._capacity: asyncio.Event | None = None  # set on unpin -> wakes a parked admit
         self._open_lock: asyncio.Lock | None = None
         self._ready = threading.Event()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="insitu-sched")
+        # OUR tasks, and only ours. `asyncio.all_tasks(loop)` is the *whole loop's* task
+        # set: correct while the loop is private, destructive the moment it is shared --
+        # it cancels unrelated zarr-sync work mid-flight. Mutated only on the loop thread
+        # (create_task and the done-callback both run there), so it needs no lock.
+        self._tasks: set[asyncio.Task] = set()
+        # Whether this scheduler stood the loop up. A borrowed loop must never be stopped
+        # or closed by us -- doing so leaves zarr's process-global loop dead for the rest
+        # of the process.
+        self._owns_loop = True
+        self._thread: threading.Thread | None = threading.Thread(
+            target=self._run_loop, daemon=True, name="insitu-sched"
+        )
         self._thread.start()
         self._ready.wait()
 
@@ -231,22 +242,33 @@ class Scheduler:
         with contextlib.suppress(Exception):  # loop may already be down
             fut = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
             fut.result(timeout=5)  # resolves while the loop is still running
-        self._loop.call_soon_threadsafe(self._loop.stop)  # ...then stop it
-        self._thread.join(timeout=5)
-        if not self._thread.is_alive():  # loop has exited run_forever -> safe to close
-            self._loop.close()  # release the self-pipe now; don't leave it for __del__
+        if self._owns_loop:
+            self._loop.call_soon_threadsafe(self._loop.stop)  # ...then stop it
+            if self._thread is not None:
+                self._thread.join(timeout=5)
+                if not self._thread.is_alive():  # exited run_forever -> safe to close
+                    self._loop.close()  # release the self-pipe; don't leave it for __del__
         self._decode_pool.shutdown(wait=False, cancel_futures=True)
-        # NB: the pool is caller-owned (persists across epochs as the cache) -- the
+        # NB: the *chunk* pool is caller-owned (persists across epochs as the cache) -- the
         # dataset closes it, not us.
 
     async def _shutdown(self) -> None:
-        # Cancel + drain in-flight tasks, but do NOT stop the loop here: stopping
-        # inside the awaited coroutine would race the delivery of this future's
-        # result back to close(), which then blocks until its timeout.
-        tasks = [t for t in asyncio.all_tasks(self._loop) if t is not asyncio.current_task()]
-        for task in tasks:
+        """Cancel + drain **our** in-flight tasks. Never the loop's other work.
+
+        Do NOT stop the loop here: stopping inside the awaited coroutine would race the
+        delivery of this future's result back to :meth:`close`, which then blocks until
+        its timeout.
+
+        This deliberately does not use ``asyncio.all_tasks(self._loop)``. That is the
+        whole loop's task set, and on a shared loop it cancels unrelated zarr-sync work
+        -- observed as a ``CancelledError`` raised inside an innocent ``zarr`` read in a
+        different thread. We cancel exactly what we created (:attr:`_tasks`).
+        """
+        current = asyncio.current_task()
+        mine = [t for t in self._tasks if t is not current and not t.done()]
+        for task in mine:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*mine, return_exceptions=True)
 
     def __enter__(self) -> Scheduler:
         return self
@@ -309,6 +331,9 @@ class Scheduler:
         # a not-ready (in-flight) slot is eviction-protected until its fetch completes.
         decided: dict[tuple[str, int], bool] = {}
         tasks: list[asyncio.Task] = []
+        me = asyncio.current_task()
+        if me is not None:
+            self._tasks.add(me)  # so _shutdown can cancel the driver itself
         try:
             for read in reads:
                 key = (read.array, read.chunk_index)
@@ -320,12 +345,18 @@ class Scheduler:
                     decided[key] = hit
                 if hit:
                     continue  # cross-epoch hit: prepped chunk already resident, no fetch
-                tasks.append(asyncio.create_task(self._one(read)))
+                task = asyncio.create_task(self._one(read))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                tasks.append(task)
             await asyncio.gather(*tasks)
         except BaseException:
             for task in tasks:
                 task.cancel()
             raise
+        finally:
+            if me is not None:
+                self._tasks.discard(me)
 
     async def _admit(self, array: str, chunk_index: int) -> None:
         """Admit a miss chunk against the byte budget, awaiting an unpin if full.
