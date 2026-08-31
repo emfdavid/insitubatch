@@ -101,14 +101,15 @@ def test_pool_aliased_labels_decode_once(tiled_store):
     reads = build_stored_chunk_reads(range(base.n_chunks), {array: base}, base.sample_chunk_size)
 
     pool = ChunkPool(geoms)
+    owner = pool.new_owner()
     for cid in range(base.n_chunks):
-        pool.try_admit(array, cid)  # admit by array name
+        pool.try_admit(array, cid, owner)  # admit by array name
     for read in reads:
-        pool.scatter(read.array, read.chunk_index, read.inner_coord, tiles[read.coords])
+        pool.deliver_tile(read.array, read.chunk_index, read.inner_coord, tiles[read.coords])
 
     spc = base.sample_chunk_size
     for cid in range(base.n_chunks):
-        pool.wait_ready(array, cid)
+        pool.wait_ready(array, cid, owner)
     n0 = len(base.samples_in_chunk(0))
     rows = np.array([[0, w] for w in range(n0)], dtype=np.int64)
     batch = pool.gather(rows, ["now", "next"], spc)
@@ -128,20 +129,21 @@ def test_pool_scatter_reconstructs_array(tiled_store, var):
     reads = build_stored_chunk_reads(range(geom.n_chunks), geoms, geom.sample_chunk_size)
 
     pool = ChunkPool(geoms)
+    owner = pool.new_owner()
     for cid in range(geom.n_chunks):
-        pool.try_admit(var, cid)
+        pool.try_admit(var, cid, owner)
 
     # Scatter every tile from a thread pool: two tiles of one slot land at once,
     # so this exercises the disjoint-lock-free-copy / lock-published-ready rule.
     def scatter(read: StoredChunkRead) -> None:
-        pool.scatter(read.array, read.chunk_index, read.inner_coord, tiles[read.coords])
+        pool.deliver_tile(read.array, read.chunk_index, read.inner_coord, tiles[read.coords])
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(scatter, reads))
 
     spc = geom.sample_chunk_size
     for cid in range(geom.n_chunks):
-        pool.wait_ready(var, cid)
+        pool.wait_ready(var, cid, owner)
         n0 = len(geom.samples_in_chunk(cid))
         rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
         batch = pool.gather(rows, [var], spc)
@@ -167,16 +169,17 @@ def test_pool_concurrent_scatter_is_race_free() -> None:
 
     for _round in range(8):  # repeated admit -> concurrent scatter -> gather (fresh pool)
         pool = ChunkPool(geoms)
-        pool.try_admit("v", 0)
+        owner = pool.new_owner()
+        pool.try_admit("v", 0, owner)
 
         def scatter(ic, pool=pool, geom=geom, ref=ref) -> None:  # default-bind per round
             dst, _src = geom.tile_placement(0, ic)
-            pool.scatter("v", 0, ic, ref[dst].copy())  # full chunk-shaped tile
+            pool.deliver_tile("v", 0, ic, ref[dst].copy())  # full chunk-shaped tile
 
         with ThreadPoolExecutor(max_workers=32) as ex:
             list(ex.map(scatter, coords))
 
-        pool.wait_ready("v", 0)
+        pool.wait_ready("v", 0, owner)
         rows = np.array([[0, w] for w in range(4)], dtype=np.int64)
         got = pool.gather(rows, ["v"], geom.sample_chunk_size).arrays["v"]
         assert np.array_equal(got, ref)
@@ -193,15 +196,16 @@ def test_pool_mmap_backing_parity_and_cleanup(tiled_store, tmp_path, var):
     backing = tmp_path / "slots"
 
     pool = ChunkPool(geoms, backing_dir=backing)
+    owner = pool.new_owner()
     for cid in range(geom.n_chunks):
-        pool.try_admit(var, cid)
+        pool.try_admit(var, cid, owner)
         for inner in geom.inner_coords():
-            pool.scatter(var, cid, inner, tiles[(cid, *inner)])
+            pool.deliver_tile(var, cid, inner, tiles[(cid, *inner)])
 
     assert list(backing.glob("*.npy")), "slots should live as .npy files on disk"
     spc = geom.sample_chunk_size
     for cid in range(geom.n_chunks):
-        pool.wait_ready(var, cid)
+        pool.wait_ready(var, cid, owner)
         n0 = len(geom.samples_in_chunk(cid))
         rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
         got = pool.gather(rows, [var], spc).arrays[var]
@@ -223,10 +227,11 @@ def test_pool_mmap_backing_with_transform(tiled_store, tmp_path):
         return chunk
 
     pool = ChunkPool(geoms, backing_dir=tmp_path / "s", chunk_transforms=[scale])
-    pool.try_admit("single_inner", 0)
+    owner = pool.new_owner()
+    pool.try_admit("single_inner", 0, owner)
     for inner in geom.inner_coords():
-        pool.scatter("single_inner", 0, inner, tiles[(0, *inner)])
-    pool.wait_ready("single_inner", 0)
+        pool.deliver_tile("single_inner", 0, inner, tiles[(0, *inner)])
+    pool.wait_ready("single_inner", 0, owner)
 
     spc = geom.sample_chunk_size
     rows = np.array([[0, w] for w in range(spc)], dtype=np.int64)
@@ -268,8 +273,9 @@ def test_pool_reshaping_transform_heap_gather(tiled_store):
     spc = geom.sample_chunk_size
 
     pool = ChunkPool(geoms, chunk_transforms=[MeanLastAxis()])
+    owner = pool.new_owner()
     for cid in range(geom.n_chunks):
-        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+        _fill_chunk(pool, "single_inner", cid, geom, tiles, owner)
         got = _gather_chunk(pool, "single_inner", cid, geom, spc)
         n0 = len(geom.samples_in_chunk(cid))
         expected = srcs["single_inner"][cid * spc : cid * spc + n0].mean(axis=-1)
@@ -286,7 +292,8 @@ def test_pool_reshaping_transform_dtype_recast(tiled_store):
     spc = geom.sample_chunk_size
 
     pool = ChunkPool(geoms, chunk_transforms=[MeanLastAxis(out_dtype="f8")])
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     got = _gather_chunk(pool, "single_inner", 0, geom, spc)
     assert got.dtype == np.dtype("f8")
     np.testing.assert_allclose(got, srcs["single_inner"][:spc].mean(axis=-1), rtol=1e-12)
@@ -315,16 +322,20 @@ def test_pool_reshaping_transform_mmap_persist_roundtrip(
     backing = tmp_path / "cache"
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[MeanLastAxis()])
+    owner = pool.new_owner()
     for cid in range(geom.n_chunks):
-        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+        _fill_chunk(pool, "single_inner", cid, geom, tiles, owner)
     assert pool.misses == geom.n_chunks and pool.hits == 0
     pool.close()
     assert list(backing.glob("*.npy")) and (backing / "insitu_cache.jsonl").exists()
 
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[MeanLastAxis()])
+    owner = pool2.new_owner()
     assert pool2.manifest_entries == geom.n_chunks
     for cid in range(geom.n_chunks):
-        assert pool2.pin_if_ready("single_inner", cid), "regridded chunk must revive as a hit"
+        assert pool2.pin_if_ready("single_inner", cid, owner), (
+            "regridded chunk must revive as a hit"
+        )
         n0 = len(geom.samples_in_chunk(cid))
         got = _gather_chunk(pool2, "single_inner", cid, geom, spc)
         expected = srcs["single_inner"][cid * spc : cid * spc + n0].mean(axis=-1)
@@ -357,14 +368,16 @@ def test_pool_reshaping_transform_structural_mismatch_is_miss(tiled_store, tmp_p
     t_old = MeanLastAxis()
     t_old.cache_key = "k"  # type: ignore[attr-defined]
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t_old])
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
 
     t_new = MeanBothAxes()
     t_new.cache_key = "k"  # type: ignore[attr-defined]
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t_new])
+    owner = pool2.new_owner()
     assert pool2.manifest_entries == 1, "same fingerprint -> entry is consulted"
-    assert not pool2.pin_if_ready("single_inner", 0), "output-geometry drift must invalidate"
+    assert not pool2.pin_if_ready("single_inner", 0, owner), "output-geometry drift must invalidate"
     assert pool2.revive_mismatch == 1 and pool2.hits == 0
     pool2.close()
 
@@ -374,10 +387,11 @@ def test_pool_wait_ready_raises_on_failure(tiled_store):
     url, _ = tiled_store
     geoms = open_geometries(obstore_store(url), variables=["spatial"])
     pool = ChunkPool(geoms)
-    pool.try_admit("spatial", 0)
+    owner = pool.new_owner()
+    pool.try_admit("spatial", 0, owner)
     pool.fail("spatial", 0, RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
-        pool.wait_ready("spatial", 0)
+        pool.wait_ready("spatial", 0, owner)
 
 
 def test_pool_lru_evicts_unpinned_under_budget(tiled_store):
@@ -390,23 +404,24 @@ def test_pool_lru_evicts_unpinned_under_budget(tiled_store):
     spc = geom.sample_chunk_size
     full_nbytes = spc * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
     pool = ChunkPool(geoms, budget_bytes=2 * full_nbytes)  # holds two full chunks
+    owner = pool.new_owner()
 
     def fill(cid):
-        assert pool.try_admit("single_inner", cid)
+        assert pool.try_admit("single_inner", cid, owner)
         for inner in geom.inner_coords():
-            pool.scatter("single_inner", cid, inner, tiles[(cid, *inner)])
-        pool.wait_ready("single_inner", cid)
+            pool.deliver_tile("single_inner", cid, inner, tiles[(cid, *inner)])
+        pool.wait_ready("single_inner", cid, owner)
 
     fill(0)
     fill(1)
     assert pool.resident_chunks == 2
     # Budget full of *referenced* slots -> a third miss can't be admitted yet.
-    assert not pool.try_admit("single_inner", 2)
-    pool.unpin_keys({("single_inner", 0), ("single_inner", 1)})  # release -> LRU-evictable
-    assert pool.try_admit("single_inner", 2)  # evicts chunk 0
+    assert not pool.try_admit("single_inner", 2, owner)
+    pool.unpin_keys({("single_inner", 0), ("single_inner", 1)}, owner)  # release -> LRU-evictable
+    assert pool.try_admit("single_inner", 2, owner)  # evicts chunk 0
     for inner in geom.inner_coords():
-        pool.scatter("single_inner", 2, inner, tiles[(2, *inner)])
-    pool.wait_ready("single_inner", 2)
+        pool.deliver_tile("single_inner", 2, inner, tiles[(2, *inner)])
+    pool.wait_ready("single_inner", 2, owner)
 
     assert not pool.is_ready("single_inner", 0)  # LRU victim, gone
     assert pool.is_ready("single_inner", 1)  # retained
@@ -425,19 +440,20 @@ def test_pool_pin_is_reference_counted_not_boolean(tiled_store):
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     full = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
     pool = ChunkPool(geoms, budget_bytes=full)  # holds exactly one chunk
+    owner = pool.new_owner()
 
-    pool.try_admit("single_inner", 0)  # admission references it -> refcount 1
+    pool.try_admit("single_inner", 0, owner)  # admission references it -> refcount 1
     for inner in geom.inner_coords():
-        pool.scatter("single_inner", 0, inner, tiles[(0, *inner)])
-    pool.wait_ready("single_inner", 0)
+        pool.deliver_tile("single_inner", 0, inner, tiles[(0, *inner)])
+    pool.wait_ready("single_inner", 0, owner)
 
-    pool.pin_keys({("single_inner", 0)})  # a second block references it -> 2
-    assert pool._pinned[("single_inner", 0)] == 2
-    pool.unpin_keys({("single_inner", 0)})  # one block done -> 1, still pinned
-    assert not pool.try_admit("single_inner", 1)  # budget full, chunk 0 not evictable
-    pool.unpin_keys({("single_inner", 0)})  # last block done -> 0, now evictable
+    pool.pin_keys({("single_inner", 0)}, owner)  # a second block references it -> 2
+    assert pool._refs(("single_inner", 0)) == 2  # total refs, across owners
+    pool.unpin_keys({("single_inner", 0)}, owner)  # one block done -> 1, still pinned
+    assert not pool.try_admit("single_inner", 1, owner)  # budget full, chunk 0 not evictable
+    pool.unpin_keys({("single_inner", 0)}, owner)  # last block done -> 0, now evictable
     assert ("single_inner", 0) not in pool._pinned
-    assert pool.try_admit("single_inner", 1)  # evicts chunk 0
+    assert pool.try_admit("single_inner", 1, owner)  # evicts chunk 0
     assert ("single_inner", 0) not in pool._slots
 
 
@@ -454,18 +470,19 @@ def test_pool_unpin_all_drops_abandoned_partial_keeps_ready(tiled_store):
     assert len(inner) > 1  # need a multi-tile chunk to leave a real partial
 
     pool = ChunkPool(geoms)
+    owner = pool.new_owner()
     # chunk 0: only the first tile scattered -> not ready (abandoned partial)
-    pool.try_admit("spatial", 0)
-    pool.scatter("spatial", 0, inner[0], tiles[(0, *inner[0])])
+    pool.try_admit("spatial", 0, owner)
+    pool.deliver_tile("spatial", 0, inner[0], tiles[(0, *inner[0])])
     assert not pool.is_ready("spatial", 0)
     # chunk 1: fully scattered -> ready (a valid cache entry)
-    pool.try_admit("spatial", 1)
+    pool.try_admit("spatial", 1, owner)
     for ic in inner:
-        pool.scatter("spatial", 1, ic, tiles[(1, *ic)])
-    pool.wait_ready("spatial", 1)
+        pool.deliver_tile("spatial", 1, ic, tiles[(1, *ic)])
+    pool.wait_ready("spatial", 1, owner)
     bytes_ready = pool._slots[("spatial", 1)].nbytes
 
-    pool.unpin_all()
+    pool.release_owner(owner)
 
     assert pool._pinned == {}  # every refcount cleared
     assert ("spatial", 0) not in pool._slots  # abandoned partial dropped
@@ -481,11 +498,11 @@ def test_pool_persist_requires_cache_dir(tiled_store):
         ChunkPool(geoms, persist=True)
 
 
-def _fill_chunk(pool, var, cid, geom, tiles):
-    pool.try_admit(var, cid)
+def _fill_chunk(pool, var, cid, geom, tiles, owner):
+    pool.try_admit(var, cid, owner)
     for inner in geom.inner_coords():
-        pool.scatter(var, cid, inner, tiles[(cid, *inner)])
-    pool.wait_ready(var, cid)
+        pool.deliver_tile(var, cid, inner, tiles[(cid, *inner)])
+    pool.wait_ready(var, cid, owner)
 
 
 def test_pool_cross_run_persistence(tiled_store, tmp_path):
@@ -500,8 +517,9 @@ def test_pool_cross_run_persistence(tiled_store, tmp_path):
 
     # Run 1: populate + close. persist must KEEP the files and write a manifest.
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool.new_owner()
     for cid in range(geom.n_chunks):
-        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+        _fill_chunk(pool, "single_inner", cid, geom, tiles, owner)
     assert pool.misses == geom.n_chunks and pool.hits == 0  # cold: every chunk a miss
     pool.close()
     assert list(backing.glob("*.npy")), "persist=True must keep slot files after close()"
@@ -509,9 +527,10 @@ def test_pool_cross_run_persistence(tiled_store, tmp_path):
 
     # Run 2: same dir -> every chunk a ready hit, no fetch/scatter.
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool2.new_owner()
     assert pool2.manifest_entries == geom.n_chunks
     for cid in range(geom.n_chunks):
-        assert pool2.pin_if_ready("single_inner", cid), "persisted chunk must be a hit"
+        assert pool2.pin_if_ready("single_inner", cid, owner), "persisted chunk must be a hit"
         n0 = len(geom.samples_in_chunk(cid))
         rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
         got = pool2.gather(rows, ["single_inner"], spc).arrays["single_inner"]
@@ -535,16 +554,20 @@ def test_pool_persist_crash_recovery_without_close(tiled_store, tmp_path):
     # Run 1: populate every chunk but NEVER close() -- simulate a killed process. The log must
     # already carry every completed entry (flushed on completion, not at close).
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool.new_owner()
     for cid in range(geom.n_chunks):
-        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+        _fill_chunk(pool, "single_inner", cid, geom, tiles, owner)
     log = (backing / "insitu_cache.jsonl").read_text().splitlines()
     assert len(log) == geom.n_chunks + 1  # header + one entry per completed chunk
 
     # Run 2: same dir, fresh pool -> every chunk a ready hit despite the missing close().
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool2.new_owner()
     assert pool2.manifest_entries == geom.n_chunks
     for cid in range(geom.n_chunks):
-        assert pool2.pin_if_ready("single_inner", cid), "crashed-run chunk must revive as a hit"
+        assert pool2.pin_if_ready("single_inner", cid, owner), (
+            "crashed-run chunk must revive as a hit"
+        )
         n0 = len(geom.samples_in_chunk(cid))
         rows = np.array([[cid, w] for w in range(n0)], dtype=np.int64)
         got = pool2.gather(rows, ["single_inner"], spc).arrays["single_inner"]
@@ -563,13 +586,18 @@ def test_pool_persist_partial_iteration_recovers_completed_subset(tiled_store, t
     backing = tmp_path / "cache"
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)  # only chunk 0 completes before the "crash"
+    owner = pool.new_owner()
+    # only chunk 0 completes before the "crash"
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     # no close()
 
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool2.new_owner()
     assert pool2.manifest_entries == 1
-    assert pool2.pin_if_ready("single_inner", 0), "the completed chunk revives"
-    assert not pool2.pin_if_ready("single_inner", 1), "an un-reached chunk is a miss, not a hit"
+    assert pool2.pin_if_ready("single_inner", 0, owner), "the completed chunk revives"
+    assert not pool2.pin_if_ready("single_inner", 1, owner), (
+        "an un-reached chunk is a miss, not a hit"
+    )
     pool2.close()
 
 
@@ -588,11 +616,12 @@ def test_pool_persist_log_dedups_across_epochs_and_runs(tiled_store, tmp_path):
     # re-completing the same key. The _recorded gate must prevent a duplicate log line.
     one_slot = int(np.prod(geom.slot_shape(0)) * geom.dtype.itemsize)
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, budget_bytes=one_slot)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
-    pool.unpin_all()  # drop the pin so chunk 0 is evictable
-    _fill_chunk(pool, "single_inner", 1, geom, tiles)  # evicts (demotes) chunk 0
-    pool.unpin_all()
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)  # refetch + re-complete chunk 0
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
+    pool.release_owner(owner)  # drop the pin so chunk 0 is evictable
+    _fill_chunk(pool, "single_inner", 1, geom, tiles, owner)  # evicts (demotes) chunk 0
+    pool.release_owner(owner)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)  # refetch + re-complete chunk 0
     pool.close()
 
     header_plus_entries = logpath.read_text().splitlines()
@@ -600,6 +629,7 @@ def test_pool_persist_log_dedups_across_epochs_and_runs(tiled_store, tmp_path):
 
     # Reopen and re-complete an already-logged chunk: still no new line.
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool2.new_owner()
     assert pool2.manifest_entries == 2
     pool2.close()
     assert len(logpath.read_text().splitlines()) == 3, "reopen must not duplicate lines"
@@ -616,7 +646,8 @@ def test_pool_close_is_idempotent(tiled_store, tmp_path):
     backing = tmp_path / "cache"
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
     assert pool._log is None  # handle released
     pool.close()  # idempotent -- no double-close error on the file handle or slots
@@ -633,7 +664,8 @@ def test_pool_persist_missing_file_is_miss_not_raise(tiled_store, tmp_path):
     backing = tmp_path / "cache"
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
 
     # Delete the data file but leave the log referencing it (a torn cache, not eviction).
@@ -641,8 +673,9 @@ def test_pool_persist_missing_file_is_miss_not_raise(tiled_store, tmp_path):
         f.unlink()
 
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool2.new_owner()
     assert pool2.manifest_entries == 1  # the log still lists the (now-missing) entry
-    assert not pool2.pin_if_ready("single_inner", 0), "a missing .npy is a miss, not a hit"
+    assert not pool2.pin_if_ready("single_inner", 0, owner), "a missing .npy is a miss, not a hit"
     assert pool2.revive_missing == 1 and pool2.hits == 0
     assert ("single_inner", 0) not in pool2._persisted  # the dangling entry is dropped
     pool2.close()
@@ -660,14 +693,17 @@ def test_pool_persist_evicted_chunk_revives_from_kept_file(tiled_store, tmp_path
 
     one_slot = int(np.prod(geom.slot_shape(0)) * geom.dtype.itemsize)
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, budget_bytes=one_slot)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
-    pool.unpin_all()  # make chunk 0 evictable
-    _fill_chunk(pool, "single_inner", 1, geom, tiles)  # admits 1 -> demotes 0 (file KEPT)
-    pool.unpin_all()  # make chunk 1 evictable so reviving 0 can free room
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
+    pool.release_owner(owner)  # make chunk 0 evictable
+    _fill_chunk(pool, "single_inner", 1, geom, tiles, owner)  # admits 1 -> demotes 0 (file KEPT)
+    pool.release_owner(owner)  # make chunk 1 evictable so reviving 0 can free room
 
     assert ("single_inner", 0) not in pool._slots  # 0 was evicted from memory
     assert (backing / pool._persisted[("single_inner", 0)]).exists()  # but its file survives
-    assert pool.pin_if_ready("single_inner", 0), "the demoted chunk revives from its kept file"
+    assert pool.pin_if_ready("single_inner", 0, owner), (
+        "the demoted chunk revives from its kept file"
+    )
     assert pool.revive_missing == 0  # nothing was lost by the eviction
     pool.close()
 
@@ -683,13 +719,15 @@ def test_pool_persist_invalidates_on_geometry_mismatch(tiled_store, tmp_path):
     backing = tmp_path / "cache"
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
 
     # Reopen with a structurally different dtype for the same array -> mismatch -> miss.
     drifted = {"single_inner": replace(geom, dtype=np.dtype("f8"))}
     pool2 = ChunkPool(drifted, backing_dir=backing, persist=True)
-    assert not pool2.pin_if_ready("single_inner", 0), "geometry drift must invalidate"
+    owner = pool2.new_owner()
+    assert not pool2.pin_if_ready("single_inner", 0, owner), "geometry drift must invalidate"
     assert pool2.revive_mismatch == 1 and pool2.hits == 0  # the mismatch is counted
     pool2.close()
 
@@ -709,11 +747,13 @@ def test_pool_persist_invalidates_on_transform_change(tiled_store, tmp_path):
         return chunk
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_a])
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
 
     same = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_a])
-    assert same.manifest_entries == 1 and same.pin_if_ready("single_inner", 0)  # same fp -> hit
+    # same fp -> hit
+    assert same.manifest_entries == 1 and same.pin_if_ready("single_inner", 0, owner)
     same.close()
 
     def scale_b(chunk):  # different body -> different fingerprint
@@ -738,7 +778,8 @@ def test_pool_persist_reset_stale_cache_gcs_and_rebuilds(tiled_store, tmp_path):
         return chunk
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale_a])
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
     stale_file = pool._persisted[("single_inner", 0)]
     assert (backing / stale_file).exists()
@@ -752,7 +793,7 @@ def test_pool_persist_reset_stale_cache_gcs_and_rebuilds(tiled_store, tmp_path):
     )
     assert reset.manifest_entries == 0  # stale cache wiped -> cold start
     assert not (backing / stale_file).exists(), "the stale .npy must be GC'd"
-    assert not reset.pin_if_ready("single_inner", 0)  # nothing to revive -> a miss
+    assert not reset.pin_if_ready("single_inner", 0, owner)  # nothing to revive -> a miss
     reset.close()
 
 
@@ -770,7 +811,8 @@ def test_pool_persist_cache_key_overrides_fingerprint(tiled_store, tmp_path):
 
     t1.cache_key = "v1"  # type: ignore[attr-defined]
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t1])
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
 
     def t2(chunk):  # a different object/body, same declared key -> treated as identical
@@ -778,7 +820,7 @@ def test_pool_persist_cache_key_overrides_fingerprint(tiled_store, tmp_path):
 
     t2.cache_key = "v1"  # type: ignore[attr-defined]
     same = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[t2])
-    assert same.pin_if_ready("single_inner", 0)
+    assert same.pin_if_ready("single_inner", 0, owner)
     same.close()
 
     t2.cache_key = "v2"  # type: ignore[attr-defined]  # bump the key -> invalidate (stale -> raise)
@@ -804,7 +846,8 @@ def test_pool_persist_cloudpickle_catches_closure_change(tiled_store, tmp_path):
         return scale
 
     pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[make_scaler(2.0)])
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
 
     with pytest.raises(ValueError, match="stale|reset_stale_cache"):  # closure change -> stale
@@ -829,12 +872,13 @@ def test_pool_persist_without_cloudpickle_warns_and_falls_back(
 
     with caplog.at_level(logging.WARNING, logger="insitubatch.pool"):
         pool = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale])
+        owner = pool.new_owner()
     assert any("best-effort" in r.message for r in caplog.records), caplog.text
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
 
     same = ChunkPool(geoms, backing_dir=backing, persist=True, chunk_transforms=[scale])
-    assert same.pin_if_ready("single_inner", 0)  # source hash matches -> hit
+    assert same.pin_if_ready("single_inner", 0, owner)  # source hash matches -> hit
     same.close()
 
 
@@ -847,8 +891,9 @@ def _persist_two(tiled_store, backing):
     geom = geoms["single_inner"]
     tiles = asyncio.run(_decode_tiles(url, "single_inner"))
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool.new_owner()
     for cid in (0, 1):
-        _fill_chunk(pool, "single_inner", cid, geom, tiles)
+        _fill_chunk(pool, "single_inner", cid, geom, tiles, owner)
     pool.close()
     return geoms, backing / "insitu_cache.jsonl"
 
@@ -912,8 +957,10 @@ def test_pool_manifest_tolerates_torn_tail(tiled_store, tmp_path):
     with mpath.open("a") as f:
         f.write('{"array": "single_inner", "chunk_ind')  # torn tail, no newline
     pool = ChunkPool(geoms, backing_dir=backing, persist=True)
+    owner = pool.new_owner()
     assert pool.manifest_entries == 2  # both complete entries survived; the torn tail dropped
-    assert pool.pin_if_ready("single_inner", 0) and pool.pin_if_ready("single_inner", 1)
+    assert pool.pin_if_ready("single_inner", 0, owner)
+    assert pool.pin_if_ready("single_inner", 1, owner)
     pool.close()
 
 
@@ -941,7 +988,8 @@ def test_pool_spill_unlinks_without_persist(tiled_store, tmp_path):
     backing = tmp_path / "spill"
 
     pool = ChunkPool(geoms, backing_dir=backing)
-    _fill_chunk(pool, "single_inner", 0, geom, tiles)
+    owner = pool.new_owner()
+    _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
     assert not list(backing.glob("*.npy")), "spill must unlink slot files on close()"
     assert not (backing / "insitu_cache.jsonl").exists(), "no manifest without persist"

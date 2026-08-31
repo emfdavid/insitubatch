@@ -377,11 +377,17 @@ class InSituDataset:
         blocks = _partition_blocks(order, self.block_chunks)
         ordered_chunks = [int(c) for _rstart, _rstop, cids in blocks for c in cids]
 
-        # Start clean: release any pins a prior epoch leaked (an early break leaves its
-        # read-ahead pinned in the persistent pool -> would shrink this epoch's budget
-        # until admission deadlocks). The prior scheduler is fully closed here, so no
-        # pin/unpin can race. Resident chunks stay (unpinned) for cross-epoch reuse.
-        self._pool.unpin_all()
+        # One owner per pass, minted here and threaded through this iteration's scheduler
+        # (admission pins) and its producer (block pins). Scoping references this way is
+        # what lets two iterations share a pool: the prologue below releases only *our*
+        # leftovers, and `wait_ready` is satisfied only by *our* reference.
+        owner = self._pool.new_owner()
+
+        # Per-pass observability starts clean. Releasing this pass's references is NOT
+        # done here: it happens in our own teardown below, so an abandoned pass cleans up
+        # after itself instead of relying on the next pass's prologue -- which, now that
+        # references are owner-scoped, would be a different owner and could not.
+        self._pool.reset_epoch_counters()
 
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
         stop = threading.Event()
@@ -430,7 +436,7 @@ class InSituDataset:
                     # ChunkPool.wait_ready -- before gathering. Each wait is cheap once ready.
                     while ready < len(blocks) and blocks[ready][0] < stop_row:
                         for path, cid in block_keys[ready]:
-                            sched.pool.wait_ready(path, cid)
+                            sched.pool.wait_ready(path, cid, owner)
                         ready += 1
                     batch = sched.pool.gather(order[start:stop_row], self.variables, spc)
                     # Release the driver's reference on chunks whose *last* use is a block now
@@ -460,6 +466,7 @@ class InSituDataset:
             self.geometries,
             self._pool,
             self.scheduler_config,
+            owner=owner,
         ) as sched:
             producer = threading.Thread(
                 target=produce, args=(sched,), name="insitu-prefetch", daemon=True
@@ -501,6 +508,11 @@ class InSituDataset:
                         pool.revive_mismatch,
                         pool.revive_missing,
                     )
+                # Last: drop this pass's references (and any partial its cancelled
+                # fetches abandoned), after every counter above has been read. An
+                # early `break` finalizes this generator, so this runs then too --
+                # which is what keeps an abandoned pass from leaking budget.
+                self._pool.release_owner(owner)
 
     def _log_epoch_summary(self, pool: ChunkPool, split: SplitName | None) -> None:
         """One INFO line per epoch *per split*: what the chunk cache and the batch buffers did.

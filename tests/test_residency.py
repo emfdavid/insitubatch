@@ -144,7 +144,7 @@ def test_starved_admission_raises_instead_of_hanging(small_store, run_by) -> Non
         sched.start(list(range(geom.n_chunks)), geom.sample_chunk_size)
         # Wait on the last chunk and never unpin the earlier ones.
         with pytest.raises(RuntimeError, match="residency budget"):
-            run_by(DEADLINE, lambda: pool.wait_ready("t2m", 7))
+            run_by(DEADLINE, lambda: pool.wait_ready("t2m", 7, sched.owner))
 
 
 def test_slow_consumer_is_not_mistaken_for_starvation(small_store, run_by) -> None:
@@ -159,7 +159,7 @@ def test_slow_consumer_is_not_mistaken_for_starvation(small_store, run_by) -> No
     def drain(sched: Scheduler) -> int:
         n = 0
         for cid in range(geom.n_chunks):
-            pool.wait_ready("t2m", cid)
+            pool.wait_ready("t2m", cid, sched.owner)
             time.sleep(0.25)  # longer than the starvation poll interval
             sched.unpin_block({(geom.path, cid)})
             n += 1

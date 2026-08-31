@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **The chunk pool's "safe to take away" predicate is now true, not approximately true.**
+  Eviction eligibility was spread across five loosely-coupled fields, and each one could
+  lie. `fail()` had to set `ready = True` to wake a waiter — the only lever available —
+  which simultaneously declared a half-written slot a finished cache entry while sibling
+  tile tasks were still writing into it, and left the poisoned slot resident so the *next*
+  epoch re-raised the stale error forever instead of refetching (#33). `unpin_all()`
+  cleared the pin map globally, so with two producers over one pool (`zip(ds.train,
+  ds.val)`, a documented configuration) one iteration's epoch boundary stripped the
+  other's pins and its in-use chunks became eviction candidates mid-gather (#34). And
+  `claimed` was a single bool, so one iteration's claim satisfied another's `wait_ready`
+  — that iteration then gathered a chunk it never referenced and its release decremented
+  someone else's count (#35). All three produced *plausible* data, which throughput,
+  shapes and smoke tests all pass; only byte fingerprints catch them.
+  A slot now carries one explicit `SlotState` (`FILLING → ASSEMBLED → READY`, `FAILED`
+  terminal) advanced in exactly one place, plus two counters that answer one question
+  each: `writers` (tile tasks *running*, so eviction is never racing a live write) and
+  `pending` (tiles not yet delivered, so completeness is separate from quiescence).
+  References are owner-scoped, and a reference *is* that owner's claim, so `claimed` is
+  gone. `Scheduler` takes the pool's obligation off the caller: every tile write happens
+  inside `pool.tile_write`, whose scope releases on **every** exit path — including
+  cancellation at an `await`, which no explicit call site can cover.
+  `ASSEMBLED` is a real state, not a formality: the chunk transform and the persist
+  write-back run outside the lock between the last tile landing and the slot being
+  published, and a predicate derived only from a tile counter would call that window
+  evictable.
+
 - **Added: `insitubatch.print_debug_info()` — one paste instead of a dozen version questions.**
   Reports the storage stack (zarr / obstore / numpy / xarray), whichever framework adapter is
   actually installed, and the **free-threading state** — both the build flag and whether an

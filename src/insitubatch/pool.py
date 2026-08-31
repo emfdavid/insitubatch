@@ -65,8 +65,9 @@ import os
 import re
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import TextIO
 
@@ -163,24 +164,102 @@ def _has_weak_token(transforms: Sequence[ChunkTransform]) -> bool:
     return cloudpickle is None and any(getattr(t, "cache_key", None) is None for t in transforms)
 
 
+class SlotState(Enum):
+    """Where a slot is in its one and only lifecycle.
+
+    ``FILLING -> ASSEMBLED -> READY``, with ``FAILED`` terminal. Exactly one function
+    advances it (:meth:`ChunkPool._advance`), so "is this gatherable" and "is this safe
+    to take away" are read off one field instead of inferred from agreeing flags.
+
+    ``ASSEMBLED`` is a *real* state, not a formality: the chunk transform and the
+    persist write-back run **outside** the lock between the last tile landing and the
+    slot being published, so another thread can observe the slot with every tile
+    delivered and the data not yet final. A predicate derived only from a tile counter
+    would call that window evictable; this one does not.
+    """
+
+    FILLING = "filling"
+    ASSEMBLED = "assembled"
+    READY = "ready"
+    FAILED = "failed"
+
+
 @dataclass(slots=True)
 class _Slot:
-    """One outer chunk's cache slot plus its completion bookkeeping.
+    """One outer chunk's cache slot plus its lifecycle bookkeeping.
 
     ``data`` is the cache slot, sized at the transform's *output* geometry. ``scratch`` is
     a transient *source*-shaped assembly buffer, present only when a reshaping transform
     means the slot cannot also be the assembly target; tiles scatter into it and the
     transformed result lands in ``data`` (then ``scratch`` is dropped). With no reshaping
     transform ``scratch`` is ``None`` and tiles scatter straight into ``data`` -- the slot
-    is buffer and cache in one, no extra copy (the common path)."""
+    is buffer and cache in one, no extra copy (the common path).
+
+    Two counters, because quiescence and completeness are different questions and
+    answering both with one number is what made ``fail()`` have to lie:
+
+    * ``writers`` -- tile tasks **currently running**. Incremented when a task enters
+      :meth:`ChunkPool.tile_write` and decremented exactly once on every exit path,
+      cancellation included. It counts *started* tasks, not planned ones: a pass that is
+      cancelled leaves some tiles never started, and counting those would keep the slot
+      permanently non-quiescent and its budget unreclaimable. ``writers == 0`` means
+      **no thread can still write here**, which is the only safe basis for eviction.
+    * ``pending`` -- tiles not yet *delivered*. Reaches 0 only when the chunk is
+      genuinely complete. A slot that quiesces with ``pending > 0`` is an abandoned
+      partial (its fetch was cancelled), never a cache entry.
+    """
 
     data: np.ndarray
-    remaining: int  # inner tiles not yet scattered; 0 => fully assembled
+    writers: int  # outstanding tile TASKS -> quiescence
+    pending: int  # tiles not yet delivered -> completeness
     nbytes: int  # slot size, charged to the budget (fixed at admit)
-    ready: bool = False
+    state: SlotState = SlotState.FILLING
     error: BaseException | None = None
-    claimed: bool = False  # the driver has referenced it *this epoch* (see wait_ready)
     scratch: np.ndarray | None = None  # source-shaped assembly buffer (reshaping path only)
+
+    @property
+    def quiescent(self) -> bool:
+        """No tile task can still write into this slot."""
+        return self.writers == 0
+
+
+@dataclass(slots=True)
+class _TileWrite:
+    """One tile task's write scope. See :meth:`ChunkPool.tile_write`.
+
+    Holds the release obligation so no caller has to remember it. ``released`` makes
+    the release idempotent: ``deliver`` releases as soon as the copy lands (so the slot
+    can publish without waiting for the coroutine to unwind), and the scope's
+    ``finally`` then finds nothing to do.
+    """
+
+    pool: ChunkPool
+    array: str
+    chunk_index: int
+    inner_coord: tuple[int, ...]
+    released: bool = False
+
+    def deliver(self, tile: np.ndarray) -> None:
+        """Land this tile in the slot, then release the write."""
+        self.pool._deliver(self.array, self.chunk_index, self.inner_coord, tile)
+        self.release()
+
+    def fail(self, error: BaseException) -> None:
+        """Poison the whole outer chunk, then release the write."""
+        self.pool.fail(self.array, self.chunk_index, error)
+        self.release()
+
+    def release(self) -> None:
+        """Drop this task's claim on the slot. Idempotent; never raises."""
+        if self.released:
+            return
+        self.released = True
+        slot = self.pool._slots.get((self.array, self.chunk_index))
+        if slot is None:  # already dropped (poisoned + unreferenced) -- nothing to release
+            return
+        with self.pool._cv:
+            slot.writers -= 1
+        self.pool._advance(self.array, self.chunk_index)
 
 
 class ChunkPool:
@@ -308,7 +387,12 @@ class ChunkPool:
         # refcounted slot is held by a live block (windows let one chunk be read by
         # several blocks at once, so pins are reference-counted, not a boolean).
         self._slots: OrderedDict[tuple[str, int], _Slot] = OrderedDict()
-        self._pinned: dict[tuple[str, int], int] = {}  # key -> refcount (>0 == pinned)
+        # key -> {owner: refcount}. Owner-scoped because one pool serves several
+        # concurrent iterations (`zip(ds.train, ds.val)`, buffers.py:238-247): a single
+        # flat map lets one iteration's epoch prologue release another's live pins, and a
+        # single `claimed` bool lets one iteration's claim satisfy another's wait_ready.
+        self._pinned: dict[tuple[str, int], dict[int, int]] = {}
+        self._owner_seq = 0  # monotonic; owners are opaque tokens minted by new_owner()
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
@@ -316,6 +400,36 @@ class ChunkPool:
         # unpin, which is what lets the scheduler prove an admission starvation is
         # terminal rather than merely slow (see Scheduler._admit).
         self._waiting: dict[tuple[str, int], int] = {}  # key -> blocked waiter count
+
+    # -- ownership ----------------------------------------------------------
+
+    def new_owner(self) -> int:
+        """Mint an opaque token identifying one iteration's references.
+
+        One iteration = one owner: its scheduler's admission pins and its producer's
+        block pins are the same owner, so ``unpin_all(owner)`` at the next epoch's
+        prologue releases exactly that iteration's state and leaves a concurrent
+        iteration's untouched. Deliberately not user-visible -- ``_iterate`` mints one
+        and threads it through; nothing in the public API names an owner.
+        """
+        with self._cv:
+            self._owner_seq += 1
+            return self._owner_seq
+
+    def _refs(self, key: tuple[str, int]) -> int:  # call under the lock
+        """Total outstanding references to ``key`` across every owner."""
+        return sum(self._pinned.get(key, {}).values())
+
+    def _evictable(self, key: tuple[str, int], slot: _Slot) -> bool:  # call under the lock
+        """May the pool take this buffer away?
+
+        The one predicate. Three independent conditions, each with a distinct reason:
+        nobody may still be *writing* (``quiescent``), nobody is still *reading*
+        (no references), and the contents are a finished cache entry (``READY``).
+        A ``FAILED`` slot is never evicted here because it is dropped as soon as it
+        quiesces (see :meth:`_advance`); an ``ASSEMBLED`` one is mid-transform.
+        """
+        return slot.quiescent and self._refs(key) == 0 and slot.state is SlotState.READY
 
     # -- observability ------------------------------------------------------
 
@@ -352,7 +466,7 @@ class ChunkPool:
 
     # -- admission / pinning / eviction -------------------------------------
 
-    def try_admit(self, array: str, chunk_index: int) -> bool:
+    def try_admit(self, array: str, chunk_index: int, owner: int) -> bool:
         """Reserve + allocate + reference one outer-chunk slot, evicting ready-LRU for room.
 
         Admission takes one reference (incref) and *claims* the slot for this epoch (so
@@ -373,8 +487,10 @@ class ChunkPool:
         nbytes = int(np.prod(out.slot_shape(chunk_index), dtype=np.int64)) * out.dtype.itemsize
         with self._cv:
             if key in self._slots:
-                self._pin(key)  # already resident (in-flight or ready hit) -> incref, reuse
-                self._slots[key].claimed = True
+                # Already resident (in-flight, or a ready cross-epoch hit) -> incref and
+                # reuse. A FAILED slot is NOT reusable: it quiesces and is dropped, so a
+                # later epoch refetches instead of re-raising a stale error forever.
+                self._pin(key, owner)  # the pin IS this owner's claim (see wait_ready)
                 self._cv.notify_all()  # a ready hit may now satisfy a waiter
                 return True
             if not self._make_room(nbytes):
@@ -387,13 +503,13 @@ class ChunkPool:
             )
             self._slots[key] = _Slot(
                 data=self._alloc(array, chunk_index, out.slot_shape(chunk_index), out.dtype),
-                remaining=src.n_inner_chunks(chunk_index),
+                writers=0,  # no task has started yet; counted on entry to tile_write
+                pending=src.n_inner_chunks(chunk_index),
                 nbytes=nbytes,
-                claimed=True,
                 scratch=scratch,
             )
             self._bytes += nbytes
-            self._pin(key)
+            self._pin(key, owner)
             self.max_resident = max(self.max_resident, len(self._positions()))
             return True
 
@@ -401,9 +517,9 @@ class ChunkPool:
         """True if the chunk is resident, fully assembled, and not failed (a hit)."""
         with self._cv:
             slot = self._slots.get((array, chunk_index))
-            return slot is not None and slot.ready and slot.error is None
+            return slot is not None and slot.state is SlotState.READY
 
-    def pin_if_ready(self, array: str, chunk_index: int) -> bool:
+    def pin_if_ready(self, array: str, chunk_index: int, owner: int) -> bool:
         """Incref + return ``True`` iff the chunk is resident, ready, and not failed.
 
         A cross-epoch (or, with ``persist``, cross-*run*) cache hit the driver can skip
@@ -417,13 +533,10 @@ class ChunkPool:
         with self._cv:
             key = (array, chunk_index)
             slot = self._slots.get(key)
-            if not (slot is not None and slot.ready and slot.error is None):
-                if not self._revive(key):
-                    return False
-                slot = self._slots[key]
+            if not (slot is not None and slot.state is SlotState.READY) and not self._revive(key):
+                return False
             self.hits += 1  # resident (cross-epoch) or revived (cross-run) -> no fetch
-            self._pin(key)
-            slot.claimed = True  # publish the claim so a waiter may now proceed
+            self._pin(key, owner)  # the pin IS this owner's claim; publish it
             self._cv.notify_all()
             return True
 
@@ -469,12 +582,16 @@ class ChunkPool:
         if not self._make_room(nbytes):
             del data
             return False
-        self._slots[key] = _Slot(data=data, remaining=0, nbytes=nbytes, ready=True)
+        # A revived chunk enters the SAME lifecycle at a later state rather than being a
+        # second way to be gatherable: no tiles were ever outstanding, nothing is pending.
+        self._slots[key] = _Slot(
+            data=data, writers=0, pending=0, nbytes=nbytes, state=SlotState.READY
+        )
         self._bytes += nbytes
         self.max_resident = max(self.max_resident, len(self._positions()))
         return True
 
-    def pin_keys(self, keys: set[tuple[str, int]]) -> None:
+    def pin_keys(self, keys: set[tuple[str, int]], owner: int) -> None:
         """Reference (incref) a set of ``(path, chunk_index)`` slots for a live block.
 
         Windows make one chunk readable by several concurrent blocks, so pins are
@@ -485,9 +602,14 @@ class ChunkPool:
         """
         with self._cv:
             for key in keys:
-                self._pin(key)
+                self._pin(key, owner)
+            # Now that a reference IS this owner's claim, pinning can be the event that
+            # satisfies a consumer parked in `wait_ready` on an already-READY chunk.
+            # Under the old shared `claimed` flag it never could, so this notify was
+            # not needed; without it that consumer sleeps until some other wake-up.
+            self._cv.notify_all()
 
-    def unpin_keys(self, keys: set[tuple[str, int]]) -> None:
+    def unpin_keys(self, keys: set[tuple[str, int]], owner: int) -> None:
         """Release (decref) a block's ``(path, chunk_index)`` references.
 
         A slot dropping to refcount 0 becomes LRU-evictable (retained for cross-epoch
@@ -496,7 +618,7 @@ class ChunkPool:
         """
         with self._cv:
             for key in keys:
-                self._unpin_one(key)
+                self._unpin_one(key, owner)
             self._cv.notify_all()
 
     def buffer_stats(self) -> BufferStats:
@@ -513,43 +635,66 @@ class ChunkPool:
         """
         self._buffers.set_allocator(allocator)
 
-    def unpin_all(self) -> None:
-        """Epoch boundary reset: clear every pin and drop abandoned partials.
+    def release_owner(self, owner: int) -> None:
+        """Release everything one iteration holds: its pins, and its abandoned partials.
 
-        A pin is per-epoch working state, not cache membership -- ready chunks stay
-        resident (unpinned) for cross-epoch reuse. No pin may survive an epoch: an
-        aborted epoch (early ``break``) leaves its read-ahead and un-drained current
-        block referenced, which would shrink the next epoch's budget until admission
-        can free no room and the driver deadlocks. A *not-ready* slot at this boundary
-        is an abandoned partial (its fetch was cancelled mid-flight) -- it can never be
-        a valid cache entry, so drop it; that also restores the in-epoch invariant
-        "not ready => in flight" that protects fetches from eviction. Called at the
-        next epoch's start, when the prior scheduler is fully closed (no race).
+        Called by that iteration's own teardown, so the state dies with the thing that
+        created it. A pin is per-pass working state, not cache membership -- READY
+        chunks stay resident (unpinned) for cross-epoch reuse.
+
+        This must happen: an abandoned pass (early ``break``) otherwise leaves its
+        read-ahead and un-drained block referenced forever, shrinking every later
+        epoch's budget until admission can free no room and the driver deadlocks.
+
+        Scoped to ``owner``, because one pool serves several concurrent iterations.
+        Releasing globally is #34 -- it strips a live iteration's pins and its in-use
+        chunks become eviction candidates mid-gather. For the same reason a partial is
+        dropped only when it is quiescent *and* unreferenced: a slot still being written
+        by a live task, or held by another owner, is not ours to reclaim.
         """
         with self._cv:
-            self._pinned.clear()
-            for key in [k for k, slot in self._slots.items() if not slot.ready]:
-                self._drop(key)
-            for slot in self._slots.values():
-                slot.claimed = False  # a retained chunk must be re-claimed next epoch
-            # Per-epoch observability resets here (the epoch boundary); manifest_entries
-            # is load-time and persists.
+            for key in [k for k, owners in self._pinned.items() if owner in owners]:
+                self._pinned[key].pop(owner, None)
+                if not self._pinned[key]:
+                    self._pinned.pop(key, None)
+            for key in [
+                k
+                for k, slot in self._slots.items()
+                if slot.state is not SlotState.READY and slot.quiescent and self._refs(k) == 0
+            ]:
+                self._drop(key)  # an abandoned partial can never be a valid cache entry
+            self._cv.notify_all()  # freed budget may unpark an admission
+
+    def reset_epoch_counters(self) -> None:
+        """Zero the per-epoch observability counters at a pass boundary.
+
+        Split out of the old ``unpin_all``: releasing references and resetting counters
+        are unrelated jobs on different clocks (one belongs to an iteration's teardown,
+        the other to a pass's start), and bundling them is why the reset used to force a
+        global unpin. ``manifest_entries`` is load-time state and deliberately survives.
+        """
+        with self._cv:
             self.hits = self.misses = 0
             self.revive_mismatch = self.revive_missing = 0
             self._buffers.reset_counters()  # batch outputs too -- same epoch boundary
-            self._cv.notify_all()
 
-    def _pin(self, key: tuple[str, int]) -> None:  # call under the lock
-        self._pinned[key] = self._pinned.get(key, 0) + 1
+    def _pin(self, key: tuple[str, int], owner: int) -> None:  # call under the lock
+        owners = self._pinned.setdefault(key, {})
+        owners[owner] = owners.get(owner, 0) + 1
         if key in self._slots:
             self._slots.move_to_end(key)  # MRU (the slot may not be allocated yet)
 
-    def _unpin_one(self, key: tuple[str, int]) -> None:  # call under the lock
-        n = self._pinned.get(key, 0)
+    def _unpin_one(self, key: tuple[str, int], owner: int) -> None:  # call under the lock
+        owners = self._pinned.get(key)
+        if owners is None:
+            return
+        n = owners.get(owner, 0)
         if n <= 1:
-            self._pinned.pop(key, None)
+            owners.pop(owner, None)
         else:
-            self._pinned[key] = n - 1
+            owners[owner] = n - 1
+        if not owners:
+            self._pinned.pop(key, None)
 
     def _make_room(self, nbytes: int) -> bool:  # call under the lock
         if self._budget is None:
@@ -557,9 +702,7 @@ class ChunkPool:
         while self._bytes + nbytes > self._budget:
             # Evict the LRU slot that is ready *and* unreferenced; a not-ready slot is
             # an in-flight fetch and a refcounted slot is held by a live block.
-            victim = next(
-                (k for k, s in self._slots.items() if k not in self._pinned and s.ready), None
-            )
+            victim = next((k for k, sl in self._slots.items() if self._evictable(k, sl)), None)
             if victim is None:  # everything resident is in-flight or pinned -> no room
                 return False
             self._drop(victim)
@@ -573,7 +716,7 @@ class ChunkPool:
         # .npy on disk so a later epoch/run can revive it. It was already recorded in the log at
         # completion (see scatter -> _record_completed), so eviction touches only the backing.
         # A not-ready partial is garbage either way -> unlink it.
-        keep = self._persistent and slot.ready
+        keep = self._persistent and slot.state is SlotState.READY
         self._free(slot, keep_file=keep)
 
     def _alloc(
@@ -584,37 +727,117 @@ class ChunkPool:
         path = self._dir / f"{_safe(array)}__{chunk_index}.npy"
         return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
 
-    def scatter(
-        self, array: str, chunk_index: int, inner_coord: tuple[int, ...], tile: np.ndarray
-    ) -> None:
-        """Copy one decoded tile into its slot; complete the chunk if it was the last.
+    @contextlib.contextmanager
+    def tile_write(
+        self, array: str, chunk_index: int, inner_coord: tuple[int, ...]
+    ) -> Iterator[_TileWrite]:
+        """Scope one tile task's write, guaranteeing the slot hears about its end.
 
-        The memcpy happens *before* the lock (rule 1); the completion counter and
-        ``ready`` flip happen *under* the lock (rule 2). Completion (chunk
-        transforms on the assembled array) runs outside the lock -- no other thread
-        touches the slot once ``remaining`` hits 0 -- then ``ready`` is published.
+        The pool owns the guarantee; the caller only has to *be inside the scope*::
+
+            with pool.tile_write(array, cid, coord) as w:
+                tile = await fetch_decode(...)     # cancellation here is covered
+                w.deliver(tile)                    # or w.fail(exc)
+
+        A bare decrement at the end of the task would not do: a tile task can end
+        without ever reaching the pool -- a fetch/decode error takes an early return,
+        and a **cancellation** (an early ``break`` closes the scheduler with
+        ``cancel_futures=True``) can unwind at any ``await``. ``writers`` is what
+        eviction reads, so a missed decrement is a slot that is never safe to take away
+        and a budget that never recovers. ``__exit__`` is the only construct that
+        cannot be forgotten by a future early return.
+
+        ``deliver`` / ``fail`` / scope exit all funnel into one release, and the
+        release is idempotent -- so a delivered tile does not double-decrement.
         """
         key = (array, chunk_index)
-        slot = self._slots[key]  # allocated by the scheduler before any scatter
+        with self._cv:
+            slot = self._slots.get(key)
+            if slot is not None:
+                slot.writers += 1  # this task is now running: the slot is not quiescent
+        writer = _TileWrite(self, array, chunk_index, inner_coord)
+        try:
+            yield writer
+        finally:
+            writer.release()
+
+    def deliver_tile(
+        self, array: str, chunk_index: int, inner_coord: tuple[int, ...], tile: np.ndarray
+    ) -> None:
+        """Synchronous convenience: scope one tile write and deliver it in one call.
+
+        Sugar over :meth:`tile_write`, not a second lever -- it opens the same scope, so
+        the writer count still moves in exactly one place. Use it when there is nothing
+        to await between reserving the write and having the tile. The scheduler cannot:
+        it awaits the fetch inside the scope, so it uses :meth:`tile_write` directly.
+        """
+        with self.tile_write(array, chunk_index, inner_coord) as writer:
+            writer.deliver(tile)
+
+    def _deliver(
+        self, array: str, chunk_index: int, inner_coord: tuple[int, ...], tile: np.ndarray
+    ) -> None:
+        """Copy one decoded tile into its slot (called by :class:`_TileWrite`).
+
+        The memcpy happens *before* the lock (rule 1); the counter moves *under* it
+        (rule 2). Publication is :meth:`_advance`'s business, not this method's.
+        """
+        key = (array, chunk_index)
+        slot = self._slots[key]  # allocated by the scheduler before any delivery
         dst, src = self._by_path[array].tile_placement(chunk_index, inner_coord)
         # Tiles assemble at the SOURCE shape: into scratch on a reshaping path, else straight
         # into the slot (which is then both buffer and cache). Disjoint, fixed-shape, lock-free.
         buffer = slot.data if slot.scratch is None else slot.scratch
         buffer[dst] = tile[src]  # disjoint, fixed-shape: lock-free (rule 1)
-
         with self._cv:
-            slot.remaining -= 1
-            last = slot.remaining == 0
-        if not last:
-            return
+            slot.pending -= 1
 
-        # Sole owner now: assemble-stage transforms on the whole (source-shaped) outer chunk,
-        # then land the (possibly reshaped) result in the output-sized slot.
+    def _advance(self, array: str, chunk_index: int) -> None:
+        """The **only** function that moves a slot's state. Called once per tile release.
+
+        Everything the old code spread across ``scatter``'s tail, ``fail`` and
+        ``unpin_all`` lives here, so there is exactly one lever:
+
+        * still has writers -> nothing to decide yet.
+        * quiesced + FAILED -> **drop it**. A poisoned slot must not survive as a
+          resident entry: ``try_admit`` would take the resident branch next epoch and
+          return ``True`` without refetching, and ``wait_ready`` would re-raise the
+          stale error forever (#33's second half).
+        * quiesced + everything delivered -> ASSEMBLED, then run the chunk transform and
+          the persist write-back **outside** the lock (no other thread can touch the
+          slot once it is quiescent), then publish READY.
+        * quiesced + tiles still pending -> an abandoned partial (cancelled fetch). Leave
+          it FILLING; ``unpin_all`` drops it once unreferenced.
+        """
+        key = (array, chunk_index)
+        with self._cv:
+            slot = self._slots.get(key)
+            if slot is None or not slot.quiescent:
+                return
+            if slot.state is SlotState.FAILED:
+                # Deliberately NOT dropped here: a consumer still has to observe the
+                # error, and this slot may be the only thing holding it. It is not
+                # evictable (that needs READY) and it does not survive the pass --
+                # `release_owner` drops it at teardown, so the next epoch refetches
+                # instead of re-raising a stale error forever (#33).
+                self._cv.notify_all()
+                return
+            if slot.pending > 0 or slot.state is not SlotState.FILLING:
+                # Either tiles are still to come (quiescent only because no task happens
+                # to be running right now, or because the pass was cancelled and left an
+                # abandoned partial), or the slot is already published.
+                return
+            slot.state = SlotState.ASSEMBLED
+            buffer = slot.data if slot.scratch is None else slot.scratch
+
+        # Sole owner now (quiescent, and ASSEMBLED excludes it from eviction): assemble-stage
+        # transforms on the whole (source-shaped) outer chunk, then land the (possibly
+        # reshaped) result in the output-sized slot.
         prepped = self._apply_transforms(array, chunk_index, buffer)
         with self._cv:
             slot.data = self._persist(slot.data, prepped)
             slot.scratch = None  # assembly done -- drop the transient source-shaped buffer
-            slot.ready = True
+            slot.state = SlotState.READY
             # Record the completed entry *now* (not at eviction/close) so a crash still leaves a
             # usable cache. Appending here, under the lock, serializes writes across decode
             # threads and orders them after the slot's data is durable in its .npy.
@@ -643,17 +866,26 @@ class ChunkPool:
         return current
 
     def fail(self, array: str, chunk_index: int, error: BaseException) -> None:
-        """Mark a slot failed so a waiting consumer re-raises instead of hanging.
+        """Poison one chunk so a waiting consumer re-raises instead of hanging.
 
         Fail-fast: a fetch/decode error on any tile poisons its outer chunk; the
         consumer's ``wait_ready`` surfaces it on the main thread.
+
+        It records the error and **nothing else**. The old version also set
+        ``ready = True`` -- because "stop waiting" and "safe to evict" shared one flag,
+        the only way to wake a waiter was to declare the slot a finished cache entry,
+        while sibling tile tasks were still writing into it (#33). ``wait_ready`` keys
+        off ``error`` independently of state, so waiters still wake immediately; the
+        slot is disposed of by :meth:`_advance` once it quiesces.
         """
         with self._cv:
             slot = self._slots.get((array, chunk_index))
-            if slot is not None:
-                slot.error = error
-                slot.ready = True
-                self._cv.notify_all()
+            if slot is None:
+                return
+            slot.error = error
+            slot.state = SlotState.FAILED
+            self._cv.notify_all()
+        self._advance(array, chunk_index)  # may already be quiescent (all tiles returned)
 
     def set_error(self, error: BaseException) -> None:
         """Poison the whole pool (the fetch driver died) so every waiter re-raises.
@@ -678,17 +910,23 @@ class ChunkPool:
 
     # -- consume: wait / gather ---------------------------------------------
 
-    def wait_ready(self, array: str, chunk_index: int) -> None:
-        """Block until the outer chunk is assembled *and claimed this epoch* (or raise).
+    def wait_ready(self, array: str, chunk_index: int, owner: int) -> None:
+        """Block until the chunk is READY *for this owner* (or raise).
 
-        Waiting on ``claimed`` (set by the driver's admit / pin_if_ready) closes a
-        cross-epoch race: a chunk still resident-and-ready from the prior epoch would
-        otherwise be gathered before the driver references it, letting the consumer's
-        last-use release land before the driver's pin -- a lost release that leaks a
-        reference (and, worse, lets the driver evict a chunk mid-gather). Requiring the
-        claim orders pin-before-consume-before-release. Wakes on: ready+claimed, the
-        chunk failed (:meth:`fail`), or the pool was poisoned (:meth:`set_error`, covering
-        a driver death before this chunk was allocated).
+        Requiring **this owner's own reference** (rather than a shared ``claimed``
+        bool) closes a cross-epoch race: a chunk still resident-and-READY from the
+        prior epoch would otherwise be gathered before the driver references it,
+        letting the consumer's last-use release land before the driver's pin -- a lost
+        release that leaks a reference and, worse, lets the driver evict a chunk
+        mid-gather. Owner-scoped because a single bool is satisfied by *another*
+        iteration's claim (#35), which is the same race with a concurrent producer
+        instead of a previous epoch.
+
+        Wakes on: READY and referenced by ``owner``; the chunk failed (:meth:`fail`,
+        which no longer has to fake readiness to get here); or the pool was poisoned
+        (:meth:`set_error`, covering a driver death before this chunk was allocated).
+        A key that is simply absent means the driver has not admitted it yet -- keep
+        waiting, as before.
         """
         key = (array, chunk_index)
         with self._cv:
@@ -699,8 +937,13 @@ class ChunkPool:
                         self._error is not None
                         or (
                             key in self._slots
-                            and self._slots[key].ready
-                            and self._slots[key].claimed
+                            and (
+                                self._slots[key].error is not None
+                                or (
+                                    self._slots[key].state is SlotState.READY
+                                    and self._pinned.get(key, {}).get(owner, 0) > 0
+                                )
+                            )
                         )
                     )
                 )
@@ -916,7 +1159,7 @@ class ChunkPool:
                 self._log = None
             for k in list(self._slots):
                 slot = self._slots.pop(k)
-                self._free(slot, keep_file=self._persistent and slot.ready)
+                self._free(slot, keep_file=self._persistent and slot.state is SlotState.READY)
             self._bytes = 0
             self._pinned.clear()
             self._buffers.clear()  # batch outputs too; a big-payload pool holds GBs of them

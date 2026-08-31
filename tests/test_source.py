@@ -492,7 +492,7 @@ def test_a_completed_epoch_leaves_no_block_pinned(
     raise, it would starve the next epoch's admission, which parks on a full budget awaiting
     a release that never comes.
 
-    Asserting that is harder than it looks. ``_iterate`` calls ``pool.unpin_all()`` at the
+    Asserting that is harder than it looks. ``_iterate`` calls ``pool.release_owner(owner)`` at the
     *start* of every epoch precisely to absorb pins an aborted epoch leaked, so any test that
     merely runs two epochs passes whether the frontier released anything or not -- it exercises
     the backstop, not the frontier. So this reads the pin table between epochs, where the
