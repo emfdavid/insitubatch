@@ -146,6 +146,18 @@ class ArrayGeometry:
             n *= len(r)
         return n
 
+    def inner_index(self, inner_coord: tuple[int, ...]) -> int:
+        """Row-major position of one inner stored-chunk coord in :meth:`inner_coords`.
+
+        The inverse of iterating ``inner_coords()``. It is what gives the persisted cache a
+        **stable tile order**: a chunk's ``.npy`` stores its tiles tile-major at this index,
+        so a revived file maps back to coordinates without recording them.
+        """
+        idx = 0
+        for i, r in zip(inner_coord, self.inner_grid(), strict=True):
+            idx = idx * len(r) + i
+        return idx
+
     def slot_shape(self, chunk_index: int) -> tuple[int, ...]:
         """Shape of the assembled outer chunk: ``(n_samples_in_chunk, *inner_shape)``.
 
@@ -153,6 +165,15 @@ class ArrayGeometry:
         exactly (no over-allocation, no out-of-range scatter).
         """
         return (len(self.samples_in_chunk(chunk_index)), *self.inner_shape)
+
+    def tile_shape(self) -> tuple[int, ...]:
+        """One stored chunk's shape, **sample-first** -- the shape a decoded tile arrives in.
+
+        The scheduler moves the sample axis to the front on decode, so this is
+        ``(sample_chunk_size, *inner_chunks)`` rather than the array's physical chunk order.
+        Full size always: an edge chunk is stored whole and its padding is kept.
+        """
+        return (self.sample_chunk_size, *self.inner_chunks)
 
     def tile_placement(self, chunk_index: int, inner_coord: tuple[int, ...]) -> ChunkProjection:
         """Where one stored tile lands inside its outer chunk, as zarr's own projection.

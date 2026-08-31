@@ -146,3 +146,120 @@ def test_user_code_never_runs_on_the_shared_event_loop(tmp_path):
         f"chunk_transform ran on {sorted(set(ran_on))}; it must run on the decode pool, "
         "never on the shared event loop"
     )
+
+
+# -- persistence: tile-major on disk, one path in memory -----------------------------
+
+
+def _fill(url, geoms, **poolkw):
+    """Drive one full pass so every chunk is fetched, assembled and persisted."""
+    geom = geoms["v"]
+    pool = ChunkPool(geoms, **poolkw)
+    with Scheduler(obstore_store(url), geoms, pool, SchedulerConfig()) as sched:
+        sched.start(range(geom.n_chunks), geom.sample_chunk_size)
+        for cid in range(geom.n_chunks):
+            sched.pool.wait_ready("v", cid, sched.owner)
+    return pool
+
+
+def test_cache_dir_no_longer_assembles(tmp_path):
+    """Persisting is not a reason to assemble -- only a chunk_transform is."""
+    url, _ = _store(tmp_path, (2, 8, 8), (1, 4, 4), name="p1.zarr")
+    geoms = open_geometries(obstore_store(url))
+    assert ChunkPool(geoms, backing_dir=tmp_path / "c1", persist=True).assembles is False
+    assert ChunkPool(geoms).assembles is False
+
+
+def test_persisted_chunk_is_stored_tile_major(tmp_path):
+    """One .npy per chunk, shaped (n_tiles, *tile_shape), each tile contiguous."""
+    url, src = _store(tmp_path, (2, 8, 8), (1, 4, 4), name="p2.zarr")
+    geoms = open_geometries(obstore_store(url))
+    geom = geoms["v"]
+    cache = tmp_path / "c2"
+    _fill(url, geoms, backing_dir=cache, persist=True)
+
+    files = sorted(cache.glob("*.npy"))
+    assert len(files) == geom.n_chunks, "file count per chunk must not change"
+    on_disk = np.lib.format.open_memmap(files[0], mode="r")
+    assert on_disk.shape == (geom.n_inner_chunks(0), *geom.tile_shape())
+    # every tile is contiguous in the file, in inner_index order
+    for coord in geom.inner_coords():
+        proj = geom.tile_placement(0, coord)
+        np.testing.assert_array_equal(
+            on_disk[geom.inner_index(coord)][proj.chunk_selection], src[0:1][proj.out_selection]
+        )
+
+
+def test_revived_tiles_are_zero_copy_views_of_one_mapping(tmp_path):
+    """A cross-run hit maps the file and slices it -- it does not read it into memory."""
+    url, src = _store(tmp_path, (2, 8, 8), (1, 4, 4), name="p3.zarr")
+    geoms = open_geometries(obstore_store(url))
+    geom = geoms["v"]
+    cache = tmp_path / "c3"
+    _fill(url, geoms, backing_dir=cache, persist=True)
+
+    revived = ChunkPool(geoms, backing_dir=cache, persist=True)
+    # A cross-run hit is revived by `pin_if_ready` -- the driver's "can I skip the fetch?"
+    # question -- not by `try_admit`, which is the miss path that allocates for a fetch.
+    assert revived.pin_if_ready("v", 0, revived.new_owner())
+    slot = revived._slots[("v", 0)]
+    assert slot.state.name == "READY", "a persisted chunk must revive ready, not refetch"
+    assert len(slot.tiles) == geom.n_inner_chunks(0), "revive must come back TILED, not assembled"
+    for tile in slot.tiles.values():
+        assert tile.base is slot.backing, "revived tiles must be views of the one mapping"
+
+
+def test_persist_round_trips_the_data(tmp_path):
+    """The real gate: a cross-run cache hit gathers byte-identical to a cold read."""
+    url, src = _store(tmp_path, (4, 721, 180), (1, 180, 90), name="p4.zarr")
+    geoms = open_geometries(obstore_store(url))
+    geom = geoms["v"]
+    assert geom.n_inner_chunks(0) == 5 * 2, "ragged, so edge padding is exercised"
+    cache = tmp_path / "c4"
+
+    def read(pool):
+        out = []
+        for cid in range(geom.n_chunks):
+            rows = np.array([[cid, 0]], dtype=np.int64)
+            out.append(pool.gather(rows, ["v"], geom.sample_chunk_size).arrays["v"])
+        return np.concatenate(out)
+
+    cold = _fill(url, geoms, backing_dir=cache, persist=True)
+    np.testing.assert_array_equal(read(cold), src)
+
+    warm = ChunkPool(geoms, backing_dir=cache, persist=True)
+    owner = warm.new_owner()
+    for cid in range(geom.n_chunks):
+        assert warm.pin_if_ready("v", cid, owner), "every chunk should revive from disk"
+    np.testing.assert_array_equal(read(warm), src)
+    assert warm.misses == 0, "a fully persisted cache should serve every chunk"
+
+
+def test_a_version_2_cache_is_rejected_not_misread(tmp_path):
+    """The layout changed, so an old cache must be reset -- never reinterpreted.
+
+    A v2 ``.npy`` holds one assembled ``slot_shape`` array; read as tile-major it would be
+    plausible-looking garbage. The manifest version is what stops that.
+    """
+    import json
+
+    url, _ = _store(tmp_path, (2, 8, 8), (1, 4, 4), name="p5.zarr")
+    geoms = open_geometries(obstore_store(url))
+    cache = tmp_path / "c5"
+    _fill(url, geoms, backing_dir=cache, persist=True)
+
+    log = next(cache.glob("*.log"), None) or next(cache.glob("*.jsonl"), None)
+    assert log is not None, f"no cache log found in {sorted(cache.iterdir())}"
+    lines = log.read_text().splitlines()
+    header = json.loads(lines[0])
+    header["format_version"] = 2  # pretend the cache predates the tile-major layout
+    log.write_text("\n".join([json.dumps(header), *lines[1:]]) + "\n")
+
+    # Loud by design: a stale cache is a user decision, not something to silently discard.
+    with pytest.raises(ValueError, match="stale .log format changed"):
+        ChunkPool(geoms, backing_dir=cache, persist=True)
+
+    # ...and with consent it resets and refetches rather than reinterpreting v2 bytes.
+    reset = ChunkPool(geoms, backing_dir=cache, persist=True, reset_stale_cache=True)
+    assert reset.manifest_entries == 0
+    assert not reset.pin_if_ready("v", 0, reset.new_owner()), "a reset cache must not revive"

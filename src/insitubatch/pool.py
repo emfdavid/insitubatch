@@ -221,6 +221,7 @@ class _Slot:
     """
 
     tiles: dict[tuple[int, ...], np.ndarray]  # inner_coord -> stored tile (the residency)
+    backing: np.ndarray | None  # the whole tile-major .npy memmap, when persisting
     array: str  # zarr path this slot belongs to
     chunk_index: int  # its outer (sample-axis) chunk
     writers: int  # outstanding tile TASKS -> quiescence
@@ -234,19 +235,6 @@ class _Slot:
     def quiescent(self) -> bool:
         """No tile task can still write into this slot."""
         return self.writers == 0
-
-    @property
-    def backing(self) -> np.ndarray | None:
-        """The single array behind a one-tile slot, or ``None`` if it is genuinely tiled.
-
-        Only the paths that publish a whole array (mmap tier, chunk transform) have one,
-        and only they ask -- ``_free`` needs the memmap to close, ``_record_completed``
-        needs its filename. A multi-tile slot is heap-backed by construction, so both are
-        no-ops for it.
-        """
-        if len(self.tiles) != 1:
-            return None
-        return next(iter(self.tiles.values()))
 
 
 @dataclass(slots=True)
@@ -308,7 +296,14 @@ class ChunkPool:
     """
 
     _MANIFEST_NAME = "insitu_cache.jsonl"
-    _MANIFEST_FORMAT = 2
+    _MANIFEST_FORMAT = 3
+    """Bumped to 3: a persisted chunk is now stored **tile-major**.
+
+    A ``.npy`` holds ``(n_tiles, *tile_shape)`` -- each stored tile contiguous, in
+    :meth:`ArrayGeometry.inner_index` order -- rather than one assembled
+    ``slot_shape`` array. File count per chunk is unchanged. A version-2 cache is
+    structurally unreadable under the new layout, so the header check rejects the whole
+    log and refetches rather than misreading it as data."""
 
     def __init__(
         self,
@@ -335,9 +330,10 @@ class ChunkPool:
             label: output_geometry(g, self._chunk_transforms) for label, g in geometries.items()
         }
         self._out_by_path = {g.path: self._out_geom[label] for label, g in geometries.items()}
-        # Does a slot hold the STORED tiles, or one whole array? Pool-level, because both
-        # consumers that need a whole array are pool-wide: a chunk_transform (user code must
-        # not be handed a dict of tiles) and the mmap tier (one file per chunk).
+        # Does a slot hold the STORED tiles, or one whole array? Only a chunk_transform
+        # forces the latter: user code must be handed a real array, never a dict of tiles.
+        # The mmap tier does NOT force it -- a persisted chunk stores its tiles tile-major
+        # (see `_tile_grid`), so the cache round-trips tiles rather than assembling them.
         self._whole_chunks = bool(self._chunk_transforms)
         self._reshapes = {
             p: (
@@ -354,7 +350,6 @@ class ChunkPool:
         self._dir = Path(backing_dir) if backing_dir is not None else None
         if self._dir is not None:
             self._dir.mkdir(parents=True, exist_ok=True)
-            self._whole_chunks = True  # the mmap tier is one .npy per chunk
         # Observability. hits/misses (+ the revive failure breakdown) are per-epoch --
         # reset by unpin_all at each epoch boundary -- so the driver can warn when a
         # configured persist cache served nothing. manifest_entries is load-time (how
@@ -558,11 +553,9 @@ class ChunkPool:
         #
         # A path that needs a whole array republishes as a single tile at completion, so
         # its charge is `slot_shape` and this reduces to the same number.
-        if self._whole_chunks:
-            nbytes = int(np.prod(out.slot_shape(chunk_index), dtype=np.int64)) * out.dtype.itemsize
-        else:
-            tile_nbytes = int(np.prod(src.chunks, dtype=np.int64)) * src.dtype.itemsize
-            nbytes = src.n_inner_chunks(chunk_index) * tile_nbytes
+        n_tiles, tile_shape = self._tile_grid(array, chunk_index)
+        dtype = out.dtype if self._whole_chunks else src.dtype
+        nbytes = n_tiles * int(np.prod(tile_shape, dtype=np.int64)) * dtype.itemsize
         with self._cv:
             if key in self._slots:
                 # Already resident (in-flight, or a ready cross-epoch hit) -> incref and
@@ -579,8 +572,17 @@ class ChunkPool:
                 if self._reshapes[array]
                 else None
             )
+            # Persisting without a transform: back the slot with one tile-major .npy now,
+            # so a delivered tile is written straight to its slice and the slot's tile is a
+            # view of the file. That is the write we already owed -- not an extra copy.
+            backing = (
+                self._alloc(array, chunk_index, (n_tiles, *tile_shape), dtype)
+                if self._dir is not None and not self._whole_chunks
+                else None
+            )
             self._slots[key] = _Slot(
                 tiles={},  # filled by reference as tiles land; no buffer allocated here
+                backing=backing,
                 array=array,
                 chunk_index=chunk_index,
                 writers=0,  # no task has started yet; counted on entry to tile_write
@@ -645,15 +647,18 @@ class ChunkPool:
             logger.debug("cache: persisted %s unreadable (%s); refetching", key, exc)
             self._persisted.pop(key, None)
             return False
-        if geom is None or data.shape != geom.slot_shape(chunk_index) or data.dtype != geom.dtype:
+        n_tiles, tile_shape = self._tile_grid(array, chunk_index)
+        want_shape = (n_tiles, *tile_shape)
+        want_dtype = geom.dtype if geom is not None else None
+        if geom is None or data.shape != want_shape or data.dtype != want_dtype:
             self.revive_mismatch += 1
             logger.debug(
                 "cache: persisted %s shape/dtype %s/%s != current %s/%s; refetching",
                 key,
                 data.shape,
                 data.dtype,
-                None if geom is None else geom.slot_shape(chunk_index),
-                None if geom is None else geom.dtype,
+                None if geom is None else want_shape,
+                want_dtype,
             )
             del data  # drop the mmap ref; structural fingerprint mismatch -> a miss
             self._persisted.pop(key, None)
@@ -664,8 +669,19 @@ class ChunkPool:
             return False
         # A revived chunk enters the SAME lifecycle at a later state rather than being a
         # second way to be gatherable: no tiles were ever outstanding, nothing is pending.
+        # Tiles come back as zero-copy VIEWS of the one mapping, in the tile-major order
+        # `inner_index` defined when it was written -- so a revived chunk is tiled exactly
+        # like a freshly fetched one. That is what keeps `gather` on a single path: there
+        # is no "revived is assembled, fresh is tiled" split to dispatch on.
+        src_geom = self._by_path[array]
+        coords = (
+            [(0,) * len(self._out_by_path[array].inner_chunks)]
+            if self._whole_chunks
+            else sorted(src_geom.inner_coords(), key=src_geom.inner_index)
+        )
         self._slots[key] = _Slot(
-            tiles={(0,) * len(self._out_by_path[array].inner_chunks): data},
+            tiles={c: data[i] for i, c in enumerate(coords)},
+            backing=data,
             array=array,
             chunk_index=chunk_index,
             writers=0,
@@ -806,6 +822,20 @@ class ChunkPool:
         keep = self._persistent and slot.state is SlotState.READY
         self._free(slot, keep_file=keep)
 
+    def _tile_grid(self, array: str, chunk_index: int) -> tuple[int, tuple[int, ...]]:
+        """``(n_tiles, tile_shape)`` for one slot -- the single rule for its residency.
+
+        Without a transform a slot holds the array's **stored** tiles, sample-first and
+        whole (padding included). With one it holds a single tile: ``output_geometry`` sets
+        post-transform ``chunks`` to the full inner shape, so a transformed chunk is a 1x1
+        grid by construction. Both the budget charge and the persisted ``.npy`` layout are
+        derived from this, so they cannot drift apart.
+        """
+        if self._whole_chunks:
+            return 1, self._out_by_path[array].slot_shape(chunk_index)
+        src = self._by_path[array]
+        return src.n_inner_chunks(chunk_index), src.tile_shape()
+
     def _alloc(
         self, array: str, chunk_index: int, shape: tuple[int, ...], dtype: np.dtype
     ) -> np.ndarray:
@@ -877,7 +907,15 @@ class ChunkPool:
         """
         key = (array, chunk_index)
         slot = self._slots[key]  # allocated by the scheduler before any delivery
-        slot.tiles[inner_coord] = tile
+        if slot.backing is None:
+            slot.tiles[inner_coord] = tile  # heap: adopt by reference, no copy
+        else:
+            # Persisting: write the tile into its tile-major slice and keep the VIEW. The
+            # copy is the file write the mmap tier already owed -- not an extra one -- and
+            # the slot then reads from the same mapping a later run will revive.
+            idx = self._by_path[array].inner_index(inner_coord)
+            slot.backing[idx] = tile
+            slot.tiles[inner_coord] = slot.backing[idx]
         with self._cv:
             slot.pending -= 1
 
@@ -971,7 +1009,11 @@ class ChunkPool:
         if self._dir is None:
             return prepped
         out = self._out_by_path[slot.array]
-        backing = self._alloc(slot.array, slot.chunk_index, prepped.shape, out.dtype)
+        # A transformed chunk is a one-tile grid, so its file is (1, *slot_shape) -- the
+        # same tile-major layout the untransformed path writes, with n_tiles == 1.
+        backing = self._alloc(slot.array, slot.chunk_index, (1, *prepped.shape), out.dtype)
+        slot.backing = backing
+        backing = backing[0]
         if prepped.shape != backing.shape:
             raise ValueError(
                 f"chunk_transform produced shape {prepped.shape} but the cache slot is sized "
@@ -1126,10 +1168,9 @@ class ChunkPool:
         ``keep_file`` leaves the ``.npy`` on disk (a persisted cache entry); otherwise the
         file is unlinked (heap/spill teardown or a discarded partial).
         """
-        backing = slot.backing
-        mmap = getattr(backing, "_mmap", None)
+        mmap = getattr(slot.backing, "_mmap", None)
         if mmap is not None:
-            fname = getattr(backing, "filename", None)
+            fname = getattr(slot.backing, "filename", None)
             mmap.close()
             if fname and not keep_file:
                 with contextlib.suppress(FileNotFoundError):
