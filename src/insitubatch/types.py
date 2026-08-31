@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 import numpy as np
+from zarr.core.indexing import ChunkProjection
 
 
 class SplitName(StrEnum):
@@ -153,22 +154,35 @@ class ArrayGeometry:
         """
         return (len(self.samples_in_chunk(chunk_index)), *self.inner_shape)
 
-    def tile_placement(
-        self, chunk_index: int, inner_coord: tuple[int, ...]
-    ) -> tuple[tuple[slice, ...], tuple[slice, ...]]:
-        """``(dst, src)`` slices for scattering one decoded tile into its slot.
+    def tile_placement(self, chunk_index: int, inner_coord: tuple[int, ...]) -> ChunkProjection:
+        """Where one stored tile lands inside its outer chunk, as zarr's own projection.
 
-        ``dst`` indexes the outer-chunk slot; ``src`` clips the full chunk-shaped
-        decoded tile to the (possibly partial) edge region -- both axis 0 (short
-        final outer chunk) and the inner edges. After the copy the tile is free.
+        Returns a :class:`zarr.core.indexing.ChunkProjection` -- the vocabulary zarr uses
+        for exactly this ("a mapping of items from chunk to output array"), rather than a
+        private ``(dst, src)`` pair. ``out_selection`` indexes the assembled outer chunk;
+        ``chunk_selection`` clips the full chunk-shaped decoded tile to the (possibly
+        partial) edge region, on axis 0 (short final outer chunk) and the inner edges
+        alike. ``is_complete_chunk`` says the tile is used whole -- i.e. it is not an edge
+        tile -- which is what tells a reader whether the stored chunk carries padding.
+
+        Both selections are **sample-first**, matching the slot and the sample-first tile
+        the scheduler delivers (it moves the sample axis to the front on decode), not the
+        array's physical axis order.
         """
         n0 = len(self.samples_in_chunk(chunk_index))
-        dst = [slice(0, n0)]
+        out = [slice(0, n0)]
         for i, c, s in zip(inner_coord, self.inner_chunks, self.inner_shape, strict=True):
             start = i * c
-            dst.append(slice(start, min(start + c, s)))
-        src = tuple(slice(0, sl.stop - sl.start) for sl in dst)
-        return tuple(dst), src
+            out.append(slice(start, min(start + c, s)))
+        chunk = tuple(slice(0, sl.stop - sl.start) for sl in out)
+        full = (self.sample_chunk_size, *self.inner_chunks)
+        complete = all(sl.stop == n for sl, n in zip(chunk, full, strict=True))
+        return ChunkProjection(
+            chunk_coords=(chunk_index, *inner_coord),
+            chunk_selection=chunk,
+            out_selection=tuple(out),
+            is_complete_chunk=complete,
+        )
 
 
 @dataclass(frozen=True, slots=True)
