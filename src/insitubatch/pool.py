@@ -555,7 +555,7 @@ class ChunkPool:
         # its charge is `slot_shape` and this reduces to the same number.
         n_tiles, tile_shape = self._tile_grid(array, chunk_index)
         dtype = out.dtype if self._whole_chunks else src.dtype
-        nbytes = n_tiles * int(np.prod(tile_shape, dtype=np.int64)) * dtype.itemsize
+        nbytes = self._charge(array, chunk_index)
         with self._cv:
             if key in self._slots:
                 # Already resident (in-flight, or a ready cross-epoch hit) -> incref and
@@ -835,6 +835,34 @@ class ChunkPool:
             return 1, self._out_by_path[array].slot_shape(chunk_index)
         src = self._by_path[array]
         return src.n_inner_chunks(chunk_index), src.tile_shape()
+
+    def _charge(self, array: str, chunk_index: int) -> int:
+        """Bytes to charge one slot against the budget: its **peak** residency.
+
+        For a tiled slot that is just its tiles. An assembling slot is charged the larger
+        of the two shapes it takes on, because it holds the **source tiles** for its whole
+        fill and only collapses to the assembled output at completion -- and on a ragged
+        grid the tiles are the bigger of the two (1.248x on ERA5 721x1440 at 180x360).
+        Charging the output alone, as the assembled design did, under-reports the entire
+        fill window.
+
+        The brief overlap at completion (tiles + assembled + the transform's own result) is
+        not charged, for the same reason the in-flight decode transient is not: it is
+        bounded by `max_inflight` and belongs to the fetch, not to residency.
+        """
+        n_tiles, tile_shape = self._tile_grid(array, chunk_index)
+        out = self._out_by_path[array]
+        dtype = out.dtype if self._whole_chunks else self._by_path[array].dtype
+        nbytes = n_tiles * int(np.prod(tile_shape, dtype=np.int64)) * dtype.itemsize
+        if not self._whole_chunks:
+            return nbytes
+        src = self._by_path[array]
+        during_fill = (
+            src.n_inner_chunks(chunk_index)
+            * int(np.prod(src.tile_shape(), dtype=np.int64))
+            * src.dtype.itemsize
+        )
+        return max(nbytes, during_fill)
 
     def _alloc(
         self, array: str, chunk_index: int, shape: tuple[int, ...], dtype: np.dtype

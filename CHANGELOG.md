@@ -52,9 +52,16 @@
   shape, which a fixed-shape arena will later need to reuse anything. So residency is
   `n_tiles * chunk_shape`, which exceeds the assembled `slot_shape` wherever the grid does
   not divide the extent: 1.248x on ERA5 721x1440 at 180x360, 1.997x on a short final outer
-  chunk. The budget charges that. Charging the assembled size instead — as the old design
-  did — would let a pool told 2048 MiB resident ~2560 MiB while reporting 2048. Invisible on
-  a grid that divides evenly, which is every store our benchmarks used.
+  chunk. The budget charges that, including on the `chunk_transform` path, which holds the
+  source tiles for its whole fill and only collapses to the assembled output at completion.
+  Charging the assembled size instead — as the old design did — would let a pool told
+  2048 MiB resident ~2560 MiB while reporting 2048. Invisible on a grid that divides evenly,
+  which is every store our benchmarks used.
+
+  A `chunk_transform` still receives the **logical** chunk: assembly clips every tile to its
+  in-bounds region first, so user code never sees stored-chunk padding, never masks an edge,
+  and never has to know the chunk grid. `DecodedChunk` now says so outright, since the pool
+  holding padded tiles internally makes the distinction newly worth stating.
 
 - **`decode_threads` is now a process-wide setting, and says so when ignored.** The decode
   pool outlives every scheduler, so it is sized by the first dataset built in the process; a

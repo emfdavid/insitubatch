@@ -263,3 +263,60 @@ def test_a_version_2_cache_is_rejected_not_misread(tmp_path):
     reset = ChunkPool(geoms, backing_dir=cache, persist=True, reset_stale_cache=True)
     assert reset.manifest_entries == 0
     assert not reset.pin_if_ready("v", 0, reset.new_owner()), "a reset cache must not revive"
+
+
+def test_a_transform_never_sees_stored_chunk_padding(tmp_path):
+    """User code gets the logical chunk: no edge padding, no fill values, no masking.
+
+    721 rows chunked at 180 occupy 900 rows of storage. The pool holds those tiles whole,
+    so the padding is real -- but assembly clips every tile before the transform runs, and
+    `DecodedChunk.data` documents that guarantee.
+    """
+    seen: list[tuple] = []
+
+    class Spy:
+        def __call__(self, chunk):
+            seen.append((chunk.data.shape, float(np.nanmin(chunk.data)), chunk.data.base))
+            return chunk
+
+    url, _ = _store(tmp_path, (2, 721, 360), (1, 180, 360), name="pad.zarr")
+    geoms = open_geometries(obstore_store(url))
+    geom = geoms["v"]
+    assert geom.inner_grid()[0].stop * 180 > geom.inner_shape[0], "grid must overhang the array"
+
+    pool = ChunkPool(geoms, chunk_transforms=[Spy()])
+    with Scheduler(obstore_store(url), geoms, pool, SchedulerConfig()) as sched:
+        sched.start(range(geom.n_chunks), geom.sample_chunk_size)
+        for cid in range(geom.n_chunks):
+            sched.pool.wait_ready("v", cid, sched.owner)
+
+    assert seen, "the transform never ran"
+    for shape, _mn, base in seen:
+        assert shape == geom.slot_shape(0), f"transform saw {shape}, not the logical chunk"
+        assert base is None, "the transform must get a real array, not a view over tiles"
+
+
+def test_an_assembling_slot_is_charged_its_fill_time_residency(tmp_path):
+    """A transform pool holds SOURCE tiles for its whole fill, then collapses to one.
+
+    On a ragged grid the tiles are the larger shape, so charging only the assembled output
+    under-reports the entire fill window -- 1.248x on this geometry.
+    """
+    url, _ = _store(tmp_path, (2, 721, 1440), (1, 180, 360), name="charge.zarr")
+    geoms = open_geometries(obstore_store(url))
+    geom = geoms["v"]
+
+    tiles = geom.n_inner_chunks(0) * int(np.prod(geom.tile_shape())) * geom.dtype.itemsize
+    assembled = int(np.prod(geom.slot_shape(0))) * geom.dtype.itemsize
+    assert tiles > assembled
+
+    class Scale:
+        def __call__(self, chunk):
+            return chunk
+
+    for transforms in ([], [Scale()]):
+        pool = ChunkPool(geoms, chunk_transforms=transforms)
+        pool.try_admit("v", 0, pool.new_owner())
+        assert pool.resident_bytes == tiles, (
+            f"charged {pool.resident_bytes} but holds {tiles} bytes of tiles during fill"
+        )

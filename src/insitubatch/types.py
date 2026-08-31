@@ -248,9 +248,18 @@ class StoredChunkRead:
 class DecodedChunk:
     """A decoded, in-memory chunk, keyed by its read.
 
-    ``data`` has shape ``(n_samples_in_chunk, *inner_shape)``. The buffer holds a
-    bounded number of these; memory overhead is O(in-flight chunks), independent
-    of batch size.
+    ``data`` has shape ``(n_samples_in_chunk, *inner_shape)`` -- the **logical** chunk, and
+    a real contiguous array, never a view over stored tiles.
+
+    In particular it carries **no stored-chunk padding**. A zarr chunk grid that does not
+    divide the array evenly still stores full-size chunks at the edges (721 rows chunked at
+    180 occupy 900), and the pool holds those tiles whole. Assembly clips every tile to its
+    in-bounds region before a transform sees it, so a transform never has to know the chunk
+    grid, mask an edge, or handle padding values. ``n_samples_in_chunk`` is likewise the
+    real count, so a short final chunk arrives short rather than padded.
+
+    The buffer holds a bounded number of these; memory overhead is O(in-flight chunks),
+    independent of batch size.
     """
 
     read: ChunkRead
