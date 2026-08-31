@@ -218,12 +218,13 @@ class SlotState(Enum):
 class _Slot:
     """One outer chunk's cache slot plus its lifecycle bookkeeping.
 
-    In zarr's vocabulary this is a **decoded shard**: zarr calls one addressable unit made
-    of a grid of inner chunks a *shard*, and that is exactly what a slot is once decoded --
-    ``tiles`` are its inner chunks, keyed by the same stored-chunk coordinates. The word is
-    worth keeping straight for the upstream conversation (``decode(out=)``,
-    zarr-python#3060), where "make ``out`` a chunked in-memory array rather than requiring
-    contiguity" is a proposal for precisely this shape.
+    A slot is **not** a zarr shard, despite having the same shape. A shard is a *storage*
+    unit -- one addressable object holding a grid of chunks; a slot is a *residency* unit,
+    a group of stored chunks sharing a sample-axis index, never stored or addressed as one
+    object. zarr has no name for that grouping, which is why ours is called a chunk. (What
+    this file calls a **tile** is what the public API calls a **stored chunk**: one zarr
+    chunk, or one zarr shard on a sharded array -- whatever a single ``store.get`` returns.
+    Two names for one concept; see #40.)
 
     **The buffer unit is the stored chunk.** ``tiles`` maps each inner stored-chunk
     coordinate to the decoded tile itself: the tile *is* the residency, adopted by

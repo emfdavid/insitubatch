@@ -221,7 +221,15 @@ legible to zarr rather than being a private dict of ndarrays:
 | `ArrayGeometry.tile_placement` | returns a `zarr.core.indexing.ChunkProjection` — `chunk_coords`, `chunk_selection`, `out_selection`, `is_complete_chunk` |
 | the sync decode | `zarr.core.chunk_utils.ChunkTransform.decode_chunk` — so we do not maintain a codec whitelist |
 | `ArrayGeometry` inner grid | conforms to `DimensionGridLike` (proven in `tests/test_zarr_indexing_parity.py`) |
-| a `_Slot` | a **decoded shard** — zarr's word for one addressable unit made of a grid of inner chunks |
+
+A `_Slot` deliberately has **no** zarr counterpart. It is a *residency* unit — the stored
+chunks sharing one sample-axis index — whereas a zarr **shard** is a *storage* unit, one
+addressable object holding a grid of chunks. They have the same shape, which makes the
+analogy tempting and wrong: a slot is never stored or addressed as one object. What this
+codebase calls a *tile* is what its public API calls a **stored chunk** (one zarr chunk,
+or one zarr shard on a sharded array — whatever a single `store.get` returns); that
+duplication is tracked in
+[#40](https://github.com/emfdavid/insitubatch/issues/40), not fixed here.
 
 Two zarr facilities are deliberately *not* adopted. `FusedCodecPipeline.read_sync` takes
 `ByteGetter`s and therefore **owns the IO**, which would surrender the scheduler,
