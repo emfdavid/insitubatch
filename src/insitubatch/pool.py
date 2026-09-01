@@ -223,20 +223,19 @@ class SlotState(Enum):
 
 @dataclass(slots=True)
 class _Slot:
-    """One outer chunk's cache slot plus its lifecycle bookkeeping.
+    """Everything the pool holds for one outer chunk, and the bookkeeping that says when
+    it is complete and when it is safe to take away.
 
-    A slot is **not** a zarr shard, despite having the same shape. A shard is a *storage*
-    unit -- one addressable object holding a grid of chunks; a slot is a *residency* unit,
-    a group of stored chunks sharing a sample-axis index, never stored or addressed as one
-    object. zarr has no name for that grouping, which is why ours is called a chunk. (What
-    this file calls a **tile** is what the public API calls a **stored chunk**: one zarr
-    chunk, or one zarr shard on a sharded array -- whatever a single ``store.get`` returns.
-    Two names for one concept; see #40.)
+    A slot is a unit of **residency**: one array's chunk along the sample axis, held as
+    the stored chunks it is made of. **The buffer unit is the stored chunk** -- ``tiles``
+    maps each inner coordinate to the decoded tile itself (whatever a single ``store.get``
+    returns), adopted by reference, so the tile *is* the resident buffer and the fill path
+    has no memcpy. ``gather`` places each tile straight into its sub-rectangle of the
+    batch.
 
-    **The buffer unit is the stored chunk.** ``tiles`` maps each inner stored-chunk
-    coordinate to the decoded tile itself: the tile *is* the residency, adopted by
-    reference, so the fill path has no memcpy. ``gather`` places each tile straight into
-    its sub-rectangle of the batch.
+    Admission, pinning, the byte budget, eviction and ``wait_ready`` all work at slot
+    granularity, so a chunk is never half-resident even though it arrives one tile at a
+    time.
 
     A chunk that needs a whole array collapses to a **one-tile** slot rather than a second
     representation: ``output_geometry`` already sets post-transform ``chunks`` to the full
@@ -251,8 +250,8 @@ class _Slot:
     tiles would create two kinds of tile and a ragged shape, which defeats a fixed-shape
     arena later. The padding is therefore real residency, and is charged as such at admit.
 
-    Two counters, because quiescence and completeness are different questions and
-    answering both with one number is what made ``fail()`` have to lie:
+    Two counters, because quiescence and completeness are different questions and one
+    number cannot answer both:
 
     * ``writers`` -- tile tasks **currently running**. Incremented when a task enters
       :meth:`ChunkPool.tile_write` and decremented exactly once on every exit path,
@@ -989,8 +988,8 @@ class ChunkPool:
     def _advance(self, array: str, chunk_index: int) -> None:
         """The **only** function that moves a slot's state. Called once per tile release.
 
-        Everything the old code spread across the scatter's tail, ``fail`` and
-        ``unpin_all`` lives here, so there is exactly one lever:
+        Every transition is decided here, from the slot's own counters, so there is
+        exactly one lever:
 
         * still has writers -> nothing to decide yet.
         * quiesced + FAILED -> **drop it**. A poisoned slot must not survive as a
