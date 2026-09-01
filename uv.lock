@@ -1428,7 +1428,7 @@ requires-dist = [
     { name = "virtualizarr", marker = "extra == 'virtual'", specifier = ">=1.2" },
     { name = "xarray", specifier = ">=2024.9" },
     { name = "xbatcher", marker = "extra == 'bench'", specifier = ">=0.3" },
-    { name = "zarr", specifier = ">=3.0" },
+    { name = "zarr", specifier = ">=3.3" },
     { name = "zarr", marker = "extra == 'astronomy'", specifier = ">=3.3" },
 ]
 provides-extras = ["torch", "jax", "tf", "gpu", "virtual", "cache", "bench", "docs", "icechunk", "gcsfs", "arraylake", "astronomy"]

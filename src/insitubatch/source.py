@@ -17,9 +17,10 @@ dataset directly (``frameworks.to_jax`` per batch); TF wraps it
 (``frameworks.as_tf_dataset``).
 
 The engine is the fetch scheduler: one event loop streams stored-chunk reads under
-a single ``max_inflight`` budget and scatters decoded tiles into a
-:class:`ChunkPool`. This producer walks the shuffle order, waits on each block's
-assembled chunks, gathers coalesced batches, and unpins the block (making it
+a single ``max_inflight`` budget and delivers decoded tiles into a
+:class:`ChunkPool`, which holds them by reference. This producer walks the shuffle
+order, waits on each block's chunks, gathers coalesced batches, and unpins the block
+(making it
 LRU-evictable / retainable for reuse). Read concurrency (``max_inflight``) and the
 residency budget are independent dials. See [docs/architecture.md] for the pipeline.
 """
@@ -36,7 +37,7 @@ import numpy as np
 from zarr.abc.store import Store
 
 from .buffers import HostAllocator
-from .pool import ChunkPool, output_geometry
+from .pool import ChunkPool, output_geometry, slot_charge_bytes
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
@@ -216,8 +217,13 @@ class InSituDataset:
         out_geoms = list(self._out_geometries.values())
         geoms = list(self.geometries.values())
 
+        assembles = bool(self.chunk_transforms)
+
         def bytes_per_chunk(g: ArrayGeometry, o: ArrayGeometry) -> int:
-            return int(g.sample_chunk_size * int(np.prod(o.inner_shape)) * o.dtype.itemsize)
+            # Exactly what ChunkPool will charge -- see `slot_charge_bytes`. Sizing from the
+            # output shape while the pool charges stored tiles under-provisions the budget,
+            # and the pool then starves mid-epoch instead of merely running lean.
+            return slot_charge_bytes(g, o, assembles=assembles)
 
         if uniform_spc:
             # Uniform chunk size: every variable's chunk aligns to the reference grid, so a

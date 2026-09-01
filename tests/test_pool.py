@@ -173,8 +173,9 @@ def test_pool_concurrent_scatter_is_race_free() -> None:
         pool.try_admit("v", 0, owner)
 
         def scatter(ic, pool=pool, geom=geom, ref=ref) -> None:  # default-bind per round
-            dst, _src = geom.tile_placement(0, ic)
-            pool.deliver_tile("v", 0, ic, ref[dst].copy())  # full chunk-shaped tile
+            proj = geom.tile_placement(0, ic)
+            # full chunk-shaped tile: the pool adopts it by reference, so hand it its own
+            pool.deliver_tile("v", 0, ic, ref[proj.out_selection].copy())
 
         with ThreadPoolExecutor(max_workers=32) as ex:
             list(ex.map(scatter, coords))

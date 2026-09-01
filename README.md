@@ -38,8 +38,8 @@ running a *synchronous* `__getitem__`. Against cloud Zarr that means no shared
 chunk cache (every worker re-reads the same chunk), no way to drive async
 obstore, and dask thread pools nested inside forked workers. `insitubatch`
 **inverts** it: one async event loop streams stored chunks under a single
-concurrency budget and scatters them into a bounded pool that assembles batches —
-the pool doubles as the cache; torch runs `num_workers=0`.
+concurrency budget into a bounded pool that holds them and assembles batches on
+demand — the pool doubles as the cache; torch runs `num_workers=0`.
 
 The payoff is a **two-regime** story against the worker-process `DataLoader`. On a
 **well-chunked** store it **matches a hand-tuned worker/xbatcher pool** (swept to 32 workers)
@@ -66,8 +66,9 @@ chunk once. Full numbers + methodology:
 
 The engine is the **decoupled fetch scheduler**: reads flatten to *stored chunks*
 under one `max_inflight` budget (no nested inner/outer concurrency caps), decoded
-tiles scatter into a **`ChunkPool`** that is the assembly buffer *and* the cache
-(byte budget + pin/LRU, heap or mmap-on-NVMe). **Read concurrency and
+stored chunks are adopted **by reference** into a **`ChunkPool`** that is the
+residency tier *and* the cache (byte budget + pin/LRU, heap or mmap-on-NVMe); `gather`
+places each one straight into its rectangle of the batch. **Read concurrency and
 residency/shuffle span are independent dials** — the decoupling reaches ~1 GB/s at
 flat, low memory (validated on S3; see below). Built: planner + chunk-aligned
 splits, async obstore reads, the scheduler + pool (with **decode-once caching**,
@@ -129,10 +130,11 @@ the same is enforced in CI.
 
 ### Free-threaded (3.13t)
 
-The engine is free-threading-correct by construction: the `ChunkPool`'s scatter
-does its disjoint copy **before** the lock and publishes readiness **under** it, so
-the lock — not the GIL — is the happens-before edge to the consuming gather. The
-race probe is `test_pool_concurrent_scatter_is_race_free` (64 tiles, 32 threads).
+The engine is free-threading-correct by construction: a delivering thread does its
+write **before** the lock — each tile is its own key, so writers never collide — and
+publishes readiness **under** it, so the lock, not the GIL, is the happens-before edge
+to the consuming gather. The race probe is
+`test_pool_concurrent_scatter_is_race_free` (64 tiles, 32 threads).
 
 Run the suite GIL-free on a free-threaded interpreter:
 
@@ -152,7 +154,7 @@ PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t pytest -q
 
 CI mirrors this: a `{3.12, 3.13}` matrix plus a `3.13t` job that asserts the GIL is
 actually off before testing. Throughput is **GIL-independent by design** — fetch
-(obstore/Rust), decode (numcodecs zstd, C), and scatter/gather (vectorized numpy) all
+(obstore/Rust), decode (numcodecs zstd, C), and gather (vectorized numpy) all
 release the GIL — so 3.13t runs at the **same speed** as the GIL build, not faster. The
 free-threading work is **correctness + future-proofing, not a speedup**; *not depending*
 on the GIL is the point (see [DESIGN.md](DESIGN.md)).

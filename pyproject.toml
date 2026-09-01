@@ -19,7 +19,12 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.26",
-    "zarr>=3.0",
+    # 3.3 for `zarr.core.chunk_utils.ChunkTransform.decode_chunk` -- the *synchronous*
+    # full-chain decode the scheduler dispatches to its own executor. Without it we would
+    # be back to the async codec pipeline, which dispatches to the event loop's default
+    # executor and so cannot be used on a loop we share (see docs/architecture.md).
+    # NB this is also what sets our Python floor: zarr itself requires >=3.12 from 3.2.0.
+    "zarr>=3.3",
     "xarray>=2024.9",
     "obstore>=0.3",
 ]

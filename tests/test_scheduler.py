@@ -91,20 +91,23 @@ def test_scheduler_inflight_saturates_to_budget(tiled_store):
         assert sched.inflight_peak == 4
 
 
-def test_scheduler_close_closes_the_loop(tiled_store):
-    """close() must close the loop, not leave it for GC.
+def test_scheduler_close_leaves_the_borrowed_loop_alive(tiled_store):
+    """close() must leave zarr's loop running and usable -- it is not ours to close.
 
-    An unclosed event loop is re-closed by ``BaseEventLoop.__del__`` during garbage
-    collection, which raises ``ValueError: Invalid file descriptor: -1`` on the
-    already-gone self-pipe socket -- a noisy unraisable first seen under
-    free-threaded 3.13t (where finalizer timing exposes the latent leak).
+    This test used to assert the opposite. Orchestration now runs on zarr's
+    process-global loop (``zarr.core.sync._get_loop()``), so closing it would leave every
+    other zarr sync call in the process dead. The leak the old contract guarded against
+    -- an unclosed loop re-closed by ``BaseEventLoop.__del__``, raising ``ValueError:
+    Invalid file descriptor: -1`` on the gone self-pipe -- cannot happen to a loop we
+    never created and zarr keeps alive for the process lifetime.
     """
     url, _ = tiled_store
     geoms = open_geometries(obstore_store(url), variables=["single_inner"])
     sched = _make(url, geoms)
     sched.start(range(geoms["single_inner"].n_chunks), geoms["single_inner"].sample_chunk_size)
     sched.close()
-    assert sched._loop.is_closed()
+    assert not sched._loop.is_closed(), "close() closed a loop it does not own"
+    assert sched._loop.is_running(), "close() stopped a loop it does not own"
 
 
 def test_scheduler_windowed_views_decode_once_and_lead(tiled_store):

@@ -2,10 +2,10 @@
 
 Sampling (not deterministic, unlike yappi/cProfile) so it barely perturbs the
 threading we want to study, and ``--native`` reaches into Rust and C -- the
-obstore/tokio fetch and the numcodecs decode + numpy scatter memcpy -- exactly
-the parts a Python-level profiler cannot see. py-spy samples *all* threads of the
-target, so the named threads (``insitu-sched`` / ``insitu-dec`` / ``insitu-prefetch``)
-show up as distinct stacks.
+obstore/tokio fetch, the numcodecs decode, and the numpy gather -- exactly the parts
+a Python-level profiler cannot see. py-spy samples *all* threads of the target, so the
+decode pool (``insitu-dec``), the producer (``insitu-prefetch``) and zarr's shared loop
+thread (``zarr_io``, where orchestration runs) show up as distinct stacks.
 
 Attach model: py-spy uses ptrace, and here it is a *child* attaching to its
 parent (this process). Under the common ``kernel.yama.ptrace_scope=1`` a child may

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 import numpy as np
+from zarr.core.indexing import ChunkProjection
 
 
 class SplitName(StrEnum):
@@ -145,6 +146,18 @@ class ArrayGeometry:
             n *= len(r)
         return n
 
+    def inner_index(self, inner_coord: tuple[int, ...]) -> int:
+        """Row-major position of one inner stored-chunk coord in :meth:`inner_coords`.
+
+        The inverse of iterating ``inner_coords()``. It is what gives the persisted cache a
+        **stable tile order**: a chunk's ``.npy`` stores its tiles tile-major at this index,
+        so a revived file maps back to coordinates without recording them.
+        """
+        idx = 0
+        for i, r in zip(inner_coord, self.inner_grid(), strict=True):
+            idx = idx * len(r) + i
+        return idx
+
     def slot_shape(self, chunk_index: int) -> tuple[int, ...]:
         """Shape of the assembled outer chunk: ``(n_samples_in_chunk, *inner_shape)``.
 
@@ -153,22 +166,44 @@ class ArrayGeometry:
         """
         return (len(self.samples_in_chunk(chunk_index)), *self.inner_shape)
 
-    def tile_placement(
-        self, chunk_index: int, inner_coord: tuple[int, ...]
-    ) -> tuple[tuple[slice, ...], tuple[slice, ...]]:
-        """``(dst, src)`` slices for scattering one decoded tile into its slot.
+    def tile_shape(self) -> tuple[int, ...]:
+        """One stored chunk's shape, **sample-first** -- the shape a decoded tile arrives in.
 
-        ``dst`` indexes the outer-chunk slot; ``src`` clips the full chunk-shaped
-        decoded tile to the (possibly partial) edge region -- both axis 0 (short
-        final outer chunk) and the inner edges. After the copy the tile is free.
+        The scheduler moves the sample axis to the front on decode, so this is
+        ``(sample_chunk_size, *inner_chunks)`` rather than the array's physical chunk order.
+        Full size always: an edge chunk is stored whole and its padding is kept.
+        """
+        return (self.sample_chunk_size, *self.inner_chunks)
+
+    def tile_placement(self, chunk_index: int, inner_coord: tuple[int, ...]) -> ChunkProjection:
+        """Where one stored tile lands inside its outer chunk, as zarr's own projection.
+
+        Returns a :class:`zarr.core.indexing.ChunkProjection` -- the vocabulary zarr uses
+        for exactly this ("a mapping of items from chunk to output array"), rather than a
+        private ``(dst, src)`` pair. ``out_selection`` indexes the assembled outer chunk;
+        ``chunk_selection`` clips the full chunk-shaped decoded tile to the (possibly
+        partial) edge region, on axis 0 (short final outer chunk) and the inner edges
+        alike. ``is_complete_chunk`` says the tile is used whole -- i.e. it is not an edge
+        tile -- which is what tells a reader whether the stored chunk carries padding.
+
+        Both selections are **sample-first**, matching the slot and the sample-first tile
+        the scheduler delivers (it moves the sample axis to the front on decode), not the
+        array's physical axis order.
         """
         n0 = len(self.samples_in_chunk(chunk_index))
-        dst = [slice(0, n0)]
+        out = [slice(0, n0)]
         for i, c, s in zip(inner_coord, self.inner_chunks, self.inner_shape, strict=True):
             start = i * c
-            dst.append(slice(start, min(start + c, s)))
-        src = tuple(slice(0, sl.stop - sl.start) for sl in dst)
-        return tuple(dst), src
+            out.append(slice(start, min(start + c, s)))
+        chunk = tuple(slice(0, sl.stop - sl.start) for sl in out)
+        full = (self.sample_chunk_size, *self.inner_chunks)
+        complete = all(sl.stop == n for sl, n in zip(chunk, full, strict=True))
+        return ChunkProjection(
+            chunk_coords=(chunk_index, *inner_coord),
+            chunk_selection=chunk,
+            out_selection=tuple(out),
+            is_complete_chunk=complete,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,9 +248,18 @@ class StoredChunkRead:
 class DecodedChunk:
     """A decoded, in-memory chunk, keyed by its read.
 
-    ``data`` has shape ``(n_samples_in_chunk, *inner_shape)``. The buffer holds a
-    bounded number of these; memory overhead is O(in-flight chunks), independent
-    of batch size.
+    ``data`` has shape ``(n_samples_in_chunk, *inner_shape)`` -- the **logical** chunk, and
+    a real contiguous array, never a view over stored tiles.
+
+    In particular it carries **no stored-chunk padding**. A zarr chunk grid that does not
+    divide the array evenly still stores full-size chunks at the edges (721 rows chunked at
+    180 occupy 900), and the pool holds those tiles whole. Assembly clips every tile to its
+    in-bounds region before a transform sees it, so a transform never has to know the chunk
+    grid, mask an edge, or handle padding values. ``n_samples_in_chunk`` is likewise the
+    real count, so a short final chunk arrives short rather than padded.
+
+    The buffer holds a bounded number of these; memory overhead is O(in-flight chunks),
+    independent of batch size.
     """
 
     read: ChunkRead

@@ -2,6 +2,73 @@
 
 ## Unreleased
 
+- **The pool's buffer unit is now the stored chunk, and the scheduler runs on zarr's loop.**
+  Two changes that had to land together, because both rewrite `Scheduler._one`. A slot used
+  to be one assembled ndarray that every decoded tile was memcpy'd into; it is now the
+  decoded tiles themselves, adopted by reference, with placement deferred to `gather`. And
+  orchestration moved from a private per-pass event loop onto zarr's process-global one.
+  What made the second possible was `zarr.core.chunk_utils.ChunkTransform.decode_chunk`
+  (new in zarr 3.3.0) being *synchronous*: the async codec pipeline dispatches to the loop's
+  default executor, so keeping our own decode pool meant claiming that slot — which on a
+  borrowed loop retunes zarr's concurrency process-wide and then breaks it on close. Calling
+  a sync decode ourselves means we never touch it.
+
+  Deleted: the fsspec bridge (`_io`, `_foreign_loop`, `_fsspec_io_loop`) — gcsfs and obstore
+  are now the same inline `await`, because we are already on the loop an async fsspec session
+  binds to; the per-pass loop, scheduler thread and decode pool (three of four execution
+  contexts were rebuilt every epoch); the second executor hop; and the fill-path memcpy.
+  Verified byte-identical on real GCS against both backends, on our zarr-v3 store and on
+  WeatherBench2's zarr-v2.
+
+  **Sold as simplicity, not throughput.** Wall clock is a null in every warm configuration
+  measured on 4 and 16 vCPU; the deleted memcpy is 7.7–10.1% of process CPU and never
+  surfaced, because it was not the bottleneck. Chunked `gather` is *faster* at coarse tile
+  grids (0.83–1.02x at 1–16 tiles per chunk) and slower only at the fine end (1.84–2.20x at
+  256), which restates known chunking guidance rather than indicting the design.
+
+- **A scheduler may no longer tear down anything it shares.** `close()` used to cancel every
+  task on its loop via `asyncio.all_tasks`, then stop and close the loop, then shut down the
+  decode pool. All three were correct while the loop was private and destructive the moment
+  it was not: cancelling the whole task set raises `CancelledError` inside unrelated `zarr`
+  reads in other threads, stopping the loop hangs every later `zarr.core.sync.sync()` call in
+  the process, and shutting the shared pool down makes the next scheduler raise `cannot
+  schedule new futures after shutdown`. The failures are races — the same arm produced them
+  2/3, 3/3 or 0/3 across runs — which is why they are pinned by tests rather than left to
+  review. A scheduler now cancels only the tasks it created and tears down nothing else.
+
+- **Persisted chunks are stored tile-major.** A cache entry's `.npy` now holds
+  `(n_tiles, *tile_shape)` — each stored tile contiguous, in `inner_index` order — instead of
+  one assembled array. File count per chunk is unchanged. This is what keeps one code path:
+  a revived chunk comes back as zero-copy views of the mapping, tiled exactly like a freshly
+  fetched one, so `gather` never asks "assembled or tiled?". Contiguous-on-disk tiles also
+  make a future `decode(out=)` usable on the mmap tier, not just the heap.
+  **Breaking:** the manifest format is bumped to 3, so an existing `cache_dir` is rejected
+  with the usual stale-cache error and rebuilt (`reset_stale_cache=True`, or delete it). A
+  version-2 file read as tile-major would be plausible-looking garbage, so this is refused
+  rather than reinterpreted.
+
+- **A ragged chunk grid is now charged for the padding it actually holds.** A stored chunk
+  decodes whole, and we keep it whole rather than clipping edge tiles — one buffer unit, one
+  shape, which a fixed-shape arena will later need to reuse anything. So residency is
+  `n_tiles * chunk_shape`, which exceeds the assembled `slot_shape` wherever the grid does
+  not divide the extent: 1.248x on ERA5 721x1440 at 180x360, 1.997x on a short final outer
+  chunk. The budget charges that, including on the `chunk_transform` path, which holds the
+  source tiles for its whole fill and only collapses to the assembled output at completion.
+  Charging the assembled size instead — as the old design did — would let a pool told
+  2048 MiB resident ~2560 MiB while reporting 2048. Invisible on a grid that divides evenly,
+  which is every store our benchmarks used.
+
+  A `chunk_transform` still receives the **logical** chunk: assembly clips every tile to its
+  in-bounds region first, so user code never sees stored-chunk padding, never masks an edge,
+  and never has to know the chunk grid. `DecodedChunk` now says so outright, since the pool
+  holding padded tiles internally makes the distinction newly worth stating.
+
+- **`decode_threads` is now a process-wide setting, and says so when ignored.** The decode
+  pool outlives every scheduler, so it is sized by the first dataset built in the process; a
+  later, different value is ignored with a warning rather than silently. Thread count is a
+  property of the machine, not of a dataset, so one number per process is the honest shape —
+  and two datasets in one process should not run two pools competing for the same cores.
+
 - **Under-sizing the budget for concurrent iterations now says so.** One `InSituDataset`
   owns one chunk pool and every active iteration shares it — `zip(ds.train, ds.val)`, or
   two `DataLoader`s — but each holds its *own* chunk references, so residency is the sum

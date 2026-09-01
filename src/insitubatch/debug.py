@@ -3,9 +3,9 @@
 ``print_debug_info()`` dumps the versions and interpreter facts that actually change
 insitubatch's behavior: the storage stack (zarr / obstore / numpy), whichever framework
 adapter is installed, and the **free-threading state**. That last one matters more here
-than in most libraries -- the ``ChunkPool``'s lock-free disjoint scatter is exercised very
-differently on a 3.13t build with the GIL genuinely off, and "works for me" reports have
-turned on exactly that difference::
+than in most libraries -- the ``ChunkPool``'s lock discipline and its cross-thread readiness
+signalling are exercised very differently on a 3.13t build with the GIL genuinely off, and
+"works for me" reports have turned on exactly that difference::
 
     python -c "import insitubatch; insitubatch.print_debug_info()"
 

@@ -131,7 +131,7 @@ uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 ## Status
 
 **Alpha — validated on real cloud IO.** Built: planner + chunk-aligned splits, async
-obstore reads, the decoupled fetch **`Scheduler`** + **`ChunkPool`** (assembly buffer
+obstore reads, the decoupled fetch **`Scheduler`** + **`ChunkPool`** (residency tier
 *and* cache — byte budget + pin/LRU, heap or mmap-on-NVMe, with **cross-run
 persistence** via `persist=True`), approximate (shuffle-block) shuffle, chunk/batch
 **transforms** (incl. a fitted `StandardScaler`), **prefetch**, **windowed multi-offset
