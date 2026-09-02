@@ -25,6 +25,21 @@ only when called, so importing `insitubatch` never pulls a framework in.
         - print_debug_info
         - debug_info
 
+## The static report
+
+The entry points are the two `InSituDataset` methods above — `describe()` for the dict,
+`print_summary()` for the rendering. These are the shapes `describe()` returns.
+
+::: insitubatch.summary
+    options:
+      show_root_heading: false
+      members:
+        - DatasetReport
+        - VariableReport
+        - ConfigReport
+        - MemoryReport
+        - Note
+
 ## Framework adapters
 
 ::: insitubatch.frameworks
