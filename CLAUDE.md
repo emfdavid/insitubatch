@@ -39,6 +39,11 @@ Contributor-facing rules (scope limits, dev setup, AI policy) live in
   `uv run pytest -q`. Docs: `uv run --extra docs mkdocs build --strict` (CI runs it, so a
   broken link fails the build). Pages under `docs/` **cannot** relatively link root files
   (`DESIGN.md`, `GOVERNANCE.md`) — use the GitHub URL, as the existing pages do.
+- **One framework per env.** torch/JAX/TF cannot share a process (Keras 3 pulls JAX in when
+  installed), so a `.venv` carrying several **segfaults mid-suite** — the documented failure
+  mode (README, "One framework per environment"), not a regression. If yours has them all:
+  `pytest -q --ignore=tests/test_tf.py`, then `pytest -q tests/test_tf.py`. CI gives each
+  framework its own job and so never hits it.
 - Pre-commit (ruff + mypy): `uv run pre-commit install` once; runs on every commit.
 - Build: `uv build`. Sync env: `uv sync` (extras: `--extra torch`, `--extra gpu`).
 - Python ≥ 3.12, src layout (`src/insitubatch/`), build backend `uv_build`.
