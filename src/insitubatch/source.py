@@ -31,6 +31,7 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import TextIO
 
@@ -39,6 +40,7 @@ from zarr.abc.store import Store
 
 from .buffers import HostAllocator
 from .pool import ChunkPool, output_geometry
+from .runtime import Depths, PassStats, StatsCollector, format_pass
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
@@ -196,6 +198,11 @@ class InSituDataset:
         # (array, chunk_index, inner_coord) reads were corrupt/truncated. len() is the
         # count. Inspect after iterating to log/quarantine bad chunks.
         self.bad_chunks: list[StoredChunkRead] = []
+        self.inflight_peak = 0  # peak in-flight tiles (observability); see `last_pass`
+        # The last completed pass, or None before one finishes. Per pass, not per epoch: a
+        # training epoch iterates train then val over one pool, and averaging two passes
+        # with different shapes into one report is how a number stops meaning anything.
+        self.last_pass: PassStats | None = None
         self._on_bad_chunk = on_bad_chunk
 
         # The pool is the assembly buffer AND the cache, owned here so it persists
@@ -376,6 +383,11 @@ class InSituDataset:
 
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
         stop = threading.Event()
+        # One collector for the pass, shared with the Scheduler. It takes no lock: every
+        # field has a single writing thread (see StatsCollector), and this pass reads it
+        # only after `producer.join()` and the scheduler's `close()` have published them.
+        stats = StatsCollector(queue_capacity=self.prefetch_depth)
+        wall0 = time.perf_counter()
 
         # Per-block read-union keys (path, chunk) -- what each block reads across all
         # variables' offsets. A windowed read can spill into chunks owned by any other
@@ -423,7 +435,11 @@ class InSituDataset:
                         for path, cid in block_keys[ready]:
                             sched.pool.wait_ready(path, cid, owner)
                         ready += 1
+                    g0 = time.thread_time()
                     batch = sched.pool.gather(order[start:stop_row], self.variables, spc)
+                    # thread_time, not perf_counter: gather is work this thread does, and a
+                    # wall clock here would bill it for whatever else held the GIL.
+                    stats.gather_s += time.thread_time() - g0
                     # Release the driver's reference on chunks whose *last* use is a block now
                     # fully behind the frontier -- a batch has consumed its last row, so it is
                     # done. Now LRU-evictable (retained for reuse if budget allows), unblocking
@@ -438,8 +454,10 @@ class InSituDataset:
                     while freed < len(blocks) and blocks[freed][1] <= stop_row:
                         sched.unpin_block(release[freed])
                         freed += 1
+                    b0 = time.thread_time()
                     for transform in self.batch_transforms:
                         batch = transform(batch)
+                    stats.batch_transform_s += time.thread_time() - b0
                     out_q.put(batch)  # blocks when full -> backpressure
             except Exception as exc:  # noqa: BLE001 - forwarded to the consumer
                 out_q.put(exc)
@@ -452,18 +470,24 @@ class InSituDataset:
             self._pool,
             self.scheduler_config,
             owner=owner,
+            stats=stats,
         ) as sched:
             producer = threading.Thread(
                 target=produce, args=(sched,), name="insitu-prefetch", daemon=True
             )
             producer.start()
+            batches = 0
             try:
                 while True:
+                    # Sample before the get: qsize() after it has already been decremented
+                    # by our own take, which would report every healthy queue as one short.
+                    stats.sample_queue(out_q.qsize())
                     item = out_q.get()
                     if item is self._SENTINEL:
                         break
                     if isinstance(item, Exception):
                         raise item
+                    batches += 1
                     yield item
             finally:
                 # Signal stop, then drain so a producer parked on a full queue can
@@ -472,12 +496,30 @@ class InSituDataset:
                 while producer.is_alive():
                     with contextlib.suppress(queue.Empty):
                         out_q.get(timeout=0.05)
-                producer.join(timeout=10)
+                producer.join(timeout=10)  # publishes the producer's stage timers
                 pool = sched.pool
                 self.resident_peak = pool.max_resident  # peak residency this epoch
                 self.cache_hits = pool.hits
                 self.cache_misses = pool.misses
                 self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
+                # Was unreachable before: it lives on the Scheduler, which is created inside
+                # this method and torn down with the pass, so unlike the three above nothing
+                # ever copied it out.
+                self.inflight_peak = sched.inflight_peak
+                depths = Depths(
+                    batch_queue_capacity=stats.queue_capacity,
+                    batch_queue_peak=stats.queue_peak,
+                    batch_queue_samples=stats.queue_samples,
+                    batch_queue_empty=stats.queue_empty,
+                    batch_queue_full_enough=stats.queue_full_enough,
+                    inflight_peak=sched.inflight_peak,
+                    max_inflight=self.scheduler_config.max_inflight,
+                    decode_queue_peak=stats.decode_queue_peak,
+                    decode_threads=sched.decode_threads,
+                    resident_peak=pool.max_resident,
+                    resident_peak_bytes=pool.max_resident_bytes,
+                    budget_bytes=pool.budget_bytes,
+                )
                 self._log_epoch_summary(pool, split)
                 # Persistence was asked for but served nothing, and the cache *was*
                 # consulted (entries existed and every revive failed) -> almost certainly
@@ -498,6 +540,22 @@ class InSituDataset:
                 # early `break` finalizes this generator, so this runs then too --
                 # which is what keeps an abandoned pass from leaking budget.
                 self._pool.release_owner(owner)
+        # OUTSIDE the `with`: the scheduler is closed, so every counter the event loop owns
+        # has been published to us. Reading the stage timers inside it would race the tiles
+        # still finishing -- the producer is joined by then, but the loop is not.
+        self.last_pass = PassStats(
+            split="all" if split is None else split.value,
+            epoch=self._epoch,
+            batches=batches,
+            cache_hits=self.cache_hits,
+            cache_misses=self.cache_misses,
+            bad_chunks=len(self.bad_chunks),
+            wall_s=time.perf_counter() - wall0,
+            times=stats.times(),
+            depths=depths,
+        )
+        if logger.isEnabledFor(logging.INFO):
+            logger.info("%s", format_pass(self.last_pass))
 
     def _log_epoch_summary(self, pool: ChunkPool, split: SplitName | None) -> None:
         """One INFO line per epoch *per split*: what the chunk cache and the batch buffers did.

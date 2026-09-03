@@ -58,6 +58,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -73,6 +74,7 @@ from zarr.core.sync import _get_loop
 
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
+from .runtime import StatsCollector
 from .types import ArrayGeometry, StoredChunkRead
 
 STARVATION_POLL_S = 0.25
@@ -120,6 +122,36 @@ def decode_pool(workers: int | None = None) -> ThreadPoolExecutor:
                 _DECODE_POOL_WORKERS,
             )
         return _DECODE_POOL
+
+
+def decode_pool_workers() -> int:
+    """Threads the process-wide decode pool actually has, or 0 before it is built.
+
+    The *effective* count, deliberately -- ``SchedulerConfig.decode_threads`` is a request
+    that the first dataset in the process wins, so a report quoting the config would tell a
+    later caller a number that never applied to it.
+    """
+    return _DECODE_POOL_WORKERS
+
+
+def _timed_decode(codec: ChunkTransform, buf: object, spec: ArraySpec) -> tuple[Any, float]:
+    """Decode on the pool thread and hand back what it cost *that thread*.
+
+    Returning the number instead of adding it is what keeps :class:`StatsCollector`
+    single-writer: the add happens on the loop, in the coroutine that awaited this. It is
+    also why the number is honest -- ``thread_time`` here is CPU burned decoding, where a
+    ``perf_counter`` around the hop on the loop side would have measured GIL wait.
+    """
+    t0 = time.thread_time()
+    out = codec.decode_chunk(buf, spec)  # type: ignore[arg-type]
+    return out, time.thread_time() - t0
+
+
+def _timed_deliver(deliver: Callable[[np.ndarray], None], tile: np.ndarray) -> float:
+    """Run the assembling delivery on the pool thread; return its CPU cost. See above."""
+    t0 = time.thread_time()
+    deliver(tile)
+    return time.thread_time() - t0
 
 
 def reset_decode_pool() -> None:
@@ -239,6 +271,7 @@ class Scheduler:
         pool: ChunkPool,
         config: SchedulerConfig | None = None,
         owner: int | None = None,
+        stats: StatsCollector | None = None,
     ) -> None:
         self._store = store
         self._geometries = geometries
@@ -253,6 +286,10 @@ class Scheduler:
         # iteration's references and leaves a concurrent iteration's alone. Minted here
         # when the caller does not supply one, so a standalone Scheduler still works.
         self._owner = pool.new_owner() if owner is None else owner
+        # Shared with the pass that owns us, so one report covers loop and producer alike.
+        # Every field this class touches is written on the loop thread only -- see
+        # StatsCollector, where that ownership is the reason there is no lock.
+        self.stats = StatsCollector() if stats is None else stats
         self.bad_chunks: list[StoredChunkRead] = []  # tiles NaN-filled this run (observability)
         self._proto = default_buffer_prototype()
         self._arrays: dict[str, _ArrayCtx] = {}
@@ -349,6 +386,11 @@ class Scheduler:
     # -- public, synchronous surface ---------------------------------------
 
     @property
+    def decode_threads(self) -> int:
+        """Effective decode-pool width; see :func:`decode_pool_workers`."""
+        return decode_pool_workers()
+
+    @property
     def owner(self) -> int:
         """This scheduler's reference token, for the consumer's ``pool.wait_ready``.
 
@@ -443,7 +485,12 @@ class Scheduler:
         while not self.pool.try_admit(array, chunk_index, self._owner):
             self._capacity.clear()
             if self.pool.try_admit(array, chunk_index, self._owner):
-                return
+                break
+            # perf_counter, not thread_time: this coroutine is *waiting*, and the waiting is
+            # exactly the quantity. A merely budget-starved loader is otherwise
+            # indistinguishable from slow storage -- which is how the pre-#39 deadlock
+            # presented -- so this is the counter that separates them.
+            t0 = time.perf_counter()
             try:
                 await asyncio.wait_for(self._capacity.wait(), STARVATION_POLL_S)
             except TimeoutError:
@@ -453,6 +500,10 @@ class Scheduler:
                     # cause is the budget, and chaining it would put a red herring at
                     # the top of the traceback the consumer re-raises.
                     raise starved from None
+            finally:
+                # In the `finally` so a terminal starvation still reports the time it
+                # parked before proving itself fatal -- that number is the evidence.
+                self.stats.admission_parked_s += time.perf_counter() - t0
 
     def _starvation(self, array: str, chunk_index: int) -> RuntimeError | None:
         """The error for a *provably* unbreakable admission stall, else ``None``.
@@ -584,8 +635,17 @@ class Scheduler:
                         # This loop is zarr's, shared with the whole process: running user
                         # code on it would stall every other zarr caller.
                         if self.pool.assembles:
-                            await self._loop.run_in_executor(self._decode_pool, w.deliver, tile)
+                            self.stats.decode_enter()
+                            try:
+                                self.stats.assemble_s += await self._loop.run_in_executor(
+                                    self._decode_pool, _timed_deliver, w.deliver, tile
+                                )
+                            finally:
+                                self.stats.decode_exit()
                         else:
+                            # Inline on the loop: a dict assignment and a counter. Timing it
+                            # would cost more than it measures, and it is not a stage anyone
+                            # can act on -- `assemble_s` stays 0 on this path, honestly.
                             w.deliver(tile)
                     except Exception as exc:  # noqa: BLE001 - a delivery failure is a real bug
                         w.fail(exc)
@@ -601,15 +661,27 @@ class Scheduler:
         key = ctx.path + "/" + ctx.encode(phys)
         # One path for every backend. We are on zarr's loop, which is the loop an async
         # fsspec session is bound to, so gcsfs and obstore are both a plain inline await.
+        # perf_counter: this is a wait on the network, and summed across the tiles in
+        # flight -- so it exceeds wall time by design. Read it against the other stages,
+        # never against the clock.
+        t0 = time.perf_counter()
         buf = await ctx.store.get(key, prototype=self._proto)
+        self.stats.fetch_wait_s += time.perf_counter() - t0
         if buf is None:  # absent chunk == all fill_value (zarr's getitem semantics)
             tile = np.full(ctx.chunk_shape, ctx.fill_value, dtype=ctx.dtype)
         else:
             # Decode on OUR pool, named explicitly -- never `None`, which would mean the
             # loop's default executor and would make us a guest that retunes its host.
-            decoded = await self._loop.run_in_executor(
-                self._decode_pool, ctx.codec.decode_chunk, buf, ctx.spec
-            )
+            # `_timed_decode` measures on the pool thread and returns the cost; we add it
+            # here, on the loop, which is what keeps the collector single-writer.
+            self.stats.decode_enter()
+            try:
+                decoded, cpu_s = await self._loop.run_in_executor(
+                    self._decode_pool, _timed_decode, ctx.codec, buf, ctx.spec
+                )
+            finally:
+                self.stats.decode_exit()
+            self.stats.decode_s += cpu_s
             tile = decoded.as_numpy_array()
         # Seam 2: the decoded tile is in physical order; move the sample axis to the front
         # so it matches the sample-first grid the pool and gather address (no-op when ax == 0).

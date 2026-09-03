@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- **`InSituDataset.last_pass` — which stage was the bottleneck, and what to do about it.**
+  Every producer-side problem presents the same way, as an empty batch queue: slow storage,
+  a saturated decode pool, and a residency budget too small to admit the next chunk are
+  indistinguishable from the consumer's seat, and they want opposite fixes. Turning the
+  wrong knob is the default outcome. `last_pass` is a `PassStats` carrying sampled depths
+  (batch queue, in-flight permits, decode-pool depth, residency vs budget) and cumulative
+  time by stage, and `last_pass.limiting_stage` applies a rule to them and names *one*
+  stage. The per-epoch INFO line ends in `limited by: <stage> -- <what to do>`.
+
+  The counter worth having is `admission_parked_s`. A merely budget-starved loader looks
+  exactly like slow storage — which is how the pre-#39 deadlock presented, "slow storage
+  rather than an error" — and this is the only number that separates them. It is the
+  non-terminal neighbour of the state the loader raises `residency budget exhausted` on,
+  made visible before it becomes provably fatal. `inflight_peak` is also reachable at last:
+  it lived on the `Scheduler`, which is created inside the pass and torn down with it, so
+  nothing ever copied it out.
+
+  **Two clocks, deliberately.** Waiting uses `perf_counter`, because there the waiting is
+  the quantity; in-thread cost uses `thread_time`, because a wall clock around a thread hop
+  measures GIL wait rather than work — that is how our scatter memcpy once read as 51% of
+  the hot path when its real share is 7.7-10.1%. A stage timer that over-attributes is
+  worse than no timer: it sends people to optimize a stage that was never the problem.
+  `fetch_wait_s` is therefore summed across tiles in flight and exceeds wall time by design.
+
+  **The collector takes no lock.** Every counter has exactly one writing thread, and decode
+  — the one stage that runs on the pool's threads — measures its own `thread_time` and
+  *returns* it, so the add happens back on the loop. Measured cost, interleaved against
+  `main` with a same-vs-same NULL control on an 8-vCPU box reading a local NVMe store: a
+  null on ordinary geometry (32-sample chunks, one tile each, 128 tiles/pass), and **~2-5%
+  on a deliberately tile-heavy shape** (4-sample chunks on a 4x4 inner grid, 16,384
+  tiles/pass) where the NULL's own worst pair was 6%. The cost is per tile, so it is
+  largest exactly where tiles are smallest — which is also where you are least likely to be
+  IO-bound.
+
 - **`InSituDataset.describe()` / `.print_summary()` — what this configuration will cost,
   before it costs it.** The layout facts that decide whether a run is fast or twice as slow
   were only discoverable by running it: a 360-byte gather run (1.8-2.2x on the placement

@@ -184,6 +184,54 @@ measure it; [Architecture](architecture.md) explains why the block-local shuffle
 This section is training-only: only `.train` shuffles — `.val`, `.test` and `.all` are
 deterministic — so a scoring pass has no shuffle quality to protect.
 
+## Which stage is actually the bottleneck?
+
+The knobs above only help if you turn the right one, and the symptom that sends people to
+the wrong one is always the same: **the batch queue is empty**. Slow storage, a saturated
+decode pool, and a residency budget too small to admit the next chunk all present that way,
+and they want opposite fixes. `ds.last_pass` separates them.
+
+```python
+for batch in ds.train:
+    ...
+
+st = ds.last_pass
+print(st.limiting_stage)                    # e.g. "residency"
+print(st.times.admission_parked_s)          # the evidence behind it
+```
+
+Or read it from the per-epoch log line
+(`logging.getLogger("insitubatch").setLevel(logging.INFO)`), which ends in
+`limited by: <stage> -- <what to do>`.
+
+| what the report shows | limiting stage | what to do |
+|---|---|---|
+| batch queue **fed** (`fed_frac` high) | `consumer` | nothing — the loader kept up and your training step is the constraint. This is the goal |
+| queue empty, `fetch_wait_s` dominant | `store` | raise `max_inflight`; check the store is in-region and on the fast backend |
+| queue empty, `decode_s` / `assemble_s` dominant | `decode` | raise `decode_threads`; check the `chunk_transform` is vectorized numpy that releases the GIL |
+| queue empty, `admission_parked_s` dominant | `residency` | raise `cache_budget_bytes`, or lower `batch_size` / `block_chunks` / concurrent iterations |
+| queue empty, `gather_s` / `batch_transform_s` dominant | `gather` | check the gather run length in `describe()`, and any `batch_transform` |
+
+The **residency** row is the one worth knowing exists. A budget-starved loader is otherwise
+indistinguishable from slow storage — it is exactly how the pre-#39 deadlock presented — and
+`admission_parked_s` is the only counter that tells them apart. It is the non-terminal
+neighbour of the state the loader raises `residency budget exhausted` on: same cause, caught
+before it becomes provably fatal.
+
+`limiting_stage` returns `"unknown"` rather than guessing when the evidence does not
+separate the candidates — no samples, starvation too rare to matter, or no stage owning
+enough of the accounted time. A confident wrong verdict costs more than an admission.
+
+!!! note "Two clocks, on purpose"
+
+    Waiting is measured with `perf_counter` (waiting *is* the quantity); in-thread cost is
+    measured with `thread_time` (CPU actually burned). A wall clock around a thread hop
+    measures GIL wait, not work — that is how the scatter memcpy once read as 51% of the hot
+    path when its real share is 7.7–10.1%.
+
+    So `fetch_wait_s` is summed across the tiles in flight and **will exceed wall time**.
+    Read the stages against each other, never against the clock.
+
 ## The recipe
 
 1. **At write time, pick `inner_chunks`** so a stored chunk is ~10–50 MB: small enough that
