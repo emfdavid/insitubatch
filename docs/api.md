@@ -40,6 +40,21 @@ The entry points are the two `InSituDataset` methods above — `describe()` for 
         - MemoryReport
         - Note
 
+## The runtime report
+
+Where `describe()` predicts before a pass, `ds.last_pass` reports after one. It is a
+`PassStats`, and `last_pass.limiting_stage` names the one stage worth going to fix.
+
+::: insitubatch.runtime
+    options:
+      show_root_heading: false
+      members:
+        - PassStats
+        - StageTimes
+        - Depths
+        - bottleneck
+        - format_pass
+
 ## Framework adapters
 
 ::: insitubatch.frameworks

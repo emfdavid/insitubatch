@@ -16,6 +16,7 @@ from .debug import debug_info, print_debug_info
 from .frameworks import as_tf_dataset, as_torch, to_jax, to_tf, to_torch
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
+from .runtime import Depths, PassStats, StageTimes, bottleneck
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import (
     block_shuffled_order,
@@ -58,9 +59,12 @@ __all__ = [
     "ChunkTransform",
     "DatasetReport",
     "DecodedChunk",
+    "Depths",
     "InSituDataset",
+    "PassStats",
     "Scheduler",
     "SchedulerConfig",
+    "StageTimes",
     "SplitManifest",
     "SplitName",
     "StandardScaler",
@@ -70,6 +74,7 @@ __all__ = [
     "as_torch",
     "close_store",
     "block_shuffled_order",
+    "bottleneck",
     "build_stored_chunk_reads",
     "chunk_permutation",
     "debug_info",

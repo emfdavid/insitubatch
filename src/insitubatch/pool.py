@@ -471,6 +471,9 @@ class ChunkPool:
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
+        # Peak of the running charge, not a re-sum: `_bytes` is already maintained and
+        # we are already under `_cv` at the one site that grows it, so this is free.
+        self.max_resident_bytes = 0  # peak bytes charged to the budget at once
         # Keys currently blocked in wait_ready. A blocked consumer is one that cannot
         # unpin, which is what lets the scheduler prove an admission starvation is
         # terminal rather than merely slow (see Scheduler._admit).
@@ -638,6 +641,7 @@ class ChunkPool:
             self._bytes += nbytes
             self._pin(key, owner)
             self.max_resident = max(self.max_resident, len(self._positions()))
+            self.max_resident_bytes = max(self.max_resident_bytes, self._bytes)
             return True
 
     def is_ready(self, array: str, chunk_index: int) -> bool:
@@ -736,6 +740,7 @@ class ChunkPool:
         )
         self._bytes += nbytes
         self.max_resident = max(self.max_resident, len(self._positions()))
+        self.max_resident_bytes = max(self.max_resident_bytes, self._bytes)
         return True
 
     def pin_keys(self, keys: set[tuple[str, int]], owner: int) -> None:
@@ -823,6 +828,7 @@ class ChunkPool:
         """
         with self._cv:
             self.hits = self.misses = 0
+            self.max_resident = self.max_resident_bytes = 0  # peaks are per-pass too
             self.revive_mismatch = self.revive_missing = 0
             self._buffers.reset_counters()  # batch outputs too -- same epoch boundary
 

@@ -184,6 +184,129 @@ measure it; [Architecture](architecture.md) explains why the block-local shuffle
 This section is training-only: only `.train` shuffles — `.val`, `.test` and `.all` are
 deterministic — so a scoring pass has no shuffle quality to protect.
 
+## Which stage is actually the bottleneck?
+
+The knobs above only help if you turn the right one, and the symptom that sends people to
+the wrong one is always the same: **the batch queue is empty**. Slow storage, a saturated
+decode pool, and a residency budget too small to admit the next chunk all present that way,
+and they want opposite fixes. `ds.last_pass` separates them.
+
+```python
+for batch in ds.train:
+    ...
+
+st = ds.last_pass
+print(st.limiting_stage)                    # e.g. "residency"
+print(st.times.admission_parked_s)          # the evidence behind it
+```
+
+Or read it from the per-epoch log line
+(`logging.getLogger("insitubatch").setLevel(logging.INFO)`), which ends in
+`limited by: <stage> -- <what to do>`.
+
+### Try it: a misconfigured loader that diagnoses itself
+
+This runs as written — the store is one of the public benchmark stores, no credentials and
+no build step. `era5_c1` is the chunk-per-sample (GRIB-like) end of the family: 6000 full
+`721x1440` fields, one per chunk.
+
+**Keep the `sleep`.** It stands in for a training step, and without one the question is
+degenerate: a `for batch in ds.train: pass` loop takes batches as fast as they appear, so
+the queue is empty on every sample however fast the loader is. The report says so if you
+drop it, but then all it can tell you is throughput.
+
+```python
+import logging
+import time
+
+from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_chunk
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+store = obstore_store(
+    "gs://insitubatch-bench-insitubatch/era5_c1.zarr", skip_signature=True
+)
+geoms = open_geometries(store)
+manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
+
+# max_inflight=1 is the mistake. One read at a time against an object store.
+ds = InSituDataset(store, manifest, batch_size=16, block_chunks=8, max_inflight=1)
+
+for i, batch in enumerate(ds.train):
+    time.sleep(0.15)  # stand in for a training step
+    if i == 9:
+        break
+```
+
+```
+epoch 0 (train): 10 batches in 15.3s | queue 0/2 (empty 100%, fed 0%)
+  | inflight peak 1/1 | resident 32 chunks, 127 MiB of 127 MiB | consumer 1.35s
+  | wait fetch 14.06s, parked 15.18s | cpu decode 1.05s, gather 0.32s
+  | limited by: store -- ... the loader waited on the store. Raise max_inflight ...
+    Admission also parked on the residency budget (50%), but that is most likely
+    backpressure from this stage rather than a budget that is too small.
+```
+
+Two things to read. The verdict is `store`, and the parked total — nearly as large as the
+fetch total — is called out as **backpressure rather than a cause**: with one read in
+flight, chunks are fetched slowly and therefore sit resident longer, so the budget stays
+full (`127 MiB of 127 MiB`). Raising `cache_budget_bytes` would fix none of it.
+
+Now raise `max_inflight`, and keep raising it:
+
+| `max_inflight` | wall for 10 batches | verdict |
+|---:|---:|---|
+| 1 | 15.3 s | `store` (+ residency backpressure) |
+| 8 | 1.8 s | `store` |
+| **16** | **1.1 s** | `store`, permits saturated |
+| 32 | 1.6 s | `store`, permits saturated |
+
+**16 is the knee, and 32 is worse.** Once every permit is in use the advice changes to say
+so: *"Raise max_inflight and re-measure — but if throughput stops improving, the store or
+the network is the floor and this is the honest answer rather than a knob left unturned."*
+That is the truth for this run: it reads GCS cross-cloud over the public internet. Run it
+in-region and this is where it stops.
+
+Note `wait fetch` **rises** as the pass gets faster (14.06s at `max_inflight=1`, 15.86s at
+16). That is the summing rule, not a contradiction: 16 tiles now wait concurrently, so the
+total is task-seconds against a 1.1s wall. Read the ratios between stages, never any stage
+against the clock.
+
+| what the report shows | limiting stage | what to do |
+|---|---|---|
+| batch queue **fed** (`fed_frac` high) | `consumer` | nothing — the loader kept up and your training step is the constraint. This is the goal |
+| queue empty, `fetch_wait_s` dominant | `store` | raise `max_inflight`; check the store is in-region and on the fast backend |
+| as above, **and `inflight_peak == max_inflight`** | `store` | same, but re-measure: if throughput stops improving the network is the floor, not a knob left unturned |
+| queue empty but `consumer_s` is a few % of wall | *reported, not diagnosed* | your loop has no real training step, so the queue cannot stay fed; read throughput instead |
+| queue empty, `decode_s` / `assemble_s` dominant | `decode` | raise `decode_threads`; check the `chunk_transform` is vectorized numpy that releases the GIL |
+| queue empty, `admission_parked_s` dominant | `residency` | raise `cache_budget_bytes`, or lower `batch_size` / `block_chunks` / concurrent iterations |
+| queue empty, `gather_s` / `batch_transform_s` dominant | `gather` | check the gather run length in `describe()`, and any `batch_transform` |
+
+`residency` is only named when *nothing else* explains the pressure. Parking is
+backpressure: whatever is slow downstream holds chunks pinned until the budget fills, so a
+parked total that merely tracks another stage is a symptom. When a runner-up is large enough
+to explain it, the report names that stage instead and says why.
+
+The **residency** row is the one worth knowing exists. A budget-starved loader is otherwise
+indistinguishable from slow storage — it is exactly how the pre-#39 deadlock presented — and
+`admission_parked_s` is the only counter that tells them apart. It is the non-terminal
+neighbour of the state the loader raises `residency budget exhausted` on: same cause, caught
+before it becomes provably fatal.
+
+`limiting_stage` returns `"unknown"` rather than guessing when the evidence does not
+separate the candidates — no samples, starvation too rare to matter, or no stage owning
+enough of the accounted time. A confident wrong verdict costs more than an admission.
+
+!!! note "Two clocks, on purpose"
+
+    Waiting is measured with `perf_counter` (waiting *is* the quantity); in-thread cost is
+    measured with `thread_time` (CPU actually burned). A wall clock around a thread hop
+    measures GIL wait, not work — that is how the scatter memcpy once read as 51% of the hot
+    path when its real share is 7.7–10.1%.
+
+    So `fetch_wait_s` is summed across the tiles in flight and **will exceed wall time**.
+    Read the stages against each other, never against the clock.
+
 ## The recipe
 
 1. **At write time, pick `inner_chunks`** so a stored chunk is ~10–50 MB: small enough that
