@@ -470,9 +470,12 @@ samples in order — for eval / inference / reconstruction.)
 
 The pipeline holds two guarantees, and they are **orthogonal** — batch size touches neither:
 
-- **read-once** — a stored tile is fetched and decoded exactly once, however many samples,
-  batches, or epochs reference it (the read plan dedups; the `ChunkPool` keeps it resident;
-  gather reads from the slot).
+- **read-once** — a stored tile is fetched and decoded exactly once, however many samples
+  and batches reference it (the read plan dedups; the `ChunkPool` keeps it resident; gather
+  reads from the slot). Across **epochs** it holds only while the tile stays resident: the
+  default budget is the working set, which is read-once *per epoch*; raise
+  `cache_budget_bytes` past it and an unevicted chunk is a cross-epoch hit too
+  (see [The caching continuum](#the-caching-continuum)).
 - **sample-once** — each valid sample lands in exactly one batch.
 
 `order` is the ledger for sample-once: an `(N, 2)` array of `[chunk_id, within]`, one row per

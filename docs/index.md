@@ -22,8 +22,9 @@ resharded. See [Examples](examples.md) and the
 
 **Where it wins.** On a well-chunked store it **matches a hand-tuned worker `DataLoader`**
 (swept to its best worker count) **at a fraction of the memory** — one process, bounded
-residency, ~ms to first batch instead of seconds of pool cold-start. When the chunk layout
-**isn't sample-optimized** — fat time-chunks, overlapping windows, verification grids — it pulls
+residency, a fraction of a second to first batch instead of the seconds a worker pool spends
+starting. When the chunk layout **isn't sample-optimized** — fat time-chunks, overlapping
+windows, verification grids — it pulls
 **far ahead of even a tuned worker pool**, because read planning decodes each shared chunk once
 where per-sample workers re-read it (the win grows with samples-per-chunk). It is **not** a
 universal speed win: at the one-sample-per-chunk (GRIB) end, or against an unbounded gather on
