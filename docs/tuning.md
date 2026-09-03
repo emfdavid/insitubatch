@@ -83,6 +83,15 @@ or dataset size:
 - **Reads in flight:** `max_inflight × stored_chunk_bytes` — the fetch pipeline.
 - **Batch queue:** `prefetch_depth × batch_bytes` — assembled batches awaiting the consumer.
 
+`InSituDataset.print_summary()` evaluates all of this for *your* geometry and configuration,
+before any read happens — including the ragged multiplier below, the run length `gather` will
+get, and an estimated peak. Reach for it rather than doing the arithmetic by hand:
+
+```python
+ds = InSituDataset(store, manifest, batch_size=32, block_chunks=16)
+ds.print_summary()              # ds.print_summary(iterations=2) if you will zip two views
+```
+
 where a stored chunk is `sample_chunk × ∏inner_chunk × itemsize`, and a resident chunk is
 the **stored chunks that compose it**, held whole:
 `n_stored_chunks × stored_chunk_bytes`. That equals the logical
@@ -108,7 +117,7 @@ decoded once and reused by both. But each iteration holds its **own** references
 it is working on, so residency is the sum, not the maximum:
 
 ```
-cache_budget_bytes  >=  n_concurrent_iterations x (block_chunks x outer_chunk_bytes)
+cache_budget_bytes  >=  n_concurrent_iterations x (block_chunks x resident_chunk_bytes)
 ```
 
 **The auto-sized default is deliberately computed for one iteration, and stays that way.**
@@ -181,8 +190,9 @@ deterministic — so a scoring pass has no shuffle quality to protect.
    many reads in flight stay cheap, large enough that per-request overhead doesn't dominate.
 2. **Start with the defaults** (`max_inflight=32`, `block_chunks=16`). 32 reads in flight
    saturates in-region S3 in most cases.
-3. **Size `block_chunks` to your RAM budget** (`block_chunks × outer_chunk_bytes` ≤ what you
-   have). Which direction to push it from there is the branch below.
+3. **Size `block_chunks` to your RAM budget** (`block_chunks × resident_chunk_bytes` ≤ what
+   you have — on a ragged grid that is *more* than the outer chunk's logical size). Which
+   direction to push it from there is the branch below.
 4. **Tune `max_inflight`** by the metric your operating point cares about — raise it until
    decoded MB/s stops climbing, *and* check TTFB, because past the IO-bound region only TTFB
    keeps responding. From the repo you can measure the knee directly:

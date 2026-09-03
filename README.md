@@ -185,7 +185,7 @@ from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_
 # The engine reads a zarr Store; build one per backend. obstore_store covers
 # file://, s3://, gs://, az://. (fsspec_store reaches GCS Rapid/requester-pays;
 # arraylake_store opens an Icechunk session — same InSituDataset below.)
-store = obstore_store("file:///data/era5.zarr")  # or "s3://bucket/era5.zarr"
+store = obstore_store("gs://insitubatch-bench-insitubatch/era5_c16.zarr", skip_signature=True)
 geoms = open_geometries(store)  # {var: ArrayGeometry} from zarr metadata
 # contiguous chunk blocks by default (no time-series leakage);
 # pass contiguous=False for exchangeable samples (independent scenes)
@@ -200,6 +200,55 @@ for epoch in range(n_epochs):
     for batch in ds.val:  # deterministic; shares the pool with train
         ...
 ```
+
+That store is one of the public benchmark stores, readable by anyone
+(`gs://insitubatch-bench-insitubatch/era5_c{1,2,4,8,16,32}.zarr` — the same
+`era5_c*` chunk-size family the [benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/)
+sweep, full-resolution `721×1440` ERA5-shaped `t2m`, differing only in samples per chunk).
+
+### What it will cost, before it costs it
+
+`ds.print_summary()` answers from **geometry and configuration alone** — it opens no store,
+fetches nothing, and runs no pass. That is what makes it usable in the situation it exists
+for: finding out that a configuration needs 5 GiB, or that concurrency and memory are welded
+together by the chunk layout, *before* waiting an hour to discover it.
+
+```console
+>>> ds.print_summary()
+insitubatch dataset
+
+variables
+  t2m
+    6000x721x1440 float32   chunks 16x721x1440   sample axis 0
+    375 chunks of 16 sample(s)   field 721x1440 in 1 stored chunk(s) of 721x1440
+    stored chunk 63.4 MiB   resident per chunk 63.4 MiB   gather run 4.0 MiB
+
+configuration (resolved)
+  batch_size 32   block_chunks 16   max_inflight 32   prefetch_depth 2
+  shuffle on (seed 0, quality 0.96)   window no   shuffle pool 256 samples for a 32-sample batch
+  splits (chunks)  train 300  val 38  test 37
+  cache backing heap
+
+memory, accounted, for 1 concurrent iteration(s)
+  residency       1.98 GiB   budget (automatic: the working-set floor)
+  in flight       1.98 GiB   max_inflight x stored chunk
+  batch queue    380.2 MiB   (prefetch_depth + 1) x batch
+  accounted       4.33 GiB   sum of the rows above
+  ESTIMATED       5.41 GiB   accounted x 1.25 -- plan for this
+  ...
+
+notes
+  [t2m] one stored chunk per outer chunk at 63.4 MiB: concurrency and memory are coupled here,
+      so each of max_inflight=32 slots costs a whole chunk. Inner-chunk the field to separate
+      them.
+```
+
+The **notes** section is the part that earns the call. Here it caught the *fat, single-inner*
+regime: because the whole `721×1440` field is one stored chunk, every one of the 32 reads in
+flight costs a full 63.4 MiB — so `max_inflight` and memory are welded together, and the fix
+is at write time (inner-chunk the field), not in the loader config. `describe()` returns the
+same report as data if you would rather assert on it in CI than read it, and
+`describe(iterations=N)` sizes the budget for `N` passes sharing the pool.
 
 Hand off to a framework — **zero-copy on CPU via DLPack for torch and JAX**; TF takes one
 CPU copy (its experimental DLPack is unreliable — see `frameworks.to_tf`). The ecosystems

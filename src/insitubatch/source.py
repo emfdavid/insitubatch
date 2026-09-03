@@ -32,16 +32,18 @@ import logging
 import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
+from typing import TextIO
 
 import numpy as np
 from zarr.abc.store import Store
 
 from .buffers import HostAllocator
-from .pool import ChunkPool, output_geometry, slot_charge_bytes
+from .pool import ChunkPool, output_geometry
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
 from .store import close_store, open_geometries
+from .summary import DatasetReport, describe, print_summary, working_set_bytes
 from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRead
 
 logger = logging.getLogger(__name__)
@@ -163,6 +165,7 @@ class InSituDataset:
         # forever. Capped at the array's chunk count: no batch can span more blocks than
         # there are chunks.
         min_block_chunks = min(-(-batch_size // self._ref_spc), manifest.n_chunks)
+        self._block_chunks_requested = block_chunks  # reported by describe()
         self.block_chunks = max(block_chunks, min_block_chunks)
         if self.block_chunks != block_chunks:
             logger.info(
@@ -185,6 +188,7 @@ class InSituDataset:
         }
         self._epoch = 0
         self._persist = persist
+        self._cache_dir = cache_dir
         self.resident_peak = 0  # peak resident outer chunks (observability)
         self.cache_hits = 0  # chunks served without a fetch this epoch (cross-epoch/run)
         self.cache_misses = 0  # chunks fetched + decoded this epoch
@@ -204,65 +208,19 @@ class InSituDataset:
         # `self.block_chunks` (widened above) guarantees, and what the scheduler's
         # release bookkeeping assumes.
         #
-        # Windows widen the floor. A windowed read (any nonzero offset) crosses a chunk
-        # boundary, so an anchor chunk's read-union spans up to 2 + ceil(span/spc)
-        # chunks per variable (span = max offset - min offset); with every offset 0 the
-        # factor is 1 -- the plain 2 * block_chunks working set.
-        offsets = [g.offset for g in self.geometries.values()]
-        span = max(offsets) - min(offsets)
-        windowed = any(o != 0 for o in offsets)
-        uniform_spc = len({g.sample_chunk_size for g in self.geometries.values()}) == 1
-        # Size from the OUTPUT geometry: the pool caches post-transform chunks, so a regrid
-        # that grows (or shrinks) the data changes the resident footprint the budget must hold.
-        out_geoms = list(self._out_geometries.values())
-        geoms = list(self.geometries.values())
-
-        assembles = bool(self.chunk_transforms)
-
-        def bytes_per_chunk(g: ArrayGeometry, o: ArrayGeometry) -> int:
-            # Exactly what ChunkPool will charge -- see `slot_charge_bytes`. Sizing from the
-            # output shape while the pool charges stored tiles under-provisions the budget,
-            # and the pool then starves mid-epoch instead of merely running lean.
-            return slot_charge_bytes(g, o, assembles=assembles)
-
-        if uniform_spc:
-            # Uniform chunk size: every variable's chunk aligns to the reference grid, so a
-            # block reads exactly its own chunks. (Unchanged formula.)
-            spc0 = geoms[0].sample_chunk_size
-            window_factor = 2 + (-(-span // spc0)) if windowed else 1  # 2 + ceil(span/spc)
-            per_chunk_all_vars = sum(
-                bytes_per_chunk(g, o) for g, o in zip(geoms, out_geoms, strict=True)
-            )
-            working_set = 2 * self.block_chunks * window_factor * per_chunk_all_vars
-            if windowed and self.shuffle:
-                # Shuffle permutes chunk order, so a windowed read can spill into chunks
-                # owned by any other block: a chunk admitted early may be needed late. Until
-                # bounded residency (re-fetch the spill) lands, hold the whole split resident
-                # -- decode-once, the accepted memory cost of windows (spill to NVMe via
-                # cache_dir on large splits). Only `.train` shuffles (eval views are
-                # sequential and spill only locally), so size to the train split.
-                n_train_chunks = len(self.manifest.chunks[SplitName.TRAIN.value])
-                working_set = max(working_set, n_train_chunks * per_chunk_all_vars)
-        else:
-            # Non-uniform chunk size: a variable maps the reference anchor grid onto its own
-            # chunks, so a block touches a variable-specific chunk count. A 2-block read-ahead
-            # window of `2*block_chunks*ref_spc` anchor samples (plus the offset span) covers,
-            # per variable, ceil(window/spc)+1 of its chunks (the +1 for boundary misalignment).
-            def var_bytes(g: ArrayGeometry, o: ArrayGeometry, samples: int) -> int:
-                n_chunks = -(-(samples + span) // g.sample_chunk_size) + 1
-                return n_chunks * bytes_per_chunk(g, o)
-
-            pairs = list(zip(geoms, out_geoms, strict=True))
-            window_samples = 2 * self.block_chunks * self._ref_spc
-            working_set = sum(var_bytes(g, o, window_samples) for g, o in pairs)
-            if self.shuffle:
-                # Under shuffle a variable chunk can be needed by scattered blocks (a coarse
-                # chunk straddling reference-block boundaries) -- like a window spill -- so
-                # hold the train split resident per variable (decode-once). A tighter bound is
-                # future work; different-axis-chunking is today a modest-sized microscopy case.
-                train_samples = len(self.manifest.chunks[SplitName.TRAIN.value]) * self._ref_spc
-                train_ws = sum(var_bytes(g, o, train_samples) for g, o in pairs)
-                working_set = max(working_set, train_ws)
+        # One formula, shared with `describe()`: see summary.working_set_bytes for how
+        # windows and shuffle widen that floor, and why it charges slot_charge_bytes rather
+        # than the assembled shape. A report that predicted a different number from the one
+        # the engine uses would be worse than no report.
+        working_set = working_set_bytes(
+            [self.geometries[label] for label in self.variables],
+            [self._out_geometries[label] for label in self.variables],
+            manifest,
+            block_chunks=self.block_chunks,
+            ref_spc=self._ref_spc,
+            shuffle=self.shuffle,
+            assembles=bool(self.chunk_transforms),
+        )
         # Sized for ONE iteration, deliberately. Every active iteration shares this pool and
         # holds its own references, so N concurrent iterations need ~N x this -- but the engine
         # cannot know N, and guessing high would cost memory in the single-iteration case that
@@ -295,6 +253,20 @@ class InSituDataset:
     def set_epoch(self, epoch: int) -> None:
         """Call from the training loop so each epoch reshuffles deterministically."""
         self._epoch = epoch
+
+    def describe(self, *, iterations: int = 1) -> DatasetReport:
+        """What this dataset will do, from geometry and configuration -- no store access.
+
+        ``iterations`` is how many passes will share the pool at once (``zip(ds.train,
+        ds.val)`` is two), since each holds its own chunk references and the automatic
+        budget covers one. See :meth:`print_summary` for the formatted view, and
+        :mod:`insitubatch.summary` for what each number means.
+        """
+        return describe(self, iterations=iterations)
+
+    def print_summary(self, *, iterations: int = 1, file: TextIO | None = None) -> None:
+        """Print :meth:`describe` for a human. On demand -- construction stays quiet."""
+        print_summary(self.describe(iterations=iterations), file=file)
 
     # -- the splits, as iterables (one dataset, one shared pool) -------------
 

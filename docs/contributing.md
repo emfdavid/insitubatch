@@ -52,7 +52,7 @@ will not show up in a small test — it shows up as a lost benchmark six months 
 
 **Parallelism lives in the async event loop, not in worker processes.** The torch surface
 runs `num_workers=0, batch_size=None`. *Why:* worker processes cannot share a chunk cache,
-cannot drive async obstore, and nest thread pools inside forks.
+reach no further than one sample when fanning out reads, and nest thread pools inside forks.
 
 **`chunk_transform`s must be vectorized numpy that releases the GIL.** A pure-Python
 per-element transform is a bug, not a slow path — it serializes the decode pool and kills IO

@@ -33,6 +33,7 @@ from .store import (
     obstore_store,
     open_geometries,
 )
+from .summary import DatasetReport
 from .transforms import (
     BatchTransform,
     ChunkTransform,
@@ -55,6 +56,7 @@ __all__ = [
     "ChunkPool",
     "ChunkRead",
     "ChunkTransform",
+    "DatasetReport",
     "DecodedChunk",
     "InSituDataset",
     "Scheduler",

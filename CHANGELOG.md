@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **`InSituDataset.describe()` / `.print_summary()` — what this configuration will cost,
+  before it costs it.** The layout facts that decide whether a run is fast or twice as slow
+  were only discoverable by running it: a 360-byte gather run (1.8-2.2x on the placement
+  path), a chunk grid that does not divide the array so residency is 1.25x what the logical
+  chunk size predicts, `block_chunks` silently widened to fit a batch, a budget sized for one
+  iteration when you meant to `zip(ds.train, ds.val)`. Each of those cost someone an hour to
+  find out, and none of them needs a byte read to know. The report answers from geometry and
+  configuration alone — it opens no store and runs no pass, which is the whole point, because
+  a report that had to touch the store would be useless in exactly the situation you want it.
+  It is on demand: construction stays quiet, because layout advice on every dataset you build
+  teaches people to skim our logs.
+
+  The working-set formula the report prints is now the same function the engine sizes its
+  automatic budget with (`summary.working_set_bytes`) rather than a second copy — a report
+  that predicted a different number from the one the loader uses would be worse than none.
+  The memory block ends in an ESTIMATED row: accounted x 1.25 for glibc's retention of freed
+  slot buffers, re-measured on the chunked-slot pool (#36; it was ~1.85x before that work).
+  Runtime observability — queue depths, per-stage timing, cache hits, peak residency — is a
+  different surface with a different cost model and is tracked separately (#45).
+
 - **The pool's buffer unit is now the stored chunk, and the scheduler runs on zarr's loop.**
   Two changes that had to land together, because both rewrite `Scheduler._one`. A slot used
   to be one assembled ndarray that every decoded tile was memcpy'd into; it is now the
