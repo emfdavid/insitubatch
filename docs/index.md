@@ -47,9 +47,10 @@ an offline synthetic mode so it runs with no network or credentials. Details and
 
 The classic PyTorch `DataLoader` puts parallelism in worker **processes**, each running a
 *synchronous* `__getitem__`. Against cloud Zarr that fights itself: no shared chunk cache
-(every worker re-reads the same chunk), no way to drive async obstore, and dask thread
-pools nested inside forked workers. The usual escape — **resharding** to one-sample-per-file
-— is a second copy of the dataset that throws away the chunk locality the store already has.
+(every worker re-reads the same chunk), read concurrency that reaches no further than one
+sample, and dask thread pools nested inside forked workers. The usual escape — **resharding**
+to one-sample-per-file — is a second copy of the dataset that throws away the chunk locality
+the store already has.
 
 `insitubatch` keeps the data in place and **inverts the loader**:
 
@@ -57,8 +58,8 @@ pools nested inside forked workers. The usual escape — **resharding** to one-s
 > synchronous `__getitem__`. insitubatch: parallelism lives in **one async event loop**;
 > batch assembly is the consumer.
 
-That single move unlocks async obstore, a **shared chunk cache**, bounded memory, and
-**prefetch overlap** with the training step; torch runs `num_workers=0`.
+That single move unlocks read concurrency across a whole batch, a **shared chunk cache**,
+bounded memory, and **prefetch overlap** with the training step; torch runs `num_workers=0`.
 [Architecture](architecture.md) has the full frictions breakdown, the loader/prefetch
 diagrams, and the read-plan abstraction;
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) has the why.

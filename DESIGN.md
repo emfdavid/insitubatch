@@ -70,8 +70,10 @@ Three frictions with cloud Zarr:
 
 1. **No shared chunk cache** across workers → one chunk fetched + decompressed
    once *per worker* whose samples land in it.
-2. **Sync `getitem` can't drive async obstore** → you can't fan out 200 concurrent
-   range reads from inside a worker.
+2. **Fan-out is one sample deep** → a worker *can* drive async obstore (zarr's sync
+   API runs a process-wide event loop), but `__getitem__` returns one sample before
+   the next starts, so concurrency never spans the samples a batch needs — and the
+   budget is per-process, multiplied N times against the store.
 3. **dask thread pool nested in each worker** → procs × threads oversubscription,
    slow fork startup, fat memory.
 

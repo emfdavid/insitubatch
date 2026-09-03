@@ -35,9 +35,9 @@ spectra without building anything:
 
 The classic PyTorch `DataLoader` spreads work across worker **processes**, each
 running a *synchronous* `__getitem__`. Against cloud Zarr that means no shared
-chunk cache (every worker re-reads the same chunk), no way to drive async
-obstore, and dask thread pools nested inside forked workers. `insitubatch`
-**inverts** it: one async event loop streams stored chunks under a single
+chunk cache (every worker re-reads the same chunk), read concurrency that reaches no
+further than one sample, and dask thread pools nested inside forked workers.
+`insitubatch` **inverts** it: one async event loop streams stored chunks under a single
 concurrency budget into a bounded pool that holds them and assembles batches on
 demand — the pool doubles as the cache; torch runs `num_workers=0`.
 
