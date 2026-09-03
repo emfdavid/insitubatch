@@ -22,8 +22,9 @@ resharded. See [Examples](examples.md) and the
 
 **Where it wins.** On a well-chunked store it **matches a hand-tuned worker `DataLoader`**
 (swept to its best worker count) **at a fraction of the memory** — one process, bounded
-residency, ~ms to first batch instead of seconds of pool cold-start. When the chunk layout
-**isn't sample-optimized** — fat time-chunks, overlapping windows, verification grids — it pulls
+residency, a fraction of a second to first batch instead of the seconds a worker pool spends
+starting. When the chunk layout **isn't sample-optimized** — fat time-chunks, overlapping
+windows, verification grids — it pulls
 **far ahead of even a tuned worker pool**, because read planning decodes each shared chunk once
 where per-sample workers re-read it (the win grows with samples-per-chunk). It is **not** a
 universal speed win: at the one-sample-per-chunk (GRIB) end, or against an unbounded gather on
@@ -47,9 +48,10 @@ an offline synthetic mode so it runs with no network or credentials. Details and
 
 The classic PyTorch `DataLoader` puts parallelism in worker **processes**, each running a
 *synchronous* `__getitem__`. Against cloud Zarr that fights itself: no shared chunk cache
-(every worker re-reads the same chunk), no way to drive async obstore, and dask thread
-pools nested inside forked workers. The usual escape — **resharding** to one-sample-per-file
-— is a second copy of the dataset that throws away the chunk locality the store already has.
+(every worker re-reads the same chunk), read concurrency that reaches no further than one
+sample, and dask thread pools nested inside forked workers. The usual escape — **resharding**
+to one-sample-per-file — is a second copy of the dataset that throws away the chunk locality
+the store already has.
 
 `insitubatch` keeps the data in place and **inverts the loader**:
 
@@ -57,8 +59,8 @@ pools nested inside forked workers. The usual escape — **resharding** to one-s
 > synchronous `__getitem__`. insitubatch: parallelism lives in **one async event loop**;
 > batch assembly is the consumer.
 
-That single move unlocks async obstore, a **shared chunk cache**, bounded memory, and
-**prefetch overlap** with the training step; torch runs `num_workers=0`.
+That single move unlocks read concurrency across a whole batch, a **shared chunk cache**,
+bounded memory, and **prefetch overlap** with the training step; torch runs `num_workers=0`.
 [Architecture](architecture.md) has the full frictions breakdown, the loader/prefetch
 diagrams, and the read-plan abstraction;
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md) has the why.

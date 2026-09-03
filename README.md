@@ -35,19 +35,19 @@ spectra without building anything:
 
 The classic PyTorch `DataLoader` spreads work across worker **processes**, each
 running a *synchronous* `__getitem__`. Against cloud Zarr that means no shared
-chunk cache (every worker re-reads the same chunk), no way to drive async
-obstore, and dask thread pools nested inside forked workers. `insitubatch`
-**inverts** it: one async event loop streams stored chunks under a single
+chunk cache (every worker re-reads the same chunk), read concurrency that reaches no
+further than one sample, and dask thread pools nested inside forked workers.
+`insitubatch` **inverts** it: one async event loop streams stored chunks under a single
 concurrency budget into a bounded pool that holds them and assembles batches on
 demand — the pool doubles as the cache; torch runs `num_workers=0`.
 
 The payoff is a **two-regime** story against the worker-process `DataLoader`. On a
 **well-chunked** store it **matches a hand-tuned worker/xbatcher pool** (swept to 32 workers)
-while running in **one process at bounded memory**, reaching first batch in ~ms rather than
-seconds of pool cold-start. When the chunk layout **isn't sample-optimized** — fat time-chunks,
-overlapping windows, verification grids — it pulls **far ahead of even a tuned pool**: read
-planning decodes each shared chunk **once** where a per-sample `__getitem__` re-reads it, so the
-win **grows with samples-per-chunk** (to ~25× at the fat end of the ERA5 sweep) and cross-epoch
+while running in **one process at bounded memory**, reaching first batch in a fraction of a
+second rather than the seconds a worker pool spends starting. When the chunk layout **isn't
+sample-optimized** — fat time-chunks, overlapping windows, verification grids — it pulls
+**far ahead of even a tuned pool**: read planning decodes each shared chunk **once** where a
+per-sample `__getitem__` re-reads it, so the win **grows with samples-per-chunk** (to ~25× at the fat end of the ERA5 sweep) and cross-epoch
 caching compounds it. The **honest boundary**: at the one-sample-per-chunk (GRIB) end there is
 nothing to amortize, so a tuned pool edges ahead on single-pass throughput, and against an
 *unbounded* concurrent gather on large fields bounded-inflight streaming trails per byte — the
@@ -57,11 +57,14 @@ sweet spot is streaming with bounded memory, not a universal speed win. Full com
 ## Status
 
 🚧 **alpha, but validated on real cloud IO.** On an in-region S3 run
-(`c6id.8xlarge`, ERA5-shaped `721×1440` fields, `sample_chunk=8`), insitubatch
-delivers **~8× the throughput** of a *tuned* `xbatcher`/worker `DataLoader`
-baseline (swept to 32 workers) and reaches its first batch **~10× sooner** — the
+(`c6id.8xlarge`, 32 vCPU, coarsened ERA5 `361×720` fields), at fat chunks
+(`sample_chunk=16`) insitubatch delivers **~19× the throughput** of a *tuned*
+`xbatcher`/worker `DataLoader` baseline (swept to 32 workers), in **~8× less
+memory**, and reaches its first batch **~22× sooner** (0.7 s vs 15.6 s) — the
 map-style baseline re-decodes a whole chunk per sample; insitubatch reads each
-chunk once. Full numbers + methodology:
+chunk once. That is the *fat* end of the sweep, where the advantage is largest;
+at one sample per chunk there is nothing to amortize and a tuned pool edges ahead
+on single-pass throughput. Full numbers + methodology:
 [the benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/).
 
 The engine is the **decoupled fetch scheduler**: reads flatten to *stored chunks*
@@ -130,11 +133,19 @@ the same is enforced in CI.
 
 ### Free-threaded (3.13t)
 
-The engine is free-threading-correct by construction: a delivering thread does its
+The `ChunkPool` is free-threading-correct **by construction**: a delivering thread does its
 write **before** the lock — each tile is its own key, so writers never collide — and
 publishes readiness **under** it, so the lock, not the GIL, is the happens-before edge
 to the consuming gather. The race probe is
 `test_pool_concurrent_scatter_is_race_free` (64 tiles, 32 threads).
+
+The batch-buffer pool is *enforced* rather than structural, and the distinction is worth
+knowing: it decides a buffer is free by reading `sys.getrefcount` on the buffer's owner
+against a calibrated idle baseline, and a refcount read off-GIL can be stale. Reading
+*high* only wastes a buffer (the pool allocates another). Reading *low* would hand live
+memory to a second writer, so the pool treats a below-baseline count as impossible and
+**raises** rather than lending — see `buffers.py`. That guard is what makes the mechanism
+safe on 3.13t; it is not the same claim as the pool scatter's.
 
 Run the suite GIL-free on a free-threaded interpreter:
 

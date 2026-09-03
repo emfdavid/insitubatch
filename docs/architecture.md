@@ -10,7 +10,8 @@ how downstream frameworks integrate. For the why behind the project see
 Classic `DataLoader`: parallelism lives in **`num_workers` OS processes**, each
 running a *synchronous* `__getitem__`. insitubatch: parallelism lives in **one
 async event loop**; batch assembly is the consumer. That move is what unlocks
-async obstore, a shared chunk cache, bounded memory, and prefetch overlap.
+read concurrency across a whole batch, a shared chunk cache, bounded memory, and
+prefetch overlap.
 
 ## Classic worker-based loader
 
@@ -36,8 +37,10 @@ Frictions against cloud ndim zarr:
 
 - **No shared chunk cache** — a chunk is fetched + decompressed once *per worker*
   whose samples land in it.
-- **Sync `getitem` can't drive async obstore** — no way to fan out concurrent
-  range reads from inside a worker.
+- **Fan-out is one sample deep** — a worker *can* drive async obstore (zarr's sync
+  API runs a process-wide event loop), but `__getitem__` returns one sample before
+  the next starts, so concurrency never spans the samples a batch needs, and the
+  budget is per-process, multiplied N times against the store.
 - **dask thread pool nested in each worker** — procs × threads oversubscription,
   slow fork startup, fat memory.
 - **The fork-safety tax** — a modern object store (obstore) runs a Rust **tokio**
@@ -56,7 +59,7 @@ Frictions against cloud ndim zarr:
   we prefetch is.
 
 > **Why this is the argument for the single loop.** Every friction above — no
-> shared cache, sync IO that can't drive obstore, thread oversubscription, the
+> shared cache, per-sample fan-out, thread oversubscription, the
 > fork-safety tax — follows from putting parallelism in OS *processes*.
 > insitubatch drives one in-process event loop (`num_workers=0`): there is no
 > fork, so there is no fork-safety tax, no per-worker runtime to relaunch, and the
@@ -123,13 +126,17 @@ and amortized across every sample that touches it; **read concurrency
 total memory is the budget + the prefetch queue (depth `d`) + the in-flight tiles —
 every term a tunable cap, none scaling with batch size or epoch length.
 
-The batch buffers themselves are **not** pooled: `gather` allocates a fresh array per
-batch (the DLPack export aliases it into the consumer's tensor, so safe reuse would
-need lifetime tracking against the prefetch window), and host memory is **not pinned**
-yet, so host→device copies are pageable. Both are one deferred fix — a small ring of
-pre-pinned buffers (depth ≈ `prefetch_depth`) reused round-robin, which kills the
-per-batch allocation *and* enables `non_blocking` transfer together. See Known
-limitations in
+The batch buffers are **pooled** too, on different machinery: `gather` takes one from a
+reuse pool that allocates on a miss and reclaims a buffer once nothing outside the pool
+references it. Lifetime tracking is what makes that safe against the DLPack export, which
+aliases the buffer into the consumer's tensor — so *retaining a batch retains its buffer*
+automatically and the pool just allocates elsewhere. There is no depth parameter (it
+converges on however many buffers are genuinely in flight) and a short final batch is a
+prefix view, costing neither an allocation nor a copy. `INSITUBATCH_NO_BUFFER_REUSE` is the
+escape hatch back to one fresh array per batch. Host memory is pageable by default;
+`as_torch(view, device=...)` swaps in a page-locked allocator, which is what makes the H2D
+copy genuinely asynchronous — pinning is coupled to `device` on purpose, since it is only
+safe when whoever issues the copy also knows when it landed. See Known limitations in
 [DESIGN.md](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#known-limitations--defects).
 
 ### One event loop, one decode pool
@@ -463,9 +470,12 @@ samples in order — for eval / inference / reconstruction.)
 
 The pipeline holds two guarantees, and they are **orthogonal** — batch size touches neither:
 
-- **read-once** — a stored tile is fetched and decoded exactly once, however many samples,
-  batches, or epochs reference it (the read plan dedups; the `ChunkPool` keeps it resident;
-  gather reads from the slot).
+- **read-once** — a stored tile is fetched and decoded exactly once, however many samples
+  and batches reference it (the read plan dedups; the `ChunkPool` keeps it resident; gather
+  reads from the slot). Across **epochs** it holds only while the tile stays resident: the
+  default budget is the working set, which is read-once *per epoch*; raise
+  `cache_budget_bytes` past it and an unevicted chunk is a cross-epoch hit too
+  (see [The caching continuum](#the-caching-continuum)).
 - **sample-once** — each valid sample lands in exactly one batch.
 
 `order` is the ledger for sample-once: an `(N, 2)` array of `[chunk_id, within]`, one row per
@@ -833,7 +843,7 @@ shortcut: it is exactly what lets xbatcher's cache survive process exit today.
 | dimension | insitubatch — chunk pool | xbatcher — batch cache |
 |---|---|---|
 | unit cached | decoded + chunk-transformed **chunk** (deduped) | **assembled batch**, in batch layout |
-| extra copy | none — `gather` views the slot in place | a separate materialized copy |
+| extra copy | none beyond the batch — `gather` copies rows from the slot straight into it | the batch, **plus** a separate materialized copy in the cache |
 | key | `(array, chunk_index)` | batch index → zarr store |
 | backing | heap or mmap'd `.npy` (reclaimable NVMe page cache) | zarr store (local dir or cloud) |
 | cross-epoch reuse | intrinsic (just don't evict) | yes |
@@ -842,7 +852,7 @@ shortcut: it is exactly what lets xbatcher's cache survive process exit today.
 | sweet spot | many samples per chunk, fat-chunk, multi-epoch, scoring reuse | one-sample-per-chunk, stable batch defs reused across runs |
 
 Both persist across runs now; the distinction is the **unit**. insitu caches deduped
-decoded chunks (no second copy, `gather` views the slot in place) and keeps a stronger
+decoded chunks (stored once, with nothing staged between slot and batch) and keeps a stronger
 per-epoch shuffle because the cache is *upstream* of shuffling; xbatcher caches
 materialized batches with frozen composition. Pick by regime, not by a missing feature.
 
@@ -907,8 +917,9 @@ isn't working is loud, not silent.
 - The cache key is `(array_path, global chunk_index)` — the *absolute* zarr chunk index,
   not relative to a split or `sample_range`. So overlapping subsets/splits and a later
   fuller run **share** entries: chunk 5 is always the same `.npy`.
-- A hit returns the **prepped** chunk (post-`chunk_transform`), no copy — `gather` views
-  the slot in place.
+- A hit returns the **prepped** chunk (post-`chunk_transform`): no fetch, no decode, no
+  transform. `gather` copies its rows straight into the batch, with nothing staged in
+  between.
 - **Crash-safe:** each *completed* chunk is appended to the log as it finishes (flushed to
   the OS page cache, which survives process death), so a killed run keeps everything it
   decoded. The log is self-deduplicating (a re-completed chunk across epochs/runs is not
