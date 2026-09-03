@@ -22,7 +22,14 @@ from insitubatch import (
     open_geometries,
     split_by_chunk,
 )
-from insitubatch.runtime import DOMINANT, FULL_ENOUGH, STARVED_ENOUGH, StatsCollector, format_pass
+from insitubatch.runtime import (
+    DOMINANT,
+    FULL_ENOUGH,
+    SEPARATION,
+    STARVED_ENOUGH,
+    StatsCollector,
+    format_pass,
+)
 
 
 def _stats(**kw) -> PassStats:
@@ -99,15 +106,48 @@ def test_residency_starvation_is_distinguishable_from_slow_storage():
 def test_a_spread_cost_admits_it_rather_than_picking_one():
     """No stage dominant -> "unknown". A confident wrong answer tunes the wrong knob."""
     starved = {"batch_queue_capacity": 2, "batch_queue_samples": 100, "batch_queue_empty": 90}
-    even = dict.fromkeys(("fetch_wait_s", "decode_s", "gather_s", "batch_transform_s"), 1.0)
+    even = dict.fromkeys(("fetch_wait_s", "decode_s", "gather_s"), 1.0)
     stage, why = bottleneck(_stats(depths=starved, times=even))
     assert stage == "unknown"
     assert "spread" in why
 
 
+def test_two_near_tied_stages_are_reported_as_a_tie():
+    """The real numbers that caught this: both clear DOMINANT, 2.6% apart.
+
+    From an actual under-configured pass (max_inflight=1, chunk-per-sample store). Ranking
+    on DOMINANT alone, both stages clear it and the winner is decided by tie-break order --
+    a coin flip wearing a diagnosis. Fixing either alone just moves the pass to the other.
+    """
+    starved = {"batch_queue_capacity": 2, "batch_queue_samples": 100, "batch_queue_empty": 100}
+    stats = _stats(
+        depths=starved,
+        times={
+            "admission_parked_s": 23.26,
+            "fetch_wait_s": 22.05,
+            "decode_s": 1.16,
+            "gather_s": 0.35,
+        },
+    )
+    stage, why = bottleneck(stats)
+    assert stage == "unknown"
+    assert "residency" in why and "store" in why
+    assert "Address them together" in why
+
+
+def test_a_stage_does_not_lose_to_itself():
+    """decode and gather each have two timers; they must be summed before ranking."""
+    starved = {"batch_queue_capacity": 2, "batch_queue_samples": 100, "batch_queue_empty": 90}
+    # Split across gather's two timers, each individually below the store's single one.
+    stats = _stats(
+        depths=starved, times={"gather_s": 3.0, "batch_transform_s": 3.0, "fetch_wait_s": 4.0}
+    )
+    assert bottleneck(stats)[0] == "gather"
+
+
 def test_thresholds_are_the_documented_ones():
     # Guards the constants against a silent retune: they are load-bearing for every verdict.
-    assert (FULL_ENOUGH, STARVED_ENOUGH, DOMINANT) == (0.5, 0.2, 0.4)
+    assert (FULL_ENOUGH, STARVED_ENOUGH, DOMINANT, SEPARATION) == (0.5, 0.2, 0.4, 0.1)
 
 
 # -- the collector ----------------------------------------------------------------
@@ -222,3 +262,28 @@ def test_format_pass_survives_an_unbounded_budget():
     # budget_bytes is None for an unbounded pool; the formatter must not divide by it.
     line = format_pass(_stats(depths={"batch_queue_samples": 1, "budget_bytes": None}))
     assert "unbounded" in line
+
+
+def test_an_abandoned_pass_still_reports(write_zarr):
+    """A `break` out of the loop must still leave a report behind.
+
+    Found by writing the tuning-guide example. The report used to be built *after* the
+    `with`, and an early break throws GeneratorExit at the yield: it unwinds through the
+    `with` (so the scheduler closed correctly) but skipped everything that merely followed
+    it, leaving `last_pass` as None. Backwards -- a pass you abandoned is usually one you
+    abandoned *because* it was slow, which is exactly when you want the diagnosis.
+    """
+    url, _ = write_zarr(n=160, spc=8)
+    store = obstore_store(url)
+    geoms = open_geometries(store)
+    manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
+    ds = InSituDataset(store, manifest, batch_size=8, block_chunks=4)
+
+    for i, _ in enumerate(ds.train):
+        if i == 1:
+            break
+
+    st = ds.last_pass
+    assert st is not None
+    assert st.batches == 2  # only what the consumer actually took
+    assert st.depths.max_inflight == ds.scheduler_config.max_inflight

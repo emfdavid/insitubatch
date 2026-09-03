@@ -204,6 +204,67 @@ Or read it from the per-epoch log line
 (`logging.getLogger("insitubatch").setLevel(logging.INFO)`), which ends in
 `limited by: <stage> -- <what to do>`.
 
+### Try it: a misconfigured loader that diagnoses itself
+
+This runs as written — the store is one of the public benchmark stores, no credentials and
+no build step. `era5_c1` is the chunk-per-sample (GRIB-like) end of the family: 6000 full
+`721x1440` fields, one per chunk.
+
+```python
+import logging
+
+from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_chunk
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+store = obstore_store(
+    "gs://insitubatch-bench-insitubatch/era5_c1.zarr", skip_signature=True
+)
+geoms = open_geometries(store)
+manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
+
+# max_inflight=1 is the mistake. One read at a time against an object store.
+ds = InSituDataset(store, manifest, batch_size=16, block_chunks=8, max_inflight=1)
+
+for i, batch in enumerate(ds.train):
+    if i == 9:
+        break
+```
+
+```
+epoch 0 (train): 10 batches in 11.1s | queue 0/2 (empty 100%, fed 0%)
+  | inflight peak 1/1 | decode peak 1/12 | resident 32 chunks, 127 MiB of 127 MiB
+  | wait fetch 9.96s, parked 11.01s | cpu decode 1.01s, gather 0.31s
+  | limited by: unknown -- residency (49%) and store (45%) are within 10% of each
+    other: this pass is limited by both, and fixing either alone moves it to the
+    other. Address them together.
+```
+
+Read what it actually says. The queue was empty on **every** sample, so the loader never
+kept up — but it declines to name one stage, because two are within 10% of each other. That
+is not the report hedging: with one read in flight, chunks are fetched slowly and therefore
+sit resident longer, so the budget stays exactly full (`127 MiB of 127 MiB`) and admission
+parks. The two stages are causally coupled, and `max_inflight` is upstream of both.
+
+Delete `max_inflight=1` and run it again:
+
+```
+epoch 0 (train): 10 batches in 1.4s | queue 0/2 (empty 100%, fed 0%)
+  | inflight peak 32/32 | decode peak 17/12 | resident 32 chunks, 127 MiB of 127 MiB
+  | wait fetch 14.70s, parked 1.25s | cpu decode 1.50s, gather 0.38s
+  | limited by: store -- the loader waited on the store. Raise max_inflight, and
+    check the store is in-region and the backend is the fast one for it.
+```
+
+**8x faster**, and `parked` collapsed from 11.01s to 1.25s — the residency pressure was a
+symptom, not the disease. The verdict is now cleanly `store`, which for this run is the
+truth and not a further mistake: it is reading GCS cross-cloud over the public internet, so
+the network genuinely is the floor. Run it in-region and this is where it stops.
+
+Note `wait fetch` **rose** to 14.70s while the pass got 8x faster. That is the summing rule,
+not a contradiction: 32 tiles now wait concurrently, so the total is task-seconds against a
+1.4s wall. It is the ratio between stages that carries the meaning.
+
 | what the report shows | limiting stage | what to do |
 |---|---|---|
 | batch queue **fed** (`fed_frac` high) | `consumer` | nothing — the loader kept up and your training step is the constraint. This is the goal |

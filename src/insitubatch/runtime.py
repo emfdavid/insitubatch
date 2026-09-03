@@ -44,10 +44,15 @@ FULL_ENOUGH = 0.5
 # that rare is noise, and naming a stage for it is how a report loses its authority.
 STARVED_ENOUGH = 0.2
 
-# A stage must own this share of the accounted producer time before it is named. Two
-# stages within this of each other is a genuine tie, and saying so beats a coin flip
-# dressed as a diagnosis.
+# A stage must own this share of the accounted producer time before it is named.
 DOMINANT = 0.4
+
+# ...and must beat the runner-up by this share of the total. Without it, two stages at 50%
+# and 47% both clear DOMINANT and the winner is decided by tie-break order -- which is a
+# coin flip wearing a diagnosis. Measured against a real under-configured pass (max_inflight=1
+# on a chunk-per-sample store): parked 23.3s vs fetch 22.1s, 2.6% apart. Naming either one
+# would have sent someone to turn a knob that was half the problem at most.
+SEPARATION = 0.1
 
 
 @dataclass(frozen=True)
@@ -163,23 +168,33 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
     total = t.producer_s
     if total <= 0:
         return "unknown", "the queue ran empty but no stage time was accounted."
-    ranked = sorted(
-        (
-            (t.admission_parked_s, "residency"),
-            (t.fetch_wait_s, "store"),
-            (t.decode_s, "decode"),
-            (t.assemble_s, "decode"),
-            (t.gather_s, "gather"),
-            (t.batch_transform_s, "gather"),
-        ),
-        reverse=True,
-    )
-    top_s, top = ranked[0]
+    # Aggregate by stage first: decode and gather each have two timers, and ranking the
+    # timers rather than the stages would let a stage lose to itself.
+    by_stage: dict[str, float] = {}
+    for secs, name in (
+        (t.admission_parked_s, "residency"),
+        (t.fetch_wait_s, "store"),
+        (t.decode_s, "decode"),
+        (t.assemble_s, "decode"),
+        (t.gather_s, "gather"),
+        (t.batch_transform_s, "gather"),
+    ):
+        by_stage[name] = by_stage.get(name, 0.0) + secs
+    ranked = sorted(by_stage.items(), key=lambda kv: kv[1], reverse=True)
+    top, top_s = ranked[0]
+    runner, runner_s = ranked[1] if len(ranked) > 1 else ("", 0.0)
     if top_s / total < DOMINANT:
         return (
             "unknown",
             f"the queue ran empty but no stage owned more than {top_s / total:.0%} of "
             "accounted time: the cost is spread, so there is no single knob to turn.",
+        )
+    if (top_s - runner_s) / total < SEPARATION:
+        return (
+            "unknown",
+            f"{top} ({top_s / total:.0%}) and {runner} ({runner_s / total:.0%}) are within "
+            f"{SEPARATION:.0%} of each other: this pass is limited by both, and fixing "
+            "either alone moves it to the other. Address them together.",
         )
     advice: dict[str, str] = {
         "residency": (

@@ -26,6 +26,14 @@
   worse than no timer: it sends people to optimize a stage that was never the problem.
   `fetch_wait_s` is therefore summed across tiles in flight and exceeds wall time by design.
 
+  The verdict names a stage only when one is *both* dominant and clearly ahead of the
+  runner-up. Writing the tuning guide's example is what caught the difference: a real
+  under-configured pass came back parked 23.3s against fetch 22.1s -- two stages 2.6% apart,
+  where ranking on dominance alone picks a winner by tie-break order and sends someone to
+  turn a knob that was half the problem at most. Near-ties are now reported as ties, which
+  in that example is the true answer: one read in flight makes chunks sit resident longer,
+  so the budget stays full and `max_inflight` is upstream of both.
+
   **The collector takes no lock.** Every counter has exactly one writing thread, and decode
   — the one stage that runs on the pool's threads — measures its own `thread_time` and
   *returns* it, so the add happens back on the loop. Measured cost, interleaved against

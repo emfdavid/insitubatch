@@ -388,6 +388,11 @@ class InSituDataset:
         # only after `producer.join()` and the scheduler's `close()` have published them.
         stats = StatsCollector(queue_capacity=self.prefetch_depth)
         wall0 = time.perf_counter()
+        batches = 0
+        depths = Depths(
+            batch_queue_capacity=self.prefetch_depth,
+            max_inflight=self.scheduler_config.max_inflight,
+        )
 
         # Per-block read-union keys (path, chunk) -- what each block reads across all
         # variables' offsets. A windowed read can spill into chunks owned by any other
@@ -464,98 +469,106 @@ class InSituDataset:
             finally:
                 out_q.put(self._SENTINEL)
 
-        with Scheduler(
-            self.store,
-            self.geometries,
-            self._pool,
-            self.scheduler_config,
-            owner=owner,
-            stats=stats,
-        ) as sched:
-            producer = threading.Thread(
-                target=produce, args=(sched,), name="insitu-prefetch", daemon=True
-            )
-            producer.start()
-            batches = 0
-            try:
-                while True:
-                    # Sample before the get: qsize() after it has already been decremented
-                    # by our own take, which would report every healthy queue as one short.
-                    stats.sample_queue(out_q.qsize())
-                    item = out_q.get()
-                    if item is self._SENTINEL:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
-                    batches += 1
-                    yield item
-            finally:
-                # Signal stop, then drain so a producer parked on a full queue can
-                # proceed and exit before the scheduler (context manager) is closed.
-                stop.set()
-                while producer.is_alive():
-                    with contextlib.suppress(queue.Empty):
-                        out_q.get(timeout=0.05)
-                producer.join(timeout=10)  # publishes the producer's stage timers
-                pool = sched.pool
-                self.resident_peak = pool.max_resident  # peak residency this epoch
-                self.cache_hits = pool.hits
-                self.cache_misses = pool.misses
-                self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
-                # Was unreachable before: it lives on the Scheduler, which is created inside
-                # this method and torn down with the pass, so unlike the three above nothing
-                # ever copied it out.
-                self.inflight_peak = sched.inflight_peak
-                depths = Depths(
-                    batch_queue_capacity=stats.queue_capacity,
-                    batch_queue_peak=stats.queue_peak,
-                    batch_queue_samples=stats.queue_samples,
-                    batch_queue_empty=stats.queue_empty,
-                    batch_queue_full_enough=stats.queue_full_enough,
-                    inflight_peak=sched.inflight_peak,
-                    max_inflight=self.scheduler_config.max_inflight,
-                    decode_queue_peak=stats.decode_queue_peak,
-                    decode_threads=sched.decode_threads,
-                    resident_peak=pool.max_resident,
-                    resident_peak_bytes=pool.max_resident_bytes,
-                    budget_bytes=pool.budget_bytes,
+        try:
+            with Scheduler(
+                self.store,
+                self.geometries,
+                self._pool,
+                self.scheduler_config,
+                owner=owner,
+                stats=stats,
+            ) as sched:
+                producer = threading.Thread(
+                    target=produce, args=(sched,), name="insitu-prefetch", daemon=True
                 )
-                self._log_epoch_summary(pool, split)
-                # Persistence was asked for but served nothing, and the cache *was*
-                # consulted (entries existed and every revive failed) -> almost certainly
-                # a stale cache_dir or changed data/transforms. Loud once per epoch; a
-                # plain miss (no persisted entry for a chunk) is silent (normal).
-                failed_revives = pool.revive_mismatch + pool.revive_missing
-                if self._persist and pool.hits == 0 and failed_revives:
-                    logger.warning(
-                        "persist=True but 0 of %d persisted chunks were served this epoch "
-                        "(%d shape/dtype mismatches, %d missing/unreadable) -- stale cache_dir "
-                        "or changed data/transforms?",
-                        pool.manifest_entries,
-                        pool.revive_mismatch,
-                        pool.revive_missing,
+                producer.start()
+                try:
+                    while True:
+                        # Sample before the get: qsize() after it has already been decremented
+                        # by our own take, which would report every healthy queue as one short.
+                        stats.sample_queue(out_q.qsize())
+                        item = out_q.get()
+                        if item is self._SENTINEL:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        batches += 1
+                        yield item
+                finally:
+                    # Signal stop, then drain so a producer parked on a full queue can
+                    # proceed and exit before the scheduler (context manager) is closed.
+                    stop.set()
+                    while producer.is_alive():
+                        with contextlib.suppress(queue.Empty):
+                            out_q.get(timeout=0.05)
+                    producer.join(timeout=10)  # publishes the producer's stage timers
+                    pool = sched.pool
+                    self.resident_peak = pool.max_resident  # peak residency this epoch
+                    self.cache_hits = pool.hits
+                    self.cache_misses = pool.misses
+                    self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
+                    # Was unreachable before: it lives on the Scheduler, which is created inside
+                    # this method and torn down with the pass, so unlike the three above nothing
+                    # ever copied it out.
+                    self.inflight_peak = sched.inflight_peak
+                    depths = Depths(
+                        batch_queue_capacity=stats.queue_capacity,
+                        batch_queue_peak=stats.queue_peak,
+                        batch_queue_samples=stats.queue_samples,
+                        batch_queue_empty=stats.queue_empty,
+                        batch_queue_full_enough=stats.queue_full_enough,
+                        inflight_peak=sched.inflight_peak,
+                        max_inflight=self.scheduler_config.max_inflight,
+                        decode_queue_peak=stats.decode_queue_peak,
+                        decode_threads=sched.decode_threads,
+                        resident_peak=pool.max_resident,
+                        resident_peak_bytes=pool.max_resident_bytes,
+                        budget_bytes=pool.budget_bytes,
                     )
-                # Last: drop this pass's references (and any partial its cancelled
-                # fetches abandoned), after every counter above has been read. An
-                # early `break` finalizes this generator, so this runs then too --
-                # which is what keeps an abandoned pass from leaking budget.
-                self._pool.release_owner(owner)
-        # OUTSIDE the `with`: the scheduler is closed, so every counter the event loop owns
-        # has been published to us. Reading the stage timers inside it would race the tiles
-        # still finishing -- the producer is joined by then, but the loop is not.
-        self.last_pass = PassStats(
-            split="all" if split is None else split.value,
-            epoch=self._epoch,
-            batches=batches,
-            cache_hits=self.cache_hits,
-            cache_misses=self.cache_misses,
-            bad_chunks=len(self.bad_chunks),
-            wall_s=time.perf_counter() - wall0,
-            times=stats.times(),
-            depths=depths,
-        )
-        if logger.isEnabledFor(logging.INFO):
-            logger.info("%s", format_pass(self.last_pass))
+                    self._log_epoch_summary(pool, split)
+                    # Persistence was asked for but served nothing, and the cache *was*
+                    # consulted (entries existed and every revive failed) -> almost certainly
+                    # a stale cache_dir or changed data/transforms. Loud once per epoch; a
+                    # plain miss (no persisted entry for a chunk) is silent (normal).
+                    failed_revives = pool.revive_mismatch + pool.revive_missing
+                    if self._persist and pool.hits == 0 and failed_revives:
+                        logger.warning(
+                            "persist=True but 0 of %d persisted chunks were served this epoch "
+                            "(%d shape/dtype mismatches, %d missing/unreadable) -- stale cache_dir "
+                            "or changed data/transforms?",
+                            pool.manifest_entries,
+                            pool.revive_mismatch,
+                            pool.revive_missing,
+                        )
+                    # Last: drop this pass's references (and any partial its cancelled
+                    # fetches abandoned), after every counter above has been read. An
+                    # early `break` finalizes this generator, so this runs then too --
+                    # which is what keeps an abandoned pass from leaking budget.
+                    self._pool.release_owner(owner)
+        finally:
+            # A `finally` around the `with`, not a statement after it: an early `break`
+            # throws GeneratorExit at the yield, which unwinds through the `with` (so the
+            # scheduler still closes) but would skip anything that merely followed it. The
+            # abandoned pass is the one most worth a report -- it is usually abandoned
+            # *because* it was slow.
+            #
+            # Here rather than in the inner teardown because only the scheduler's close()
+            # publishes the counters the event loop owns; the producer's are already
+            # published by its join(). Reading them inside would race the tiles still
+            # finishing.
+            self.last_pass = PassStats(
+                split="all" if split is None else split.value,
+                epoch=self._epoch,
+                batches=batches,
+                cache_hits=self.cache_hits,
+                cache_misses=self.cache_misses,
+                bad_chunks=len(self.bad_chunks),
+                wall_s=time.perf_counter() - wall0,
+                times=stats.times(),
+                depths=depths,
+            )
+            if logger.isEnabledFor(logging.INFO):
+                logger.info("%s", format_pass(self.last_pass))
 
     def _log_epoch_summary(self, pool: ChunkPool, split: SplitName | None) -> None:
         """One INFO line per epoch *per split*: what the chunk cache and the batch buffers did.
