@@ -34,6 +34,18 @@
   in that example is the true answer: one read in flight makes chunks sit resident longer,
   so the budget stays full and `max_inflight` is upstream of both.
 
+  Provoking each verdict against a real store — rather than only against constructed
+  stats — found two more. `assemble_s` was undercounting the `chunk_transform` by ~8x
+  (0.21s recorded against 1.62s actually spent), because `x += await f()` loads the target
+  *before* evaluating the right-hand side: the await suspends between the load and the
+  store, and concurrent tile tasks each write back a value read before the others ran.
+  Single-writer means no await between load and store, not merely one thread. And
+  `residency` now yields a near-tie rather than winning it, because parking is
+  backpressure: any slow stage downstream keeps chunks pinned until the budget fills.
+  Measured twice — `max_inflight=1` gave residency 49% / store 45%, a heavy
+  `batch_transform` gave residency 49% / gather 45% — and both times raising the budget
+  would have fixed nothing.
+
   **The collector takes no lock.** Every counter has exactly one writing thread, and decode
   — the one stage that runs on the pool's threads — measures its own `thread_time` and
   *returns* it, so the add happens back on the loop. Measured cost, interleaved against

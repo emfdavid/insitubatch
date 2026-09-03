@@ -19,7 +19,17 @@ the hot path when its real share is 7.7-10.1%. So:
 * **waiting** uses :func:`time.perf_counter`, because there the waiting *is* the quantity.
 
 A stage timer that over-attributes is worse than no timer: it sends people to optimize a
-stage that was never the problem.
+stage that was never the problem. The same rule bites inside a coroutine: ``x += await f()``
+loads ``x`` *before* evaluating the right-hand side, so the await suspends between the load
+and the store and concurrent tasks lose each other's updates. Bind the cost to a local
+first. Single-writer means no await between load and store, not merely one thread.
+
+**Why ``residency`` rarely wins on its own.** Admission parking is backpressure: any slow
+stage downstream keeps chunks pinned, the budget fills, and admission parks behind it. So a
+budget that is genuinely too small sits in a narrow band between two neighbours -- a tie
+with the stage actually causing the pressure (where :func:`bottleneck` names that stage),
+and the provably-terminal stall the pool raises ``residency budget exhausted`` on. The value
+of ``admission_parked_s`` is mostly in telling those two apart, which nothing else can.
 
 **Wait totals are summed across concurrent tasks and will exceed wall time.** Many tiles
 are in flight at once, so `fetch_wait_s` is task-seconds, not a share of the pass. Divide
@@ -190,13 +200,34 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
             "accounted time: the cost is spread, so there is no single knob to turn.",
         )
     if (top_s - runner_s) / total < SEPARATION:
+        # Residency loses a near-tie, because parking is *backpressure*: any slow stage
+        # downstream keeps chunks pinned, the budget fills, and admission parks behind it.
+        # Measured twice on real passes -- max_inflight=1 gave residency 49% / store 45%,
+        # and a heavy batch_transform gave residency 49% / gather 45% -- and both times the
+        # other stage was the cause and raising the budget would have fixed neither.
+        # Residency is named only when it wins outright, which is the case where nothing
+        # downstream is slow enough to explain the pressure.
+        if top == "residency":
+            return (
+                runner,  # type: ignore[return-value]
+                f"{advice_for(runner)} ({runner_s / total:.0%} of accounted time). Admission "
+                f"also parked on the residency budget ({top_s / total:.0%}), but that is "
+                "most likely backpressure from this stage rather than a budget that is too "
+                "small: chunks stay pinned while a slow stage drains them. Fix this first "
+                "and check whether the parking goes with it.",
+            )
         return (
             "unknown",
             f"{top} ({top_s / total:.0%}) and {runner} ({runner_s / total:.0%}) are within "
             f"{SEPARATION:.0%} of each other: this pass is limited by both, and fixing "
             "either alone moves it to the other. Address them together.",
         )
-    advice: dict[str, str] = {
+    return top, advice_for(top)  # type: ignore[return-value]
+
+
+def advice_for(stage: str) -> str:
+    """What to do about ``stage``, in one sentence the log line can carry."""
+    advice = {
         "residency": (
             "admission parked on the residency budget: the pool could not allocate the "
             "next chunk. Raise cache_budget_bytes, or lower batch_size, block_chunks, or "
@@ -217,7 +248,7 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
             "any batch_transform, which runs per batch on the producer thread."
         ),
     }
-    return top, advice[top]  # type: ignore[return-value]
+    return advice[stage]
 
 
 class StatsCollector:

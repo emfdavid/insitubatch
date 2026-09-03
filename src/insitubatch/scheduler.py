@@ -637,11 +637,18 @@ class Scheduler:
                         if self.pool.assembles:
                             self.stats.decode_enter()
                             try:
-                                self.stats.assemble_s += await self._loop.run_in_executor(
+                                # Bind the cost to a local FIRST. `x += await f()` loads x
+                                # before evaluating the RHS, so the await suspends between
+                                # the load and the store and concurrent tile tasks each
+                                # write back a value read before the others ran -- lost
+                                # updates on one thread. Single-writer means no await
+                                # between load and store, not just one thread.
+                                cost = await self._loop.run_in_executor(
                                     self._decode_pool, _timed_deliver, w.deliver, tile
                                 )
                             finally:
                                 self.stats.decode_exit()
+                            self.stats.assemble_s += cost
                         else:
                             # Inline on the loop: a dict assignment and a counter. Timing it
                             # would cost more than it measures, and it is not a stage anyone
