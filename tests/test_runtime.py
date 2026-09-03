@@ -28,6 +28,7 @@ from insitubatch import (
 from insitubatch.runtime import (
     DOMINANT,
     FULL_ENOUGH,
+    RESIDENCY_YIELD,
     SEPARATION,
     STARVED_ENOUGH,
     StatsCollector,
@@ -143,6 +144,7 @@ def test_a_stage_does_not_lose_to_itself():
 def test_thresholds_are_the_documented_ones():
     # Guards the constants against a silent retune: they are load-bearing for every verdict.
     assert (FULL_ENOUGH, STARVED_ENOUGH, DOMINANT, SEPARATION) == (0.5, 0.2, 0.4, 0.1)
+    assert RESIDENCY_YIELD == 0.2
 
 
 # -- the collector ----------------------------------------------------------------
@@ -305,6 +307,21 @@ def test_residency_still_wins_outright_when_nothing_downstream_explains_it():
     assert bottleneck(stats)[0] == "residency"
 
 
+def test_residency_yields_by_any_margin_not_only_in_a_near_tie():
+    """Caught on 3.13t: free-threaded, the producer runs faster and parks *longer*.
+
+    Residency led gather by well over SEPARATION, so a near-tie rule let it win -- but the
+    cause was still the batch_transform holding chunks pinned. Backpressure can beat the
+    stage causing it by any margin, so the bar is "is anything downstream a sufficient
+    explanation", not "is this a photo finish".
+    """
+    starved = {"batch_queue_capacity": 2, "batch_queue_samples": 100, "batch_queue_empty": 100}
+    stats = _stats(depths=starved, times={"admission_parked_s": 6.0, "batch_transform_s": 2.5})
+    stage, why = bottleneck(stats)
+    assert stage == "gather"  # 71% vs 29%, nowhere near a tie
+    assert "backpressure" in why
+
+
 # -- end-to-end: does the verdict actually turn up? --------------------------------
 
 
@@ -341,7 +358,7 @@ def test_a_heavy_chunk_transform_is_attributed_to_decode(write_zarr):
         if i == 9:
             break
     assert ds.last_pass is not None
-    assert ds.last_pass.limiting_stage == "decode"
+    assert ds.last_pass.limiting_stage == "decode", ds.last_pass.times
 
 
 def test_a_heavy_batch_transform_is_attributed_to_gather(write_zarr):
@@ -355,7 +372,7 @@ def test_a_heavy_batch_transform_is_attributed_to_gather(write_zarr):
         if i == 9:
             break
     assert ds.last_pass is not None
-    assert ds.last_pass.limiting_stage == "gather"
+    assert ds.last_pass.limiting_stage == "gather", ds.last_pass.times
 
 
 def test_assemble_time_is_not_lost_across_the_await(write_zarr):
@@ -385,3 +402,44 @@ def test_assemble_time_is_not_lost_across_the_await(write_zarr):
     # Generous: assemble_s also covers the assembly memcpy, so it is >= the transform. The
     # bug made it a *fraction*, which is what this catches.
     assert recorded >= actual * 0.8, f"lost {1 - recorded / actual:.0%} of the transform"
+
+
+def test_an_idle_consumer_is_reported_not_diagnosed_away():
+    """`for batch in ds.train: pass` cannot keep a queue fed, however fast the loader is.
+
+    The starvation thresholds would fire on every such loop and accuse a producer stage of
+    a shortfall that is structural. Name what limits throughput, but say what the number
+    means: this is a throughput measurement, not a starved pipeline.
+    """
+    starved = {"batch_queue_capacity": 2, "batch_queue_samples": 100, "batch_queue_empty": 100}
+    stats = _stats(wall_s=10.0, depths=starved, times={"fetch_wait_s": 9.0, "consumer_s": 0.0})
+    assert stats.consumer_idle
+    stage, why = bottleneck(stats)
+    assert stage == "store"
+    assert "throughput measurement, not a starved pipeline" in why
+
+
+def test_a_real_training_step_is_not_called_idle():
+    stats = _stats(wall_s=10.0, times={"consumer_s": 6.0})
+    assert not stats.consumer_idle
+
+
+def test_a_saturated_inflight_budget_says_the_store_may_be_the_floor():
+    """Raising max_inflight is only advice while it can still help.
+
+    Reported from a real session: raising it 1 -> 8 -> 16 -> 32 went 11.9s -> 1.8s -> 1.1s
+    -> 1.6s, so 16 was the knee and 32 was worse -- while the report kept saying "raise
+    max_inflight". Every permit in use is the state where the network may simply be the
+    floor, and the advice has to admit that rather than send someone round the loop again.
+    """
+    starved = {
+        "batch_queue_capacity": 2,
+        "batch_queue_samples": 100,
+        "batch_queue_empty": 100,
+        "inflight_peak": 16,
+        "max_inflight": 16,
+    }
+    stats = _stats(wall_s=10.0, depths=starved, times={"fetch_wait_s": 9.0, "consumer_s": 6.0})
+    stage, why = bottleneck(stats)
+    assert stage == "store"
+    assert "the store or the network is the floor" in why

@@ -54,6 +54,12 @@ FULL_ENOUGH = 0.5
 # that rare is noise, and naming a stage for it is how a report loses its authority.
 STARVED_ENOUGH = 0.2
 
+# Below this share of wall time spent in the caller's own loop body, there is effectively no
+# training step: the consumer takes batches as fast as they appear, so the batch queue is
+# empty by construction and its depth answers nothing. Reported rather than diagnosed away --
+# a bare `for batch in ds.train: pass` is a throughput measurement, not a starved pipeline.
+IDLE_CONSUMER = 0.1
+
 # A stage must own this share of the accounted producer time before it is named.
 DOMINANT = 0.4
 
@@ -63,6 +69,14 @@ DOMINANT = 0.4
 # on a chunk-per-sample store): parked 23.3s vs fetch 22.1s, 2.6% apart. Naming either one
 # would have sent someone to turn a knob that was half the problem at most.
 SEPARATION = 0.1
+
+# Residency needs more than SEPARATION, because parking is backpressure rather than a cause:
+# whatever is slow downstream holds chunks pinned, so the budget fills behind it and the
+# parked total tracks that stage. A budget that is genuinely too small is the case where
+# *nothing else* is slow enough to explain the pressure, so residency is named only when
+# every other stage is below this share. Set to half of DOMINANT: a runner-up at 20%+ of
+# accounted time is a sufficient explanation on its own.
+RESIDENCY_YIELD = 0.2
 
 
 @dataclass(frozen=True)
@@ -75,10 +89,14 @@ class StageTimes:
     assemble_s: float = 0.0  # thread_time: tile assembly + chunk_transform
     gather_s: float = 0.0  # thread_time in the producer: batch assembly
     batch_transform_s: float = 0.0  # thread_time in the producer: user batch stage
+    consumer_s: float = 0.0  # perf_counter: what the caller did between batches
 
     @property
     def producer_s(self) -> float:
-        """Total accounted producer-side cost, the denominator for a stage's share."""
+        """Accounted producer-side cost, the denominator for a stage's share.
+
+        Excludes ``consumer_s``, which is the caller's own work and not a stage we can tune.
+        """
         return (
             self.fetch_wait_s
             + self.admission_parked_s
@@ -136,6 +154,17 @@ class PassStats:
     depths: Depths = field(default_factory=Depths)
 
     @property
+    def consumer_idle(self) -> bool:
+        """True when the caller's loop body did essentially nothing.
+
+        A `for batch in ds.train: pass` loop takes batches as fast as they are produced, so
+        the queue is empty on every sample no matter how fast the loader is. That is a
+        throughput measurement, not a starved pipeline, and saying "the queue ran empty" of
+        it would be true and useless.
+        """
+        return self.wall_s > 0 and self.times.consumer_s / self.wall_s < IDLE_CONSUMER
+
+    @property
     def limiting_stage(self) -> Stage:
         """The stage to go fix, by :func:`bottleneck`."""
         return bottleneck(self)[0]
@@ -162,11 +191,24 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
     d, t = stats.depths, stats.times
     if not d.batch_queue_samples:
         return "unknown", "no consumer samples: the pass ended before any batch was taken."
+    saturated = d.inflight_peak >= d.max_inflight > 0
     if d.fed_frac >= FULL_ENOUGH:
         return (
             "consumer",
             "the batch queue stayed fed, so the loader kept up and your training step is "
             "the constraint. This is the desired steady state -- nothing to tune here.",
+        )
+    if stats.consumer_idle:
+        # Not a hedge: with no training step the queue *cannot* stay fed, so its depth
+        # carries no signal and the starvation thresholds below would fire on every such
+        # loop. Name what limits raw throughput and say plainly what the number means.
+        top, why = _dominant(t, saturated)
+        share = t.consumer_s / stats.wall_s if stats.wall_s else 0.0
+        return top, (
+            f"your loop body took {t.consumer_s:.2f}s of {stats.wall_s:.1f}s wall "
+            f"({share:.0%}), so the loader is nearly the whole program and the batch queue "
+            "cannot stay fed however fast it gets -- read this as a throughput measurement, "
+            f"not a starved pipeline. What limits that throughput is: {why}"
         )
     if d.starved_frac < STARVED_ENOUGH:
         return (
@@ -175,9 +217,14 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
             "rather than a bottleneck.",
         )
 
+    return _dominant(t, saturated)
+
+
+def _dominant(t: StageTimes, saturated: bool) -> tuple[Stage, str]:
+    """The stage owning the accounted producer time, or ``unknown`` if none clearly does."""
     total = t.producer_s
     if total <= 0:
-        return "unknown", "the queue ran empty but no stage time was accounted."
+        return "unknown", "no stage time was accounted."
     # Aggregate by stage first: decode and gather each have two timers, and ranking the
     # timers rather than the stages would let a stage lose to itself.
     by_stage: dict[str, float] = {}
@@ -199,29 +246,32 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
             f"the queue ran empty but no stage owned more than {top_s / total:.0%} of "
             "accounted time: the cost is spread, so there is no single knob to turn.",
         )
+    # Residency yields to any runner-up big enough to explain the pressure, not merely to a
+    # near-tie: parking is backpressure, so its share tracks whatever is slow downstream and
+    # can beat that stage by any margin. Measured on real passes -- max_inflight=1 gave
+    # residency 49% / store 45%, a heavy batch_transform gave 49% / gather 45% under the
+    # GIL and a *wider* residency margin free-threaded, where the producer runs faster and
+    # parks longer. Raising the budget would have fixed none of them.
+    if top == "residency" and runner_s / total >= RESIDENCY_YIELD:
+        return (
+            runner,  # type: ignore[return-value]
+            f"{advice_for(runner)} ({runner_s / total:.0%} of accounted time). Admission "
+            f"also parked on the residency budget ({top_s / total:.0%}), but that is most "
+            "likely backpressure from this stage rather than a budget that is too small: "
+            "chunks stay pinned while a slow stage drains them. Fix this first and check "
+            "whether the parking goes with it.",
+        )
     if (top_s - runner_s) / total < SEPARATION:
-        # Residency loses a near-tie, because parking is *backpressure*: any slow stage
-        # downstream keeps chunks pinned, the budget fills, and admission parks behind it.
-        # Measured twice on real passes -- max_inflight=1 gave residency 49% / store 45%,
-        # and a heavy batch_transform gave residency 49% / gather 45% -- and both times the
-        # other stage was the cause and raising the budget would have fixed neither.
-        # Residency is named only when it wins outright, which is the case where nothing
-        # downstream is slow enough to explain the pressure.
-        if top == "residency":
-            return (
-                runner,  # type: ignore[return-value]
-                f"{advice_for(runner)} ({runner_s / total:.0%} of accounted time). Admission "
-                f"also parked on the residency budget ({top_s / total:.0%}), but that is "
-                "most likely backpressure from this stage rather than a budget that is too "
-                "small: chunks stay pinned while a slow stage drains them. Fix this first "
-                "and check whether the parking goes with it.",
-            )
+        # Residency cannot reach here: a near-tie puts the runner-up within SEPARATION of a
+        # stage above DOMINANT, which is well past RESIDENCY_YIELD, so it yielded above.
         return (
             "unknown",
             f"{top} ({top_s / total:.0%}) and {runner} ({runner_s / total:.0%}) are within "
             f"{SEPARATION:.0%} of each other: this pass is limited by both, and fixing "
             "either alone moves it to the other. Address them together.",
         )
+    if top == "store" and saturated:
+        return top, advice_for("store_saturated")  # type: ignore[return-value]
     return top, advice_for(top)  # type: ignore[return-value]
 
 
@@ -237,6 +287,12 @@ def advice_for(stage: str) -> str:
         "store": (
             "the loader waited on the store. Raise max_inflight, and check the store is "
             "in-region and the backend is the fast one for it."
+        ),
+        "store_saturated": (
+            "the loader waited on the store with every one of its max_inflight permits in "
+            "use. Raise max_inflight and re-measure -- but if throughput stops improving, "
+            "the store or the network is the floor and this is the honest answer rather "
+            "than a knob left unturned. Check region and backend before concluding that."
         ),
         "decode": (
             "codec decode and chunk_transform dominated. Raise decode_threads, and check "
@@ -282,6 +338,7 @@ class StatsCollector:
         "admission_parked_s",
         "assemble_s",
         "batch_transform_s",
+        "consumer_s",
         "decode_inflight",
         "decode_queue_peak",
         "decode_s",
@@ -301,6 +358,7 @@ class StatsCollector:
         self.assemble_s = 0.0
         self.gather_s = 0.0
         self.batch_transform_s = 0.0
+        self.consumer_s = 0.0
         self.decode_inflight = 0
         self.decode_queue_peak = 0
         self.queue_capacity = queue_capacity
@@ -348,6 +406,7 @@ class StatsCollector:
             assemble_s=self.assemble_s,
             gather_s=self.gather_s,
             batch_transform_s=self.batch_transform_s,
+            consumer_s=self.consumer_s,
         )
 
 
@@ -364,6 +423,7 @@ def format_pass(stats: PassStats) -> str:
         f" | decode peak {d.decode_queue_peak}/{d.decode_threads}"
         f" | resident {d.resident_peak} chunks, {d.resident_peak_bytes / 2**20:.0f} MiB"
         f" of {budget}"
+        f" | consumer {t.consumer_s:.2f}s"
         f" | wait fetch {t.fetch_wait_s:.2f}s, parked {t.admission_parked_s:.2f}s"
         f" | cpu decode {t.decode_s:.2f}s, assemble {t.assemble_s:.2f}s,"
         f" gather {t.gather_s:.2f}s, batch_tf {t.batch_transform_s:.2f}s"

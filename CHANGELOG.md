@@ -46,6 +46,16 @@
   `batch_transform` gave residency 49% / gather 45% — and both times raising the budget
   would have fixed nothing.
 
+  Two more came out of someone actually using it. Raising `max_inflight` 1 -> 8 -> 16 ->
+  32 went 11.9s -> 1.8s -> 1.1s -> 1.6s, and the report said "raise max_inflight" at every
+  step, including the two past the knee: when every permit is already in use the advice now
+  says so, and that the network may simply be the floor rather than a knob left unturned.
+  And a `for batch in ds.train: pass` loop cannot keep a queue fed however fast the loader
+  is, so `consumer_s` now measures the caller's own loop body and a pass whose consumer did
+  essentially nothing is reported as a throughput measurement rather than diagnosed as a
+  starved pipeline. Both were the report over-claiming, which is the failure mode this
+  feature exists to avoid.
+
   **The collector takes no lock.** Every counter has exactly one writing thread, and decode
   — the one stage that runs on the pool's threads — measures its own `thread_time` and
   *returns* it, so the add happens back on the loop. Measured cost, interleaved against

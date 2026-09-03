@@ -210,8 +210,14 @@ This runs as written — the store is one of the public benchmark stores, no cre
 no build step. `era5_c1` is the chunk-per-sample (GRIB-like) end of the family: 6000 full
 `721x1440` fields, one per chunk.
 
+**Keep the `sleep`.** It stands in for a training step, and without one the question is
+degenerate: a `for batch in ds.train: pass` loop takes batches as fast as they appear, so
+the queue is empty on every sample however fast the loader is. The report says so if you
+drop it, but then all it can tell you is throughput.
+
 ```python
 import logging
+import time
 
 from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_chunk
 
@@ -227,51 +233,59 @@ manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
 ds = InSituDataset(store, manifest, batch_size=16, block_chunks=8, max_inflight=1)
 
 for i, batch in enumerate(ds.train):
+    time.sleep(0.15)  # stand in for a training step
     if i == 9:
         break
 ```
 
 ```
-epoch 0 (train): 10 batches in 11.1s | queue 0/2 (empty 100%, fed 0%)
-  | inflight peak 1/1 | decode peak 1/12 | resident 32 chunks, 127 MiB of 127 MiB
-  | wait fetch 9.96s, parked 11.01s | cpu decode 1.01s, gather 0.31s
-  | limited by: unknown -- residency (49%) and store (45%) are within 10% of each
-    other: this pass is limited by both, and fixing either alone moves it to the
-    other. Address them together.
+epoch 0 (train): 10 batches in 15.3s | queue 0/2 (empty 100%, fed 0%)
+  | inflight peak 1/1 | resident 32 chunks, 127 MiB of 127 MiB | consumer 1.35s
+  | wait fetch 14.06s, parked 15.18s | cpu decode 1.05s, gather 0.32s
+  | limited by: store -- ... the loader waited on the store. Raise max_inflight ...
+    Admission also parked on the residency budget (50%), but that is most likely
+    backpressure from this stage rather than a budget that is too small.
 ```
 
-Read what it actually says. The queue was empty on **every** sample, so the loader never
-kept up — but it declines to name one stage, because two are within 10% of each other. That
-is not the report hedging: with one read in flight, chunks are fetched slowly and therefore
-sit resident longer, so the budget stays exactly full (`127 MiB of 127 MiB`) and admission
-parks. The two stages are causally coupled, and `max_inflight` is upstream of both.
+Two things to read. The verdict is `store`, and the parked total — nearly as large as the
+fetch total — is called out as **backpressure rather than a cause**: with one read in
+flight, chunks are fetched slowly and therefore sit resident longer, so the budget stays
+full (`127 MiB of 127 MiB`). Raising `cache_budget_bytes` would fix none of it.
 
-Delete `max_inflight=1` and run it again:
+Now raise `max_inflight`, and keep raising it:
 
-```
-epoch 0 (train): 10 batches in 1.4s | queue 0/2 (empty 100%, fed 0%)
-  | inflight peak 32/32 | decode peak 17/12 | resident 32 chunks, 127 MiB of 127 MiB
-  | wait fetch 14.70s, parked 1.25s | cpu decode 1.50s, gather 0.38s
-  | limited by: store -- the loader waited on the store. Raise max_inflight, and
-    check the store is in-region and the backend is the fast one for it.
-```
+| `max_inflight` | wall for 10 batches | verdict |
+|---:|---:|---|
+| 1 | 15.3 s | `store` (+ residency backpressure) |
+| 8 | 1.8 s | `store` |
+| **16** | **1.1 s** | `store`, permits saturated |
+| 32 | 1.6 s | `store`, permits saturated |
 
-**8x faster**, and `parked` collapsed from 11.01s to 1.25s — the residency pressure was a
-symptom, not the disease. The verdict is now cleanly `store`, which for this run is the
-truth and not a further mistake: it is reading GCS cross-cloud over the public internet, so
-the network genuinely is the floor. Run it in-region and this is where it stops.
+**16 is the knee, and 32 is worse.** Once every permit is in use the advice changes to say
+so: *"Raise max_inflight and re-measure — but if throughput stops improving, the store or
+the network is the floor and this is the honest answer rather than a knob left unturned."*
+That is the truth for this run: it reads GCS cross-cloud over the public internet. Run it
+in-region and this is where it stops.
 
-Note `wait fetch` **rose** to 14.70s while the pass got 8x faster. That is the summing rule,
-not a contradiction: 32 tiles now wait concurrently, so the total is task-seconds against a
-1.4s wall. It is the ratio between stages that carries the meaning.
+Note `wait fetch` **rises** as the pass gets faster (14.06s at `max_inflight=1`, 15.86s at
+16). That is the summing rule, not a contradiction: 16 tiles now wait concurrently, so the
+total is task-seconds against a 1.1s wall. Read the ratios between stages, never any stage
+against the clock.
 
 | what the report shows | limiting stage | what to do |
 |---|---|---|
 | batch queue **fed** (`fed_frac` high) | `consumer` | nothing — the loader kept up and your training step is the constraint. This is the goal |
 | queue empty, `fetch_wait_s` dominant | `store` | raise `max_inflight`; check the store is in-region and on the fast backend |
+| as above, **and `inflight_peak == max_inflight`** | `store` | same, but re-measure: if throughput stops improving the network is the floor, not a knob left unturned |
+| queue empty but `consumer_s` is a few % of wall | *reported, not diagnosed* | your loop has no real training step, so the queue cannot stay fed; read throughput instead |
 | queue empty, `decode_s` / `assemble_s` dominant | `decode` | raise `decode_threads`; check the `chunk_transform` is vectorized numpy that releases the GIL |
 | queue empty, `admission_parked_s` dominant | `residency` | raise `cache_budget_bytes`, or lower `batch_size` / `block_chunks` / concurrent iterations |
 | queue empty, `gather_s` / `batch_transform_s` dominant | `gather` | check the gather run length in `describe()`, and any `batch_transform` |
+
+`residency` is only named when *nothing else* explains the pressure. Parking is
+backpressure: whatever is slow downstream holds chunks pinned until the budget fills, so a
+parked total that merely tracks another stage is a symptom. When a runner-up is large enough
+to explain it, the report names that stage instead and says why.
 
 The **residency** row is the one worth knowing exists. A budget-starved loader is otherwise
 indistinguishable from slow storage — it is exactly how the pre-#39 deadlock presented — and

@@ -493,7 +493,12 @@ class InSituDataset:
                         if isinstance(item, Exception):
                             raise item
                         batches += 1
+                        # perf_counter around the yield: the caller's loop body is wall
+                        # time to us, whatever it spends it on (a GPU step is mostly not
+                        # CPU). Consumer thread only, and no await between load and store.
+                        t_yield = time.perf_counter()
                         yield item
+                        stats.consumer_s += time.perf_counter() - t_yield
                 finally:
                     # Signal stop, then drain so a producer parked on a full queue can
                     # proceed and exit before the scheduler (context manager) is closed.
