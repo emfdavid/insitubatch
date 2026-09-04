@@ -1748,10 +1748,16 @@ class ChunkPool:
             if self._log_fd is not None:
                 os.close(self._log_fd)
                 self._log_fd = None
-            self._release_lock()
             for k in list(self._slots):
                 slot = self._slots.pop(k)
                 self._free(slot, keep_file=self._persistent and slot.state is SlotState.READY)
+            # LAST, after the final mmap is closed. Releasing it earlier would open a window
+            # where another process may take the write lock while this one still has cache
+            # files mapped. Atomic replace means that window cannot corrupt data -- POSIX
+            # keeps our inode alive -- but the arbitration's invariant is "hold the lock for
+            # as long as you hold a mapping", and leaning on the other layer to cover it is
+            # how a fix quietly stops working.
+            self._release_lock()
             self._bytes = 0
             self._pinned.clear()
             self._buffers.clear()  # batch outputs too; a big-payload pool holds GBs of them

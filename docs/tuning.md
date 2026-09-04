@@ -202,6 +202,24 @@ The error names the array and chunk, and the usual cause is a different split,
 `sample_range` or transform set than the run that warmed it. `reset_stale_cache=True` is
 rejected in this mode — a reader may not delete files another process is using.
 
+### What happens to active readers when a writer invalidates the cache
+
+Nothing, because the writer never starts. Invalidation — `reset_stale_cache=True` deleting
+every entry, or a run re-admitting chunks it evicted — is work a *writer* does, and a writer
+cannot open the directory while any reader holds it. The exclusion is at construction, before
+the writer can allocate, evict or delete anything.
+
+The layer underneath does not depend on that, though, which matters on the configurations
+where the lock is not available. A reader that already holds a chunk's mapping keeps reading
+real data even if the file is replaced (the new content goes to a new inode) *or* deleted
+(POSIX keeps the inode alive until the last reference goes). So the worst a bypassed lock
+can do to an active reader is cost it a **future** open — a miss, which `readonly_cache`
+turns into a loud error — never wrong numbers in a batch that looks fine.
+
+Both properties are pinned by tests rather than left as reasoning:
+`test_a_writer_cannot_start_while_another_process_is_reading` and
+`test_deleting_a_cached_file_does_not_disturb_a_held_mapping`.
+
 ### If you hit the lock
 
 ```

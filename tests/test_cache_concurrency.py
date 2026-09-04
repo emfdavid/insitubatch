@@ -52,6 +52,20 @@ sys.stdin.readline()
 """
 
 
+# Opens a *read-only* pool and parks, holding the shared lock, until it is killed.
+_SHARED_HOLDER = """
+import sys
+from insitubatch import obstore_store, open_geometries
+from insitubatch.pool import ChunkPool
+cache, url = sys.argv[1], sys.argv[2]
+pool = ChunkPool(open_geometries(obstore_store(url), variables=["t2m"]),
+                 backing_dir=cache, readonly_cache=True)
+assert pool.pin_if_ready("t2m", 0, pool.new_owner())
+print("reading", flush=True)
+sys.stdin.readline()
+"""
+
+
 def _geoms(url, var="t2m"):
     return open_geometries(obstore_store(url), variables=[var])
 
@@ -400,3 +414,95 @@ def test_log_entries_append_regardless_of_file_position(write_zarr, tmp_path):
     assert len(lines) == 3, "header + one entry per completed chunk, none overwritten"
     assert "format_version" in lines[0]
     assert [json.loads(x)["chunk_index"] for x in lines[1:]] == [0, 1]
+
+
+def test_the_lock_outlives_every_mapping_the_pool_holds(write_zarr, tmp_path, monkeypatch):
+    """The lock must be released *last*, after the final mmap is closed.
+
+    Otherwise ``close()`` opens a window where this process still has cache files mapped
+    while another process is already free to take the write lock and replace them. Atomic
+    replace means that window cannot corrupt data -- POSIX keeps our inode alive -- but the
+    invariant the arbitration rests on is "hold the lock for as long as you hold a mapping",
+    and a fix that leans on the other layer to cover it is a fix that stops working the day
+    the other layer changes."""
+    url, srcs = write_zarr()
+    cache = tmp_path / "cache"
+    geoms = _warm(url, cache, srcs)
+    pool = ChunkPool(geoms, backing_dir=cache, persist=True)
+    assert pool.pin_if_ready("t2m", 0, pool.new_owner()), "need a live mapping to close"
+
+    held: list[bool] = []
+    real_free = ChunkPool._free
+    monkeypatch.setattr(
+        ChunkPool,
+        "_free",
+        lambda self, slot, *, keep_file: (
+            held.append(self._lock_fd is not None),
+            real_free(self, slot, keep_file=keep_file),
+        )[1],
+    )
+    pool.close()
+    assert held, "the pool freed no mapping -- the test proves nothing"
+    assert all(held), "close() released the cache lock while mappings were still open"
+
+
+def test_a_writer_cannot_start_while_another_process_is_reading(write_zarr, tmp_path):
+    """The question the single-writer rule has to answer: what happens to active readers
+    when a writer starts overwriting? Nothing -- because the writer never starts.
+
+    A reader holds ``LOCK_SH``, which excludes ``LOCK_EX``, so the writer is refused at
+    construction, before it can allocate, evict, or reset anything. Cross-process on
+    purpose: the in-process case (``test_a_reader_and_a_writer_do_not_coexist``) proves the
+    same thing, but a real reader in another process is the case people actually run."""
+    url, srcs = write_zarr()
+    cache = tmp_path / "cache"
+    geoms = _warm(url, cache, srcs)
+    reader = subprocess.Popen(
+        [sys.executable, "-c", _SHARED_HOLDER, str(cache), url],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert reader.stdout.readline().strip() == "reading"
+        with pytest.raises(RuntimeError, match="already open for writing"):
+            ChunkPool(geoms, backing_dir=cache, persist=True)
+        # A second reader is still fine -- readers do not exclude each other.
+        ChunkPool(geoms, backing_dir=cache, readonly_cache=True).close()
+    finally:
+        reader.stdin.close()
+        reader.wait(timeout=30)
+    ChunkPool(geoms, backing_dir=cache, persist=True).close()  # free once the reader exits
+
+
+def test_deleting_a_cached_file_does_not_disturb_a_held_mapping(write_zarr, tmp_path):
+    """Invalidation is deletion (``reset_stale_cache``), and deletion is safe for a reader
+    that already holds the mapping: POSIX keeps the inode alive until the last reference
+    goes. So even if the lock were bypassed -- a network filesystem, a platform without
+    advisory locking, a user with ``rm`` -- an active reader keeps reading real data. What
+    it can lose is a *future* open, which is a miss, never wrong numbers.
+
+    This is the second layer, tested on its own so we know it is load-bearing rather than
+    merely implied by the lock."""
+    url, srcs = write_zarr()
+    cache = tmp_path / "cache"
+    _warm(url, cache, srcs)
+    npy = cache / "t2m__0.npy"
+    expected = _hash(npy)
+
+    reader = subprocess.Popen(
+        [sys.executable, "-c", _READER, str(npy)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert reader.stdout.readline().strip() == expected
+        npy.unlink()  # what a stale-cache reset does to every entry it listed
+        reader.stdin.write("go\n")
+        reader.stdin.flush()
+        after = reader.stdout.readline().strip()
+    finally:
+        reader.stdin.close()
+        reader.wait(timeout=30)
+    assert after == expected, "unlinking the file corrupted a mapping already held on it"
