@@ -1,14 +1,14 @@
 """Cross-process arbitration of a shared ``cache_dir`` (#42, part 1).
 
-Two processes pointed at one cache directory is the obvious thing to do -- and until
-this module's contract landed it silently corrupted data. The re-admission window is
-the sharp edge: a reader holds a chunk's mapping while a writer re-allocates the same
-chunk, and ``open_memmap(mode="w+")`` truncates the file *under the reader*. Right
-shape, right dtype, wrong numbers; throughput and smoke tests all pass.
+Two processes pointed at one cache directory is the obvious thing to do, and unarbitrated
+it corrupts data silently. The re-admission window is the sharp edge: a reader holds a
+chunk's mapping while a writer re-allocates the same chunk, and ``open_memmap(mode="w+")``
+truncates the file *under the reader*. Right shape, right dtype, wrong numbers; throughput
+and smoke tests all pass.
 
-The tests here are deliberately multi-process. A same-process test cannot see the bug
-(one pool arbitrates itself with its own lock), and the fix -- atomic replace plus an
-advisory ``flock`` -- is only meaningful across process boundaries.
+The tests here are deliberately multi-process. A same-process pool arbitrates itself with
+its own lock, so nothing below is observable within one, and neither half of the
+contract -- atomic replace, and an advisory ``flock`` -- means anything until there are two.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def _hash(path):
 
 
 def test_readmission_does_not_corrupt_another_process_mapping(write_zarr, tmp_path):
-    """The bug: re-admitting a chunk another process has mapped must not truncate it.
+    """Re-admitting a chunk another process has mapped must not truncate it.
 
     POSIX keeps the old inode alive for anyone holding it, so replacing the directory
     entry (write a temp file, ``rename``) is safe where ``open_memmap(mode="w+")`` --
@@ -118,10 +118,10 @@ def test_readmission_does_not_corrupt_another_process_mapping(write_zarr, tmp_pa
     )
     try:
         assert reader.stdout.readline().strip() == expected, "reader mapped the wrong bytes"
-        # A miss on a chunk whose .npy is on disk is reachable: an evicted (demoted)
-        # entry whose revive is declined by a full budget, or -- until the lock landed --
-        # any second process with persist=False sharing the dir. try_admit IS that
-        # re-admission; going through it directly keeps the test on the mechanic.
+        # A miss on a chunk whose .npy is on disk is reachable: an evicted (demoted) entry
+        # whose revive a full budget declines, or -- where no lock can be taken -- any second
+        # process with persist=False sharing the dir. try_admit IS that re-admission; going
+        # through it directly keeps the test on the mechanic.
         pool = ChunkPool(geoms, backing_dir=cache, persist=True)
         owner = pool.new_owner()
         assert pool.try_admit("t2m", 0, owner)
@@ -138,7 +138,8 @@ def test_readmission_does_not_corrupt_another_process_mapping(write_zarr, tmp_pa
 def test_second_writer_fails_fast_with_guidance(write_zarr, tmp_path):
     """Two writers on one cache_dir is an error, not a warning -- and the error has to be
     actionable: who holds it, what to do either way, and the two commands that answer
-    "who?". Silent corruption is what this replaces, so a vague message would waste it."""
+    "who?". The alternative outcome is silent corruption, so a vague message wastes the
+    one chance to say so."""
     url, srcs = write_zarr()
     cache = tmp_path / "cache"
     geoms = _geoms(url)
