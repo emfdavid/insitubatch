@@ -257,7 +257,7 @@ def test_a_version_2_cache_is_rejected_not_misread(tmp_path):
     log.write_text("\n".join([json.dumps(header), *lines[1:]]) + "\n")
 
     # Loud by design: a stale cache is a user decision, not something to silently discard.
-    with pytest.raises(ValueError, match="stale .log format changed"):
+    with pytest.raises(ValueError, match="stale .*log format"):
         ChunkPool(geoms, backing_dir=cache, persist=True)
 
     # ...and with consent it resets and refetches rather than reinterpreting v2 bytes.

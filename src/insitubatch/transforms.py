@@ -12,10 +12,15 @@ stages; ``device_transform`` lives in the framework adapters (M2/M3).
 
 Rule of thumb: per-variable + per-chunk + deterministic -> chunk stage;
 cross-variable or per-sample-random -> batch stage; cross-chunk -> not supported.
+
+**Scope is declared at the call site**, with :func:`applies` -- never by a name test inside
+the transform's body. "Subtract 273.15" is a fact about Kelvin; "``2m_temperature`` is in
+Kelvin" is a fact about *your store*, and only the call site knows it.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -29,7 +34,7 @@ from .types import ArrayGeometry, Batch, DecodedChunk
 class ChunkTransform(Protocol):
     """Per-chunk transform applied before shuffle/gather (cacheable)."""
 
-    def __call__(self, chunk: DecodedChunk) -> DecodedChunk: ...
+    def __call__(self, chunk: DecodedChunk, /) -> DecodedChunk: ...
 
 
 @runtime_checkable
@@ -60,7 +65,100 @@ class ReshapingChunkTransform(ChunkTransform, Protocol):
 class BatchTransform(Protocol):
     """Per-batch transform applied after gather (not cached)."""
 
-    def __call__(self, batch: Batch) -> Batch: ...
+    def __call__(self, batch: Batch, /) -> Batch: ...
+
+
+# -- scope: which arrays a chunk_transform applies to ------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Scoped:
+    """One chunk_transform, restricted to a set of array paths. Built by :func:`applies`.
+
+    The engine reads ``arrays`` directly: it skips the call for an array outside the scope,
+    and -- the part a name test in ``__call__`` cannot provide -- it excludes the transform
+    from those arrays' *declared output geometry* and from their *cache fingerprint*.
+    """
+
+    arrays: frozenset[str]
+    transform: ChunkTransform
+
+    def __call__(self, chunk: DecodedChunk) -> DecodedChunk:
+        return self.transform(chunk)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScopedReshaping(_Scoped):
+    """A scoped :class:`ReshapingChunkTransform`.
+
+    ``output_inner`` exists as a *separate class* rather than a delegating method on
+    :class:`_Scoped`, because the engine detects a reshaping transform by
+    ``hasattr(t, "output_inner")``: a wrapper that always defined it would make every
+    shape-preserving transform claim to reshape.
+    """
+
+    def output_inner(self, geom: ArrayGeometry) -> tuple[tuple[int, ...], np.dtype]:
+        return self.transform.output_inner(geom)  # type: ignore[attr-defined]
+
+
+def applies(arrays: Sequence[str], transform: ChunkTransform) -> ChunkTransform:
+    """Restrict a ``chunk_transform`` to the named arrays; every other array passes through.
+
+    ``arrays`` are zarr array **paths** (what ``open_geometries`` keys on, and what
+    ``chunk.read.array`` carries) -- not dict labels, since two labels may alias one array
+    (``t2m_now`` / ``t2m_next``). Unknown names raise at dataset construction::
+
+        InSituDataset(..., chunk_transforms=[
+            applies(["2m_temperature"], kelvin_to_celsius),
+            Coarsen(2),                    # bare = every array, as before
+        ])
+
+    Declaring scope here rather than with an ``if chunk.read.array == ...`` inside the
+    transform is not a style preference: an in-body gate is invisible to the engine, which
+    folds a reshaping transform's ``output_inner`` into *every* array's declared geometry.
+    The unaffected arrays are then gathered as truncated prefixes of themselves and can
+    never revive from cache -- with no exception raised. Scope also enters the cache
+    fingerprint per array, so editing one variable's transform no longer invalidates the
+    rest.
+
+    A transform may be *parameterized* by variable (a fitted scaler's statistics
+    legitimately are) but must not decide whether it runs. If it can validate a declared
+    scope -- :class:`StandardScaler` checks the names against its own stats dict -- it
+    defines ``validate_scope(arrays)`` and this calls it now, not in a decode thread.
+    """
+    if isinstance(arrays, str):
+        raise TypeError(
+            f"applies() takes a sequence of array names, not the bare string {arrays!r} -- "
+            f'a string would scope to its characters. Write applies(["{arrays}"], ...).'
+        )
+    scope = frozenset(arrays)
+    if not scope:
+        raise ValueError(
+            "applies() was given an empty scope, so the transform would never run. Drop it "
+            "from chunk_transforms instead, or name the arrays it applies to."
+        )
+    check = getattr(transform, "validate_scope", None)
+    if check is not None:
+        check(scope)
+    if hasattr(transform, "output_inner"):
+        return _ScopedReshaping(scope, transform)
+    return _Scoped(scope, transform)
+
+
+def transform_scope(transform: ChunkTransform) -> frozenset[str] | None:
+    """The array paths ``transform`` is restricted to, or ``None`` for "every array"."""
+    return transform.arrays if isinstance(transform, _Scoped) else None
+
+
+def unwrap_transform(transform: ChunkTransform) -> ChunkTransform:
+    """The user's own callable, with any :func:`applies` wrapper removed.
+
+    The cache fingerprint hashes *this*, never the wrapper: scope already selects which
+    transforms enter an array's hash, so folding it into the token as well would invalidate
+    the variable that **stayed** in scope every time another one left it."""
+    while isinstance(transform, _Scoped):
+        transform = transform.transform
+    return transform
 
 
 @dataclass(slots=True)
@@ -88,6 +186,20 @@ class StandardScaler:
         s = self.std[chunk.read.array]
         chunk.data = (chunk.data - m) / (s + self.eps)
         return chunk
+
+    def validate_scope(self, arrays: frozenset[str]) -> None:
+        """Reject a scope this scaler has no statistics for (called by :func:`applies`).
+
+        ``applies(["u10"], scaler_fitted_on_t2m)`` would otherwise ``KeyError`` inside a
+        decode thread, one chunk into training. The stats dict may be *wider* than the
+        scope -- one fitted scaler shared by several scoped uses is normal."""
+        missing = sorted(arrays - (self.mean.keys() | self.std.keys()))
+        if missing:
+            raise ValueError(
+                f"StandardScaler has no mean/std for {missing}; it was fitted for "
+                f"{sorted(self.mean.keys() & self.std.keys())}. Fit those variables, or "
+                "scope this scaler to the ones it knows."
+            )
 
     def save(self, path: str | Path) -> None:
         flat = {f"{k}.mean": v for k, v in self.mean.items()}

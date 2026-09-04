@@ -178,9 +178,12 @@ def clean_normalize(chunk: DecodedChunk) -> DecodedChunk:
     the per-frame median and divide by a MAD-based scale, then clip -- so MSE denoising is
     well-conditioned. Per-(variable, chunk), deterministic, pure numpy: the cacheable chunk
     stage, and it releases the GIL on the decode pool.
+
+    No variable gate, in the body or at the call site: this dataset opens ``SCI`` and nothing
+    else, so an unscoped transform already applies to exactly the right array. Scope a
+    transform with ``insitubatch.applies`` when the dataset has variables it must not touch --
+    never with an ``if`` inside the transform, which the engine cannot see.
     """
-    if chunk.read.array != SCI_VAR:
-        return chunk
     x = np.nan_to_num(chunk.data.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     med = np.median(x, axis=(1, 2), keepdims=True)
     mad = np.median(np.abs(x - med), axis=(1, 2), keepdims=True)

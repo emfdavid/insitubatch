@@ -687,16 +687,11 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   the corruption. **What remains open** is named where the user meets it: a network
   `cache_dir` (`flock` may be emulated per client) and a platform with no POSIX locking are
   still unarbitrated, and both warn at construction saying so. Detection is not a fix.
-- **Cache invalidation is whole-pipeline, not per-variable.** `chunk_transforms` is one list
-  applied to every variable (each transform self-gates by name and no-ops on the rest), and
-  the fingerprint hashes the **whole list once** → a single `pipeline_hash` on every array's
-  entries. Editing a transform that only affects `t2m` therefore invalidates the *whole*
-  cache (`u10`/`v10` too, whose chunks are byte-identical) — and with the raise-on-stale
-  default the user must `reset_stale_cache` and re-decode everything. Fix: assign transforms
-  per variable (or derive, per array, the subset that touches it) and fingerprint **per
-  array**, which also drops the wasted no-op passes. Open design question: how a transform
-  declares which variables it applies to (explicit mapping vs today's name-gating
-  convention). Documented as a limitation in `docs/architecture.md`.
+- **Per-array assembly.** A variable no transform touches could stay on the tiled fast path
+  instead of assembling into one contiguous array at completion. It does not, because
+  `assembles` is a single bool the scheduler reads to decide *where* delivery runs; making
+  it per path also moves `_tile_grid`, `_charge` and gather's `tile_geom`. Now that scope is
+  declared (`applies`), the information is available — the work is the plumbing.
 - **Windowed + shuffle holds the whole split resident.** Shuffle spills a windowed chunk's
   reads into arbitrary blocks, so residency is bounded by the split rather than the block;
   the same applies to a non-uniformly chunked variable (geometry rung 4). The tighter bound
@@ -970,8 +965,12 @@ measurements live in [docs/benchmarks.md](docs/benchmarks.md).
   dtype recast) are cacheable on every tier via `output_inner`. Closed decisions: the store
   URL is **not** in the key (session stores have no round-trippable URL, so `cache_dir`
   *is* the dataset identity); `chunk_index` is the *global* zarr index so subsets and
-  splits share entries; the log needs no compaction. See Known limitations for the
-  per-variable fingerprint gap.
+  splits share entries. Cache identity is **per array** (manifest format 4): each entry
+  carries the hash of the transforms scoped to *its* array, so editing one variable's
+  transform leaves the others valid, an array with no entries is *cold* rather than stale,
+  and an array a run does not read keeps its files — two configurations may share a
+  `cache_dir`. The log is compacted (temp file + rename) when a load drops entries, which
+  the one-writer lock makes safe.
 - **M-W — windowed / multi-offset sampling** ✅ the forecasting unlock and the prerequisite
   for M4. Design, scope decision and as-built deviations are in the geometry-ladder section;
   validated by `examples/advection/` across torch, JAX and TF.

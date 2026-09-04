@@ -231,6 +231,29 @@ There is no such thing as a stale lock, and so no cleanup procedure. The kernel 
 when the process dies — `SIGKILL`, OOM and spot preemption included. If you are seeing the
 error, that process is alive.
 
+### What a transform edit invalidates
+
+Cache identity is **per array**: each manifest entry carries the hash of the
+`chunk_transforms` scoped to *its* array (see
+[`applies`](architecture.md#scoping-a-transform-to-variables)). Editing a transform scoped
+to `2m_temperature` therefore raises naming `['2m_temperature']`, and
+`reset_stale_cache=True` deletes just that array's chunk files — `10m_u_component_of_wind`
+and the rest keep theirs, because their bytes did not change.
+
+Two cases that are deliberately *not* stale:
+
+- **Adding a variable.** An array with no entries yet is a cold start for that array. You
+  can widen a configuration without a wipe.
+- **Reading a subset.** An array this run does not open is left alone entirely — entries
+  and files. Two configurations can share one `cache_dir`, each warming its own arrays.
+
+Narrowing a scope invalidates the variable that *left* it, and only that one: the transform
+itself is hashed without its scope, so the variables that stayed hash identically.
+
+A load that drops entries rewrites the log (to a temp name, then a rename), so a reset is
+not re-read and re-rejected on every subsequent open. That is safe only because one writer
+holds the lock above.
+
 ### Put `cache_dir` on local NVMe, not NFS
 
 The cache is an mmap tier, so this is what it is built for. Over a network filesystem it

@@ -31,7 +31,6 @@ import os
 import statistics
 import sys
 import time
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -41,9 +40,8 @@ from zarr.abc.store import Store
 
 from .pool import output_geometry
 from .store import obstore_store, open_geometries
+from .transforms import ChunkTransform, transform_scope
 from .types import ArrayGeometry, ChunkRead, DecodedChunk
-
-ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
 
 
 def load_transform(target: str) -> ChunkTransform:
@@ -235,6 +233,20 @@ def main(argv: list[str] | None = None) -> int:
         f"  chunk {a.chunk:<5}: {n_samples} samples -> source shape "
         f"{geom.slot_shape(a.chunk)} = {src_mb:.1f} MB decoded"
     )
+
+    # A scoped transform (`applies`) that does not name this variable would never run in the
+    # engine, so running it here would report on something training will not do. Say which
+    # variables it covers rather than printing a misleading PASS.
+    scope = transform_scope(fn)
+    if scope is not None and geom.path not in scope:
+        print(
+            f"\nFAIL: this transform is scoped with applies({sorted(scope)}), which does not "
+            f"include {geom.path!r}. The engine would skip it for this variable entirely. "
+            f"Re-run with --var one of {sorted(scope)}."
+        )
+        return 1
+    if scope is not None:
+        print(f"  scope       : applies to {sorted(scope)}")
 
     base = read_chunk(store, a.var, a.chunk, geom)
     in_shape, in_dtype = base.data.shape, base.data.dtype

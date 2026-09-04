@@ -27,6 +27,7 @@ import numpy as np
 from .pool import slot_charge_bytes
 from .shuffle import shuffle_quality
 from .split import SplitManifest
+from .transforms import transform_scope, unwrap_transform
 from .types import ArrayGeometry, SplitName
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps summary importable from source
@@ -405,7 +406,14 @@ def describe(ds: InSituDataset, *, iterations: int = 1) -> DatasetReport:
 
 
 def _name(fn: object) -> str:
-    return getattr(fn, "__name__", type(fn).__name__)
+    """A transform's display name, with its scope when it has one.
+
+    ``kelvin_to_celsius[2m_temperature]`` -- the report exists to say what a configuration
+    will do, and "which variables does this transform touch" is now part of that."""
+    scope = transform_scope(fn) if callable(fn) else None
+    base = unwrap_transform(fn) if scope is not None else fn  # type: ignore[arg-type]
+    label = getattr(base, "__name__", type(base).__name__)
+    return label if scope is None else f"{label}[{','.join(sorted(scope))}]"
 
 
 def _bytes(n: int) -> str:
