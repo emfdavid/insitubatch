@@ -84,6 +84,10 @@ jobs:
   # Free-threaded 3.13t: the real test of the pool's lock-free disjoint scatter +
   # lock-published readiness. torch/bench have no free-threaded wheels yet, so this
   # job is core-deps-only (the torch tests skip via importorskip).
+  #
+  # numcodecs publishes no cp313t wheel, so it compiles from sdist -- ~6 min, which is the
+  # whole job and the workflow's critical path. The uv cache holds that build; see the
+  # cache-suffix note below for what makes it reachable.
   test-freethreaded:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -97,6 +101,14 @@ jobs:
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
+          # This job needs a cache key of its own. setup-uv derives the key from the lock
+          # files and the *runner's* interpreter, so every job in this workflow computes the
+          # same one -- and `uv cache prune --ci`, which runs before the save, keeps only
+          # wheels built from source. The 3.12 jobs build nothing (everything has a wheel),
+          # so whichever finishes first stores an ~12 KB cache under the shared key and the
+          # rest, this one included, are refused as duplicates. The suffix separates it, so
+          # the numcodecs/pyyaml/librt builds below are stored once and restored after.
+          cache-suffix: freethreaded
       - run: uv sync --python 3.13t
       # Fail loudly if the GIL is actually still on -- otherwise the run below is a
       # no-op masquerading as a free-threading test.
