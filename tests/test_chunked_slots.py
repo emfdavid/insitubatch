@@ -226,6 +226,7 @@ def test_persist_round_trips_the_data(tmp_path):
 
     cold = _fill(url, geoms, backing_dir=cache, persist=True)
     np.testing.assert_array_equal(read(cold), src)
+    cold.close()  # run 1 ends here: one writer at a time holds the cache dir's lock
 
     warm = ChunkPool(geoms, backing_dir=cache, persist=True)
     owner = warm.new_owner()
@@ -246,7 +247,7 @@ def test_a_version_2_cache_is_rejected_not_misread(tmp_path):
     url, _ = _store(tmp_path, (2, 8, 8), (1, 4, 4), name="p5.zarr")
     geoms = open_geometries(obstore_store(url))
     cache = tmp_path / "c5"
-    _fill(url, geoms, backing_dir=cache, persist=True)
+    _fill(url, geoms, backing_dir=cache, persist=True).close()  # run 1 ends; lock released
 
     log = next(cache.glob("*.log"), None) or next(cache.glob("*.jsonl"), None)
     assert log is not None, f"no cache log found in {sorted(cache.iterdir())}"

@@ -110,6 +110,16 @@ class InSituDataset:
       per-sample random augmentation; runs after the cache, so it is **never cached**.
 
     Runnable side-by-side example: ``examples/transforms.py``.
+
+    **One writer per ``cache_dir``.** The cache directory (and ``persist=True`` on top of
+    it) is arbitrated across processes by an advisory lock held for the dataset's
+    lifetime: one writer at a time, and a second fails fast rather than silently
+    corrupting the first's chunks. Several jobs may read one warm cache at once with
+    ``readonly_cache=True``, which takes the lock shared, never writes, and **raises on a
+    miss** -- it asserts the cache is complete for what this run reads, rather than
+    quietly falling back to fetching. Put ``cache_dir`` on local NVMe: over a network
+    filesystem the lock may be emulated per client and we can only warn. See
+    ``docs/tuning.md``, "Sharing a cache_dir between processes".
     """
 
     def __init__(
@@ -127,6 +137,7 @@ class InSituDataset:
         cache_dir: str | None = None,
         cache_budget_bytes: int | None = None,
         persist: bool = False,
+        readonly_cache: bool = False,
         reset_stale_cache: bool = False,
         on_bad_chunk: str = "raise",
         chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
@@ -190,6 +201,7 @@ class InSituDataset:
         }
         self._epoch = 0
         self._persist = persist
+        self._readonly_cache = readonly_cache
         self._cache_dir = cache_dir
         self.resident_peak = 0  # peak resident outer chunks (observability)
         self.cache_hits = 0  # chunks served without a fetch this epoch (cross-epoch/run)
@@ -241,12 +253,16 @@ class InSituDataset:
         # the dir path is the dataset+pipeline identity (bury a version in it).
         if persist and cache_dir is None:
             raise ValueError("persist=True requires cache_dir to keep the cache files in")
+        # One writer per cache_dir, arbitrated by an advisory lock the pool holds for its
+        # lifetime; `readonly_cache=True` opens it shared, serves only what is already
+        # cached, and raises on a miss. See ChunkPool._lock and docs/tuning.md.
         self._pool = ChunkPool(
             self.geometries,
             chunk_transforms=self.chunk_transforms,
             backing_dir=cache_dir,
             budget_bytes=self.cache_budget_bytes,
             persist=persist,
+            readonly_cache=readonly_cache,
             reset_stale_cache=reset_stale_cache,
         )
 

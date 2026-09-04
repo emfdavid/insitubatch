@@ -166,6 +166,80 @@ kernel cannot reclaim — so it is bounded separately at RAM/8 by default. Past 
 hands out ordinary pageable memory and warns once, rather than raising or stalling; raise
 `pin_budget_bytes` if you meant to exceed it.
 
+## Sharing a `cache_dir` between processes
+
+**One writer at a time, or any number of readers — never both.** The pool takes an advisory
+lock on the directory for its lifetime, so the second opener is refused at construction
+rather than corrupting the first:
+
+| already open | second opener | |
+|---|---|---|
+| writer | writer | refused |
+| writer | reader (`readonly_cache=True`) | refused |
+| reader | writer | refused |
+| reader | reader | **allowed** |
+
+This applies whenever `cache_dir` is set — with or without `persist=True` — because the two
+write the same filenames. Without it, a second process re-admitting a chunk the first has
+mapped truncates the file underneath it, and the reader carries on with right-shape,
+right-dtype, wrong numbers.
+
+The workload it is shaped around — one job warms a cache, several score against it — is
+spelled `readonly_cache=True`:
+
+```python
+# Run once: warm the cache.
+warm = InSituDataset(store, manifest, cache_dir="/data/era5-cache", persist=True)
+for batch in warm.all: ...
+warm.close()
+
+# Then, concurrently, as many readers as you like.
+ds = InSituDataset(store, manifest, cache_dir="/data/era5-cache", readonly_cache=True)
+```
+
+A read-only opener writes nothing — no chunk files, no log entries — and **a cache miss
+raises**, naming the array and chunk. That is what makes it a contract (*this cache is
+complete for what I am about to read*) rather than a performance hint; the usual cause of a
+miss is a different split, `sample_range` or transform set than the run that warmed it.
+`reset_stale_cache=True` is rejected in this mode. Excluding a reader from a *live* writer
+follows from the same promise: a cache still being warmed is not complete, so it is better
+refused at construction than failed forty batches in.
+
+Invalidation — `reset_stale_cache` deleting entries, or a run re-admitting chunks it evicted
+— is therefore something no reader is ever present for. Underneath that, a chunk file is
+written to a temp name and renamed into place, so a reader holding a mapping keeps its own
+inode and keeps reading real data whether that file is replaced or deleted. That second
+layer is what stands where the lock cannot be taken (below): the worst a bypassed lock costs
+an active reader is a *future* open — a miss — never wrong numbers.
+
+### If you hit the lock
+
+The error names the holder's PID, host and start time. That is a **hint** read from the
+lockfile; the lock itself is authoritative, so confirm with:
+
+```bash
+fuser -v /data/era5-cache/.insitu.lock
+lsof /data/era5-cache/.insitu.lock
+```
+
+**Do not delete the lockfile.** It is the first thing people try and it is actively harmful:
+the lock is held by the kernel against an open file description, not by the file, so
+deleting it releases nothing — and it makes the next two processes lock *different inodes*,
+reintroducing exactly the corruption the check prevents.
+
+There is no such thing as a stale lock, and so no cleanup procedure. The kernel releases it
+when the process dies — `SIGKILL`, OOM and spot preemption included. If you are seeing the
+error, that process is alive.
+
+### Put `cache_dir` on local NVMe, not NFS
+
+The cache is an mmap tier, so this is what it is built for. Over a network filesystem it
+is slow and — more to the point — **unarbitrated**: `flock` may be emulated per client, so
+two processes on different hosts can each believe they hold the write lock. The loader warns
+when it can detect one (Linux, via the mount table), but detection is not a fix. A network
+`cache_dir` and a platform with no POSIX locking (Windows) are the two configurations where
+two writers can still corrupt each other, and both warn saying so.
+
 ## Shuffle quality
 
 `block_chunks` is also the shuffle-quality knob. Each batch is drawn from the samples in the

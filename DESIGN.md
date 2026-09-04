@@ -665,6 +665,28 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   so any consumer can detect silent shrinkage without re-deriving `valid_anchor_range`. An
   opt-in `on_edge="drop"|"raise"` is deliberately **deferred as YAGNI** until a second
   inference-style consumer appears — don't add the knob for one caller.
+- ~~**A shared `cache_dir` had no cross-process arbitration.**~~ **FIXED (part 1 of #42).**
+  Two processes on one `cache_dir` corrupted each other *silently*. Not a torn read on a
+  half-written chunk — the manifest gates that. The window is **re-admission after
+  eviction**: B revives a persisted chunk and holds its mapping; A misses the same chunk and
+  re-admits it; `open_memmap(mode="w+")` **truncates the file under B**, which then reads
+  zero pages as data. Right shape, right dtype, wrong numbers, so throughput, shapes and
+  smoke tests all pass. Surfaced in the supply-chain audit on
+  [NVIDIA/earth2studio#962](https://github.com/NVIDIA/earth2studio/pull/962), where
+  `InSituForecastFeed` exposes `cache_dir` with no warning. Two changes: (1) a slot file is
+  written under a temp name and `rename`d into place — POSIX keeps the old inode alive for
+  anyone holding it, so the truncation window is gone *independently of any locking*; (2) the
+  pool takes an advisory `flock` on the cache dir for its lifetime, exclusive to write and
+  shared under the new `readonly_cache=True`, so a second writer fails fast naming the holder
+  rather than corrupting the first. The lock keys on **`cache_dir` being set, not on
+  `persist`** — a correction to the issue as filed: `_alloc` writes the same filenames in
+  ephemeral spill mode, so scoping it to persist would have left the hole open. There is no
+  stale-lock procedure to document, because there is no stale lock: the kernel releases it
+  when the process dies, `SIGKILL` included. Deleting the lockfile is actively harmful — it
+  releases nothing and makes the next two processes lock *different inodes*, reintroducing
+  the corruption. **What remains open** is named where the user meets it: a network
+  `cache_dir` (`flock` may be emulated per client) and a platform with no POSIX locking are
+  still unarbitrated, and both warn at construction saying so. Detection is not a fix.
 - **Cache invalidation is whole-pipeline, not per-variable.** `chunk_transforms` is one list
   applied to every variable (each transform self-gates by name and no-ops on the rest), and
   the fingerprint hashes the **whole list once** → a single `pipeline_hash` on every array's

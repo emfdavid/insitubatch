@@ -16,6 +16,10 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
+    # Linux is what CI runs and therefore the only platform we claim. macOS is expected
+    # to work but untested; Windows is untested and, lacking POSIX advisory locking,
+    # cannot arbitrate two processes sharing a cache_dir. See README, "Platform support".
+    "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
     "numpy>=1.26",

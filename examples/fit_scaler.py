@@ -97,6 +97,8 @@ def run_demo(
     *,
     url: str | None = None,
     cache_dir: str | None = None,
+    persist: bool = False,
+    readonly_cache: bool = False,
     variables: list[str] | None = None,
     verbose: bool = True,
     **store_kwargs: Any,
@@ -118,6 +120,8 @@ def run_demo(
     manifest = split_by_chunk(geoms[var0], fractions=(1.0, 0.0, 0.0))
 
     # A cache big enough to hold the split: the fit pass warms it, training reuses it.
+    # With --persist that reuse survives the process; --readonly-cache reads a cache
+    # another run warmed and refuses to write it. One writer per cache_dir.
     ds = InSituDataset(
         store,
         manifest,
@@ -127,6 +131,8 @@ def run_demo(
         shuffle=False,
         cache_dir=cache_dir or (f"{tmp}/cache" if tmp else None),
         cache_budget_bytes=4 << 30,
+        persist=persist,
+        readonly_cache=readonly_cache,
     )
 
     # 1) fit over the loader (cold: decode + cache) -----------------------------------
@@ -188,6 +194,16 @@ def main() -> None:
     p.add_argument("--url", default=None, help="zarr URL (default: synthetic file://)")
     p.add_argument("--cache-dir", default=None, help="spill the cache to this dir (NVMe)")
     p.add_argument(
+        "--persist",
+        action="store_true",
+        help="keep the --cache-dir files across runs (a cross-run cache). One writer at a time",
+    )
+    p.add_argument(
+        "--readonly-cache",
+        action="store_true",
+        help="read a --cache-dir another run warmed, without writing it; a miss is an error",
+    )
+    p.add_argument(
         "--variables",
         default=None,
         help="comma list; must share the sample axis + chunking. --wb2 default: two "
@@ -205,7 +221,13 @@ def main() -> None:
         variables = ["2m_temperature", "10m_u_component_of_wind"]
     else:
         variables = None
-    run_demo(url=url, cache_dir=a.cache_dir, variables=variables)
+    run_demo(
+        url=url,
+        cache_dir=a.cache_dir,
+        persist=a.persist,
+        readonly_cache=a.readonly_cache,
+        variables=variables,
+    )
 
 
 if __name__ == "__main__":
