@@ -59,15 +59,17 @@ def test_each_crop_is_a_real_contiguous_window_of_its_own_sample():
 
 
 def test_per_sample_offsets_are_independent():
-    # Constant-fill samples: every value in out[b] equals b, and at least two
-    # samples land on different windows when the domain is large enough for
-    # the seeds to differ.
-    a = np.zeros((8, 10, 10))
-    for b in range(a.shape[0]):
-        a[b] = b
+    # Random content makes every sample's window locatable (_find_window),
+    # so the offsets can be inspected, not just inferred. Requiring at
+    # least two distinct windows fails the degenerate form where a single
+    # scalar offset is broadcast across the whole batch — the exact bug a
+    # vectorized rewrite could introduce (all samples cropped identically).
+    rng = np.random.default_rng(8)
+    a = rng.standard_normal((8, 10, 10))
     out = _apply(a, (3, 3), seed=6)
-    for b in range(a.shape[0]):
-        assert np.all(out[b] == b), f"sample {b} contains values from another sample"
+    windows = [_find_window(a[b], out[b]) for b in range(a.shape[0])]
+    assert all(w is not None for w in windows), "a crop is not a window of its sample"
+    assert len(set(windows)) > 1, "every sample shares one window; offsets are not per-sample"
 
 
 def test_same_seed_is_reproducible_and_different_seed_differs():
