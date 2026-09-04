@@ -89,12 +89,24 @@ def _subregion_crop(var: str, subregion: tuple[int, int], seed: int) -> Callable
     def crop(batch: Batch) -> Batch:
         a = batch.arrays[var]  # (batch, ..., LAT, LON)
         lat, lon = a.shape[-2], a.shape[-1]
-        out = np.empty(a.shape[:-2] + (h, w), dtype=a.dtype)
-        for b in range(a.shape[0]):
-            i = int(rng.integers(0, lat - h + 1))
-            j = int(rng.integers(0, lon - w + 1))
-            out[b] = a[b, ..., i : i + h, j : j + w]
-        batch.arrays[var] = out
+        b_size = a.shape[0]
+        # Draw every sample's offset in one batched pull from the RNG. Each
+        # sample still gets its own independent crop window — batching the
+        # draw changes the order the stream is consumed in, not the
+        # per-sample randomness — and one window per sample still covers
+        # every middle slice, exactly as the per-sample loop did.
+        i = rng.integers(0, lat - h + 1, size=b_size)  # (B,)
+        j = rng.integers(0, lon - w + 1, size=b_size)  # (B,)
+        # One strided view of every (h, w) window over the last two axes.
+        # The gather below indexes the batch axis with an array while the
+        # trailing : , : stay slices, so each window copies as a block
+        # instead of walking every axis element by element; the ellipsis
+        # puts the broadcast batch dims first and keeps the middle dims in
+        # place, so no reshape is needed.
+        windows = np.lib.stride_tricks.sliding_window_view(
+            a, (h, w), axis=(-2, -1)
+        )
+        batch.arrays[var] = windows[np.arange(b_size), ..., i, j, :, :]
         return batch
 
     return crop
