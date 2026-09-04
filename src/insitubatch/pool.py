@@ -1409,23 +1409,33 @@ class ChunkPool:
         cached chunk stays on NVMe, and returns the memmap -- which then becomes the slot's
         single tile. The backing is sized at the transform's *output* geometry (see
         :func:`output_geometry`), so a reshaping transform lands here exactly like a
-        shape-preserving one. A shape mismatch means ``__call__`` disagreed with its
-        declared ``output_inner``: a bug, raised.
+        shape-preserving one.
+
+        Sizing it from the **declared** geometry rather than from ``prepped`` is what makes
+        the check below mean anything: everything downstream of assembly -- the budget charge,
+        ``gather``'s tile placement, the revive structural check -- is derived from the
+        declaration, so a ``__call__`` that returns something else corrupts silently. ``gather``
+        reads a prefix of the real data (right shape, right dtype, wrong numbers) and the entry
+        can never revive again, because the file on disk no longer matches what the geometry
+        says to expect. Sizing from ``prepped.shape`` and then comparing against it, as this
+        did, is a guard that cannot fire.
         """
         if self._dir is None:
             return prepped
         out = self._out_by_path[slot.array]
         # A transformed chunk is a one-tile grid, so its file is (1, *slot_shape) -- the
         # same tile-major layout the untransformed path writes, with n_tiles == 1.
-        backing = self._alloc(slot.array, slot.chunk_index, (1, *prepped.shape), out.dtype)
+        declared = out.slot_shape(slot.chunk_index)
+        if prepped.shape != declared:
+            raise ValueError(
+                f"chunk_transform produced shape {prepped.shape} but its declared output "
+                f"geometry is {declared}; a reshaping transform's output_inner must agree with "
+                "what __call__ returns. The cache slot, the byte budget and gather are all "
+                "sized from the declaration, so this would be read back as truncated data."
+            )
+        backing = self._alloc(slot.array, slot.chunk_index, (1, *declared), out.dtype)
         slot.backing = backing
         backing = backing[0]
-        if prepped.shape != backing.shape:
-            raise ValueError(
-                f"chunk_transform produced shape {prepped.shape} but the cache slot is sized "
-                f"{backing.shape} from the declared output geometry; a reshaping transform's "
-                "output_inner must agree with what __call__ returns."
-            )
         backing[:] = prepped  # write into the memmap (casts to slot dtype)
         return backing
 
