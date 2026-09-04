@@ -63,6 +63,7 @@ So the GIL build is just the serialized (slower) case; free threading is upside.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import hashlib
 import inspect
@@ -70,13 +71,16 @@ import json
 import logging
 import os
 import re
+import socket
+import sys
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TextIO, cast
+from typing import cast
 
 import numpy as np
 
@@ -88,9 +92,92 @@ try:  # optional: stronger transform fingerprint (closures + globals). `--extra 
 except ImportError:  # pragma: no cover - exercised by the no-cloudpickle fallback path
     cloudpickle = None
 
+try:  # POSIX advisory locking, which is what arbitrates writers of a shared cache dir.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows; warned about at pool construction
+    fcntl = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
+
+
+#: Suffix of the private file a slot is written to before it is renamed into place
+#: (see :meth:`ChunkPool._alloc`). A crash between the two leaves one behind; the next
+#: writer to hold the cache lock sweeps them (:meth:`ChunkPool._sweep_tmp`).
+_TMP_SUFFIX = ".insitu-tmp"
+
+#: The advisory-lock file arbitrating writers of one cache dir (see :meth:`ChunkPool._lock`).
+_LOCK_NAME = ".insitu.lock"
+
+#: Filesystems on which the cache's arbitration does not hold. A **denylist**, not an
+#: allowlist: an unrecognized local filesystem stays quiet, and only the types we know
+#: break ``flock``/``rename`` semantics (or are ruinously slow for an mmap tier) warn.
+#: NFS in particular: ``flock`` may be emulated per-client (so two hosts both "hold" it),
+#: and a silently-dropped lock is exactly the case this arbitration exists to prevent.
+_NETWORK_FILESYSTEMS = frozenset(
+    {
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "fuse.sshfs",
+        "fuse.s3fs",
+        "fuse.gcsfuse",
+        "9p",
+        "lustre",
+        "ceph",
+        "glusterfs",
+    }
+)
+
+
+def _read_holder(fd: int) -> str:
+    """The lockfile's self-reported holder, rendered for an error message.
+
+    A **hint**: the ``flock`` is authoritative and this record can lie -- it names the last
+    process to take the lock for writing, while the lock may currently be held by readers.
+    Never let a parse failure mask the contention error we are on our way to raising.
+    """
+    try:
+        rec = json.loads(os.pread(fd, 4096, 0).decode() or "{}")
+        return f"PID {rec['pid']} on host {rec['host']}, since {rec['since']}"
+    except Exception:  # noqa: BLE001 - any unreadable record degrades to "unknown"
+        return "holder unknown -- the lockfile carries no readable record"
+
+
+def _filesystem_type(path: str | Path) -> str | None:
+    """The filesystem type backing ``path``, or ``None`` where we cannot tell.
+
+    Linux only, read from ``/proc/self/mountinfo`` by longest-prefix match on the
+    *resolved* path -- so a bind mount reports the type of what it is bound to, and a
+    cache dir under a deeper mount is attributed to that mount rather than to ``/``.
+    Returns ``None`` on macOS and Windows (no ``/proc``): we do not know, and a guess
+    would be worse than the honest absence, since the caller only ever *warns* on it.
+    """
+    try:
+        entries = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+    target = os.path.realpath(path)
+    best: tuple[int, str] | None = None
+    for line in entries:
+        # mountinfo: <id> <parent> <maj:min> <root> <mount point> <opts> [<tag>...] - <fstype> ...
+        left, sep, right = line.partition(" - ")
+        fields, rest = left.split(), right.split()
+        if not sep or len(fields) < 5 or not rest:
+            continue
+        try:  # mount points escape spaces/tabs as octal (\040); decode before comparing
+            mount = codecs.decode(fields[4], "unicode_escape")
+        except UnicodeDecodeError:  # pragma: no cover - a mount point we cannot read
+            continue
+        if target != mount and not target.startswith(mount.rstrip("/") + "/"):
+            continue
+        # Longest prefix wins; on a tie the later line does, since a mount stacked on an
+        # existing mount point shadows the one beneath it.
+        if best is None or len(mount) >= best[0]:
+            best = (len(mount), rest[0])
+    return None if best is None else best[1]
 
 
 def _safe(name: str) -> str:
@@ -337,6 +424,16 @@ class ChunkPool:
     ready+drained, so an in-flight or in-use chunk is never dropped. Backing is heap
     or mmap (see ``backing_dir``); ``chunk_transforms`` run once per outer chunk on
     the *assembled* array, so a hit reflects decode + transform.
+
+    **One writer per ``backing_dir``** (#42). Whenever a backing dir is set -- with or
+    without ``persist``, since ``_alloc`` writes the same filenames either way -- the pool
+    takes an advisory lock on it for its lifetime and a second writer fails fast
+    (:meth:`_lock`). ``readonly_cache=True`` takes that lock *shared* instead: many such
+    openers coexist with each other, none with a writer, none of them writes anything, and
+    a miss **raises** (:meth:`_readonly_miss`) rather than fetching -- the flag is an
+    assertion that this cache is complete for what the run reads. Slot files are replaced,
+    never truncated in place (:meth:`_alloc`), so a reader holding a mapping keeps reading
+    real data even while a writer re-admits the same chunk.
     """
 
     _MANIFEST_NAME = "insitu_cache.jsonl"
@@ -357,6 +454,7 @@ class ChunkPool:
         backing_dir: str | Path | None = None,
         budget_bytes: int | None = None,
         persist: bool = False,
+        readonly_cache: bool = False,
         reset_stale_cache: bool = False,
     ) -> None:
         self._geom = geometries  # label -> geometry (a label is one (array, offset) view)
@@ -386,6 +484,20 @@ class ChunkPool:
             )
             for p, out in self._out_by_path.items()
         }
+        # Cross-process arbitration (#42). Validate before creating anything: a rejected
+        # configuration should leave no directory and no lockfile behind.
+        if persist and backing_dir is None:
+            raise ValueError("persist=True requires cache_dir (a backing_dir) to keep files in")
+        if readonly_cache and backing_dir is None:
+            raise ValueError("readonly_cache=True requires cache_dir -- there is no cache to read")
+        if readonly_cache and reset_stale_cache:
+            raise ValueError(
+                "readonly_cache=True and reset_stale_cache=True contradict each other: a "
+                "read-only opener may not delete a cache another process may be reading. "
+                "Reset it from the run that writes it."
+            )
+        self._readonly = readonly_cache
+        self._lock_fd: int | None = None
         # backing: heap (np.empty) or mmap'd .npy under backing_dir (point at NVMe).
         # A heap slot adopts the tile; the mmap tier writes it into its tile-major slice
         # and keeps the view. mmap keeps the working set as reclaimable page cache rather
@@ -394,7 +506,18 @@ class ChunkPool:
         # spill a working set past RAM or for cross-epoch reuse, not for plain streaming.
         self._dir = Path(backing_dir) if backing_dir is not None else None
         if self._dir is not None:
+            if readonly_cache and not self._dir.is_dir():
+                raise ValueError(
+                    f"readonly_cache=True but {self._dir} does not exist. A read-only opener "
+                    "reads a cache another run warmed; it never creates one."
+                )
             self._dir.mkdir(parents=True, exist_ok=True)
+            self._warn_environment()
+            # The lock keys on cache_dir being set, NOT on persist: `_alloc` writes
+            # `{array}__{cid}.npy` whenever a backing dir is set, so two processes sharing a
+            # spill dir with persist=False collide on identical filenames just as surely.
+            self._lock()
+            self._sweep_tmp()
         # Observability. hits/misses (+ the revive failure breakdown) are per-epoch --
         # reset by unpin_all at each epoch boundary -- so the driver can warn when a
         # configured persist cache served nothing. manifest_entries is load-time (how
@@ -408,29 +531,30 @@ class ChunkPool:
         # entries, and revive them on reopen. Requires a dir to keep the files in. The dir
         # path is the dataset+pipeline identity (the user buries a version in it); we only
         # auto-check shape/dtype on revive (a mismatch is a miss, not an error).
-        self._persistent = persist
+        # readonly_cache reads the cross-run cache without writing it, so it needs the same
+        # revive machinery persist does -- `persist` only additionally *writes*.
+        self._persistent = persist or readonly_cache
         # When the on-disk cache is *stale* (its chunk_transform fingerprint or the log format
         # differs from this run's), the default is to fail fast -- a stale cache is almost never
         # what the user intended. Setting this opts into deleting the stale files and rebuilding.
         self._reset_stale_cache = reset_stale_cache
-        if persist and self._dir is None:
-            raise ValueError("persist=True requires cache_dir (a backing_dir) to keep files in")
         # key -> on-disk filename for completed entries known to survive a run.
         self._persisted: dict[tuple[str, int], str] = {}
         # Keys already written to the on-disk log this pool's lifetime (loaded entries + entries
         # appended on completion). Gates the append so re-completing a chunk across epochs/runs
         # never duplicates a line -- the log is self-deduplicating and bounded to O(#chunks).
         self._recorded: set[tuple[str, int]] = set()
-        # The append-only manifest handle (persist mode), held open for the pool's lifetime so a
-        # completion is one write()+flush() -- no per-chunk open(). None in heap/spill mode.
-        self._log: TextIO | None = None
+        # The append-only manifest fd (persist mode), held open for the pool's lifetime so a
+        # completion is one os.write() -- no per-chunk open(). None in heap/spill mode, and in
+        # readonly_cache mode, which reads the log and never appends to it.
+        self._log_fd: int | None = None
         # Fingerprint of the chunk_transform pipeline (only chunk_transforms are baked into
         # cached chunks; batch_transforms run post-cache). A run whose fingerprint differs
         # from the manifest's discards the cache (changed transforms -> stale). batch
         # transforms and the store identity are out of scope (the cache_dir path is the
         # dataset identity -- see the class docstring).
         self._pipeline_fp = ""
-        if persist:
+        if self._persistent:
             self._pipeline_fp = hashlib.sha256(
                 "\n".join(_transform_token(t) for t in self._chunk_transforms).encode()
             ).hexdigest()
@@ -441,8 +565,18 @@ class ChunkPool:
                     "(source only; closure/global changes may not invalidate). Install "
                     "`insitubatch[cache]` or set a `cache_key` attribute for a stronger guarantee."
                 )
-            self._load_log()
-            self._open_log()
+            try:
+                self._load_log()
+                if not readonly_cache:
+                    self._open_log()
+            except BaseException:
+                # A stale cache raises here, and the pool never becomes an object anyone can
+                # close -- so release the lock ourselves. `__del__` cannot: `close()` reads
+                # attributes this half-built pool does not have yet, and its own error
+                # suppression would swallow that, leaving the dir locked until the process
+                # exits. The user is expected to fix the configuration and construct again.
+                self._release_lock()
+                raise
         # Batch *output* buffers, distinct from the chunk slots below: gather lends one per
         # variable per batch and reclaims it once the consumer's view is unreferenced. It
         # carries its own lock, and needs it -- one ChunkPool is shared by every active
@@ -478,6 +612,172 @@ class ChunkPool:
         # unpin, which is what lets the scheduler prove an admission starvation is
         # terminal rather than merely slow (see Scheduler._admit).
         self._waiting: dict[tuple[str, int], int] = {}  # key -> blocked waiter count
+
+    # -- cross-process arbitration (#42) -------------------------------------
+
+    def _warn_environment(self) -> None:
+        """Warn once, at construction, about the configurations we cannot arbitrate.
+
+        Both messages have to say plainly that this is where two writers can still
+        corrupt each other -- it is exactly where the lock that would prevent it cannot
+        be taken. A denylist, so an unrecognized local filesystem stays quiet.
+        """
+        assert self._dir is not None
+        fstype = _filesystem_type(self._dir)
+        if fstype in _NETWORK_FILESYSTEMS:
+            logger.warning(
+                "cache_dir %s is on a %s filesystem. The cache is an mmap tier: it wants "
+                "local NVMe, and over a network filesystem it is both slow and "
+                "**unarbitrated** -- flock may be emulated per client, so two processes on "
+                "different hosts can each believe they hold the write lock and silently "
+                "corrupt each other's chunks. This is the one configuration where that is "
+                "still possible. Point cache_dir at local disk.",
+                self._dir,
+                fstype,
+            )
+        if fcntl is None:
+            logger.warning(
+                "no POSIX advisory locking on this platform (%s), so insitubatch cannot "
+                "arbitrate writers of cache_dir %s. Two processes sharing it will silently "
+                "corrupt each other's chunks -- give each its own cache_dir. This is the one "
+                "configuration where that is still possible.",
+                sys.platform,
+                self._dir,
+            )
+
+    def _lock(self) -> None:
+        """Take the cache dir's advisory lock, held for the pool's lifetime.
+
+        ``LOCK_EX`` to write, ``LOCK_SH`` for ``readonly_cache``: one writer at a time, any
+        number of concurrent readers, never both. **Non-blocking** -- contention is a
+        configuration fact the user has to resolve, not a queue to join, so it raises with
+        the diagnosis rather than parking a training job indefinitely.
+
+        The lock cannot go stale. ``flock`` is held by the kernel on behalf of the open
+        file description, so it is released when the process dies -- ``SIGKILL``, OOM and
+        spot preemption included. There is therefore no cleanup procedure, and deleting the
+        lockfile is actively harmful: it releases nothing and makes the next two processes
+        lock different inodes, which is the corruption this exists to prevent.
+        """
+        assert self._dir is not None
+        path = self._dir / _LOCK_NAME
+        if fcntl is None:  # pragma: no cover - Windows; warned about in _warn_environment
+            return
+        flags = (os.O_RDONLY if self._readonly else os.O_RDWR) | os.O_CREAT
+        fd = os.open(path, flags, 0o644)
+        op = (fcntl.LOCK_SH if self._readonly else fcntl.LOCK_EX) | fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd, op)
+        except OSError as exc:
+            holder = _read_holder(fd)
+            os.close(fd)
+            raise RuntimeError(self._contention_message(path, holder)) from exc
+        self._lock_fd = fd
+        if not self._readonly:
+            # Who holds it, for the *next* process's error message. A hint only -- the
+            # flock is authoritative and this record can lie (it names the last writer,
+            # while the lock may currently be held by readers).
+            os.ftruncate(fd, 0)
+            os.write(
+                fd,
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "since": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                ).encode()
+                + b"\n",
+            )
+
+    def _contention_message(self, path: Path, holder: str) -> str:
+        """What to tell the user when the cache lock is already held.
+
+        Two different situations, so two different leads: a writer blocked by anyone, and
+        a ``readonly_cache`` opener blocked by a live writer. Both end with the same
+        diagnostic instructions, because both are answered by the same commands.
+        """
+        how = (
+            f"To see who holds it:  fuser -v {path}\n"
+            f"                      lsof {path}\n"
+            "\n"
+            "Do NOT delete the lockfile. The lock is held by the kernel, not by the file, so\n"
+            "deleting it releases nothing -- it only makes the next two processes lock "
+            "different\ninodes, which is the corruption this check exists to prevent. A hard "
+            "kill (SIGKILL,\nOOM, spot preemption) cannot leave a stale lock: the kernel "
+            "releases it when the\nprocess dies. If you see this message, that process is "
+            "alive."
+        )
+        if self._readonly:
+            return (
+                f"insitubatch: cache_dir '{self._dir}' is being written right now "
+                f"({holder}), so it\ncannot be opened with readonly_cache=True. That flag "
+                "asserts the cache is complete\nfor what this run reads, and a cache still "
+                "being warmed is not. Wait for the writing\nrun to finish, or point this run "
+                f"at a cache_dir of its own.\n\n{how}"
+            )
+        return (
+            f"insitubatch: cache_dir '{self._dir}' is already open for writing by another\n"
+            f"process ({holder}).\n"
+            "\n"
+            "Is that expected?\n"
+            "  - If you meant to run two jobs against one cache: only one may write. Start "
+            "the\n    others with readonly_cache=True, once this one has finished warming "
+            "it.\n"
+            "  - If you did not: two writers silently corrupt each other's chunks, which is "
+            "why\n    this is an error rather than a warning. Point them at separate "
+            f"cache_dirs.\n\n{how}"
+        )
+
+    def _release_lock(self) -> None:
+        """Drop the cache dir's lock, if we hold one. Idempotent.
+
+        Closing the fd is what releases the ``flock`` -- the kernel holds it against the
+        open file description. The lockfile itself **stays**: it is the inode every process
+        locks, and unlinking it is precisely what would let the next two lock different
+        inodes and corrupt each other.
+        """
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    def _sweep_tmp(self) -> None:
+        """Delete temp files a crashed writer left behind.
+
+        ``_alloc`` writes ``<name>.<pid>.insitu-tmp`` and renames it into place; a process
+        killed between the two leaves one. Sweeping is safe **only** under the exclusive
+        lock -- that is what proves no other writer has one in flight -- so a read-only
+        opener never sweeps, and neither does a platform where no lock could be taken.
+        """
+        assert self._dir is not None
+        if self._lock_fd is None or self._readonly:
+            return
+        for stale in self._dir.glob(f"*{_TMP_SUFFIX}"):
+            with contextlib.suppress(OSError):
+                stale.unlink()
+
+    def _readonly_miss(self, array: str, chunk_index: int) -> RuntimeError:
+        """The error a ``readonly_cache`` miss raises -- the contract, not a slow path.
+
+        Two causes worth separating: the entry is not in the cache at all (the usual one,
+        and a configuration mismatch with the run that warmed it), or it is there and could
+        not be made resident (budget).
+        """
+        if self._persisted.get((array, chunk_index)) is not None:
+            return RuntimeError(
+                f"readonly_cache: chunk {chunk_index} of {array!r} is in the cache at "
+                f"{self._dir} but could not be made resident. Either its .npy is unreadable "
+                "or no longer matches the current geometry (the debug log names which), or "
+                "the byte budget is too small to hold the working set and nothing resident "
+                "is evictable -- raise cache_budget_bytes."
+            )
+        return RuntimeError(
+            f"readonly_cache: chunk {chunk_index} of {array!r} is not in the cache at "
+            f"{self._dir}, and a read-only opener may not fetch it. readonly_cache=True "
+            "asserts this cache is complete for what the run reads; it is not. The usual "
+            "cause is that the run that warmed it used a different split, sample_range or "
+            "transform set. Warm this configuration once with persist=True, then re-run."
+        )
 
     # -- ownership ----------------------------------------------------------
 
@@ -611,6 +911,16 @@ class ChunkPool:
                 # later epoch refetches instead of re-raising a stale error forever.
                 self._pin(key, owner)  # the pin IS this owner's claim (see wait_ready)
                 self._cv.notify_all()  # a ready hit may now satisfy a waiter
+                return True
+            if self._readonly:
+                # A read-only opener never allocates: the cache is its whole supply. A miss
+                # is the `readonly_cache` contract turning out to be false, so say so --
+                # raising is what makes it a contract rather than a silent slow path.
+                if not self._revive(key):
+                    raise self._readonly_miss(array, chunk_index)
+                self.hits += 1  # revived from disk -> no fetch (as in pin_if_ready)
+                self._pin(key, owner)
+                self._cv.notify_all()
                 return True
             if not self._make_room(nbytes):
                 return False
@@ -911,10 +1221,29 @@ class ChunkPool:
     def _alloc(
         self, array: str, chunk_index: int, shape: tuple[int, ...], dtype: np.dtype
     ) -> np.ndarray:
+        """Back one slot: heap, or a fresh ``.npy`` under the cache dir.
+
+        The mmap tier **never truncates an existing file in place**. ``open_memmap(mode=
+        "w+")`` opens with ``O_TRUNC``, which zeroes the pages of every mapping already
+        held on that inode -- including another process's, reading a revived cache entry
+        and getting right-shape, right-dtype, wrong numbers (#42). So write a private temp
+        file and ``replace()`` the directory entry: POSIX keeps the old inode alive for
+        anyone holding it, so their mapping stays intact while new openers see the new
+        file. The rename is atomic within a directory, so nobody sees a half-written entry
+        either.
+        """
         if self._dir is None:
             return np.empty(shape, dtype=dtype)
         path = self._dir / f"{_safe(array)}__{chunk_index}.npy"
-        return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+        tmp = self._dir / f"{path.name}.{os.getpid()}{_TMP_SUFFIX}"
+        backing = np.lib.format.open_memmap(tmp, mode="w+", dtype=dtype, shape=shape)
+        tmp.replace(path)
+        # The mapping *is* `path` now -- renaming does not disturb it -- but numpy recorded
+        # the name it was opened under. Correct it: `_record_completed` names the cache entry
+        # from here and `_free` unlinks through it, and both would otherwise chase a temp
+        # path that no longer exists.
+        cast("np.memmap", backing).filename = os.path.abspath(path)
+        return backing
 
     @contextlib.contextmanager
     def tile_write(
@@ -1280,37 +1609,54 @@ class ChunkPool:
             return  # heap backing -- nothing on disk to record
         fname = Path(fname).name
         self._persisted[key] = fname
-        if self._log is not None and key not in self._recorded:
+        if self._log_fd is not None and key not in self._recorded:
             array, chunk_index = key
             self._append_entry(array, chunk_index, fname)
             self._recorded.add(key)
 
     def _append_entry(self, array: str, chunk_index: int, fname: str) -> None:  # under the lock
-        """Append one completed-entry line to the open log and flush it to the page cache.
+        """Append one completed-entry line to the open log."""
+        self._write_line({"array": array, "chunk_index": chunk_index, "file": fname})
 
-        ``flush`` (not ``fsync``) makes the entry durable against *process death* -- the target
-        failure mode (spot preemption / OOM / SIGTERM); the kernel flushes the page cache. Power
-        loss (which would need ``fsync`` per chunk) is out of scope.
+    def _write_line(self, record: dict[str, object]) -> None:
+        """Append one JSON record as a **single** ``os.write`` on an ``O_APPEND`` fd.
+
+        POSIX makes an append of less than ``PIPE_BUF`` atomic -- the seek to the end and the
+        write are one operation -- and entries are ~100 bytes, so a line can never interleave
+        with another writer's. The lock already gives us a single writer; this makes the
+        *format* robust independently of it, which is what keeps a log written on an
+        unarbitrated platform readable.
+
+        No ``flush``/``fsync``: the write lands in the page cache directly, which is durable
+        against *process death* -- the target failure mode (spot preemption / OOM / SIGTERM).
+        Power loss (which would need ``fsync`` per chunk) is out of scope. A short write would
+        leave a torn line and cannot be retried (a retry would land after another writer's
+        line), so it raises.
         """
-        assert self._log is not None
-        self._log.write(json.dumps({"array": array, "chunk_index": chunk_index, "file": fname}))
-        self._log.write("\n")
-        self._log.flush()
+        assert self._log_fd is not None
+        data = (json.dumps(record) + "\n").encode()
+        written = os.write(self._log_fd, data)
+        if written != len(data):  # pragma: no cover - only reachable on a full disk
+            raise OSError(
+                f"persist: short write to the cache log ({written} of {len(data)} bytes) -- "
+                "the disk is probably full. The log now ends in a torn line, which the next "
+                "run drops; the entries before it are intact."
+            )
 
     def _open_log(self) -> None:
         """Open the append-only manifest for the pool's lifetime; write the header on a cold
         start (or after a stale-cache reset removed the file). A warm reopen appends after the
         existing entries -- the ``_recorded`` gate (populated by :meth:`_load_log`) keeps those
-        from being re-appended."""
+        from being re-appended. ``readonly_cache`` never gets here: it reads the log and
+        never opens it for writing."""
         assert self._dir is not None
         path = self._dir / self._MANIFEST_NAME
         fresh = not path.exists()
-        self._log = path.open("a")
+        self._log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         if fresh:
-            header = {"format_version": self._MANIFEST_FORMAT, "pipeline_hash": self._pipeline_fp}
-            self._log.write(json.dumps(header))
-            self._log.write("\n")
-            self._log.flush()
+            self._write_line(
+                {"format_version": self._MANIFEST_FORMAT, "pipeline_hash": self._pipeline_fp}
+            )
 
     def _load_log(self) -> None:
         """Populate the persisted-entry registry from a prior run's append-only log, if any.
@@ -1394,14 +1740,15 @@ class ChunkPool:
         logger.info("persist: stale cache at %s (%s changed) reset; rebuilding.", self._dir, why)
 
     def close(self) -> None:
-        """Free every remaining slot and release the log handle. Persist keeps ready cache files
+        """Free every remaining slot; release the log handle and the cache lock. Persist keeps
+        ready cache files
         (each already recorded in the log at completion, so there is nothing to rewrite -- just
         flush + close the handle); heap/spill mmap files are unlinked. Idempotent."""
         with self._cv:
-            if self._log is not None:
-                self._log.flush()
-                self._log.close()
-                self._log = None
+            if self._log_fd is not None:
+                os.close(self._log_fd)
+                self._log_fd = None
+            self._release_lock()
             for k in list(self._slots):
                 slot = self._slots.pop(k)
                 self._free(slot, keep_file=self._persistent and slot.state is SlotState.READY)

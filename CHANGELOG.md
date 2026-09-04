@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- **One writer per `cache_dir` — the silent corruption two jobs on one cache could cause is
+  now an error.** Two Earth2Studio inference jobs pointed at one `cache_dir` — the obvious
+  thing to do, and what the supply-chain audit on
+  [NVIDIA/earth2studio#962](https://github.com/NVIDIA/earth2studio/pull/962) found the feed
+  invites — could corrupt each other with nothing to show for it. The window is re-admission
+  after eviction: process B revives a cached chunk and holds its mapping, process A misses
+  the same chunk and re-admits it, and `open_memmap(mode="w+")` truncates the file *under
+  B*, which reads zero pages as data. Right shape, right dtype, wrong numbers — throughput,
+  shapes and smoke tests all pass, and only a model-free baseline like persistence RMSE
+  would have noticed.
+
+  Two changes, and the first stands on its own: a chunk file is now written under a temp
+  name and `rename`d into place, so a held mapping keeps its inode and its data no matter
+  who re-admits the chunk. On top of that the pool takes an advisory `flock` on the cache
+  directory for its lifetime, so a second writer **fails fast** — with the holder's PID and
+  host, what to do in either case, and the two commands that answer "who?" — instead of
+  quietly disagreeing with the first. The lock keys on **`cache_dir` being set, not on
+  `persist=True`**: `_alloc` writes the same filenames in ephemeral spill mode, so scoping
+  it to persist would have left the identical hole open.
+
+  New `readonly_cache=True` (on `InSituDataset` and `ChunkPool`) is the workload this is
+  shaped around — one job warms a cache, several score against it. It takes the lock shared,
+  so any number coexist; it writes nothing; and **a cache miss raises**, naming the array
+  and chunk. That is what makes it a contract — *this cache is complete for what I am about
+  to read* — rather than a slow path that silently re-fetches whatever the warming run's
+  split or transforms left out.
+
+  Two things the docs now have to say because users will otherwise get them wrong. There is
+  no such thing as a stale `flock` — the kernel releases it when the process dies, `SIGKILL`
+  and spot preemption included — so there is no cleanup procedure, and **deleting the
+  lockfile is actively harmful**: it releases nothing and makes the next two processes lock
+  different inodes, reintroducing the corruption. And a network `cache_dir` (where `flock`
+  may be emulated per client) or a platform without POSIX locking is still unarbitrated;
+  both now warn at construction saying exactly that, because it is the one configuration
+  where two writers can still corrupt each other. Which also forced the project's first
+  **platform-support statement** (README, contributing, classifiers): Linux supported and
+  the only thing CI proves, macOS untested, Windows untested and unarbitrated — *untested*,
+  not *unsupported*.
+
+  Part 1 of #42. Per-variable cache identity (part 2) needs a manifest bump and is
+  unchanged; this fixes the corruption without invalidating anybody's cache.
+
 - **`InSituDataset.last_pass` — which stage was the bottleneck, and what to do about it.**
   Every producer-side problem presents the same way, as an empty batch queue: slow storage,
   a saturated decode pool, and a residency budget too small to admit the next chunk are

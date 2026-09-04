@@ -166,6 +166,75 @@ kernel cannot reclaim — so it is bounded separately at RAM/8 by default. Past 
 hands out ordinary pageable memory and warns once, rather than raising or stalling; raise
 `pin_budget_bytes` if you meant to exceed it.
 
+## Sharing a `cache_dir` between processes
+
+**One process at a time may write a given `cache_dir`.** The loader enforces it: the pool
+takes an advisory lock on the directory for its lifetime, and a second writer fails fast
+with an error naming the holder rather than corrupting the first one's chunks. This applies
+whenever `cache_dir` is set — with or without `persist=True` — because the two write the
+same filenames.
+
+The failure it replaces was silent. A cached chunk is an mmap'd `.npy`; a second process
+re-admitting a chunk the first has mapped used to truncate the file underneath it, and the
+reader carried on with right-shape, right-dtype, wrong numbers. Throughput, shapes and
+smoke tests all pass. Chunk files are now replaced rather than truncated in place, so a
+held mapping keeps reading real data; the lock is what keeps two writers from disagreeing
+about *what* should be there in the first place.
+
+The workload this is shaped around — one job warms a cache, several score against it — is
+spelled `readonly_cache=True`:
+
+```python
+# Run once: warm the cache.
+warm = InSituDataset(store, manifest, cache_dir="/data/era5-cache", persist=True)
+for batch in warm.all: ...
+warm.close()
+
+# Then, concurrently, as many readers as you like.
+ds = InSituDataset(store, manifest, cache_dir="/data/era5-cache", readonly_cache=True)
+```
+
+A read-only opener takes the lock *shared*: any number coexist with each other, none with a
+writer. It writes nothing — no chunk files, no log entries — and **a cache miss raises**.
+That is deliberate: the flag asserts *this cache is complete for what I am about to read*,
+and a silent fall-back to fetching would make it a performance hint instead of a contract.
+The error names the array and chunk, and the usual cause is a different split,
+`sample_range` or transform set than the run that warmed it. `reset_stale_cache=True` is
+rejected in this mode — a reader may not delete files another process is using.
+
+### If you hit the lock
+
+```
+insitubatch: cache_dir '/data/era5-cache' is already open for writing by another
+process (PID 44315 on host gpu-07, since 14:22:10).
+```
+
+To find the holder:
+
+```bash
+fuser -v /data/era5-cache/.insitu.lock
+lsof /data/era5-cache/.insitu.lock
+```
+
+**Do not delete the lockfile.** It is the first thing people try and it is actively
+harmful. The lock is held by the kernel against an open file description, not by the file:
+deleting it releases nothing, and it makes the next two processes lock *different inodes* —
+reintroducing exactly the corruption the check prevents. The PID/host/time in the file are
+a **hint** for the message; the lock itself is authoritative.
+
+There is also no such thing as a stale lock, so there is no cleanup procedure to run. The
+kernel releases it when the process dies — `SIGKILL`, OOM and spot preemption included. If
+you are seeing the error, that process is alive.
+
+### Put `cache_dir` on local NVMe, not NFS
+
+This is the mmap tier used as designed, not a new restriction. Over a network filesystem it
+is slow, and — more to the point — **unarbitrated**: `flock` may be emulated per client, so
+two processes on different hosts can each believe they hold the write lock. The loader
+warns when it can detect one (Linux, via the mount table), but detection is not a fix. A
+network `cache_dir` and a platform with no POSIX locking (Windows) are the two
+configurations where two writers can still corrupt each other, and both warn saying so.
+
 ## Shuffle quality
 
 `block_chunks` is also the shuffle-quality knob. Each batch is drawn from the samples in the

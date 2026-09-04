@@ -110,6 +110,8 @@ def run_demo(
     prefetch_depth: int = 2,
     cache_resident: bool = False,
     cache_dir: str | None = None,
+    persist: bool = False,
+    readonly_cache: bool = False,
     train_step_ms: float = 0.0,
     num_epochs: int = 1,
     max_batches: int = 0,
@@ -144,6 +146,8 @@ def run_demo(
     # Caching is the pool's policy (V2: "don't evict"). --cache-resident sizes the budget
     # to hold the whole train split, so epoch 2+ is served from the pool (decode-once);
     # --cache-dir spills the slots to NVMe (mmap) instead of heap. Default: read-once.
+    # --persist keeps those files across runs (a cross-run cache); --readonly-cache reads
+    # one another run warmed without writing it. One writer per cache_dir, always.
     cache_budget_bytes = None
     if cache_resident:
         per_chunk = geom.sample_chunk_size * int(np.prod(geom.inner_shape)) * geom.dtype.itemsize
@@ -158,6 +162,8 @@ def run_demo(
         prefetch_depth=prefetch_depth,
         cache_dir=cache_dir,
         cache_budget_bytes=cache_budget_bytes,
+        persist=persist,
+        readonly_cache=readonly_cache,
         shuffle=shuffle,
         seed=seed,
         batch_transforms=[_subregion_crop(var, subregion, seed)],
@@ -229,6 +235,16 @@ def main() -> None:
         help="hold the whole train split in the pool -> epoch 2+ decode-once (else read-once)",
     )
     p.add_argument("--cache-dir", default=None, help="spill the resident cache to NVMe (mmap)")
+    p.add_argument(
+        "--persist",
+        action="store_true",
+        help="keep the --cache-dir files across runs (a cross-run cache). One writer at a time",
+    )
+    p.add_argument(
+        "--readonly-cache",
+        action="store_true",
+        help="read a --cache-dir another run warmed, without writing it; a miss is an error",
+    )
     p.add_argument("--train-step-ms", type=float, default=0.0)
     p.add_argument("--num-epochs", type=int, default=1)
     p.add_argument("--max-batches", type=int, default=0, help="cap batches per epoch (0 = all)")
@@ -253,6 +269,8 @@ def main() -> None:
         prefetch_depth=a.prefetch_depth,
         cache_resident=a.cache_resident,
         cache_dir=a.cache_dir,
+        persist=a.persist,
+        readonly_cache=a.readonly_cache,
         train_step_ms=a.train_step_ms,
         num_epochs=a.num_epochs,
         max_batches=a.max_batches,

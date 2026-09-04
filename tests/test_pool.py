@@ -15,6 +15,7 @@ import asyncio
 import itertools
 import json
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
@@ -499,6 +500,18 @@ def test_pool_persist_requires_cache_dir(tiled_store):
         ChunkPool(geoms, persist=True)
 
 
+def _die(pool):
+    """Simulate the process being *killed* (spot preempt / OOM / SIGKILL).
+
+    The kernel closes its fds -- releasing the cache dir's ``flock``, which is held on
+    behalf of the open file description and so can never go stale -- while nothing in
+    ``close()`` runs: no orderly teardown, no manifest rewrite. What survives on disk is
+    exactly what was appended as each chunk completed, which is the contract under test.
+    """
+    os.close(pool._lock_fd)
+    pool._lock_fd = None
+
+
 def _fill_chunk(pool, var, cid, geom, tiles, owner):
     pool.try_admit(var, cid, owner)
     for inner in geom.inner_coords():
@@ -560,6 +573,7 @@ def test_pool_persist_crash_recovery_without_close(tiled_store, tmp_path):
         _fill_chunk(pool, "single_inner", cid, geom, tiles, owner)
     log = (backing / "insitu_cache.jsonl").read_text().splitlines()
     assert len(log) == geom.n_chunks + 1  # header + one entry per completed chunk
+    _die(pool)
 
     # Run 2: same dir, fresh pool -> every chunk a ready hit despite the missing close().
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
@@ -590,7 +604,7 @@ def test_pool_persist_partial_iteration_recovers_completed_subset(tiled_store, t
     owner = pool.new_owner()
     # only chunk 0 completes before the "crash"
     _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
-    # no close()
+    _die(pool)  # no close()
 
     pool2 = ChunkPool(geoms, backing_dir=backing, persist=True)
     owner = pool2.new_owner()
@@ -650,7 +664,7 @@ def test_pool_close_is_idempotent(tiled_store, tmp_path):
     owner = pool.new_owner()
     _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
     pool.close()
-    assert pool._log is None  # handle released
+    assert pool._log_fd is None  # log handle released
     pool.close()  # idempotent -- no double-close error on the file handle or slots
 
 

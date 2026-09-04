@@ -111,6 +111,17 @@ uv sync --extra docs       # MkDocs site
 uv sync --extra gpu        # CUDA box only: cupy + kvikio zero-copy path
 ```
 
+### Which platform
+
+**Linux is what CI runs, and the only platform we claim.** macOS is expected to work and is
+*untested* — no CI job, no regular local runs. Windows is untested too, and additionally has
+no POSIX advisory locking, so it cannot arbitrate two processes sharing a `cache_dir`; the
+loader warns at construction when it finds itself there.
+
+*Untested* is not *unsupported*: we have no evidence either way, and claiming support we do
+not test is an overclaim. If you develop on macOS or Windows, a bug report — or a CI job —
+is a genuinely useful contribution.
+
 Code lives in `src/insitubatch/`, tests in `tests/`, the benchmark suite in `bench/`, and
 runnable examples in `examples/`. DESIGN.md's
 [**Module map**](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#module-map) is the

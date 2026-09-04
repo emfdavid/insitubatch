@@ -88,6 +88,8 @@ def run(
     sample_range: tuple[int, int] | None = None,
     cache_resident: bool = False,
     cache_dir: str | None = None,
+    persist: bool = False,
+    readonly_cache: bool = False,
     train_step_ms: float = 0.0,
     num_epochs: int = 1,
     max_batches: int = 0,
@@ -109,6 +111,10 @@ def run(
     first batch. Pick a window (e.g. one year of 6-hourly steps) so the cache fits; pair
     with ``cache_dir`` to spill the slots to NVMe (mmap) instead of RAM. With a bounded,
     cached split, epoch 2+ is served decode-once from the pool (no re-fetch).
+
+    ``persist`` keeps those files across runs; ``readonly_cache`` reads a cache another run
+    warmed without writing it. Only one process at a time may write a given ``cache_dir``
+    -- a second is an error, not a corruption.
     """
     qual = f"{group}/{var}" if group else var
     geom = open_geometries(store, variables=[qual])[qual]
@@ -144,6 +150,8 @@ def run(
         max_inflight=max_inflight,
         cache_budget_bytes=cache_budget_bytes,
         cache_dir=cache_dir,
+        persist=persist,
+        readonly_cache=readonly_cache,
         shuffle=shuffle,
         seed=seed,
         batch_transforms=[_crop(patch, seed)],
@@ -231,6 +239,16 @@ def main() -> None:
         help="hold the (subset) train split resident -> epoch 2+ is decode-once (no re-fetch)",
     )
     p.add_argument("--cache-dir", default=None, help="spill cached slots to this NVMe dir (mmap)")
+    p.add_argument(
+        "--persist",
+        action="store_true",
+        help="keep the --cache-dir files across runs (a cross-run cache). One writer at a time",
+    )
+    p.add_argument(
+        "--readonly-cache",
+        action="store_true",
+        help="read a --cache-dir another run warmed, without writing it; a miss is an error",
+    )
     add_log_level(p)
     a = p.parse_args()
     configure_logging(a.log_level)
@@ -251,6 +269,8 @@ def main() -> None:
         sample_range=a.sample_range,
         cache_resident=a.cache_resident,
         cache_dir=a.cache_dir,
+        persist=a.persist,
+        readonly_cache=a.readonly_cache,
     )
 
 

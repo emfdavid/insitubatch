@@ -95,6 +95,7 @@ class ConfigReport(TypedDict):
     cache_budget_bytes: int
     cache_dir: str | None
     persist: bool
+    readonly_cache: bool
     chunk_transforms: tuple[str, ...]
     batch_transforms: tuple[str, ...]
     assembles: bool
@@ -351,6 +352,7 @@ def describe(ds: InSituDataset, *, iterations: int = 1) -> DatasetReport:
         cache_budget_bytes=ds.cache_budget_bytes,
         cache_dir=str(ds._cache_dir) if ds._cache_dir is not None else None,
         persist=ds._persist,
+        readonly_cache=ds._readonly_cache,
         chunk_transforms=tuple(_name(t) for t in ds.chunk_transforms),
         batch_transforms=tuple(_name(t) for t in ds.batch_transforms),
         assembles=assembles,
@@ -477,8 +479,11 @@ def print_summary(report: DatasetReport, file: TextIO | None = None) -> None:
     splits = "  ".join(f"{k} {n}" for k, n in cfg["split_chunks"].items())
     out.append(f"  splits (chunks)  {splits}")
     cache = cfg["cache_dir"] or "heap"
-    persist = ", persist" if cfg["persist"] else ""
-    out.append(f"  cache backing {cache}{persist}")
+    # read-only is worth a line of its own: it changes what the run *does* (serves only what
+    # is already cached, and raises on a miss rather than fetching), which is exactly what a
+    # "what will this cost" report exists to tell you before it costs it.
+    mode = ", read-only" if cfg["readonly_cache"] else (", persist" if cfg["persist"] else "")
+    out.append(f"  cache backing {cache}{mode}")
     if cfg["chunk_transforms"]:
         out.append(f"  chunk_transforms {', '.join(cfg['chunk_transforms'])} (slot assembles)")
     if cfg["batch_transforms"]:
