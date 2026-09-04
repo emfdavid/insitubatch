@@ -301,6 +301,46 @@ def test_pool_reshaping_transform_dtype_recast(tiled_store):
     np.testing.assert_allclose(got, srcs["single_inner"][:spc].mean(axis=-1), rtol=1e-12)
 
 
+class LiesAboutItsOutput:
+    """Declares one output shape and returns another -- the user error the slot-shape guard
+    exists to catch. ``output_inner`` says the last axis collapses; ``__call__`` leaves it."""
+
+    cache_key = "lies-about-its-output"
+
+    def __call__(self, chunk):
+        return chunk  # untouched: still (n, 9, 7)
+
+    def output_inner(self, geom: ArrayGeometry) -> tuple[tuple[int, ...], np.dtype]:
+        return geom.inner_shape[:-1], geom.dtype  # claims (n, 9)
+
+
+def test_pool_transform_disagreeing_with_its_declared_output_raises(tiled_store, tmp_path):
+    """A ``chunk_transform`` whose ``__call__`` disagrees with its own ``output_inner`` must
+    raise, not write a differently-shaped file.
+
+    Everything downstream of assembly -- the budget charge, ``gather``'s tile placement, the
+    revive structural check -- is sized from the *declared* output geometry, so a transform
+    that returns something else corrupts silently: ``gather`` reads a prefix of the real data
+    (right shape, right dtype, wrong numbers) and the entry can never revive, because the
+    ``.npy`` on disk no longer matches what the geometry says to expect.
+    """
+    url, _ = tiled_store
+    geoms = open_geometries(obstore_store(url), variables=["single_inner"])
+    geom = geoms["single_inner"]
+    tiles = asyncio.run(_decode_tiles(url, "single_inner"))
+    backing = tmp_path / "cache"
+
+    pool = ChunkPool(
+        geoms, backing_dir=backing, persist=True, chunk_transforms=[LiesAboutItsOutput()]
+    )
+    owner = pool.new_owner()
+    try:
+        with pytest.raises(ValueError, match="output_inner"):
+            _fill_chunk(pool, "single_inner", 0, geom, tiles, owner)
+    finally:
+        pool.close()
+
+
 @pytest.mark.parametrize("no_cloudpickle", [False, True], ids=["cloudpickle", "source-hash"])
 def test_pool_reshaping_transform_mmap_persist_roundtrip(
     tiled_store, tmp_path, monkeypatch, no_cloudpickle

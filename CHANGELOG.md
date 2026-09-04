@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **A `chunk_transform` that disagrees with its own declared output shape now raises instead of
+  silently truncating.** Everything downstream of assembly — the byte budget, `gather`'s tile
+  placement, the revive structural check — is sized from the transform's declared `output_inner`,
+  so a `__call__` that returns a different shape is read back as a *prefix* of the real data:
+  right shape, right dtype, wrong numbers, and an entry that can never revive again because the
+  `.npy` on disk no longer matches what the geometry says to expect. `ChunkPool._persist` carried
+  a guard for exactly this, and it could not fire — it sized the cache slot from the result's own
+  shape and then compared the result against it. It is now sized from the declaration, which is
+  what makes the comparison mean anything, and the error names both shapes and what would have
+  happened. The check also runs before the file is allocated, so a rejected chunk leaves nothing
+  on disk.
+
 - **One writer per `cache_dir` — the silent corruption two jobs on one cache could cause is
   now an error.** Two Earth2Studio inference jobs pointed at one `cache_dir` — the obvious
   thing to do, and what the supply-chain audit on
