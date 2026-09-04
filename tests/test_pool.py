@@ -323,9 +323,6 @@ def test_pool_transform_disagreeing_with_its_declared_output_raises(tiled_store,
     that returns something else corrupts silently: ``gather`` reads a prefix of the real data
     (right shape, right dtype, wrong numbers) and the entry can never revive, because the
     ``.npy`` on disk no longer matches what the geometry says to expect.
-
-    The guard for this predates the test: it compared the result against a backing sized from
-    ``prepped.shape`` -- the result's own shape -- so it could never fire.
     """
     url, _ = tiled_store
     geoms = open_geometries(obstore_store(url), variables=["single_inner"])

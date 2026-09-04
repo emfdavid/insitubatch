@@ -1407,18 +1407,18 @@ class ChunkPool:
 
         Heap just holds the array. The mmap tier copies it into the slot's ``.npy`` so the
         cached chunk stays on NVMe, and returns the memmap -- which then becomes the slot's
-        single tile. The backing is sized at the transform's *output* geometry (see
-        :func:`output_geometry`), so a reshaping transform lands here exactly like a
-        shape-preserving one.
+        single tile. The backing is sized from the transform's **declared** output geometry
+        (see :func:`output_geometry`), so a reshaping transform lands here exactly like a
+        shape-preserving one -- and so the check below has something to test. Size it from
+        ``prepped`` instead and the comparison tests a value against itself.
 
-        Sizing it from the **declared** geometry rather than from ``prepped`` is what makes
-        the check below mean anything: everything downstream of assembly -- the budget charge,
-        ``gather``'s tile placement, the revive structural check -- is derived from the
-        declaration, so a ``__call__`` that returns something else corrupts silently. ``gather``
-        reads a prefix of the real data (right shape, right dtype, wrong numbers) and the entry
-        can never revive again, because the file on disk no longer matches what the geometry
-        says to expect. Sizing from ``prepped.shape`` and then comparing against it, as this
-        did, is a guard that cannot fire.
+        That check is load-bearing because everything downstream of assembly -- the budget
+        charge, ``gather``'s tile placement, the revive structural check -- is derived from
+        the declaration. A ``__call__`` returning a different shape would corrupt silently:
+        ``gather`` reads a prefix of the real data (right shape, right dtype, wrong numbers)
+        and the entry can never revive, because the file on disk no longer matches what the
+        geometry says to expect. Raising happens before the file is allocated, so a rejected
+        chunk leaves nothing behind.
         """
         if self._dir is None:
             return prepped
