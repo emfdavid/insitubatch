@@ -168,20 +168,23 @@ hands out ordinary pageable memory and warns once, rather than raising or stalli
 
 ## Sharing a `cache_dir` between processes
 
-**One process at a time may write a given `cache_dir`.** The loader enforces it: the pool
-takes an advisory lock on the directory for its lifetime, and a second writer fails fast
-with an error naming the holder rather than corrupting the first one's chunks. This applies
-whenever `cache_dir` is set — with or without `persist=True` — because the two write the
-same filenames.
+**One writer at a time, or any number of readers — never both.** The pool takes an advisory
+lock on the directory for its lifetime, so the second opener is refused at construction
+rather than corrupting the first:
 
-The failure it replaces was silent. A cached chunk is an mmap'd `.npy`; a second process
-re-admitting a chunk the first has mapped used to truncate the file underneath it, and the
-reader carried on with right-shape, right-dtype, wrong numbers. Throughput, shapes and
-smoke tests all pass. Chunk files are now replaced rather than truncated in place, so a
-held mapping keeps reading real data; the lock is what keeps two writers from disagreeing
-about *what* should be there in the first place.
+| already open | second opener | |
+|---|---|---|
+| writer | writer | refused |
+| writer | reader (`readonly_cache=True`) | refused |
+| reader | writer | refused |
+| reader | reader | **allowed** |
 
-The workload this is shaped around — one job warms a cache, several score against it — is
+This applies whenever `cache_dir` is set — with or without `persist=True` — because the two
+write the same filenames. What it replaces was silent: a second process re-admitting a chunk
+the first had mapped used to truncate the file underneath it, and the reader carried on with
+right-shape, right-dtype, wrong numbers.
+
+The workload it is shaped around — one job warms a cache, several score against it — is
 spelled `readonly_cache=True`:
 
 ```python
@@ -194,64 +197,48 @@ warm.close()
 ds = InSituDataset(store, manifest, cache_dir="/data/era5-cache", readonly_cache=True)
 ```
 
-A read-only opener takes the lock *shared*: any number coexist with each other, none with a
-writer. It writes nothing — no chunk files, no log entries — and **a cache miss raises**.
-That is deliberate: the flag asserts *this cache is complete for what I am about to read*,
-and a silent fall-back to fetching would make it a performance hint instead of a contract.
-The error names the array and chunk, and the usual cause is a different split,
-`sample_range` or transform set than the run that warmed it. `reset_stale_cache=True` is
-rejected in this mode — a reader may not delete files another process is using.
+A read-only opener writes nothing — no chunk files, no log entries — and **a cache miss
+raises**, naming the array and chunk. That is what makes it a contract (*this cache is
+complete for what I am about to read*) rather than a performance hint; the usual cause of a
+miss is a different split, `sample_range` or transform set than the run that warmed it.
+`reset_stale_cache=True` is rejected in this mode. Excluding a reader from a *live* writer
+follows from the same promise: a cache still being warmed is not complete, so it is better
+refused at construction than failed forty batches in.
 
-### What happens to active readers when a writer invalidates the cache
-
-Nothing, because the writer never starts. Invalidation — `reset_stale_cache=True` deleting
-every entry, or a run re-admitting chunks it evicted — is work a *writer* does, and a writer
-cannot open the directory while any reader holds it. The exclusion is at construction, before
-the writer can allocate, evict or delete anything.
-
-The layer underneath does not depend on that, though, which matters on the configurations
-where the lock is not available. A reader that already holds a chunk's mapping keeps reading
-real data even if the file is replaced (the new content goes to a new inode) *or* deleted
-(POSIX keeps the inode alive until the last reference goes). So the worst a bypassed lock
-can do to an active reader is cost it a **future** open — a miss, which `readonly_cache`
-turns into a loud error — never wrong numbers in a batch that looks fine.
-
-Both properties are pinned by tests rather than left as reasoning:
-`test_a_writer_cannot_start_while_another_process_is_reading` and
-`test_deleting_a_cached_file_does_not_disturb_a_held_mapping`.
+Invalidation — `reset_stale_cache` deleting entries, or a run re-admitting chunks it evicted
+— is therefore something no reader is ever present for. Underneath that, chunk files are
+replaced rather than truncated, so a reader holding a mapping keeps reading real data even
+if the file is replaced or deleted. That second layer is what stands where the lock cannot
+be taken (below): the worst a bypassed lock costs an active reader is a *future* open — a
+miss — never wrong numbers.
 
 ### If you hit the lock
 
-```
-insitubatch: cache_dir '/data/era5-cache' is already open for writing by another
-process (PID 44315 on host gpu-07, since 14:22:10).
-```
-
-To find the holder:
+The error names the holder's PID, host and start time. That is a **hint** read from the
+lockfile; the lock itself is authoritative, so confirm with:
 
 ```bash
 fuser -v /data/era5-cache/.insitu.lock
 lsof /data/era5-cache/.insitu.lock
 ```
 
-**Do not delete the lockfile.** It is the first thing people try and it is actively
-harmful. The lock is held by the kernel against an open file description, not by the file:
-deleting it releases nothing, and it makes the next two processes lock *different inodes* —
-reintroducing exactly the corruption the check prevents. The PID/host/time in the file are
-a **hint** for the message; the lock itself is authoritative.
+**Do not delete the lockfile.** It is the first thing people try and it is actively harmful:
+the lock is held by the kernel against an open file description, not by the file, so
+deleting it releases nothing — and it makes the next two processes lock *different inodes*,
+reintroducing exactly the corruption the check prevents.
 
-There is also no such thing as a stale lock, so there is no cleanup procedure to run. The
-kernel releases it when the process dies — `SIGKILL`, OOM and spot preemption included. If
-you are seeing the error, that process is alive.
+There is no such thing as a stale lock, and so no cleanup procedure. The kernel releases it
+when the process dies — `SIGKILL`, OOM and spot preemption included. If you are seeing the
+error, that process is alive.
 
 ### Put `cache_dir` on local NVMe, not NFS
 
 This is the mmap tier used as designed, not a new restriction. Over a network filesystem it
-is slow, and — more to the point — **unarbitrated**: `flock` may be emulated per client, so
-two processes on different hosts can each believe they hold the write lock. The loader
-warns when it can detect one (Linux, via the mount table), but detection is not a fix. A
-network `cache_dir` and a platform with no POSIX locking (Windows) are the two
-configurations where two writers can still corrupt each other, and both warn saying so.
+is slow and — more to the point — **unarbitrated**: `flock` may be emulated per client, so
+two processes on different hosts can each believe they hold the write lock. The loader warns
+when it can detect one (Linux, via the mount table), but detection is not a fix. A network
+`cache_dir` and a platform with no POSIX locking (Windows) are the two configurations where
+two writers can still corrupt each other, and both warn saying so.
 
 ## Shuffle quality
 
