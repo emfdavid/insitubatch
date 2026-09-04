@@ -1241,7 +1241,12 @@ class ChunkPool:
         # The mapping *is* `path` now -- renaming does not disturb it -- but numpy recorded
         # the name it was opened under. Correct it: `_record_completed` names the cache entry
         # from here and `_free` unlinks through it, and both would otherwise chase a temp
-        # path that no longer exists.
+        # path that no longer exists (silently: a leaked spill file is just disk, and a log
+        # entry naming a vanished temp reads as a cold cache). Safe to assign -- `filename`
+        # is a plain instance attribute numpy sets in `__new__` and copies in
+        # `__array_finalize__`, and numpy never reads it for behavior (`flush` goes through
+        # `_mmap`/`base`), so this is bookkeeping catching up with the rename, not a trick.
+        # Pinned by test_a_slot_file_is_named_by_where_it_landed_not_where_it_was_written.
         cast("np.memmap", backing).filename = os.path.abspath(path)
         return backing
 

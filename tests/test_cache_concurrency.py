@@ -506,3 +506,38 @@ def test_deleting_a_cached_file_does_not_disturb_a_held_mapping(write_zarr, tmp_
         reader.stdin.close()
         reader.wait(timeout=30)
     assert after == expected, "unlinking the file corrupted a mapping already held on it"
+
+
+def test_a_slot_file_is_named_by_where_it_landed_not_where_it_was_written(write_zarr, tmp_path):
+    """The rename leaves the two consumers of a slot's path with a name that no longer
+    exists unless it is corrected.
+
+    ``_alloc`` opens the mapping on ``<name>.<pid>.insitu-tmp`` and renames it to
+    ``<name>``. ``_record_completed`` names the manifest entry from that path and ``_free``
+    unlinks through it, so if the temp name survived, persist would log an entry that cannot
+    be reopened and spill would leak every file it was supposed to remove. Both failures are
+    silent -- a leaked spill file is just disk, and a bad log entry reads as a cold cache --
+    which is why this is asserted directly rather than left to the two tests that would
+    happen to catch it."""
+    url, srcs = write_zarr()
+    cache = tmp_path / "cache"
+    geoms = _geoms(url)
+
+    # persist: the recorded entry must be the bare landed name, and reopenable.
+    pool = ChunkPool(geoms, backing_dir=cache, persist=True)
+    _fill(pool, geoms["t2m"], "t2m", 0, srcs["t2m"])
+    assert pool._persisted[("t2m", 0)] == "t2m__0.npy"
+    assert not list(cache.glob(f"*{_TMP_SUFFIX}")), "the temp name must not survive the rename"
+    logged = json.loads((cache / "insitu_cache.jsonl").read_text().splitlines()[1])["file"]
+    assert logged == "t2m__0.npy"
+    np.lib.format.open_memmap(cache / logged, mode="r")  # the log entry actually opens
+    pool.close()
+    assert (cache / "t2m__0.npy").exists(), "persist must keep the landed file"
+
+    # spill: _free unlinks through the same path, so the landed file must go.
+    spill = tmp_path / "spill"
+    pool = ChunkPool(geoms, backing_dir=spill)
+    _fill(pool, geoms["t2m"], "t2m", 0, srcs["t2m"])
+    assert (spill / "t2m__0.npy").exists()
+    pool.close()
+    assert not list(spill.glob("*.npy")), "spill leaked the file it meant to unlink"
