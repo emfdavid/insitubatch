@@ -88,7 +88,8 @@ def _subregion_crop(var: str, subregion: tuple[int, int], seed: int) -> Callable
 
     def crop(batch: Batch) -> Batch:
         a = batch.arrays[var]  # (batch, ..., LAT, LON)
-        b_size, lat, lon = a.shape[0], a.shape[-2], a.shape[-1]
+        lat, lon = a.shape[-2], a.shape[-1]
+        b_size = a.shape[0]
         # Draw every sample's offset in one batched pull from the RNG. Each
         # sample still gets its own independent crop window — batching the
         # draw changes the order the stream is consumed in, not the
@@ -96,16 +97,16 @@ def _subregion_crop(var: str, subregion: tuple[int, int], seed: int) -> Callable
         # every middle slice, exactly as the per-sample loop did.
         i = rng.integers(0, lat - h + 1, size=b_size)  # (B,)
         j = rng.integers(0, lon - w + 1, size=b_size)  # (B,)
-        m = a.size // (b_size * lat * lon)  # middle dims, folded
-        rows = np.repeat(i, m)[:, None] + np.arange(h)  # (B*M, h)
-        cols = np.repeat(j, m)[:, None] + np.arange(w)  # (B*M, w)
-        flat = a.reshape((-1, lat, lon))  # (B*M, LAT, LON)
-        idx = np.arange(flat.shape[0])[:, None, None]
-        # Advanced indices are adjacent and cover every axis of `flat`, so
-        # the result is exactly the broadcast of (idx, rows, cols) — one
-        # gathered (h, w) crop per flattened sample in one operation.
-        out = flat[idx, rows[:, :, None], cols[:, None, :]]  # (B*M, h, w)
-        batch.arrays[var] = out.reshape(a.shape[:-2] + (h, w))
+        # One strided view of every (h, w) window over the last two axes.
+        # The gather below indexes the batch axis with an array while the
+        # trailing : , : stay slices, so each window copies as a block
+        # instead of walking every axis element by element; the ellipsis
+        # puts the broadcast batch dims first and keeps the middle dims in
+        # place, so no reshape is needed.
+        windows = np.lib.stride_tricks.sliding_window_view(
+            a, (h, w), axis=(-2, -1)
+        )
+        batch.arrays[var] = windows[np.arange(b_size), ..., i, j, :, :]
         return batch
 
     return crop
