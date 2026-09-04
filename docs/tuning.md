@@ -180,9 +180,9 @@ rather than corrupting the first:
 | reader | reader | **allowed** |
 
 This applies whenever `cache_dir` is set — with or without `persist=True` — because the two
-write the same filenames. What it replaces was silent: a second process re-admitting a chunk
-the first had mapped used to truncate the file underneath it, and the reader carried on with
-right-shape, right-dtype, wrong numbers.
+write the same filenames. Without it, a second process re-admitting a chunk the first has
+mapped truncates the file underneath it, and the reader carries on with right-shape,
+right-dtype, wrong numbers.
 
 The workload it is shaped around — one job warms a cache, several score against it — is
 spelled `readonly_cache=True`:
@@ -206,11 +206,11 @@ follows from the same promise: a cache still being warmed is not complete, so it
 refused at construction than failed forty batches in.
 
 Invalidation — `reset_stale_cache` deleting entries, or a run re-admitting chunks it evicted
-— is therefore something no reader is ever present for. Underneath that, chunk files are
-replaced rather than truncated, so a reader holding a mapping keeps reading real data even
-if the file is replaced or deleted. That second layer is what stands where the lock cannot
-be taken (below): the worst a bypassed lock costs an active reader is a *future* open — a
-miss — never wrong numbers.
+— is therefore something no reader is ever present for. Underneath that, a chunk file is
+written to a temp name and renamed into place, so a reader holding a mapping keeps its own
+inode and keeps reading real data whether that file is replaced or deleted. That second
+layer is what stands where the lock cannot be taken (below): the worst a bypassed lock costs
+an active reader is a *future* open — a miss — never wrong numbers.
 
 ### If you hit the lock
 
@@ -233,7 +233,7 @@ error, that process is alive.
 
 ### Put `cache_dir` on local NVMe, not NFS
 
-This is the mmap tier used as designed, not a new restriction. Over a network filesystem it
+The cache is an mmap tier, so this is what it is built for. Over a network filesystem it
 is slow and — more to the point — **unarbitrated**: `flock` may be emulated per client, so
 two processes on different hosts can each believe they hold the write lock. The loader warns
 when it can detect one (Linux, via the mount table), but detection is not a fix. A network

@@ -105,16 +105,14 @@ uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
 
 ### Platform support
 
-Stated honestly, because until now it was not stated at all:
-
 | platform | status |
 |---|---|
 | **Linux** | supported, and the only thing CI proves — every job is `ubuntu-latest` |
 | **macOS** | expected to work; **untested** — no CI job, no regular local runs |
 | **Windows** | **untested**, and unarbitrated: there is no POSIX advisory locking, so two processes sharing a `cache_dir` cannot be stopped from corrupting each other. The loader warns at construction |
 
-*Untested* is not *unsupported*: we have no evidence either way, and claiming support we do
-not test is exactly the overclaim we removed elsewhere. Reports (or a CI job) welcome.
+*Untested* is not *unsupported*: there is no evidence either way. Reports — or a CI job —
+are welcome.
 
 ## Tests
 
