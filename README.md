@@ -195,7 +195,9 @@ from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_
 
 # The engine reads a zarr Store; build one per backend. obstore_store covers
 # file://, s3://, gs://, az://. (fsspec_store reaches GCS Rapid/requester-pays;
-# arraylake_store opens an Icechunk session — same InSituDataset below.)
+# icechunk_store opens an Icechunk repo by URL — icechunk_store(url, anonymous=True)
+# for a public one; arraylake_store opens an Arraylake-hosted repo by catalog name.
+# All of them return a Store, and the same InSituDataset below reads any of them.)
 store = obstore_store("gs://insitubatch-bench-insitubatch/era5_c16.zarr", skip_signature=True)
 geoms = open_geometries(store)  # {var: ArrayGeometry} from zarr metadata
 # contiguous chunk blocks by default (no time-series leakage);

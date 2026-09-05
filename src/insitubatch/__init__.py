@@ -31,6 +31,7 @@ from .store import (
     close_store,
     ensure_local_dir,
     fsspec_store,
+    icechunk_store,
     obstore_store,
     open_geometries,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "StoredChunkRead",
     "applies",
     "arraylake_store",
+    "icechunk_store",
     "as_tf_dataset",
     "as_torch",
     "close_store",

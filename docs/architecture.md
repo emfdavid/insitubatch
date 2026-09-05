@@ -240,6 +240,14 @@ or one zarr shard on a sharded array — whatever a single `store.get` returns);
 duplication is tracked in
 [#40](https://github.com/emfdavid/insitubatch/issues/40), not fixed here.
 
+**On a sharded array the stored chunk is the shard**, and the distinction is load-bearing:
+zarr reports `chunks` as the *inner* chunk (read granularity inside a shard) and
+`chunk_grid.chunk_shape` as the shard itself, which is what a chunk key addresses. The
+geometry and the read plan use the latter, so a sharded array is read one whole shard at a
+time. That is a good fit where a run consumes the samples a shard holds and a poor one where
+it wants a small spatial subset of a large shard — fetching only the inner chunks a run needs
+is [#57](https://github.com/emfdavid/insitubatch/issues/57).
+
 Two zarr facilities are deliberately *not* adopted. `FusedCodecPipeline.read_sync` takes
 `ByteGetter`s and therefore **owns the IO**, which would surrender the scheduler,
 `max_inflight` and back-pressure; `decode_chunk` is IO-free, which is why it is the one we

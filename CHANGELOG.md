@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **Sharded zarr-v3 arrays could not be read at all, and said so with a checksum error.**
+  On a sharded array zarr reports two shapes: `metadata.chunks` is the *inner* chunk (read
+  granularity inside a shard) and `chunk_grid.chunk_shape` is the shard — the thing a chunk
+  key actually addresses. We planned reads, sized the `ArraySpec` and built geometry from the
+  former, so we asked the store for a key holding a shard and then decoded it as though it
+  were one inner chunk. The `ShardingCodec` sized its index from the wrong spec, read the
+  wrong trailing bytes, and raised `ValueError: Stored and computed checksum do not match` —
+  which says nothing about sharding. **Every dataset in the dynamical.org catalog is sharded**
+  (NOAA GFS/GEFS/HRRR/MRMS, ECMWF AIFS/IFS, DWD ICON-EU, NASA IMERG, ECCC HRDPS), so none of
+  it was readable; WeatherBench2 and ARCO are not sharded, which is why every benchmark,
+  example and test missed it. There is now one spelling of "the shape of one stored object",
+  read through `ChunkGrid.from_metadata` so zarr-v2 keeps working without a deprecated
+  accessor. ([#56](https://github.com/emfdavid/insitubatch/issues/56))
+
+- **`open_geometries(store)` crashed on any CF store — including the form the README
+  teaches.** A CF/xarray-written group holds coordinate arrays and a 0-D `spatial_ref` whose
+  attributes carry the CRS, alongside the data variables. Taking every array in the group
+  made the 0-D one raise `sample_axis 0 out of range for 0-D array`, and — quieter, and
+  worse — returned `time`/`latitude`/`longitude` as variables to batch, with sample-axis
+  lengths that cannot agree with any variable's. Coordinates and grid mappings are now
+  skipped, detected from `dimension_names` (v3) or xarray's `_ARRAY_DIMENSIONS` (v2). The
+  inference is deliberately narrow — only a *self-named* 1-D array is a coordinate, so a
+  station series over `('time',)` is still data — and naming an array in `variables=`
+  bypasses it entirely. A group with nothing batchable left raises, listing what it skipped
+  and pointing at the explicit route.
+
+- **A `cache_budget_bytes` too small for the run now raises instead of being silently raised
+  to the floor.** Handing back ten times what was asked for is indistinguishable from
+  honouring it, until the kernel intervenes. On an archive that chunks the sample axis deeply
+  — 1440 steps × a full field is 5.98 GB for one chunk — that number is the difference
+  between running and being OOM-killed, and the floor is computable from geometry before any
+  IO. The error names the floor, the knob, and the `block_chunks` that set it. Passing no
+  budget still sizes itself automatically.
+
+- **`icechunk_store(url)` opens an Icechunk repository by URL**, public
+  (`anonymous=True`) or with your own cloud credentials — `s3://`, `gs://`, `file://`.
+  Icechunk is the format most new public archives are published in, and our only route to one
+  was `arraylake_store`, which authenticates through Arraylake and cannot address a repo that
+  is simply sitting in a bucket. The two are not alternatives: where the repository lives
+  decides which you use, and the module docstring says so.
+
+- Tests that read a live public bucket are marked `remote` and skipped unless `--remote` is
+  given. The sharded-decode defect lived in an Icechunk store and no synthetic fixture would
+  have found it, but a public store going away must not turn into a red build for a
+  contributor who changed nothing.
+
 - **`applies(...)` scopes a `chunk_transform` to named variables — and the in-body name test
   it replaces was silently truncating data.** `chunk_transforms` is one list run on every
   variable, so the convention was for a transform to check `chunk.read.array` and no-op on

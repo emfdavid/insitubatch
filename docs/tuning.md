@@ -272,6 +272,24 @@ A load that drops entries rewrites the log (to a temp name, then a rename), so a
 not re-read and re-rejected on every subsequent open. That is safe only because one writer
 holds the lock above.
 
+### Work out what one chunk costs before setting a budget
+
+`cache_budget_bytes` below what one pass needs co-resident now **raises at construction**,
+naming the floor, rather than being quietly raised to it. Compute the floor the same way the
+engine does — per variable, `samples-per-chunk × field × itemsize`, times `block_chunks`,
+times two (the current block plus one read-ahead):
+
+```python
+geom = open_geometries(store, variables=["temperature_2m"])["temperature_2m"]
+per_chunk = geom.sample_chunk_size * math.prod(geom.inner_shape) * geom.dtype.itemsize
+```
+
+This is not a rounding detail on an archive that chunks the sample axis deeply. A store
+holding 1440 time steps per chunk over a 721×1440 field costs **5.98 GB for one chunk** —
+so `block_chunks=4` asks for ~48 GB, and a box that cannot supply it should say so before
+the first read, not be OOM-killed halfway through an epoch. Passing no budget still sizes
+itself automatically.
+
 ### Put `cache_dir` on local NVMe, not NFS
 
 The cache is an mmap tier, so this is what it is built for. Over a network filesystem it
