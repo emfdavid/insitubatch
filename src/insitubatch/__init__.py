@@ -39,6 +39,7 @@ from .transforms import (
     BatchTransform,
     ChunkTransform,
     StandardScaler,
+    applies,
 )
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk, SplitName, StoredChunkRead
 
@@ -69,6 +70,7 @@ __all__ = [
     "SplitName",
     "StandardScaler",
     "StoredChunkRead",
+    "applies",
     "arraylake_store",
     "as_tf_dataset",
     "as_torch",

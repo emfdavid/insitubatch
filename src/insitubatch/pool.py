@@ -76,7 +76,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -85,6 +85,7 @@ from typing import cast
 import numpy as np
 
 from .buffers import BatchBuffers, BufferStats, HostAllocator
+from .transforms import ChunkTransform, transform_scope, unwrap_transform
 from .types import ArrayGeometry, Batch, ChunkRead, DecodedChunk
 
 try:  # optional: stronger transform fingerprint (closures + globals). `--extra cache`.
@@ -98,8 +99,6 @@ except ImportError:  # pragma: no cover - Windows; warned about at pool construc
     fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
-
-ChunkTransform = Callable[[DecodedChunk], DecodedChunk]
 
 
 #: Suffix of the private file a slot is written to before it is renamed into place
@@ -184,8 +183,35 @@ def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
+def transforms_for(path: str, transforms: Sequence[ChunkTransform]) -> tuple[ChunkTransform, ...]:
+    """The subset of the pipeline that applies to one array, in order.
+
+    A transform wrapped in :func:`~insitubatch.transforms.applies` runs only for the arrays
+    it names; a bare one runs for all of them. This is the single place scope is resolved --
+    geometry, the cache fingerprint and the call itself all read it, so they cannot drift.
+    """
+    return tuple(t for t in transforms if (s := transform_scope(t)) is None or path in s)
+
+
+def validate_scopes(transforms: Sequence[ChunkTransform], paths: Collection[str]) -> None:
+    """Reject a scope naming an array this dataset does not have.
+
+    A misspelled name would otherwise apply to nothing, silently: the scaler that quietly
+    stops scaling. Raised at construction, before any cache directory, lockfile or fetch."""
+    known = set(paths)
+    for t in transforms:
+        scope = transform_scope(t)
+        if scope is not None and (unknown := sorted(scope - known)):
+            raise ValueError(
+                f"applies({sorted(scope)}, {getattr(unwrap_transform(t), '__name__', t)}) "
+                f"names {unknown}, which are not arrays in this dataset. Known arrays: "
+                f"{sorted(known)}. Scope is matched against the zarr array *path* (what "
+                "chunk.read.array carries), not the dict label you gave the variable."
+            )
+
+
 def output_geometry(geom: ArrayGeometry, transforms: Sequence[ChunkTransform]) -> ArrayGeometry:
-    """The geometry a chunk has *after* the chunk_transform pipeline.
+    """The geometry a chunk of ``geom`` has *after* the chunk_transform pipeline.
 
     A reshaping transform (regrid / dtype recast) declares ``output_inner(geom) ->
     (inner_shape, dtype)``; the pipeline folds them so each transform sees the geometry
@@ -194,7 +220,12 @@ def output_geometry(geom: ArrayGeometry, transforms: Sequence[ChunkTransform]) -
     transform can neither move nor reshape it (the sample-geometry invariant). A transform
     without ``output_inner`` is identity; with none reshaping, the source geometry returns
     unchanged. Output ``chunks`` are set to the inner shape (the cache slot is one assembled
-    buffer, never inner-tiled), keeping the geometry self-consistent."""
+    buffer, never inner-tiled), keeping the geometry self-consistent.
+
+    Folding is **per array**: only the transforms scoped to ``geom.path`` contribute. Folding
+    all of them into every variable is what made a transform scoped to ``t2m`` truncate
+    ``u10`` -- gather read a prefix of the real data and the entry could never revive, with
+    nothing raised (#42)."""
 
     def rebuild(inner_shape: tuple[int, ...], dt: np.dtype) -> ArrayGeometry:
         # Reinsert the (whole, single-chunk) sample dim at its physical axis so the
@@ -205,7 +236,7 @@ def output_geometry(geom: ArrayGeometry, transforms: Sequence[ChunkTransform]) -
         return replace(geom, shape=shape, chunks=chunks, dtype=dt)
 
     inner, dt = geom.inner_shape, geom.dtype
-    for t in transforms:
+    for t in transforms_for(geom.path, transforms):
         declare = getattr(t, "output_inner", None)
         if declare is None:
             continue
@@ -260,7 +291,17 @@ def _transform_token(fn: ChunkTransform) -> str:
     the object's memory address, so the token would be unstable across runs (a spurious
     cache miss on every reopen). A stable, non-default ``__repr__`` (dataclasses, partials)
     is folded in so instance config still affects the token; the address-bearing default is not.
+    That has one sharp edge: numpy **summarizes** an array over 1000 elements in ``repr``, so a
+    transform holding large statistics (a :class:`~insitubatch.transforms.StandardScaler` with
+    per-gridpoint mean/std) can repr -- and therefore hash -- identically after a re-fit. Give
+    such a transform an explicit ``cache_key``, or install cloudpickle, which hashes the values.
+
+    An :func:`~insitubatch.transforms.applies` wrapper is stripped first: the token covers
+    *what* a transform does, never *which arrays it runs on*. Narrowing a scope therefore
+    invalidates the variable that left it and leaves the ones that stayed hashing identically.
+    (Rationale for that split: DESIGN.md, "Design evolution & alternatives".)
     """
+    fn = unwrap_transform(fn)
     key = getattr(fn, "cache_key", None)
     if key is not None:
         return f"key:{key}"
@@ -281,6 +322,21 @@ def _transform_token(fn: ChunkTransform) -> str:
         repr(fn) if not inspect.isroutine(fn) and type(fn).__repr__ is not object.__repr__ else ""
     )
     return "src:" + hashlib.sha256(f"{name}\n{src}\n{config}".encode()).hexdigest()
+
+
+def _pipeline_hash(transforms: Sequence[ChunkTransform]) -> str:
+    """The cache identity of one array's pipeline: 16 hex chars over its transforms' tokens.
+
+    Stamped on every manifest entry (see :attr:`ChunkPool._MANIFEST_FORMAT`). Truncated to
+    64 bits -- a collision means serving a chunk transformed by a *different* pipeline, and
+    at the scale of one directory's worth of pipeline edits that is not a risk worth 32 more
+    bytes per line.
+
+    An empty pipeline (no transform applies to this array) hashes like any other, so a
+    variable that leaves every scope invalidates exactly once and then stays valid."""
+    return hashlib.sha256("\n".join(_transform_token(t) for t in transforms).encode()).hexdigest()[
+        :16
+    ]
 
 
 def _has_weak_token(transforms: Sequence[ChunkTransform]) -> bool:
@@ -437,14 +493,23 @@ class ChunkPool:
     """
 
     _MANIFEST_NAME = "insitu_cache.jsonl"
-    _MANIFEST_FORMAT = 3
-    """Bumped to 3: a persisted chunk is now stored **tile-major**.
+    _MANIFEST_FORMAT = 4
+    """The on-disk contract of the manifest, and cache identity is **per array**.
 
-    A ``.npy`` holds ``(n_tiles, *tile_shape)`` -- each stored tile contiguous, in
-    :meth:`ArrayGeometry.inner_index` order -- rather than one assembled
-    ``slot_shape`` array. File count per chunk is unchanged. A version-2 cache is
-    structurally unreadable under the new layout, so the header check rejects the whole
-    log and refetches rather than misreading it as data."""
+    An entry is ``{array, chunk_index, file, pipeline}``, where ``pipeline`` is the hash of
+    the chunk_transforms scoped to *that array* -- so editing a transform that touches only
+    ``t2m`` leaves ``u10`` and ``v10`` valid, their bytes being unchanged. The header line
+    carries ``{format_version}`` and nothing else; identity rides on the entry, which is what
+    lets a run append an array it is seeing for the first time without touching a byte written
+    by an earlier one. (The header-map alternative, and why it was rejected, are in DESIGN.md
+    under "Design evolution & alternatives".)
+
+    The ``file`` a persisted chunk names is **tile-major**: the ``.npy`` holds ``(n_tiles,
+    *tile_shape)``, each stored tile contiguous in :meth:`ArrayGeometry.inner_index` order,
+    not one assembled ``slot_shape`` array.
+
+    A log at any other version is rejected whole (:meth:`_reset_stale_format`): we cannot
+    read its entries' meaning, so we cannot judge any array in it valid."""
 
     def __init__(
         self,
@@ -463,6 +528,15 @@ class ChunkPool:
         # representative geometry per path suffices for slot sizing (aliases share shape).
         self._by_path = {g.path: g for g in geometries.values()}
         self._chunk_transforms = tuple(chunk_transforms)
+        # Scope first: a name that matches no array is a user error, and the fastest place to
+        # say so is before any geometry is derived from it (and before a cache dir or lockfile
+        # exists to clean up).
+        validate_scopes(self._chunk_transforms, self._by_path)
+        # The pipeline each array actually runs -- the single resolution of scope, read by
+        # geometry, by the fingerprint and by `_apply_transforms`.
+        self._transforms_by_path = {
+            p: transforms_for(p, self._chunk_transforms) for p in self._by_path
+        }
         # Output geometry after the chunk_transform pipeline. A reshaping transform (regrid /
         # dtype recast) makes the cached chunk differ from the source, so everything
         # *downstream of assembly* -- slot sizing, the cache budget, gather, the revive
@@ -548,22 +622,26 @@ class ChunkPool:
         # completion is one os.write() -- no per-chunk open(). None in heap/spill mode, and in
         # readonly_cache mode, which reads the log and never appends to it.
         self._log_fd: int | None = None
-        # Fingerprint of the chunk_transform pipeline (only chunk_transforms are baked into
-        # cached chunks; batch_transforms run post-cache). A run whose fingerprint differs
-        # from the manifest's discards the cache (changed transforms -> stale). batch
-        # transforms and the store identity are out of scope (the cache_dir path is the
-        # dataset identity -- see the class docstring).
-        self._pipeline_fp = ""
+        # Fingerprint of the chunk_transform pipeline, **per array** (only chunk_transforms are
+        # baked into cached chunks; batch_transforms run post-cache). An array whose
+        # fingerprint differs from the one stamped on its manifest entries is stale; the rest
+        # of the cache is untouched. Batch transforms and the store identity are out of scope
+        # (the cache_dir path is the dataset identity -- see the class docstring).
+        self._pipeline_fp: dict[str, str] = {}
         if self._persistent:
-            self._pipeline_fp = hashlib.sha256(
-                "\n".join(_transform_token(t) for t in self._chunk_transforms).encode()
-            ).hexdigest()
+            self._pipeline_fp = {
+                path: _pipeline_hash(pipeline)
+                for path, pipeline in self._transforms_by_path.items()
+            }
             if _has_weak_token(self._chunk_transforms):
                 logger.warning(
                     "persist: cloudpickle not installed and a chunk_transform has no "
                     "cache_key -> cache invalidation on transform changes is best-effort "
-                    "(source only; closure/global changes may not invalidate). Install "
-                    "`insitubatch[cache]` or set a `cache_key` attribute for a stronger guarantee."
+                    "(source text only; a changed closure or global may not invalidate, and "
+                    "neither may re-fitted statistics: numpy summarizes an array over 1000 "
+                    "elements in repr, so large per-gridpoint mean/std can hash identically to "
+                    "the values they replaced). Install `insitubatch[cache]` or set a "
+                    "`cache_key` attribute for a stronger guarantee."
                 )
             try:
                 self._load_log()
@@ -1474,11 +1552,14 @@ class ChunkPool:
             self._cv.notify_all()
 
     def _apply_transforms(self, array: str, chunk_index: int, data: np.ndarray) -> np.ndarray:
-        if not self._chunk_transforms:
+        """Run the transforms scoped to this array, in order. A transform outside its scope
+        is not called at all: it never sees a variable it was not given."""
+        pipeline = self._transforms_by_path[array]
+        if not pipeline:
             return data
         offset = chunk_index * self._by_path[array].sample_chunk_size
         chunk = DecodedChunk(read=ChunkRead(array, chunk_index), data=data, sample_offset=offset)
-        for transform in self._chunk_transforms:  # vectorized numpy -> GIL released
+        for transform in pipeline:  # vectorized numpy -> GIL released
             chunk = transform(chunk)
         return chunk.data
 
@@ -1630,8 +1711,16 @@ class ChunkPool:
             self._recorded.add(key)
 
     def _append_entry(self, array: str, chunk_index: int, fname: str) -> None:  # under the lock
-        """Append one completed-entry line to the open log."""
-        self._write_line({"array": array, "chunk_index": chunk_index, "file": fname})
+        """Append one completed-entry line to the open log, stamped with **this array's**
+        pipeline hash -- so a later run can tell which arrays a transform edit invalidated."""
+        self._write_line(
+            {
+                "array": array,
+                "chunk_index": chunk_index,
+                "file": fname,
+                "pipeline": self._pipeline_fp[array],
+            }
+        )
 
     def _write_line(self, record: dict[str, object]) -> None:
         """Append one JSON record as a **single** ``os.write`` on an ``O_APPEND`` fd.
@@ -1669,17 +1758,25 @@ class ChunkPool:
         fresh = not path.exists()
         self._log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         if fresh:
-            self._write_line(
-                {"format_version": self._MANIFEST_FORMAT, "pipeline_hash": self._pipeline_fp}
-            )
+            self._write_line({"format_version": self._MANIFEST_FORMAT})
 
     def _load_log(self) -> None:
         """Populate the persisted-entry registry from a prior run's append-only log, if any.
 
-        No log is a cold start (silent -- the expected first run). A log whose header ``format``
-        or ``pipeline_hash`` differs from this run is a **stale** cache: by default that *raises*
-        (a stale cache is almost never what the user intended), or -- with ``reset_stale_cache``
-        -- it deletes the listed files + the log and rebuilds (see :meth:`_reset_stale`).
+        No log is a cold start (silent -- the expected first run). Staleness is decided **per
+        array** (#42): an entry carries the pipeline hash of the array it belongs to, and an
+        array whose hash differs from this run's is stale on its own, leaving every other
+        array's entries valid. Two consequences worth stating, because they are what makes the
+        partial answer usable:
+
+        - an array with **no entries** is *cold*, not stale -- adding a variable to a
+          configuration must not invalidate the cache;
+        - an array this run does **not read** is left completely alone (entries and files), so
+          two configurations can share one ``cache_dir``.
+
+        A stale array raises by default, naming which arrays and why; ``reset_stale_cache``
+        instead deletes exactly those arrays' files. Only the log *format* is still all-or-
+        nothing -- a format we cannot parse tells us nothing about any individual array.
 
         Corruption always raises, regardless of the flag: an unreadable header, a malformed
         *interior* entry, or a ``file`` that is not a bare filename (an absolute or ``..`` path
@@ -1694,25 +1791,54 @@ class ChunkPool:
         if not lines:
             return  # header not yet flushed (a crash before the first write) -- treat as cold
         try:
-            header = json.loads(lines[0])
-            fmt, fp = header["format_version"], header["pipeline_hash"]
+            fmt = json.loads(lines[0])["format_version"]
         except (json.JSONDecodeError, TypeError, KeyError) as exc:
             raise ValueError(
                 f"persist: cache log {path} has an unreadable header ({exc}); this is corruption "
                 f"or tampering, not a stale cache -- delete {self._dir} to reset."
             ) from exc
         entry_lines = lines[1:]
-        if fmt != self._MANIFEST_FORMAT or fp != self._pipeline_fp:
-            why = "log format" if fmt != self._MANIFEST_FORMAT else "chunk_transform fingerprint"
-            self._reset_stale(path, entry_lines, why)
+        if fmt != self._MANIFEST_FORMAT:
+            # The one whole-cache case left: a log we cannot parse says nothing about any
+            # individual array, so there is no subset to keep.
+            self._reset_stale_format(path, entry_lines)
             return
+        records, torn = self._parse_entries(path, entry_lines)
+        stale = {
+            r["array"]
+            for r in records
+            if r["array"] in self._pipeline_fp and r["pipeline"] != self._pipeline_fp[r["array"]]
+        }
+        survivors = records
+        if stale:
+            survivors = self._drop_stale_arrays(records, stale)
+        for rec in survivors:
+            key = (str(rec["array"]), int(rec["chunk_index"]))
+            self._persisted[key] = str(rec["file"])
+            self._recorded.add(key)
+        # Compact only when something was actually dropped. Rewriting an unchanged log every
+        # open would be pure write traffic, and it is exactly the sort of churn a user watching
+        # an NVMe cache would have to explain to themselves.
+        if not self._readonly and (len(survivors) != len(records) or torn):
+            self._compact(path, survivors)
+        self.manifest_entries = sum(1 for a, _ in self._persisted if a in self._by_path)
+
+    def _parse_entries(self, path: Path, entry_lines: list[str]) -> tuple[list[dict], bool]:
+        """Validate every entry line; return the records and whether a torn tail was dropped.
+
+        Records for arrays this run does not read are parsed and kept like any other: they are
+        another configuration's entries in a shared directory, and dropping them on the floor
+        would delete that run's cache the next time we compact.
+        """
+        records: list[dict] = []
         for i, line in enumerate(entry_lines):
             try:
                 rec = json.loads(line)
-                array, chunk_index, fname = rec["array"], int(rec["chunk_index"]), rec["file"]
+                array, chunk_index = str(rec["array"]), int(rec["chunk_index"])
+                fname, pipeline = str(rec["file"]), str(rec["pipeline"])
             except (json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:
                 if i == len(entry_lines) - 1:
-                    break  # torn tail: the crash landed mid-append on the last line -- drop it
+                    return records, True  # torn tail: the crash landed mid-append -- drop it
                 raise ValueError(
                     f"persist: cache log {path} has a malformed entry on line {i + 2} ({exc}); "
                     f"this is corruption or tampering, not a stale cache -- delete {self._dir} "
@@ -1723,24 +1849,86 @@ class ChunkPool:
                     f"persist: cache log {path} entry file {fname!r} is not a bare filename "
                     f"(possible path-traversal tampering); delete {self._dir} to reset."
                 )
-            key = (array, chunk_index)
-            self._persisted[key] = fname
-            self._recorded.add(key)
-        self.manifest_entries = len(self._persisted)
+            records.append(
+                {"array": array, "chunk_index": chunk_index, "file": fname, "pipeline": pipeline}
+            )
+        return records, False
 
-    def _reset_stale(self, path: Path, entry_lines: list[str], why: str) -> None:
-        """A stale cache: raise by default, or (``reset_stale_cache``) GC + rebuild.
+    def _drop_stale_arrays(self, records: list[dict], stale: set[str]) -> list[dict]:
+        """Raise, or (``reset_stale_cache``) GC exactly the stale arrays' files.
 
-        The GC deletes exactly the ``.npy`` files this stale log named -- each re-checked as a
-        bare filename before ``unlink`` (a tampered path is never removed) -- then the log
-        itself. Precise: only files we recorded writing; crash-orphans are already in the log.
+        Precise on both axes: only the arrays whose pipeline changed, and only the ``.npy``
+        files this log named for them (each re-checked as a bare filename before ``unlink``, so
+        a tampered path is never removed). Everything else -- other arrays, other
+        configurations sharing this directory -- is untouched.
+        """
+        assert self._dir is not None
+        if self._readonly:
+            raise ValueError(
+                f"readonly_cache: the cache at {self._dir} is stale for {sorted(stale)} (their "
+                "chunk_transform pipeline changed since it was written). A read-only opener "
+                "may not reset it -- run the writer that warms this cache with the transforms "
+                "you are asking for, or point at the cache that matches them."
+            )
+        if not self._reset_stale_cache:
+            raise ValueError(
+                f"persist: cache at {self._dir} is stale for {sorted(stale)}: the "
+                "chunk_transform pipeline scoped to those arrays changed since they were "
+                "written. Every other array in this cache is still valid. This is not "
+                "corruption -- pass reset_stale_cache=True to delete and rebuild just those "
+                "arrays, or point at a different cache_dir."
+            )
+        survivors = []
+        for rec in records:
+            if rec["array"] not in stale:
+                survivors.append(rec)
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self._dir / str(rec["file"]))
+        logger.info(
+            "persist: cache at %s reset for %s (chunk_transform pipeline changed); %d entr(ies) "
+            "for other arrays kept.",
+            self._dir,
+            sorted(stale),
+            len(survivors),
+        )
+        return survivors
+
+    def _compact(self, path: Path, survivors: list[dict]) -> None:
+        """Rewrite the log with only the surviving entries, atomically.
+
+        Written to a temp name and ``rename``d over the log, which POSIX makes atomic: a crash
+        leaves either the old log or the new one, never a half-truncated one. Without
+        compaction a partial reset would re-read (and re-reject) the same stale entries on
+        every subsequent open, and the log would grow without bound across resets.
+
+        Safe only because part 1 of #42 made this an exclusive-writer path: we hold the
+        ``cache_dir`` lock, so no other process is appending to the file we are replacing.
+        The temp name carries ``_TMP_SUFFIX``, so a crash between write and rename leaves a
+        file the next lock holder's :meth:`_sweep_tmp` clears -- the same treatment a
+        half-written chunk file gets.
+        """
+        tmp = path.with_name(f"{path.name}.{os.getpid()}{_TMP_SUFFIX}")
+        body = [json.dumps({"format_version": self._MANIFEST_FORMAT})]
+        body += [json.dumps(rec) for rec in survivors]
+        tmp.write_text("\n".join(body) + "\n")
+        tmp.replace(path)
+
+    def _reset_stale_format(self, path: Path, entry_lines: list[str]) -> None:
+        """A log written by an incompatible manifest format: raise by default, or GC + rebuild.
+
+        Unlike a stale *pipeline* this is whole-cache. We cannot read the entries' meaning, so
+        we cannot decide any array is still valid -- and the ``.npy`` layout itself may have
+        changed (format 3 made chunks tile-major). The GC deletes exactly the files this log
+        named, each re-checked as a bare filename before ``unlink``, then the log.
         """
         assert self._dir is not None
         if not self._reset_stale_cache:
             raise ValueError(
-                f"persist: cache at {self._dir} is stale ({why} changed since it was written). "
-                "This is not corruption -- pass reset_stale_cache=True to delete and rebuild it, "
-                f"or remove {self._dir} yourself."
+                f"persist: cache at {self._dir} is stale (it was written by a different cache "
+                f"log format, which changes the on-disk layout, so none of it can be reused). "
+                "This is not corruption -- pass reset_stale_cache=True to delete and rebuild "
+                f"it, or remove {self._dir} yourself."
             )
         for line in entry_lines:
             try:
@@ -1752,7 +1940,7 @@ class ChunkPool:
                     os.unlink(self._dir / fname)
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        logger.info("persist: stale cache at %s (%s changed) reset; rebuilding.", self._dir, why)
+        logger.info("persist: stale cache at %s (log format changed) reset; rebuilding.", self._dir)
 
     def close(self) -> None:
         """Free every remaining slot; release the log handle and the cache lock. Persist keeps

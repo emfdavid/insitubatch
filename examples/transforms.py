@@ -34,7 +34,13 @@ from dataclasses import dataclass
 import numpy as np
 import zarr
 
-from insitubatch import ensure_local_dir, obstore_store, open_geometries, split_by_chunk
+from insitubatch import (
+    applies,
+    ensure_local_dir,
+    obstore_store,
+    open_geometries,
+    split_by_chunk,
+)
 from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry, Batch, DecodedChunk
 
@@ -64,17 +70,17 @@ def build_store(tmp: str, *, n: int = 64, lat: int = 16, lon: int = 32, spc: int
     return url
 
 
-# Temperature fields this K->C transform understands: the synthetic ``t2m`` here and the public
-# WeatherBench2 ERA5 name (``2m_temperature``), so the same callable works against real cloud data.
-TEMPERATURE_VARS = ("t2m", "2m_temperature")
-
-
 def kelvin_to_celsius(chunk: DecodedChunk) -> DecodedChunk:
-    """A chunk_transform: convert 2 m temperature from Kelvin to Celsius, vectorized.
+    """A chunk_transform: convert temperature from Kelvin to Celsius, vectorized.
 
-    Gated on the variable name, because a chunk_transform is called once per (variable,
-    chunk) and should only touch the field it understands (leaves u10/v10 untouched). It is
-    per-variable, per-chunk, deterministic and elementwise -- the textbook cacheable chunk
+    It knows nothing about any store -- no variable names appear in it. "Subtract 273.15" is a
+    fact about Kelvin; "``t2m`` is in Kelvin" is a fact about *your* archive, and the call site
+    declares it with ``applies(["t2m"], kelvin_to_celsius)``. Scoping in the body instead
+    would hide it from the engine, which folds a reshaping transform's declared output into
+    every variable's geometry -- and it makes one callable enumerate every archive's naming
+    convention (``t2m``, ``2m_temperature``, ...), silently skipping the next one.
+
+    Per-variable, per-chunk, deterministic and elementwise -- the textbook cacheable chunk
     stage -- and pure vectorized numpy, so it releases the GIL on the decode pool.
 
     Check it against one chunk of your real store before training (geometry, cacheability, and
@@ -83,8 +89,7 @@ def kelvin_to_celsius(chunk: DecodedChunk) -> DecodedChunk:
         insitubatch-check-transform <URL> --var 2m_temperature \\
             --transform examples/transforms.py:kelvin_to_celsius --skip-signature
     """
-    if chunk.read.array in TEMPERATURE_VARS:
-        chunk.data = chunk.data - 273.15
+    chunk.data = chunk.data - 273.15
     return chunk
 
 
@@ -144,8 +149,11 @@ def run_demo(
         manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
         source_inner = geoms["t2m"].inner_shape
 
-        # Two chunk stages: K->C (shape-preserving) then a reshaping Coarsen (halves the grid).
-        # The cache slot is sized at the *coarsened* shape via Coarsen.output_inner.
+        # Two chunk stages: K->C on t2m alone (u10/v10 are not temperatures), then a
+        # reshaping Coarsen on every variable. The cache slot is sized at the *coarsened*
+        # shape via Coarsen.output_inner. `applies` is what keeps those two facts separate:
+        # without it the engine would believe u10 and v10 were K->C'd as well, and -- worse,
+        # because it is silent -- fold Coarsen's output shape into variables it never saw.
         ds = InSituDataset(
             store,
             manifest,
@@ -153,7 +161,7 @@ def run_demo(
             batch_size=batch_size,
             block_chunks=block_chunks,
             shuffle=False,
-            chunk_transforms=[kelvin_to_celsius, Coarsen(factor=2)],
+            chunk_transforms=[applies(["t2m"], kelvin_to_celsius), Coarsen(factor=2)],
             batch_transforms=[add_windspeed],
         )
 

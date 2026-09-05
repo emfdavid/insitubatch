@@ -32,21 +32,22 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from typing import TextIO
 
 import numpy as np
 from zarr.abc.store import Store
 
 from .buffers import HostAllocator
-from .pool import ChunkPool, output_geometry
+from .pool import ChunkPool, output_geometry, validate_scopes
 from .runtime import Depths, PassStats, StatsCollector, format_pass
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
 from .store import close_store, open_geometries
 from .summary import DatasetReport, describe, print_summary, working_set_bytes
-from .types import ArrayGeometry, Batch, DecodedChunk, SplitName, StoredChunkRead
+from .transforms import BatchTransform, ChunkTransform
+from .types import ArrayGeometry, Batch, SplitName, StoredChunkRead
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,11 @@ class InSituDataset:
     - ``chunk_transforms`` -- ``(DecodedChunk) -> DecodedChunk``, run per chunk *before*
       shuffle, seeing **one variable**. The cacheable home for elementwise, per-variable,
       deterministic work (scaling, unit conversion, dtype cast); amortized over every sample
-      in the chunk and reused across epochs.
+      in the chunk and reused across epochs. Restrict one to particular variables with
+      :func:`~insitubatch.transforms.applies` -- ``applies(["2m_temperature"], k_to_c)`` --
+      rather than testing ``chunk.read.array`` inside the transform: a name test in the body
+      is invisible to the engine, which would fold a reshaping transform's declared output
+      into *every* variable's geometry and truncate the ones it does not touch.
     - ``batch_transforms`` -- ``(Batch) -> Batch``, run per assembled batch, seeing **all
       variables** aligned on the sample axis. For cross-variable derived fields and
       per-sample random augmentation; runs after the cache, so it is **never cached**.
@@ -140,8 +145,8 @@ class InSituDataset:
         readonly_cache: bool = False,
         reset_stale_cache: bool = False,
         on_bad_chunk: str = "raise",
-        chunk_transforms: Sequence[Callable[[DecodedChunk], DecodedChunk]] = (),
-        batch_transforms: Sequence[Callable[[Batch], Batch]] = (),
+        chunk_transforms: Sequence[ChunkTransform] = (),
+        batch_transforms: Sequence[BatchTransform] = (),
     ) -> None:
         self.store = store
         self.geometries = geometries if geometries is not None else open_geometries(store)
@@ -194,6 +199,10 @@ class InSituDataset:
         self.prefetch_depth = max(int(prefetch_depth), 1)
         self.chunk_transforms = tuple(chunk_transforms)
         self.batch_transforms = tuple(batch_transforms)
+        # A transform scoped with `applies` to an array this dataset does not have is a
+        # user error, and every geometry below is derived from the scopes -- so check them
+        # first, before a wrong shape can propagate into a report or a cache slot.
+        validate_scopes(self.chunk_transforms, {g.path for g in self.geometries.values()})
         # Geometry each variable presents *after* the chunk_transform pipeline (regrid / dtype
         # recast). What the consumer and the framework adapters see, and what sizes the cache.
         self._out_geometries = {

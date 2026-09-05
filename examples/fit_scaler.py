@@ -16,6 +16,12 @@ Why this over a chunk-stage scaler:
     change the scaler (or sweep normalizations) without re-decoding.
   * **Composes correctly** — the fit pass runs the dataset's own `chunk_transforms`
     (e.g. a regrid), so the scaler is fit on exactly what training will see.
+  * **No cache identity to keep in sync** — a chunk-stage scaler is part of the cache
+    fingerprint, and without cloudpickle the fallback cannot see re-fitted statistics
+    (numpy summarizes a large array's `repr`), so a re-fit can reopen a persisted cache
+    as a *hit* carrying the old numbers. Here the cache holds raw chunks and the question
+    never arises. If you do scale at the chunk stage, give
+    `insitubatch.StandardScaler` a `cache_key` and bump it on every fit.
 
     uv run python -m examples.fit_scaler                 # synthetic file://
     uv run python -m examples.fit_scaler --wb2           # public WeatherBench2 ERA5

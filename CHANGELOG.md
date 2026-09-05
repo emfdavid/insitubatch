@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- **`applies(...)` scopes a `chunk_transform` to named variables — and the in-body name test
+  it replaces was silently truncating data.** `chunk_transforms` is one list run on every
+  variable, so the convention was for a transform to check `chunk.read.array` and no-op on
+  the rest. `output_geometry` cannot see a test inside a function body: it folded **every**
+  transform's declared `output_inner` into **every** variable's geometry. So a regrid scoped
+  by an `if` to `t2m` also made the engine believe `u10` was regridded — `u10` was gathered
+  as a truncated prefix of itself, and its cache entry could never revive, because the file
+  on disk no longer matched the declared geometry. Nothing raised. Nothing in this tree was
+  affected (all four gating sites — `kelvin_to_celsius`, Hubble's `SCI`, SDSS's `flux`, and
+  `StandardScaler`'s implicit `KeyError` — are shape-preserving, and the one shipped
+  reshaping transform is ungated), but it is what a user's next regrid would have hit.
+
+  Scope is now declared at the call site, where the engine can read it:
+  `applies(["2m_temperature"], kelvin_to_celsius)`. "Subtract 273.15" is a fact about
+  Kelvin; "`2m_temperature` is in Kelvin" is a fact about your store — and the old pattern
+  welded them together, which is why one unit conversion had to enumerate two archives'
+  naming conventions and silently skipped a third. A bare transform still applies to
+  everything. A name matching no array raises at construction, a scoped `StandardScaler` is
+  checked against its own stats dict there too, and off-scope arrays now skip the call
+  entirely rather than paying a no-op pass. The four in-body gates are retired from the
+  examples and docs.
+
+- **Editing one variable's transform no longer invalidates the whole cache (manifest format
+  4).** The fingerprint hashed the entire `chunk_transforms` list once and stamped that on
+  every array's entries, so changing a transform that only touched `t2m` marked `u10` and
+  `v10` stale as well — byte-identical chunks the user then had to `reset_stale_cache` and
+  re-decode, on an NVMe cache that may have taken hours to warm. Each entry now carries the
+  hash of the transforms scoped to *its own* array. The staleness error names which arrays,
+  and `reset_stale_cache=True` deletes only their files.
+
+  Three consequences of staleness becoming a partial answer, each of which used to be a
+  wipe: an array with no entries is **cold, not stale**, so adding a variable is not a cache
+  reset; an array a run does not read keeps its entries and files, so two configurations can
+  share one `cache_dir`; and narrowing a scope invalidates the variable that *left* it and
+  not the one that stayed (a transform is hashed without its scope, deliberately). The log
+  is compacted — temp file, then `rename` — whenever a load drops entries, so a reset is not
+  re-read and re-rejected on every subsequent open; that is safe because part 1's exclusive
+  lock proves there is no second writer. A format-3 cache is still rejected whole: a log we
+  cannot parse says nothing about any individual array.
+
+- **A re-fitted `StandardScaler` could reopen a persisted cache as a *hit*, serving the old
+  normalization.** Without cloudpickle the fingerprint falls back to hashing a transform's
+  source plus its `repr` — and numpy summarizes any array over 1000 elements in `repr`, so
+  per-gridpoint `mean`/`std` repr identically whatever their values. Re-fit the scaler, reopen
+  the cache, and every chunk revives with the previous statistics: no error, no miss, wrong
+  numbers, and nothing in the run that would tell you. The hole is now documented where it
+  bites — on the scaler itself, in the fingerprint section and on the tuning page — and
+  `StandardScaler` takes a `cache_key` you bump per fit (it is a `slots=True` dataclass, so
+  setting the attribute from outside was not even possible). Installing `insitubatch[cache]`
+  remains the stronger fix: cloudpickle hashes the values, not their summary.
+
+- **Documented: two labels backed by one array cannot have different chunk transforms.** Scope
+  is per zarr array *path*, so `t2m_now` / `t2m_next` — one decoded chunk read at two sample
+  offsets — share one pipeline. That is the de-duplication the pool exists for rather than an
+  omission (two pipelines would mean two transformed copies of the same bytes under one cache
+  key), but it was nowhere on the page a reader learns about aliasing. Per-label work belongs
+  in a `batch_transform`.
+
 - **A `chunk_transform` that disagrees with its own declared output shape now raises instead of
   silently truncating.** Everything downstream of assembly — the byte budget, `gather`'s tile
   placement, the revive structural check — is sized from the transform's declared `output_inner`,
