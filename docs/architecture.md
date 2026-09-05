@@ -629,6 +629,15 @@ The names are zarr array **paths** (what `chunk.read.array` carries), not dict l
 two labels may alias one array (`t2m_now` / `t2m_next`), and the cache is keyed by path. A
 name matching no array raises at construction.
 
+**Limitation: aliased labels share one chunk pipeline.** Because scope is per array path,
+two labels backed by the same array cannot be given *different* `chunk_transforms` — there
+is no way to express "scale `t2m_now` but not `t2m_next`" at the chunk stage. This is the
+de-duplication the pool exists for: aliases are one decoded, transformed chunk read at two
+sample offsets, and two pipelines over it would mean two transformed copies of the same
+bytes and two cache entries under one key. Per-label work belongs in a `batch_transform`,
+which sees the assembled batch and each label separately (uncached, which is the honest
+price). The same holds for any two labels pointing at one path, aliased or not.
+
 **Do not gate inside the transform.** An `if chunk.read.array == "t2m"` in the body is
 invisible to the engine, and that is not a style point — it is a correctness bug for any
 reshaping transform. `output_geometry` folds every transform's declared `output_inner` into
@@ -644,8 +653,8 @@ against its own stats dict — but it must not decide whether it runs. Configura
 control flow outside. sklearn's `ColumnTransformer`, NVTabular's `cols >> Op()` and
 xarray's subset-then-`map` all place the selector the same way.
 
-Scope also buys two smaller things: the engine skips the call for arrays outside it (the
-no-op passes are gone), and cache invalidation becomes per array — see
+Scope also buys two smaller things: the engine skips the call entirely for arrays outside
+it, and cache invalidation is per array — see
 [the cache fingerprint](#cross-run-persistence).
 
 ### Standard scaler — pre-fit GLOBAL stats (not per-chunk)
@@ -669,6 +678,15 @@ Pre-fit the stats however you like and pass them in. The recommended way is to f
 — covered next — which also warms the cache. `StandardScaler` above is then the
 *chunk*-stage applier, for when you want the normalization cached with the decoded
 chunk; the fit pass and the apply stage are independent.
+
+!!! warning "A re-fitted scaler needs a `cache_key` (or cloudpickle)"
+
+    Stats large enough for numpy to summarize in `repr` — anything over 1000 elements, so
+    per-gridpoint mean/std — are invisible to the best-effort source fingerprint, and a
+    re-fit reopens a persisted cache as a **hit** carrying the old normalization. Install
+    `insitubatch[cache]`, or pass `StandardScaler(..., cache_key=...)` with a stats version
+    you bump on every fit. See [the fingerprint](#cross-run-persistence). Fitting at the *batch* stage
+    (below) sidesteps this entirely: the cache then holds raw chunks.
 
 **Alternative: fit at the *batch* stage with community tooling, warming the cache.**
 Standardization is elementwise, so per-chunk and per-batch are identical — which means
@@ -935,11 +953,21 @@ and referenced globals, so a changed closed-over constant invalidates), or a
 best-effort source hash (catches an edited body but not a changed closure/global — it
 warns once so the weaker guarantee is visible).
 
+**The source fallback is blind to large statistics.** It folds a class-based transform's
+`repr` in so instance config still counts, but numpy *summarizes* an array over 1000
+elements in `repr` — `array([0., 1., 2., ..., 1997., 1998., 1999.])` — so two transforms
+carrying different per-gridpoint arrays repr identically and hash the same. Re-fit a
+`StandardScaler` over a `(721, 1440)` grid, reopen a persisted cache without cloudpickle,
+and every chunk revives as a hit, normalized with the *old* statistics: no error, no miss,
+wrong numbers. Install `insitubatch[cache]` (cloudpickle hashes the values), or set
+pass `StandardScaler(..., cache_key="<stats version>")`, whenever a transform's identity
+lives in an array rather than in its source.
+
 **The fingerprint is per *array*, over the transforms scoped to it.** `chunk_transforms`
 is one ordered list, but a transform restricted with `applies` contributes only to the
 arrays it names, so each array's entries carry their own 16-hex `pipeline` hash. Editing a
 transform scoped to `t2m` marks `t2m` stale and leaves `u10`/`v10` — whose bytes did not
-change — valid. Staleness is a partial answer now, which changes three behaviours worth
+change — valid. Staleness is therefore a *partial* answer, with three behaviours worth
 knowing:
 
 - the error **names which arrays** are stale, and `reset_stale_cache=True` deletes exactly
@@ -947,7 +975,9 @@ knowing:
 - an array with **no entries** is *cold*, not stale — adding a variable to a configuration
   is not a cache wipe;
 - an array **this run does not read** is left entirely alone, entries and files, so two
-  configurations can share one `cache_dir`.
+  configurations can share one `cache_dir`. Dropping a variable is not an edit to it: a
+  feature-importance or ablation sweep can run variable subsets over one warm cache all day,
+  and every array it omits is still there, valid, when a later run asks for it.
 
 Scope does *not* enter a transform's own token: narrowing `applies(["t2m", "u10"], f)` to
 `applies(["t2m"], f)` invalidates `u10` (it lost a transform) and leaves `t2m` valid (its

@@ -409,7 +409,7 @@ def _name(fn: object) -> str:
     """A transform's display name, with its scope when it has one.
 
     ``kelvin_to_celsius[2m_temperature]`` -- the report exists to say what a configuration
-    will do, and "which variables does this transform touch" is now part of that."""
+    will do, and that includes which variables each transform touches."""
     scope = transform_scope(fn) if callable(fn) else None
     base = unwrap_transform(fn) if scope is not None else fn  # type: ignore[arg-type]
     label = getattr(base, "__name__", type(base).__name__)

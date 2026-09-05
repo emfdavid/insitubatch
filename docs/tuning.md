@@ -246,9 +246,27 @@ Two cases that are deliberately *not* stale:
   can widen a configuration without a wipe.
 - **Reading a subset.** An array this run does not open is left alone entirely — entries
   and files. Two configurations can share one `cache_dir`, each warming its own arrays.
+  This is what makes an **ablation / feature-importance sweep** cheap: drop a variable from
+  the run and its cached chunks are neither validated nor deleted, so the run that puts it
+  back reads it warm. Dropping a variable is not an edit to it.
 
-Narrowing a scope invalidates the variable that *left* it, and only that one: the transform
-itself is hashed without its scope, so the variables that stayed hash identically.
+Narrowing a scope is different, and it *is* stale: a variable that leaves
+`applies([...], scale)` while the run still reads it has cached chunks holding scaled bytes
+that the new configuration must not serve, so its files are deleted and re-decoded. Only that
+one variable — the transform is hashed without its scope, so the variables that stayed hash
+identically.
+
+Put the two together and the rule is: **a variable is invalidated when the pipeline over it
+changes, not when your configuration stops mentioning it.**
+
+!!! warning "Re-fitted statistics may not invalidate"
+
+    Without cloudpickle (`insitubatch[cache]`) the fingerprint falls back to hashing a
+    transform's source plus its `repr`, and numpy summarizes any array over 1000 elements in
+    `repr`. A `StandardScaler` holding per-gridpoint `mean`/`std` therefore hashes the same
+    after a re-fit, and the cache reopens as a **hit** carrying the old normalization. Install
+    the extra, or pass `StandardScaler(..., cache_key=...)` with a version you bump on every
+    fit.
 
 A load that drops entries rewrites the log (to a temp name, then a rename), so a reset is
 not re-read and re-rejected on every subsequent open. That is safe only because one writer

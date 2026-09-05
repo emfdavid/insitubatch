@@ -257,7 +257,11 @@ def test_a_new_variable_over_an_existing_cache_is_cold_not_stale(three_vars, tmp
 
 def test_an_array_this_run_does_not_read_keeps_its_files(three_vars, tmp_path):
     """Two configurations may share one cache_dir. A run that reads only ``a`` must not
-    delete -- or forget -- ``b``'s entries just because it cannot check them."""
+    delete -- or forget -- ``b``'s entries just because it cannot check them.
+
+    This is the ablation / feature-importance case: sweeping over variable subsets must not
+    cost a re-decode of the variables each run leaves out. Dropping a variable from a run is
+    not an edit to it."""
     url, _ = three_vars
     backing = tmp_path / "cache"
 
@@ -280,7 +284,13 @@ def test_an_array_this_run_does_not_read_keeps_its_files(three_vars, tmp_path):
 
 def test_narrowing_a_scope_invalidates_only_the_variable_that_left(three_vars, tmp_path):
     """Scope is not folded into a transform's own token: the array that *stays* in scope
-    hashes identically, and only the one that left is stale."""
+    hashes identically, and only the one that left is stale.
+
+    Leaving a scope *is* a real invalidation, not bookkeeping -- ``b``'s cached chunks hold
+    doubled bytes that the narrowed configuration must not serve -- so under
+    ``reset_stale_cache`` its files are deleted and it re-decodes cold (asserted below).
+    Contrast :func:`test_an_array_this_run_does_not_read_keeps_its_files`: an array the run
+    stops *reading* keeps everything."""
     url, _ = three_vars
     backing = tmp_path / "cache"
     geoms = _geoms(url)

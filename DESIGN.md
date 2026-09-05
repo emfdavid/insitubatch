@@ -725,6 +725,16 @@ Things wrong or missing in *our* code today, with the reasoning that sets their 
   the corruption. **What remains open** is named where the user meets it: a network
   `cache_dir` (`flock` may be emulated per client) and a platform with no POSIX locking are
   still unarbitrated, and both warn at construction saying so. Detection is not a fix.
+- **Aliased labels share one chunk pipeline.** `chunk_transform` scope (`applies`) is per
+  zarr array *path*, so two labels backed by the same array — `t2m_now` / `t2m_next`, or any
+  two dict entries pointing at one path — cannot be given different chunk-stage transforms.
+  This one is a *consequence*, not an omission: aliases are one decoded, transformed chunk
+  read at two sample offsets, which is the de-duplication the pool exists for, and two
+  pipelines over it would mean two transformed copies of the same bytes and two cache entries
+  under one key — resharding by transform. The workaround is exact rather than grudging: a
+  difference the labels can see is a difference the assembled batch can see, so it belongs in
+  a `batch_transform` (uncached, which is the price). Documented in
+  `docs/architecture.md`; no plan to lift it.
 - **Per-array assembly.** A variable no transform touches could stay on the tiled fast path
   instead of assembling into one contiguous array at completion. It does not, because
   `assembles` is a single bool the scheduler reads to decide *where* delivery runs; making

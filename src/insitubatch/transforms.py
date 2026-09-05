@@ -110,7 +110,7 @@ def applies(arrays: Sequence[str], transform: ChunkTransform) -> ChunkTransform:
 
         InSituDataset(..., chunk_transforms=[
             applies(["2m_temperature"], kelvin_to_celsius),
-            Coarsen(2),                    # bare = every array, as before
+            Coarsen(2),                    # bare = every array
         ])
 
     Declaring scope here rather than with an ``if chunk.read.array == ...`` inside the
@@ -118,13 +118,17 @@ def applies(arrays: Sequence[str], transform: ChunkTransform) -> ChunkTransform:
     folds a reshaping transform's ``output_inner`` into *every* array's declared geometry.
     The unaffected arrays are then gathered as truncated prefixes of themselves and can
     never revive from cache -- with no exception raised. Scope also enters the cache
-    fingerprint per array, so editing one variable's transform no longer invalidates the
-    rest.
+    fingerprint per array, so editing one variable's transform leaves the rest valid.
+
+    Scope is matched against the zarr array **path**. Two labels that alias one array
+    (``t2m_now`` / ``t2m_next``) therefore share one chunk pipeline; per-label work belongs in
+    a ``batch_transform``.
 
     A transform may be *parameterized* by variable (a fitted scaler's statistics
     legitimately are) but must not decide whether it runs. If it can validate a declared
     scope -- :class:`StandardScaler` checks the names against its own stats dict -- it
-    defines ``validate_scope(arrays)`` and this calls it now, not in a decode thread.
+    defines ``validate_scope(arrays)``, which this calls at construction rather than leaving
+    it to fail in a decode thread.
     """
     if isinstance(arrays, str):
         raise TypeError(
@@ -175,11 +179,24 @@ class StandardScaler:
     (which also warms the cache) and scale at the *batch* stage -- see
     ``examples/fit_scaler.py``; this class is the *chunk*-stage applier for when you
     want the normalization cached with the decoded chunk.
+
+    **Give a re-fitted scaler a new ``cache_key`` if you persist the cache without
+    cloudpickle.** The fallback fingerprint hashes this class's source plus its ``repr``, and
+    numpy summarizes an array over 1000 elements in ``repr`` -- so per-gridpoint statistics
+    (say ``(721, 1440)``) repr identically whatever their values, and a re-fit reopens a
+    persisted cache as a *hit*, serving chunks normalized with the old numbers. Any of three
+    closes the hole: install ``insitubatch[cache]`` (cloudpickle hashes the values), pass
+    ``cache_key="<stats version>"`` and bump it on every fit, or keep stats small enough to
+    repr in full.
     """
 
     mean: dict[str, np.ndarray]
     std: dict[str, np.ndarray]
     eps: float = 1e-8
+    cache_key: str | None = None
+    """The identity this scaler declares to the cache fingerprint, and the only one that is
+    exact: the fallback hashes ``repr``, which numpy summarizes for large statistics. ``None``
+    (the default) leaves identity to the fingerprint's own resolution."""
 
     def __call__(self, chunk: DecodedChunk) -> DecodedChunk:
         m = self.mean[chunk.read.array]

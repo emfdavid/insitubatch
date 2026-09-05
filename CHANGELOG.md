@@ -42,6 +42,24 @@
   lock proves there is no second writer. A format-3 cache is still rejected whole: a log we
   cannot parse says nothing about any individual array.
 
+- **A re-fitted `StandardScaler` could reopen a persisted cache as a *hit*, serving the old
+  normalization.** Without cloudpickle the fingerprint falls back to hashing a transform's
+  source plus its `repr` — and numpy summarizes any array over 1000 elements in `repr`, so
+  per-gridpoint `mean`/`std` repr identically whatever their values. Re-fit the scaler, reopen
+  the cache, and every chunk revives with the previous statistics: no error, no miss, wrong
+  numbers, and nothing in the run that would tell you. The hole is now documented where it
+  bites — on the scaler itself, in the fingerprint section and on the tuning page — and
+  `StandardScaler` takes a `cache_key` you bump per fit (it is a `slots=True` dataclass, so
+  setting the attribute from outside was not even possible). Installing `insitubatch[cache]`
+  remains the stronger fix: cloudpickle hashes the values, not their summary.
+
+- **Documented: two labels backed by one array cannot have different chunk transforms.** Scope
+  is per zarr array *path*, so `t2m_now` / `t2m_next` — one decoded chunk read at two sample
+  offsets — share one pipeline. That is the de-duplication the pool exists for rather than an
+  omission (two pipelines would mean two transformed copies of the same bytes under one cache
+  key), but it was nowhere on the page a reader learns about aliasing. Per-label work belongs
+  in a `batch_transform`.
+
 - **A `chunk_transform` that disagrees with its own declared output shape now raises instead of
   silently truncating.** Everything downstream of assembly — the byte budget, `gather`'s tile
   placement, the revive structural check — is sized from the transform's declared `output_inner`,

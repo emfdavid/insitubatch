@@ -291,6 +291,10 @@ def _transform_token(fn: ChunkTransform) -> str:
     the object's memory address, so the token would be unstable across runs (a spurious
     cache miss on every reopen). A stable, non-default ``__repr__`` (dataclasses, partials)
     is folded in so instance config still affects the token; the address-bearing default is not.
+    That has one sharp edge: numpy **summarizes** an array over 1000 elements in ``repr``, so a
+    transform holding large statistics (a :class:`~insitubatch.transforms.StandardScaler` with
+    per-gridpoint mean/std) can repr -- and therefore hash -- identically after a re-fit. Give
+    such a transform an explicit ``cache_key``, or install cloudpickle, which hashes the values.
 
     An :func:`~insitubatch.transforms.applies` wrapper is stripped first: the token covers
     *what* a transform does, never *which arrays it runs on*. Narrowing a scope therefore
@@ -490,21 +494,21 @@ class ChunkPool:
 
     _MANIFEST_NAME = "insitu_cache.jsonl"
     _MANIFEST_FORMAT = 4
-    """Bumped to 4: cache identity is **per array**, carried on each entry.
+    """The on-disk contract of the manifest, and cache identity is **per array**.
 
     An entry is ``{array, chunk_index, file, pipeline}``, where ``pipeline`` is the hash of
-    the chunk_transforms scoped to *that array* -- so editing a transform that only touches
-    ``t2m`` no longer invalidates ``u10`` and ``v10``, whose bytes did not change. The header
-    line carries ``{format_version}`` and nothing else; identity rides on the entry, which is
-    what lets a run append an array it is seeing for the first time without touching a byte
-    written by an earlier one. (The header-map alternative, and why it was rejected, are in
-    DESIGN.md under "Design evolution & alternatives".)
+    the chunk_transforms scoped to *that array* -- so editing a transform that touches only
+    ``t2m`` leaves ``u10`` and ``v10`` valid, their bytes being unchanged. The header line
+    carries ``{format_version}`` and nothing else; identity rides on the entry, which is what
+    lets a run append an array it is seeing for the first time without touching a byte written
+    by an earlier one. (The header-map alternative, and why it was rejected, are in DESIGN.md
+    under "Design evolution & alternatives".)
 
-    Format 3 made a persisted chunk **tile-major** -- a ``.npy`` holds ``(n_tiles,
+    The ``file`` a persisted chunk names is **tile-major**: the ``.npy`` holds ``(n_tiles,
     *tile_shape)``, each stored tile contiguous in :meth:`ArrayGeometry.inner_index` order,
-    rather than one assembled ``slot_shape`` array. That layout is unchanged in 4.
+    not one assembled ``slot_shape`` array.
 
-    A log at any earlier version is rejected whole (:meth:`_reset_stale_format`): we cannot
+    A log at any other version is rejected whole (:meth:`_reset_stale_format`): we cannot
     read its entries' meaning, so we cannot judge any array in it valid."""
 
     def __init__(
@@ -633,8 +637,11 @@ class ChunkPool:
                 logger.warning(
                     "persist: cloudpickle not installed and a chunk_transform has no "
                     "cache_key -> cache invalidation on transform changes is best-effort "
-                    "(source only; closure/global changes may not invalidate). Install "
-                    "`insitubatch[cache]` or set a `cache_key` attribute for a stronger guarantee."
+                    "(source text only; a changed closure or global may not invalidate, and "
+                    "neither may re-fitted statistics: numpy summarizes an array over 1000 "
+                    "elements in repr, so large per-gridpoint mean/std can hash identically to "
+                    "the values they replaced). Install `insitubatch[cache]` or set a "
+                    "`cache_key` attribute for a stronger guarantee."
                 )
             try:
                 self._load_log()
@@ -1545,9 +1552,8 @@ class ChunkPool:
             self._cv.notify_all()
 
     def _apply_transforms(self, array: str, chunk_index: int, data: np.ndarray) -> np.ndarray:
-        """Run the transforms scoped to this array, in order. Off-scope transforms are not
-        called at all -- the no-op pass over a variable a transform does not understand is
-        gone, and so is any chance of it acting on one it was not given."""
+        """Run the transforms scoped to this array, in order. A transform outside its scope
+        is not called at all: it never sees a variable it was not given."""
         pipeline = self._transforms_by_path[array]
         if not pipeline:
             return data
