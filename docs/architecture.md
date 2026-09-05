@@ -914,7 +914,9 @@ ds = InSituDataset(store, manifest, cache_dir="/mnt/nvme/era5/v3",
 Two guards keep a reopened cache honest:
 
 1. a **chunk-transform fingerprint** stamped on every log entry, over the transforms
-   scoped to *that array* — change your `chunk_transforms` (or bump the log format) and
+   scoped to *that array* (identity is carried on the entry, not in the header; the
+   [design record](https://github.com/emfdavid/insitubatch/blob/main/DESIGN.md#design-evolution--alternatives)
+   has the why) — change your `chunk_transforms` (or bump the log format) and
    the arrays they affect are **stale**. A stale cache is almost never what you intended,
    so by default it **raises** at construction, naming which arrays, rather than silently
    rebuilding or serving stale data. Pass `reset_stale_cache=True` to opt into deleting

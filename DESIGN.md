@@ -403,6 +403,44 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
   collapsed into the `ChunkPool`: one byte-budgeted object that is the assembly buffer when
   small and the cache when large ("don't evict"). One machinery, and no copy between a buffer
   and a cache.
+- **Cache identity per entry, not a header map.** The cross-run manifest
+  (`insitu_cache.jsonl`) is append-only: line 1 is the header, every later line is one
+  completed chunk written as a single `O_APPEND` write, and nothing ever seeks back. When
+  format 4 made cache identity **per array**, the tidy-looking place for it was the header —
+  one `{array: pipeline_hash}` map, instead of the same 16 hex chars repeated on every entry.
+  It does not survive the second run:
+
+  ```text
+  {"format_version": 4}                                   <- written once, on a cold start
+  {"array": "2m_temperature", "chunk_index": 0, "file": "t2m-0.npy", "pipeline": "a1b2c3d4e5f60718"}
+  {"array": "2m_temperature", "chunk_index": 1, "file": "t2m-1.npy", "pipeline": "a1b2c3d4e5f60718"}
+                                                          <- run 1 ends here (or is preempted)
+
+     run 2 opens the same cache_dir with u10 added to the manifest, and reads it for the
+     first time. Its pipeline hash has to be recorded somewhere:
+
+  {"array": "10m_u_component_of_wind", "chunk_index": 0, "file": "u10-0.npy", "pipeline": "9f8e7d6c5b4a3928"}
+                                                          <- ...on the entry, it just appends
+  ```
+
+  With the hash on the entry, run 2's first `u10` line carries its own identity and no
+  earlier byte moves. With a header map, `u10`'s hash belongs on line 1 — written on the cold
+  start, now sitting behind every entry appended since, and longer than the text it replaces —
+  so recording it means rewriting the whole file — and rewriting it *safely*, since
+  `readonly_cache` openers hold the directory lock shared and read that same log whole, so an
+  in-place rewrite can be read torn. The only safe form is the one `_compact` already uses
+  (temp file, then `rename`), which is fine where it is used — rare, exclusive-locked, and
+  already an invalidation the run is paying for — and wrong on the ordinary path of a run
+  touching a variable it has not seen before. The chosen form costs ~30 duplicated bytes per
+  line, which is what the 64-bit truncation of the hash trades against.
+
+  Two consequences worth naming, because they are the reason the per-array split is useful at
+  all: an array with **no entries** is *cold*, not stale (adding a variable is not a wipe), and
+  an array a run **does not read** is left alone entirely, so two configurations can share one
+  `cache_dir`. Scope is deliberately kept **out** of a transform's own token for the mirror-image
+  reason: scope already decides which transforms enter an array's hash, so folding it in as well
+  would invalidate the variable that *stayed* in scope every time another one left it.
+
 - **Transforms staged by cost, not per-sample.** torch's per-`__getitem__` transform redoes
   work for every reused sample. We split preprocessing into a per-chunk `chunk_transform`
   (deterministic, per-variable, applied *before* shuffle so it is cached), a per-batch
@@ -959,8 +997,8 @@ measurements live in [docs/benchmarks.md](docs/benchmarks.md).
   incrementally as each chunk lands — so a killed process leaves a usable cache and the
   next run re-decodes only what had not finished. A new pool over the same dir revives
   entries as ready hits, so decode-once amortizes across *runs* (relaunched jobs, sweeps,
-  several processes on one box). Invalidation is a chunk-transform fingerprint in the log
-  header; a stale cache **raises by default** (`reset_stale_cache=True` opts into GC +
+  several processes on one box). Invalidation is a chunk-transform fingerprint stamped on every
+  entry; a stale cache **raises by default** (`reset_stale_cache=True` opts into GC +
   rebuild), while corruption or tampering always raises. Reshaping transforms (`Regrid`,
   dtype recast) are cacheable on every tier via `output_inner`. Closed decisions: the store
   URL is **not** in the key (session stores have no round-trippable URL, so `cache_dir`

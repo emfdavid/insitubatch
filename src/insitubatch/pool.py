@@ -292,11 +292,10 @@ def _transform_token(fn: ChunkTransform) -> str:
     cache miss on every reopen). A stable, non-default ``__repr__`` (dataclasses, partials)
     is folded in so instance config still affects the token; the address-bearing default is not.
 
-    An :func:`~insitubatch.transforms.applies` wrapper is stripped first, for two reasons: it
-    is a frozen dataclass whose ``repr`` would otherwise dominate the source-path hash, and --
-    deliberately -- scope must **not** enter the token. Scope already decides which transforms
-    enter an array's hash; folding it in as well would invalidate the variable that *stayed*
-    in scope every time another one left it.
+    An :func:`~insitubatch.transforms.applies` wrapper is stripped first: the token covers
+    *what* a transform does, never *which arrays it runs on*. Narrowing a scope therefore
+    invalidates the variable that left it and leaves the ones that stayed hashing identically.
+    (Rationale for that split: DESIGN.md, "Design evolution & alternatives".)
     """
     fn = unwrap_transform(fn)
     key = getattr(fn, "cache_key", None)
@@ -324,11 +323,10 @@ def _transform_token(fn: ChunkTransform) -> str:
 def _pipeline_hash(transforms: Sequence[ChunkTransform]) -> str:
     """The cache identity of one array's pipeline: 16 hex chars over its transforms' tokens.
 
-    Stamped on every manifest entry (not once in the header), because the log is append-only:
-    a header map could not absorb an array this run reads for the first time without
-    rewriting it. Truncated to 64 bits -- a collision means serving a chunk transformed by a
-    *different* pipeline, and at the scale of one directory's worth of pipeline edits that is
-    not a risk worth 32 more bytes per line.
+    Stamped on every manifest entry (see :attr:`ChunkPool._MANIFEST_FORMAT`). Truncated to
+    64 bits -- a collision means serving a chunk transformed by a *different* pipeline, and
+    at the scale of one directory's worth of pipeline edits that is not a risk worth 32 more
+    bytes per line.
 
     An empty pipeline (no transform applies to this array) hashes like any other, so a
     variable that leaves every scope invalidates exactly once and then stays valid."""
@@ -497,8 +495,10 @@ class ChunkPool:
     An entry is ``{array, chunk_index, file, pipeline}``, where ``pipeline`` is the hash of
     the chunk_transforms scoped to *that array* -- so editing a transform that only touches
     ``t2m`` no longer invalidates ``u10`` and ``v10``, whose bytes did not change. The header
-    is just ``{format_version}``: a map there could not absorb an array a later run reads for
-    the first time, because the log is append-only.
+    line carries ``{format_version}`` and nothing else; identity rides on the entry, which is
+    what lets a run append an array it is seeing for the first time without touching a byte
+    written by an earlier one. (The header-map alternative, and why it was rejected, are in
+    DESIGN.md under "Design evolution & alternatives".)
 
     Format 3 made a persisted chunk **tile-major** -- a ``.npy`` holds ``(n_tiles,
     *tile_shape)``, each stored tile contiguous in :meth:`ArrayGeometry.inner_index` order,
