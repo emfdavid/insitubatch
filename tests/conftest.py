@@ -46,6 +46,34 @@ def run_by():
     return _run_by
 
 
+def pytest_addoption(parser):
+    """``--remote`` opts into the tests that read somebody else's live bucket.
+
+    They exist because a local fixture cannot reproduce a backend-specific defect: a
+    synthetic store exercises our code against our own writer, not against the encoding
+    choices a real publisher made.
+
+    Off by default, because the suite is otherwise fully offline and deterministic and
+    somebody else's public store going away must not turn into a red build for a
+    contributor who changed nothing.
+    """
+    parser.addoption(
+        "--remote",
+        action="store_true",
+        default=False,
+        help="run tests that read live public cloud stores (network, slow)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--remote"):
+        return
+    skip = pytest.mark.skip(reason="needs --remote (reads a live public bucket)")
+    for item in items:
+        if "remote" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest.fixture
 def write_zarr(tmp_path):
     """Factory: write a zarr group of random f4 variables, return (url, {var: src})."""
@@ -60,6 +88,86 @@ def write_zarr(tmp_path):
             arr = group.create_array(var, shape=(n, *inner), chunks=(spc, *inner), dtype="f4")
             data = rng.standard_normal((n, *inner)).astype("f4")
             arr[:] = data
+            srcs[var] = data
+        return url, srcs
+
+    return _write
+
+
+@pytest.fixture
+def write_sharded_zarr(tmp_path):
+    """Factory: a **sharded** zarr-v3 group -- the layout every dynamical.org store uses.
+
+    ``shard`` is the stored object (what a chunk key addresses); ``chunks`` is the read
+    granularity inside it. The two differ here on purpose: that difference is the whole of
+    #56, and a fixture where they coincide proves nothing.
+    """
+
+    def _write(
+        *, n=48, shard=(16, 8, 8), chunks=(16, 4, 4), inner=(8, 8), variables=("t2m",), seed=0
+    ):
+        url = f"file://{tmp_path}/sharded.zarr"
+        ensure_local_dir(url)
+        group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
+        rng = np.random.default_rng(seed)
+        srcs: dict[str, np.ndarray] = {}
+        for var in variables:
+            arr = group.create_array(
+                var, shape=(n, *inner), shards=shard, chunks=chunks, dtype="f4"
+            )
+            data = rng.standard_normal((n, *inner)).astype("f4")
+            arr[:] = data
+            srcs[var] = data
+        return url, srcs
+
+    return _write
+
+
+@pytest.fixture
+def write_cf_zarr(tmp_path):
+    """Factory: a CF/xarray-shaped group -- data variables plus coordinate arrays and a 0-D
+    ``spatial_ref`` grid-mapping scalar, which is what every rioxarray-written store carries.
+    """
+
+    def _write(*, n=32, spc=8, lat=4, lon=5, variables=("t2m", "u10"), v3=True, seed=0):
+        url = f"file://{tmp_path}/cf.zarr"
+        ensure_local_dir(url)
+        group = zarr.open_group(store=obstore_store(url, read_only=False), mode="w")
+        rng = np.random.default_rng(seed)
+        srcs: dict[str, np.ndarray] = {}
+        dims = ("time", "latitude", "longitude")
+
+        def _dim(arr, names):
+            # v3 carries dimension_names in metadata; v2 carries xarray's _ARRAY_DIMENSIONS.
+            if not v3:
+                arr.attrs["_ARRAY_DIMENSIONS"] = list(names)
+
+        for name, size in (("time", n), ("latitude", lat), ("longitude", lon)):
+            c = group.create_array(
+                name,
+                shape=(size,),
+                chunks=(size,),
+                dtype="f8",
+                dimension_names=(name,) if v3 else None,
+            )
+            c[:] = np.arange(size, dtype="f8")
+            _dim(c, (name,))
+
+        crs = group.create_array("spatial_ref", shape=(), chunks=(), dtype="i4")
+        crs.attrs["grid_mapping_name"] = "latitude_longitude"
+        crs.attrs["crs_wkt"] = 'GEOGCS["WGS 84"]'
+
+        for var in variables:
+            arr = group.create_array(
+                var,
+                shape=(n, lat, lon),
+                chunks=(spc, lat, lon),
+                dtype="f4",
+                dimension_names=dims if v3 else None,
+            )
+            data = rng.standard_normal((n, lat, lon)).astype("f4")
+            arr[:] = data
+            _dim(arr, dims)
             srcs[var] = data
         return url, srcs
 

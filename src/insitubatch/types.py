@@ -175,6 +175,31 @@ class ArrayGeometry:
         """
         return (self.sample_chunk_size, *self.inner_chunks)
 
+    @property
+    def chunk_bytes(self) -> int:
+        """Bytes one sample-axis chunk occupies once resident — **the number to size a
+        budget against**, and the one that is easy to get wrong by hand.
+
+        Residency is the array's stored *tiles*, kept whole: a chunk grid that does not
+        divide the array evenly still stores full-size edge chunks (721 rows chunked at 180
+        occupy 900) and the pool does not clip them. So this is
+        ``n_inner_chunks * prod(tile_shape) * itemsize``, which on a gridded inner axis is
+        **larger** than ``sample_chunk_size * prod(inner_shape) * itemsize`` — the product a
+        reader reaches for first, and which under-provisions exactly the deeply chunked
+        stores where the difference costs gigabytes.
+
+        This is the tiles term of :func:`~insitubatch.pool.slot_charge_bytes`, which charges
+        it; the two are the same expression, so they cannot drift. A configured
+        ``chunk_transform`` can make the assembled output the binding term instead — ask
+        :meth:`InSituDataset.describe` for the whole picture rather than summing this by
+        hand across variables.
+        """
+        return (
+            self.n_inner_chunks(0)
+            * int(np.prod(self.tile_shape(), dtype=np.int64))
+            * self.dtype.itemsize
+        )
+
     def tile_placement(self, chunk_index: int, inner_coord: tuple[int, ...]) -> ChunkProjection:
         """Where one stored tile lands inside its outer chunk, as zarr's own projection.
 

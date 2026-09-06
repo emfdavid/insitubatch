@@ -10,8 +10,15 @@ callers pick a constructor for their backend and hand the resulting ``Store`` to
   layer; the local-now / cloud-later story is just a different URL.
 - :func:`fsspec_store` -- fsspec-backed, for what obstore does not reach (GCS
   Rapid/zonal over gRPC, requester-pays).
-- :func:`arraylake_store` -- an Arraylake/Icechunk session store, bound to a
-  repository snapshot/branch (no URL round-trips to it, so it must be an object).
+- :func:`icechunk_store` -- an Icechunk repository you address by URL, public or with
+  your own cloud credentials.
+- :func:`arraylake_store` -- an Icechunk repository *hosted by Arraylake*, addressed by
+  catalog name and opened with an Arraylake login rather than cloud credentials.
+
+The last two both end in an Icechunk session store, and which one you want is decided by
+where the repository lives, not by preference: a bucket you can name in a URL is
+:func:`icechunk_store`; a repo in an Arraylake catalog has no such URL and is
+:func:`arraylake_store`. They are not alternatives for the same repository.
 
 Anything that is already a zarr ``Store`` (a custom store, an Icechunk session)
 is passed straight to the engine -- no constructor needed.
@@ -70,6 +77,57 @@ def fsspec_store(url: str, *, read_only: bool = True, **storage_options: Any) ->
     )
 
 
+def icechunk_store(
+    url: str,
+    *,
+    branch: str = "main",
+    anonymous: bool = False,
+    region: str | None = None,
+    **kwargs: Any,
+) -> Store:
+    """Return the read-only session ``Store`` of an Icechunk repository at ``url``.
+
+    ``s3://bucket/prefix`` (the common case for public archives), ``gs://``, or a local
+    ``file:///path``. Public buckets need ``anonymous=True``; otherwise credentials come
+    from the environment the way every other AWS/GCS tool finds them (profile, instance
+    role, ``AWS_*`` variables, an SSO login). Extra ``kwargs`` pass through to Icechunk's
+    storage constructor.
+
+    Icechunk is a *versioned* format, so a store is a snapshot: ``branch`` picks which one,
+    and the returned session is read-only, which is what the engine wants -- training reads
+    a fixed view of the data even while a writer appends to the repo.
+
+    Requires ``insitubatch[icechunk]``::
+
+        store = icechunk_store(
+            "s3://dynamical-noaa-gfs/noaa-gfs-analysis/v0.1.0.icechunk",
+            anonymous=True, region="us-west-2",
+        )
+
+    For an Arraylake-hosted repo use :func:`arraylake_store` instead: it is addressed by
+    catalog name rather than URL and authenticates with an Arraylake login.
+    """
+    import icechunk
+
+    parsed = urlparse(url)
+    bucket, prefix = parsed.netloc, parsed.path.lstrip("/")
+    if parsed.scheme in ("s3", "s3a"):
+        storage = icechunk.s3_storage(
+            bucket=bucket, prefix=prefix, region=region, anonymous=anonymous, **kwargs
+        )
+    elif parsed.scheme in ("gs", "gcs"):
+        storage = icechunk.gcs_storage(bucket=bucket, prefix=prefix, **kwargs)
+    elif parsed.scheme in ("", "file"):
+        storage = icechunk.local_filesystem_storage(parsed.path or url, **kwargs)
+    else:
+        raise ValueError(
+            f"icechunk_store does not know the scheme {parsed.scheme!r} in {url!r}; it "
+            "handles s3://, gs:// and file://. For an Arraylake-hosted repository use "
+            "arraylake_store(name), which is addressed by catalog name rather than URL."
+        )
+    return icechunk.Repository.open(storage).readonly_session(branch).store
+
+
 def arraylake_store(repo: str, *, branch: str = "main") -> Store:
     """Open an Arraylake repo and return its read-only Icechunk session store.
 
@@ -119,6 +177,62 @@ def ensure_local_dir(url: str) -> str:
     return url
 
 
+def _storage_chunks(arr: object) -> tuple[int, ...]:
+    """The shape of one **stored object** -- what a chunk key addresses.
+
+    On a **sharded** array these differ and only one is the storage unit:
+    ``metadata.chunks`` is the *inner* chunk (read granularity inside a shard), while
+    ``chunk_grid.chunk_shape`` is the shard, which is what ``store.get(key)`` returns and
+    what the codec chain (whose head is the ``ShardingCodec``) decodes. Planning reads or
+    building an ``ArraySpec`` from ``chunks`` on such an array asks for a key that holds a
+    shard and then decodes it as if it were one inner chunk -- which fails the shard index's
+    CRC rather than saying anything useful.
+
+    Identical on unsharded arrays, and defined for zarr-v2 metadata as well, so this is the
+    single format-agnostic spelling of "one stored chunk". Read through
+    ``ChunkGrid.from_metadata`` rather than ``metadata.chunk_grid``: the latter is deprecated
+    on ``ArrayV2Metadata``, and v2 is not optional here (WeatherBench2 ARCO is v2).
+    """
+    from zarr.core.chunk_grids import ChunkGrid
+
+    return tuple(ChunkGrid.from_metadata(arr.metadata).chunk_shape)  # type: ignore[attr-defined]
+
+
+def _dimension_names(arr: object) -> tuple[str, ...] | None:
+    """The array's dimension names, in either format's spelling, or ``None`` if it has none.
+
+    zarr-v3 carries ``dimension_names`` in metadata; zarr-v2 carries xarray's
+    ``_ARRAY_DIMENSIONS`` attribute. A store written by anything CF-aware has one or the
+    other, and neither is guaranteed (a hand-built or OME-NGFF store may have neither).
+    """
+    names = getattr(arr.metadata, "dimension_names", None)  # type: ignore[attr-defined]
+    if names is None:
+        names = arr.attrs.get("_ARRAY_DIMENSIONS")  # type: ignore[attr-defined]
+    return tuple(str(n) for n in names) if names else None
+
+
+def _is_coordinate(name: str, arr: object) -> bool:
+    """True for an array that describes the grid rather than being data on it.
+
+    Two shapes, both of which a CF store puts in the same group as its variables:
+
+    * a **grid mapping** -- 0-D, all of its content in attributes (``spatial_ref``'s
+      ``crs_wkt``). It has no sample axis, so it is not merely useless to batch, it cannot
+      be turned into an :class:`ArrayGeometry` at all.
+    * a **coordinate** -- 1-D and named after its own dimension (``latitude`` over
+      ``('latitude',)``). Batching it would deliver axis labels as if they were fields, and
+      its sample-axis length is the axis length, which will not agree with any variable's.
+
+    Deliberately narrow: an array is only a coordinate if it is *self-named*, so a 1-D data
+    variable (a station series over ``('time',)``) is kept. Naming it in ``variables=``
+    overrides this in either direction.
+    """
+    if getattr(arr, "ndim", None) == 0:
+        return True
+    dims = _dimension_names(arr)
+    return dims is not None and len(dims) == 1 and dims[0] == name
+
+
 def open_geometries(
     store: Store,
     variables: list[str] | None = None,
@@ -139,7 +253,22 @@ def open_geometries(
     :class:`ArrayGeometry` per array); the shape/chunks stay in physical order.
     """
     group = zarr.open_group(store=store, mode="r")
-    names = variables if variables is not None else [k for k, _ in group.arrays()]
+    if variables is not None:
+        names = variables
+    else:
+        # Infer: a CF group holds coordinates and a grid mapping alongside its variables,
+        # and taking every array makes the 0-D one raise and the 1-D ones batchable.
+        skipped = {k: a for k, a in group.arrays() if _is_coordinate(k, a)}
+        names = [k for k, _ in group.arrays() if k not in skipped]
+        if not names:
+            raise ValueError(
+                f"no batchable arrays found in {store!r}: every array in the group looks "
+                f"like a coordinate or grid mapping ({sorted(skipped)}). A 0-D array has no "
+                "sample axis, and a 1-D array named after its own dimension is an axis "
+                "label rather than data on the grid. If one of these really is the data you "
+                "mean to batch, name it explicitly -- open_geometries(store, "
+                'variables=["<name>"]) -- which bypasses this inference entirely.'
+            )
     out: dict[str, ArrayGeometry] = {}
     for name in names:
         arr = group[name]  # raises KeyError if the name is absent
@@ -151,7 +280,7 @@ def open_geometries(
         out[name] = ArrayGeometry(
             path=name,
             shape=tuple(arr.shape),
-            chunks=tuple(arr.chunks),
+            chunks=_storage_chunks(arr),
             dtype=np.dtype(arr.dtype),
             sample_axis=sample_axis,
         )

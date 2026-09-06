@@ -272,6 +272,38 @@ A load that drops entries rewrites the log (to a temp name, then a rename), so a
 not re-read and re-rejected on every subsequent open. That is safe only because one writer
 holds the lock above.
 
+### Work out what one chunk costs before setting a budget
+
+`cache_budget_bytes` below what one pass needs co-resident **raises at construction**,
+naming the floor, rather than being quietly raised to it. Ask the geometry what one chunk
+costs, then check that against the memory you actually have:
+
+```python
+geom = open_geometries(store, variables=["temperature_2m"])["temperature_2m"]
+geom.chunk_bytes                      # bytes one sample-axis chunk occupies once resident
+2 * block_chunks * geom.chunk_bytes   # the floor: current block + one read-ahead
+```
+
+Compare that with `free -h` (the `available` column, not `free`) and leave room for the
+model and the framework's own allocator. Across several variables the floor is the sum, and
+a `chunk_transform` can make the transformed output the binding term instead of the stored
+tiles — so for anything but a single-variable run, ask
+[`describe()`](api.md#insitubatch.InSituDataset.describe), which reports the number the
+engine will actually use rather than one you assembled by hand.
+
+**Do not compute this as `sample_chunk_size × prod(inner_shape) × itemsize`.** Residency is
+the array's stored *tiles*, kept whole: a grid that does not divide the array evenly still
+stores full-size edge chunks and the loader does not clip them. On NOAA GFS analysis —
+1440 time steps per chunk over a 721×1440 field, tiled 400×400 — that product gives 5.98 GB
+while the real cost is **7.37 GB**, eight whole tiles. Sizing a budget from the smaller
+number under-provisions by 19%, and the pool starves mid-epoch, which fails in the shape of
+a hang rather than an error.
+
+The difference is not a rounding detail on an archive that chunks the sample axis deeply.
+One chunk of that store is 7.37 GB, so `block_chunks=4` asks for **59 GB** — and a box that
+cannot supply it should say so before the first read, not be OOM-killed halfway through an
+epoch. Passing no budget still sizes itself automatically.
+
 ### Put `cache_dir` on local NVMe, not NFS
 
 The cache is an mmap tier, so this is what it is built for. Over a network filesystem it

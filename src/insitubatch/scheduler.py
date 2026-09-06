@@ -75,6 +75,7 @@ from zarr.core.sync import _get_loop
 from .plan import build_stored_chunk_reads
 from .pool import ChunkPool
 from .runtime import StatsCollector
+from .store import _storage_chunks
 from .types import ArrayGeometry, StoredChunkRead
 
 STARVATION_POLL_S = 0.25
@@ -572,8 +573,9 @@ class Scheduler:
                 # engine reads public v2 stores (WeatherBench2 ARCO) as well as v3.
                 meta = aa.metadata
                 dtype = getattr(meta, "data_type", None) or meta.dtype
+                stored = _storage_chunks(aa)
                 spec = ArraySpec(
-                    shape=meta.chunks,
+                    shape=stored,
                     dtype=dtype,
                     fill_value=meta.fill_value,
                     config=aa.config,
@@ -585,7 +587,7 @@ class Scheduler:
                     encode=meta.encode_chunk_key,
                     codec=_sync_transform(meta),
                     spec=spec,
-                    chunk_shape=tuple(aa.metadata.chunks),
+                    chunk_shape=stored,
                     fill_value=aa.metadata.fill_value,
                     dtype=geom.dtype,
                     sample_axis=geom.sample_axis,

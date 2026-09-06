@@ -184,14 +184,15 @@ def test_starvation_names_concurrent_iterations_as_the_cause(small_store, run_by
     geoms = open_geometries(obstore_store(small_store))
     geom = geoms["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
-    chunk_bytes = geom.sample_chunk_size * 2 * 2 * 4
+    # Sized automatically, which is exactly one iteration's residency floor -- the engine's
+    # own number rather than a hand-computed one, and the only way to say "one iteration's
+    # worth" without asserting a budget the engine would reject as under-floor.
     ds = InSituDataset(
         obstore_store(small_store),
         manifest,
         shuffle=False,
         batch_size=geom.sample_chunk_size,
         block_chunks=2,
-        cache_budget_bytes=2 * chunk_bytes,  # fits one iteration, not two
     )
     ds.set_epoch(0)
 

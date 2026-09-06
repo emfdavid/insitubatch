@@ -256,6 +256,21 @@ class InSituDataset:
         # caller's: pass `cache_budget_bytes`. Under-sizing is not silent -- admission raises
         # and names how many iterations are sharing the pool (`Scheduler._starvation`).
         # See docs/tuning.md, "Several iterations at once multiply the budget".
+        # An explicit budget below the floor is a configuration error, not something to
+        # quietly round up. Silently handing back ten times what was asked for is
+        # indistinguishable -- until the kernel intervenes -- from honouring it, and on a
+        # store whose stored chunk is hundreds of MB (a sharded analysis archive: a deep
+        # sample-chunk x a whole field) that difference is the run. Computable from geometry
+        # alone, so it is caught here rather than as starvation mid-epoch.
+        if cache_budget_bytes is not None and int(cache_budget_bytes) < working_set:
+            raise ValueError(
+                f"cache_budget_bytes={int(cache_budget_bytes)} is below this run's residency "
+                f"floor of {working_set} bytes, so the pool could not hold what one pass "
+                f"needs co-resident: block_chunks={self.block_chunks} (plus one read-ahead "
+                f"block) across {len(self.variables)} variable(s). Raise cache_budget_bytes "
+                "to at least that, or lower block_chunks -- which shrinks the floor but also "
+                "narrows the shuffle window. Passing no budget sizes it automatically."
+            )
         self.cache_budget_bytes = max(int(cache_budget_bytes or 0), working_set)
         # persist turns the cache_dir mmap tier into a cross-run cache (files + manifest
         # survive close; reopen revives them as hits). It needs a dir to keep files in;

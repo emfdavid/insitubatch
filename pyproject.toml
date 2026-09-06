@@ -163,6 +163,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "remote: reads a live public cloud store; skipped unless --remote is given",
+]
 testpaths = ["tests"]
 pythonpath = ["."]  # make the dev-only `bench` package importable in tests
 
