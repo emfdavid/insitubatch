@@ -297,3 +297,53 @@ def test_split_chunk_counts_are_reported(write_zarr):
     cfg = ds.describe()["config"]
     assert sum(cfg["split_chunks"].values()) == 16
     assert cfg["split_chunks"][SplitName.TRAIN.value] > 0
+
+
+# -- ArrayGeometry.chunk_bytes ------------------------------------------------
+#
+# The number a user needs before choosing a budget, and the one they get wrong by hand:
+# residency is whole stored *tiles*, which on a gridded inner axis exceeds the logical
+# chunk. These tests exist to keep the property and the pool's charge from drifting --
+# a helper that reports less than the engine charges is worse than no helper.
+
+
+def test_chunk_bytes_is_the_logical_chunk_when_the_inner_axes_are_not_gridded() -> None:
+    """One tile per chunk, so tiles and logical chunk agree: 8 x 4 x 5 x 4 bytes."""
+    g = _geom((80, 4, 5), (8, 4, 5))
+    assert g.chunk_bytes == 8 * 4 * 5 * 4
+
+
+def test_chunk_bytes_counts_edge_tiles_whole() -> None:
+    """A grid that does not divide the array evenly still stores full-size edge chunks.
+
+    721 rows chunked at 180 occupy 900, and the pool does not clip them -- so the honest
+    answer is bigger than ``sample_chunk_size * prod(inner_shape) * itemsize``, which is
+    what a user computing this by hand writes down.
+    """
+    g = _geom((16, 721, 8), (8, 180, 8))
+    naive = 8 * 721 * 8 * 4
+    assert g.chunk_bytes == 5 * (8 * 180 * 8) * 4  # ceil(721/180) == 5 tiles, kept whole
+    assert g.chunk_bytes > naive
+
+
+def test_chunk_bytes_is_what_the_pool_charges() -> None:
+    """The anti-drift assertion, and the reason the property is worth having.
+
+    ``slot_charge_bytes`` is the single rule for sizing and charging; this helper must be
+    the same number for the no-transform case, or documenting it teaches users to
+    under-provision.
+    """
+    from insitubatch.pool import slot_charge_bytes
+
+    for shape, chunks in [((80, 4, 5), (8, 4, 5)), ((16, 721, 8), (8, 180, 8)), ((9, 3), (4, 2))]:
+        g = _geom(shape, chunks)
+        assert g.chunk_bytes == slot_charge_bytes(g, g, assembles=False)
+
+
+def test_chunk_bytes_does_not_vary_with_the_final_short_chunk() -> None:
+    """A short *outer* chunk is still one axis-0 stored chunk, stored whole -- so the
+    per-chunk cost is one number, which is what makes a property the right shape for it.
+    """
+    g = _geom((9, 3), (4, 2))  # 9 samples in chunks of 4: the last holds 1
+    assert g.n_chunks == 3
+    assert g.chunk_bytes == 2 * (4 * 2) * 4

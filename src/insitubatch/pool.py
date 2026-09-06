@@ -264,11 +264,10 @@ def slot_charge_bytes(
     sizing from the output shape while charging the tiles under-provisions the budget and
     the pool starves mid-epoch, which is a hang-shaped failure rather than a slow one.
     """
-    tiles = (
-        src.n_inner_chunks(chunk_index)
-        * int(np.prod(src.tile_shape(), dtype=np.int64))
-        * src.dtype.itemsize
-    )
+    # chunk_index does not enter the tiles term -- a short final *outer* chunk is still
+    # one whole stored chunk -- so this is exactly ArrayGeometry.chunk_bytes, the property
+    # users size budgets against. One expression, so the two cannot drift.
+    tiles = src.chunk_bytes
     if not assembles:
         return tiles
     assembled = int(np.prod(out.slot_shape(chunk_index), dtype=np.int64)) * out.dtype.itemsize

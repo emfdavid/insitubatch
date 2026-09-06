@@ -48,6 +48,19 @@
   have found it, but a public store going away must not turn into a red build for a
   contributor who changed nothing.
 
+- **`ArrayGeometry.chunk_bytes` reports what one chunk costs — and the docs were teaching
+  a formula that under-reported it by 19%.** Sizing `cache_budget_bytes` means knowing the
+  per-chunk residency, and `docs/tuning.md` said to compute it as
+  `sample_chunk_size × prod(inner_shape) × itemsize`. That is wrong whenever the inner axes
+  are gridded, which is the ARCO/ERA5 norm: residency is the stored *tiles*, kept whole, and
+  a grid that does not divide the array evenly still stores full-size edge chunks. On NOAA
+  GFS analysis the hand-rolled product gives 5.98 GB against a real charge of **7.37 GB**
+  (eight whole 1440×400×400 tiles), so a budget sized that way under-provisions and the pool
+  starves mid-epoch — a hang-shaped failure, not an error. The property is the same
+  expression `slot_charge_bytes` charges, so the two cannot drift, and the tuning page now
+  documents the pattern: ask the geometry, compare against `free -h`, and use `describe()`
+  once more than one variable or a `chunk_transform` is in play.
+
 - **The "O(chunks), not O(samples)" invariant is now pinned by tests, having been load-bearing
   and unguarded.** A read path that degrades to one store read per *sample* is the failure
   this project exists to avoid, and nothing would have caught it: on a fixture small enough
