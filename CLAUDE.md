@@ -13,6 +13,15 @@ Contributor-facing rules (scope limits, dev setup, AI policy) live in
   when you find a second way to do something, remove one.
 - **TDD where practical**, and *always* for bugs: first write the failing test
   that reproduces the bug, then fix until green. New behavior ships with tests.
+- **Validate the instrument before the subject.** Point any new measurement — a
+  counter, a probe, a benchmark harness — at a case whose answer you already know
+  and require it to produce that answer, *before* trusting it on the case you
+  don't. A miswired instrument almost never raises; it returns a plausible number,
+  and often a flattering one. (Opening a zarr store read-only *copies* it, so a
+  read-counter kept on the instance you hold counts nothing and reports "no
+  redundant reads at all" — indistinguishable from a real, favorable result.)
+  This is the same discipline as the control/NULL run required of performance
+  claims, applied one step earlier: to the tool, not the treatment.
 - **Fail fast.** Do not catch-and-continue on errors that cannot be genuinely
   recovered — let them propagate with context. Validate at boundaries and raise
   early. Use explicit exceptions for runtime contracts; reserve `assert` for
@@ -90,10 +99,30 @@ Contributor-facing rules (scope limits, dev setup, AI policy) live in
   Earth2Studio section in docs/architecture.md).
 - **Reshard** data into a sample format (the no-reshard, train-in-place stance).
 
-## Status / roadmap
+## Docs: what goes where
 
-Single source of truth: [DESIGN.md](DESIGN.md) (Status + Roadmap sections). Do
-not mirror milestone state here — it goes stale.
+**Living docs describe the code as it is now.** README, `docs/architecture.md`,
+`docs/tuning.md`, the other `docs/*.md` pages and every docstring document the
+*current* implementation only — the pattern a reader should use today, and why it
+works. **`DESIGN.md` and `CHANGELOG.md` own the history**: how the design got
+here, which alternatives were weighed and rejected, and what changed in each
+release.
+
+The reason is that a living doc is read by someone deciding what to do next, and
+prose about a superseded design is indistinguishable from prose about the current
+one at the moment of reading. History is not lost by this rule, only relocated to
+where it is read deliberately rather than accidentally.
+
+The test is mechanical: **if a sentence needs "used to", "previously", "no
+longer", "instead of" or "we considered", it belongs in `DESIGN.md` or
+`CHANGELOG.md`**, not in the living doc. Rationale for a *rejected* alternative
+goes to `DESIGN.md`; rationale for the *implemented* pattern stays with the code,
+stated positively. When a change makes a living doc's claim false, fix the claim —
+do not append the correction to it.
+
+Status and roadmap follow the same rule: single source of truth is
+[DESIGN.md](DESIGN.md) (Status + Roadmap sections). Do not mirror milestone state
+here or in the docs pages — it goes stale.
 
 ## Commits & pull requests
 
