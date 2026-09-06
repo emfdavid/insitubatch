@@ -48,6 +48,18 @@
   have found it, but a public store going away must not turn into a red build for a
   contributor who changed nothing.
 
+- **The "O(chunks), not O(samples)" invariant is now pinned by tests, having been load-bearing
+  and unguarded.** A read path that degrades to one store read per *sample* is the failure
+  this project exists to avoid, and nothing would have caught it: on a fixture small enough
+  for CI it is not slower, merely wrong, so no throughput test can see it. Chunk reads are
+  counted through a store wrapper and asserted to depend on the plan alone — never on
+  `batch_size` or shuffle. The assertion is an independence property rather than a fixed
+  ratio, because a fixed ratio is false in both directions: a warm epoch legitimately reads
+  *fewer* chunks than the plan names (the pool retains them), and a sharded array may take
+  several byte-range calls for one key. A companion control drives a case known to amplify
+  through the same counter, so that a counter which has come unwired fails loudly instead of
+  reporting "no redundant reads" — which is indistinguishable from a pass.
+
 - **`applies(...)` scopes a `chunk_transform` to named variables — and the in-body name test
   it replaces was silently truncating data.** `chunk_transforms` is one list run on every
   variable, so the convention was for a transform to check `chunk.read.array` and no-op on
