@@ -108,17 +108,30 @@ works. **`DESIGN.md` and `CHANGELOG.md` own the history**: how the design got
 here, which alternatives were weighed and rejected, and what changed in each
 release.
 
-The reason is that a living doc is read by someone deciding what to do next, and
-prose about a superseded design is indistinguishable from prose about the current
-one at the moment of reading. History is not lost by this rule, only relocated to
-where it is read deliberately rather than accidentally.
+The reason is that a living doc is read by someone deciding what to do next, so it
+owes them the current rule and the reason for it — and nothing else. Two things
+impersonate a reason without being one:
 
-The test is mechanical: **if a sentence needs "used to", "previously", "no
-longer", "instead of" or "we considered", it belongs in `DESIGN.md` or
-`CHANGELOG.md`**, not in the living doc. Rationale for a *rejected* alternative
-goes to `DESIGN.md`; rationale for the *implemented* pattern stays with the code,
-stated positively. When a change makes a living doc's claim false, fix the claim —
-do not append the correction to it.
+- **A superseded design.** Prose about what the code used to do is indistinguishable
+  from prose about what it does, at the moment of reading.
+- **Provenance — how we came to know.** *Keep the reason a thing exists, not how we
+  found it.* "A local fixture cannot reproduce a backend-specific defect" is the
+  reason; "the sharded-decode bug lived in an Icechunk store and no synthetic fixture
+  would have found it" is the incident that taught us the reason, and it does not
+  make the rule any truer to a reader meeting it fresh.
+
+Neither is lost by this rule, only relocated to where it is read deliberately rather
+than accidentally: rejected alternatives and design evolution to `DESIGN.md`, and the
+incident to `CHANGELOG.md`, whose house style (*what broke, who it bit, how it
+presented*) is exactly the war story's home.
+
+The test is mechanical: **"used to", "previously", "no longer", "instead of", "we
+considered", "we found", "turned out", "while investigating", "was discovered" — each
+is a signal the sentence belongs in `DESIGN.md` or `CHANGELOG.md`**, not in the living
+doc. Rationale for a *rejected* alternative goes to `DESIGN.md`; rationale for the
+*implemented* pattern stays with the code, stated positively. Linking an issue as a
+pointer (`(#56)`) is fine — retelling it is not. When a change makes a living doc's
+claim false, fix the claim; do not append the correction to it.
 
 Status and roadmap follow the same rule: single source of truth is
 [DESIGN.md](DESIGN.md) (Status + Roadmap sections). Do not mirror milestone state
