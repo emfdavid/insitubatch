@@ -185,9 +185,8 @@ def test_starvation_names_concurrent_iterations_as_the_cause(small_store, run_by
     geom = geoms["t2m"]
     manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
     # Sized automatically, which is exactly one iteration's residency floor -- the engine's
-    # own number rather than a hand-computed one. (It used to pass 2 * chunk_bytes, which is
-    # *below* that floor and was silently promoted to it; an under-floor budget now raises at
-    # construction, so the intent is written directly.)
+    # own number rather than a hand-computed one, and the only way to say "one iteration's
+    # worth" without asserting a budget the engine would reject as under-floor.
     ds = InSituDataset(
         obstore_store(small_store),
         manifest,

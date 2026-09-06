@@ -49,11 +49,13 @@ def run_by():
 def pytest_addoption(parser):
     """``--remote`` opts into the tests that read somebody else's live bucket.
 
-    Off by default: the suite is otherwise fully offline and deterministic, and a public
-    store going away must not turn into a red build for a contributor who changed nothing.
-    These tests exist because a local fixture cannot reproduce a backend-specific defect --
-    the sharded-decode bug (#56) lived in an Icechunk store and no synthetic fixture would
-    have found it.
+    They exist because a local fixture cannot reproduce a backend-specific defect: a
+    synthetic store exercises our code against our own writer, not against the encoding
+    choices a real publisher made.
+
+    Off by default, because the suite is otherwise fully offline and deterministic and
+    somebody else's public store going away must not turn into a red build for a
+    contributor who changed nothing.
     """
     parser.addoption(
         "--remote",
