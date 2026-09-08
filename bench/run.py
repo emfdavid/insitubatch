@@ -55,6 +55,16 @@ def run_suite(
     # Auth knobs are named per backend: obstore uses request_payer / s3_express (S3),
     # gcsfs uses requester_pays. For an owned standard bucket both are empty and the
     # backend falls back to ambient credentials -- which is the M-GCS A/B case.
+    # Validated here, not on first use: an unknown label used to reach `_run_insitu`,
+    # raise per config, and be swallowed as a skip -- so a whole cache axis could measure
+    # nothing while the run looked complete (tests/test_plot.py asked for "memory" for
+    # months). Cheap, computable before any IO, so it is a boundary check.
+    unknown = sorted(set(caches) - {"none", "resident"})
+    if unknown:
+        raise ValueError(
+            f"unknown insitu cache mode(s) {unknown}; expected 'none' (read-once working "
+            "set) or 'resident' (hold the whole split)"
+        )
     store_kwargs: dict[str, bool] = {}
     if backend == "fsspec":
         if request_payer:
@@ -109,6 +119,9 @@ def run_suite(
                 print(f"  warmup failed: {type(exc).__name__}: {exc}")
 
     results: list[Result] = []
+    # (engine, label, reason) for every config that raised -- summarised at the end, and
+    # fatal if the engine under test is among them (see below).
+    skipped: list[tuple[str, str, str]] = []
     # Total configs, so the progress line can show [i/total] + ETA on long S3 runs.
     total = len(urls) * sum(
         (len(caches) if e == "insitu" else 1)  # insitu honors "none"/"resident"
@@ -169,11 +182,10 @@ def run_suite(
                                 try:
                                     rows = run(cfg, cache_dir=str(cdir), store_kwargs=store_kwargs)
                                 except Exception as exc:  # noqa: BLE001 - skip a failing engine
+                                    label = f"{engine}/{cache}/c{spc}/bc{bc}/w{nw}"
+                                    skipped.append((engine, label, f"{type(exc).__name__}: {exc}"))
                                     if verbose:
-                                        print(
-                                            f"  skip {engine}/{cache}/c{spc}/bc{bc}/w{nw}: "
-                                            f"{type(exc).__name__}: {exc}"
-                                        )
+                                        print(f"  skip {label}: {type(exc).__name__}: {exc}")
                                     continue
                                 for r in rows:
                                     append_jsonl(out, r)
@@ -189,10 +201,36 @@ def run_suite(
                                         )
     if verbose:
         print(f"\nwrote {len(results)} rows -> {out}")
+        if skipped:
+            print(f"\n{len(skipped)} config(s) skipped:")
+            for _engine, label, why in skipped:
+                print(f"  {label}: {why}")
+
+    # A baseline that cannot run is a gap in the comparison; the *subject* failing to run
+    # is not a benchmark at all. Both were equally quiet before: a skipped config printed
+    # one line thousands of lines above the table and the suite still exited 0, so a run
+    # that measured nothing looked exactly like a run that measured everything -- which is
+    # how a `c1` config that raised on every repeat reached a results file as absence.
+    # Raised at the END, after every row is on disk: the other configs' data is good and
+    # re-running an S3 sweep to recover it is expensive.
+    subject = [f"{label}: {why}" for engine, label, why in skipped if engine == "insitu"]
+    if subject:
+        raise RuntimeError(
+            f"the engine under test failed on {len(subject)} config(s), so this run cannot "
+            "support a comparison (rows for the configs that did run are in "
+            f"{out}):\n  " + "\n  ".join(subject)
+        )
     return results
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The suite's CLI, built where a test can reach it.
+
+    Separate from :func:`main` so the documented run commands can be checked against the
+    real flags: `--storage` was dropped when the suite started deriving storage from the
+    URL scheme, and every S3 command in the runbooks kept it for months -- copy-paste
+    instructions that die on `unrecognized arguments` before a single byte is read.
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--data-dir", default=None, help="where to write local datasets (default: temp)")
@@ -227,7 +265,11 @@ def main() -> None:
     )
     p.add_argument("--plot", action="store_true", help="render Plotly graphs after the run")
     p.add_argument("--fig-dir", default="bench/figures")
-    a = p.parse_args()
+    return p
+
+
+def main() -> None:
+    a = build_parser().parse_args()
 
     kw: dict = dict(
         out=a.out,

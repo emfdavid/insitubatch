@@ -17,7 +17,7 @@ def test_plot_smoke(tmp_path) -> None:
         data_dir=tmp_path / "d",
         chunk_sizes=(1, 4),  # chunk-size axis varies (G1)
         engines=("naive", "insitu", "memory"),
-        caches=("none", "memory"),
+        caches=("none", "resident"),  # the two real insitu modes; G4 needs the axis
         n_samples=48,
         inner=(4, 4),
         batch_size=8,
