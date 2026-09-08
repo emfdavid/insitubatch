@@ -688,7 +688,10 @@ class ChunkPool:
         # Keys currently blocked in wait_ready. A blocked consumer is one that cannot
         # unpin, which is what lets the scheduler prove an admission starvation is
         # terminal rather than merely slow (see Scheduler._admit).
-        self._waiting: dict[tuple[str, int], int] = {}  # key -> blocked waiter count
+        # (key, owner) -> waiter count. Keyed by owner because "can this waiter proceed?"
+        # is answered per owner: readiness alone is not enough, the slot must be referenced
+        # by *that* iteration (see wait_ready).
+        self._waiting: dict[tuple[tuple[str, int], int], int] = {}
 
     # -- cross-process arbitration (#42) -------------------------------------
 
@@ -936,17 +939,35 @@ class ChunkPool:
         with self._cv:
             return len(self._owners)
 
-    def blocked_waiters(self) -> list[tuple[str, int]]:
-        """``(path, chunk_index)`` keys some thread is currently blocked on in
-        :meth:`wait_ready`.
+    def _wait_satisfied(self, key: tuple[str, int], owner: int) -> bool:  # call under the lock
+        """Would :meth:`wait_ready` return (or raise) right now for this waiter?
 
-        A blocked consumer is a consumer that cannot reach its next
-        :meth:`unpin_keys`, so it can never free budget. The scheduler pairs this
-        with "no tile in flight" to tell a terminal starvation from a slow consumer
-        -- see :meth:`Scheduler._admit`. Read-only snapshot.
+        The one definition of that question, shared by the wait itself and by
+        :meth:`blocked_waiters`. Two callers deciding it separately is how the second one
+        came to mean something subtly different from the first.
+        """
+        if self._error is not None:
+            return True
+        slot = self._slots.get(key)
+        if slot is None:
+            return False  # not admitted yet -- the driver has not reached it
+        if slot.error is not None:
+            return True  # the wait raises rather than returns, but it does not block
+        return slot.state is SlotState.READY and self._pinned.get(key, {}).get(owner, 0) > 0
+
+    def blocked_waiters(self) -> list[tuple[str, int]]:
+        """``(path, chunk_index)`` keys a thread is blocked on in :meth:`wait_ready` **and
+        cannot yet proceed**.
+
+        A waiter whose condition already holds is excluded, even though its thread is
+        still parked: it is registered until the OS reschedules it, and reporting it as
+        blocked asserts something false about the future. The scheduler pairs this with
+        "no tile in flight" to prove a stall terminal (:meth:`Scheduler._starvation`), and
+        that proof is only as sound as this list -- a waiter that is about to wake up,
+        gather and unpin is precisely the thing that *will* free budget. Read-only snapshot.
         """
         with self._cv:
-            return list(self._waiting)
+            return [key for key, owner in self._waiting if not self._wait_satisfied(key, owner)]
 
     # -- admission / pinning / eviction -------------------------------------
 
@@ -1584,28 +1605,14 @@ class ChunkPool:
         """
         key = (array, chunk_index)
         with self._cv:
-            self._waiting[key] = self._waiting.get(key, 0) + 1
+            self._waiting[(key, owner)] = self._waiting.get((key, owner), 0) + 1
             try:
-                self._cv.wait_for(
-                    lambda: (
-                        self._error is not None
-                        or (
-                            key in self._slots
-                            and (
-                                self._slots[key].error is not None
-                                or (
-                                    self._slots[key].state is SlotState.READY
-                                    and self._pinned.get(key, {}).get(owner, 0) > 0
-                                )
-                            )
-                        )
-                    )
-                )
+                self._cv.wait_for(lambda: self._wait_satisfied(key, owner))
             finally:
-                if self._waiting[key] > 1:
-                    self._waiting[key] -= 1
+                if self._waiting[(key, owner)] > 1:
+                    self._waiting[(key, owner)] -= 1
                 else:
-                    del self._waiting[key]
+                    del self._waiting[(key, owner)]
             if self._error is not None:
                 raise self._error
             error = self._slots[key].error
