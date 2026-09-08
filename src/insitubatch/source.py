@@ -585,12 +585,18 @@ class InSituDataset:
                             pool.revive_mismatch,
                             pool.revive_missing,
                         )
-                    # Last: drop this pass's references (and any partial its cancelled
-                    # fetches abandoned), after every counter above has been read. An
-                    # early `break` finalizes this generator, so this runs then too --
-                    # which is what keeps an abandoned pass from leaking budget.
-                    self._pool.release_owner(owner)
         finally:
+            # Drop this pass's references (and any partial its cancelled fetches
+            # abandoned) *after* the `with` above has closed the scheduler -- never
+            # inside it. Closing is what stops the driver, and on a borrowed event loop
+            # it is not synchronous: a driver cancelled but not yet unwound can still
+            # reach `try_admit`, and an admission after the release re-pins the slot
+            # under an owner that no longer exists. Nothing releases that pin, and the
+            # slot it holds stays FILLING -- its sibling tiles were cancelled -- so it
+            # can never become READY and therefore never becomes evictable. Each
+            # abandoned pass then burns part of the budget permanently, and a later
+            # epoch starves on a pool it cannot free (`Scheduler._starvation`).
+            #
             # A `finally` around the `with`, not a statement after it: an early `break`
             # throws GeneratorExit at the yield, which unwinds through the `with` (so the
             # scheduler still closes) but would skip anything that merely followed it. The
@@ -614,6 +620,7 @@ class InSituDataset:
             )
             if logger.isEnabledFor(logging.INFO):
                 logger.info("%s", format_pass(self.last_pass))
+            self._pool.release_owner(owner)
 
     def _log_epoch_summary(self, pool: ChunkPool, split: SplitName | None) -> None:
         """One INFO line per epoch *per split*: what the chunk cache and the batch buffers did.
