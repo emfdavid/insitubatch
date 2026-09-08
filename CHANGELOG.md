@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Breaking out of a loader loop early permanently burned part of the chunk pool, and a
+  later epoch then died with "residency budget exhausted ... this would hang".** A pass
+  released its references *inside* the scheduler's `with` block -- before the scheduler was
+  closed. Closing is what stops the driver, and on a borrowed event loop it is not
+  synchronous: a cancelled-but-not-yet-unwound driver could still reach `try_admit` and
+  re-pin a slot under the owner that had just been released. Nothing releases that pin, and
+  the slot stays `FILLING` (its sibling tiles were cancelled) so it never becomes `READY`
+  and therefore never becomes evictable. The loss was cumulative and silent -- throughput,
+  shapes and memory all look normal -- until a budget sized for exactly two blocks had too
+  little left to admit the chunk a consumer was waiting for. It bit hardest where a batch
+  pins a whole block (one sample per chunk, `batch_size == block_chunks`), which is the
+  GRIB regime and the benchmark suite's own `c1` configuration: **every `c1` run of the
+  suite raised**, on S3 and GCS alike, while the published `c1` number was measured before
+  the defect existed. `release_owner` now runs after the `with` has closed. Bisected to
+  `5b8fae4`, which did not introduce the over-pinning: it removed the over-broad
+  `unpin_all()` that had been quietly wiping it at every epoch boundary (#34).
+
 - **Sharded zarr-v3 arrays could not be read at all, and said so with a checksum error.**
   On a sharded array zarr reports two shapes: `metadata.chunks` is the *inner* chunk (read
   granularity inside a shard) and `chunk_grid.chunk_shape` is the shard — the thing a chunk
