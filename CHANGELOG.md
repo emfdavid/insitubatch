@@ -19,6 +19,23 @@
   `5b8fae4`, which did not introduce the over-pinning: it removed the over-broad
   `unpin_all()` that had been quietly wiping it at every epoch boundary (#34).
 
+- **A benchmark run whose *subject* failed exited 0 with a tidy table.** Every engine
+  failure was caught and skipped so one flaky baseline could not kill an hours-long S3
+  sweep -- but that made a run in which `insitu` never ran indistinguishable from a
+  complete one, which is how the `c1` starvation above reached a results file as *absence*
+  rather than as a failure. Skips are now summarised at the end, and a skip of the engine
+  under test raises -- after every row is on disk, because re-running an S3 sweep to
+  recover the configs that did work is expensive. A failing baseline stays non-fatal: that
+  is a gap in the comparison, not a dead run.
+
+- **Six documented benchmark commands could not be pasted.** The suite dropped `--storage`
+  when it started deriving storage from the URL scheme, and the S3 invocations in
+  `docs/benchmarks.md` and `bench/benchmark_plan.md` kept passing it -- so the runbook for
+  a benchmark that costs an EC2 box and hours of reads died on `unrecognized arguments`
+  before the first byte. The flag is gone from those commands, and `tests/test_bench_docs.py`
+  now parses every documented `python -m bench` command against the real parser, so the
+  docs and the CLI cannot drift apart silently again.
+
 - **Sharded zarr-v3 arrays could not be read at all, and said so with a checksum error.**
   On a sharded array zarr reports two shapes: `metadata.chunks` is the *inner* chunk (read
   granularity inside a shard) and `chunk_grid.chunk_shape` is the shard — the thing a chunk

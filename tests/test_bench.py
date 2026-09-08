@@ -352,3 +352,68 @@ def test_every_declared_arm_is_reachable_from_main() -> None:
     source = probe.main.__code__.co_consts
     branches = {c for c in source if isinstance(c, str)}
     assert set(ARMS) <= branches
+
+
+# -- the suite's own failure reporting ----------------------------------------
+#
+# A skipped config printed one line and the suite still exited 0, so a run in which the
+# engine under test never ran was indistinguishable from a complete one -- how a `c1`
+# config that raised on every repeat reached a results file as *absence* rather than as
+# a failure. A baseline that cannot run is a gap in the comparison and stays non-fatal.
+
+
+def _suite(tmp_path, **kw):
+    return run_suite(
+        out=tmp_path / "suite.jsonl",
+        data_dir=tmp_path / "data",
+        chunk_sizes=(1,),
+        caches=("none",),
+        n_samples=32,
+        inner=(4, 4),
+        batch_size=8,
+        block_chunks_sweep=(4,),
+        worker_sweep=(0,),
+        cache_dir=tmp_path / "cache",
+        epochs=1,
+        warmup_batches=0,
+        verbose=False,
+        **kw,
+    )
+
+
+def _raise_for(engine_name: str, monkeypatch) -> None:
+    import bench.run as bench_run
+
+    real = bench_run.run
+
+    def fake(cfg, **kwargs):
+        if cfg.engine == engine_name:
+            raise RuntimeError("engine exploded")
+        return real(cfg, **kwargs)
+
+    monkeypatch.setattr(bench_run, "run", fake)
+
+
+def test_a_failing_subject_fails_the_suite(tmp_path, monkeypatch) -> None:
+    """insitu raising on every config must not exit 0 with a tidy table."""
+    _raise_for("insitu", monkeypatch)
+
+    with pytest.raises(RuntimeError, match="engine under test"):
+        _suite(tmp_path, engines=("naive", "insitu"))
+
+
+def test_a_failing_subject_still_writes_the_rows_that_ran(tmp_path, monkeypatch) -> None:
+    """The raise comes last, so an expensive S3 sweep is not thrown away with it."""
+    _raise_for("insitu", monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        _suite(tmp_path, engines=("naive", "insitu"))
+    assert (tmp_path / "suite.jsonl").read_text().count("naive") > 0
+
+
+def test_a_failing_baseline_does_not_fail_the_suite(tmp_path, monkeypatch) -> None:
+    """The control: a missing/broken baseline is a gap in the comparison, not a dead run."""
+    _raise_for("naive", monkeypatch)
+
+    results = _suite(tmp_path, engines=("naive", "insitu"))
+    assert {r.engine for r in results} == {"insitu"}

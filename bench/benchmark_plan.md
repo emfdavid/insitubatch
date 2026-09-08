@@ -210,20 +210,20 @@ across stories piles duplicates into one JSONL and muddles `--plot`.
 
 ```bash
 # (a) find best num_workers on one chunk size
-uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
+uv run python -m bench --url-prefix s3://$BUCKET/era5 \
   --out bench/results/story1_tune.jsonl \
   --engines workers,xbatcher --chunk-sizes 8 \
   --num-workers 8,16,32 --max-batches 64 --repeats 3 --warmup-batches 32
 
 # (b) the spectrum at the tuned best (drop `memory` here; it ignores --max-batches)
-uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
+uv run python -m bench --url-prefix s3://$BUCKET/era5 \
   --out bench/results/story1_spectrum.jsonl --fig-dir bench/figures/story1 \
   --engines naive,workers,xbatcher,insitu \
   --chunk-sizes 1,2,4,8,16,32 --num-workers 32 \
   --max-batches 64 --repeats 3 --warmup-batches 32 --plot
 
 # (c) the in-memory ceiling, on its own, on a moderate set (whole array preloaded)
-uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
+uv run python -m bench --url-prefix s3://$BUCKET/era5 \
   --out bench/results/story1_ceiling.jsonl \
   --engines memory,insitu --chunk-sizes 8 --repeats 3
 ```
@@ -247,7 +247,7 @@ Memory-flatness (story 2, the `block_chunks` axis stays flat in RSS while
 `max_inflight` rises) comes from the suite with an explicit `--block-chunks` sweep:
 
 ```bash
-uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
+uv run python -m bench --url-prefix s3://$BUCKET/era5 \
   --out bench/results/story2_mem.jsonl \
   --engines insitu --chunk-sizes 8 --block-chunks 8,32,128 \
   --max-batches 64 --repeats 3
@@ -270,7 +270,7 @@ train split (read-once "none" re-reads each epoch), and **full epochs** (no
 `--max-batches`) so epoch 0 caches the entire split and any epoch-1 draw order hits:
 
 ```bash
-uv run python -m bench --url-prefix s3://$BUCKET/era5 --storage s3 \
+uv run python -m bench --url-prefix s3://$BUCKET/era5 \
   --out bench/results/story3_cache.jsonl --fig-dir bench/figures/story3 \
   --engines insitu --caches resident --chunk-sizes 1,8,32 --epochs 2 \
   --repeats 3 --cache-dir /mnt/nvme/insitu-cache --plot
@@ -546,7 +546,7 @@ uv run python -m bench.probe_decode --s3-express \
   | tee bench/results/express_ceiling.log
 # the GRIB-end suite on Express (vs the same engines on regular S3)
 uv run python -m bench --s3-express \
-  --url-prefix s3://$XBUCKET/era5 --storage s3 \
+  --url-prefix s3://$XBUCKET/era5 \
   --out bench/results/express_suite.jsonl \
   --engines naive,workers,xbatcher,insitu --chunk-sizes 1 \
   --num-workers 32 --max-batches 64 --repeats 3 --warmup-batches 32

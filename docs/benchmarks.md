@@ -516,7 +516,7 @@ Full dataset matrix and per-story commands are in the
 The story-1 spectrum on a pre-generated S3 family, then rebuild the figures:
 
 ```bash
-uv run python -m bench --url-prefix "s3://$BUCKET/era5" --storage s3 \
+uv run python -m bench --url-prefix "s3://$BUCKET/era5" \
   --out bench/results/story1_spectrum.jsonl \
   --engines naive,workers,xbatcher,insitu --chunk-sizes 1,2,4,8,16,32 \
   --num-workers 32 --max-batches 64 --repeats 3 --warmup-batches 32
