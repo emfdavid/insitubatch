@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **A healthy run could be killed with "residency budget exhausted ... this would hang".**
+  `Scheduler._starvation` turns an admission stall into a raise rather than a hang, and it
+  proves the stall terminal from three facts, the third being "a consumer is blocked in
+  `wait_ready`, so it can never reach its next unpin and free budget". That fact was read
+  off the registration in `ChunkPool._waiting` -- but a waiter registers *before* it tests
+  its condition and is removed only once its thread is rescheduled, so a waiter whose chunk
+  was already READY and referenced by its own owner -- one about to wake, gather and unpin,
+  which is precisely the thing that frees budget -- counted as blocked. Caught in the act on
+  a real store: at the instant the detector fired there were zero tile tasks outstanding and
+  exactly one waiter, on a chunk in state READY pinned by its own owner. The run was
+  correct, the working set was the intended two blocks, and it was aborted anyway. It
+  presented as an intermittent failure of the benchmark suite (~1 pass in 20) with a second
+  pass sharing the loop, and never on a quiet process -- the shape of a scheduling race, and
+  unaffected by raising `cache_budget_bytes`, which is what ruled out sizing. `wait_ready`
+  and `blocked_waiters` now share one definition of "can this waiter proceed", and only a
+  waiter that genuinely cannot is reported. A real deadlock still raises: the detector polls,
+  and an unsatisfiable waiter stays unsatisfiable.
+
 - **Breaking out of a loader loop early permanently burned part of the chunk pool, and a
   later epoch then died with "residency budget exhausted ... this would hang".** A pass
   released its references *inside* the scheduler's `with` block -- before the scheduler was
