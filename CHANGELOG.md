@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **The windowed residency clamp charged every *view* of an array, not every array.** With
+  shuffle on, a windowed pass holds the split resident; that clamp multiplied the split by
+  the number of variables, but `t2m.shift(0/24/240)` are three views of one array and the
+  pool keys slots by `(path, chunk)` -- the planner already collapses them into one fetch.
+  Three leads therefore reserved three times the memory one of them needs. Counted once per
+  array, and extended by the window's reach in chunks so the clamp still covers the chunks a
+  lead reads beyond the split's edges: sizing to the split alone under-provisioned the
+  five-lead case (a floor of 1,638 against a measured live set of 1,711), and an under-sized
+  floor starves mid-epoch, which is the failure the floor exists to prevent. With the span
+  fix above, sparse forecast leads size to 1,878 chunk-equivalents where they cost 46,464 --
+  1.1-1.5x the measured requirement rather than 28x the whole dataset.
+
+  This costs no latency, and it is worth being precise about why: bounded read-ahead already
+  decoupled admission from the budget, so an inflated floor no longer makes the driver fetch
+  further ahead. Measured on the same store, a 9x difference in budget moved
+  time-to-first-batch not at all (1372 ms at 46,464 chunks, 1373 ms at 5,040). What it buys
+  is a configuration that can be *run*: an explicit budget covering the real need was
+  previously rejected outright, and `describe()` reported a number up to 45x too large.
+
 - **The residency floor was sized by the distance between offsets, so sparse forecast
   leads reserved memory nobody needed (#27).** `working_set_bytes` derived a single
   `window_factor` from `max(offset) - min(offset)` and applied it to every variable, so

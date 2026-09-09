@@ -412,3 +412,49 @@ def test_a_variable_chunked_finer_than_the_reference_is_not_widened_by_the_span(
         )
 
     assert floor(240) == floor(8), "a distant lead costs the same as a near one"
+
+
+def test_windowed_views_of_one_array_are_charged_once():
+    """Three leads on one array hold one slot per chunk between them, not three.
+
+    The pool keys slots by `(path, chunk)` and the planner collapses several windowed
+    views of one array into a single fetch, so charging the whole-split clamp per view
+    tripled the estimate for the case windows exist for.
+    """
+    g = _geom((256, 4, 4), (4, 4, 4))
+    manifest = split_by_chunk(g)
+
+    def other(path):
+        return ArrayGeometry(path=path, shape=(256, 4, 4), chunks=(4, 4, 4), dtype=np.dtype("f4"))
+
+    # Both arms are windowed with the same offsets, so both hit the whole-split clamp and
+    # the only difference is how many distinct arrays those offsets read.
+    aliased = [g.shift(0), g.shift(4), g.shift(8)]  # one path, three views
+    distinct = [g.shift(0), other("u10").shift(4), other("v10").shift(8)]
+
+    def floor(geoms):
+        return working_set_bytes(
+            geoms, geoms, manifest, block_chunks=4, ref_spc=4, shuffle=True, assembles=False
+        )
+
+    assert floor(aliased) < floor(distinct), "aliased views must not be charged three times"
+
+
+def test_the_windowed_clamp_reaches_past_the_split_edges():
+    """A lead reads chunks the split does not contain, so the clamp must cover them.
+
+    Sizing the clamp to the split alone under-provisions the sparse-lead case -- measured
+    at a floor of 1,638 against a live set of 1,711 -- and an under-sized floor starves
+    mid-epoch, which is the failure this floor exists to prevent.
+    """
+    g = _geom((256, 4, 4), (1, 4, 4))
+    manifest = split_by_chunk(g)
+    near = [g.shift(0), g.shift(1)]
+    far = [g.shift(0), g.shift(64)]
+
+    def floor(geoms):
+        return working_set_bytes(
+            geoms, geoms, manifest, block_chunks=4, ref_spc=1, shuffle=True, assembles=False
+        )
+
+    assert floor(far) > floor(near), "a wider reach touches more chunks and must be sized for"

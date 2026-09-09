@@ -194,7 +194,6 @@ def working_set_bytes(
         def chunks_per_anchor(g: ArrayGeometry) -> int:
             return 1 if g.offset % spc0 == 0 else 2
 
-        per_chunk_all_vars = sum(bytes_per_chunk(g, o) for g, o in pairs)
         per_anchor_all_vars = sum(chunks_per_anchor(g) * bytes_per_chunk(g, o) for g, o in pairs)
         working_set = 2 * block_chunks * per_anchor_all_vars
         if windowed and shuffle:
@@ -204,8 +203,25 @@ def working_set_bytes(
             # once, the accepted memory cost of windows (spill to NVMe via cache_dir on large
             # splits). Only `.train` shuffles (eval views are sequential and spill only
             # locally), so size to the train split.
+            #
+            # Counted once per *array*, not once per view. The pool keys slots by
+            # `(path, chunk)` and the planner collapses several windowed views of one array
+            # into a single fetch, so `t2m.shift(0/24/240)` holds one slot per chunk between
+            # them -- charging three triples the estimate for the case windows exist for.
+            # Where views of one array disagree on slot size (a transform on one of them),
+            # the largest is what that slot must hold.
+            # The reach is added once, in chunks, rather than multiplied per variable: the
+            # union of chunks a windowed pass touches is the split shifted by each offset,
+            # so it runs past the split's edges by the offset range and no further. Sizing
+            # to the split alone under-provisions exactly the sparse-lead case (measured:
+            # a floor of 1,638 against a live set of 1,711), which starves mid-epoch.
+            per_path: dict[str, int] = {}
+            for g, o in pairs:
+                per_path[g.path] = max(per_path.get(g.path, 0), bytes_per_chunk(g, o))
+            span = max(offsets) - min(offsets)
             n_train_chunks = len(manifest.chunks[SplitName.TRAIN.value])
-            working_set = max(working_set, n_train_chunks * per_chunk_all_vars)
+            reach = n_train_chunks + -(-span // spc0)
+            working_set = max(working_set, reach * sum(per_path.values()))
         return working_set
 
     # Non-uniform chunk size: a variable maps the reference anchor grid onto its own chunks,
