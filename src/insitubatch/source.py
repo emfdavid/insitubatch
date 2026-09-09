@@ -33,7 +33,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TextIO
 
 import numpy as np
@@ -43,7 +43,7 @@ from .buffers import HostAllocator
 from .pool import ChunkPool, output_geometry, validate_scopes
 from .runtime import Depths, PassStats, StatsCollector, format_pass
 from .scheduler import Scheduler, SchedulerConfig
-from .shuffle import block_shuffled_order, sequential_order
+from .shuffle import DrawOrder, block_shuffled_order, sequential_order
 from .split import SplitManifest, valid_anchor_range
 from .store import close_store, open_geometries
 from .summary import DatasetReport, describe, print_summary, working_set_bytes
@@ -58,28 +58,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_INFLIGHT = 32
 
 
-def _partition_blocks(order: np.ndarray, block_chunks: int) -> list[tuple[int, int, np.ndarray]]:
-    """Split a draw ``order`` into shuffle-blocks: ``(row_start, row_stop, chunk_ids)``.
+@dataclass(eq=False, slots=True)
+class _Block:
+    """One shuffle-block: where its rows are, what it draws from, and what it reads.
 
-    ``block_shuffled_order`` shuffles samples *within* a block of ``block_chunks``
-    chunks and concatenates blocks in chunk-permutation order, so every block is a
-    contiguous row range over disjoint chunks. We recover the blocks from the chunks'
-    first-appearance order (vectorized: O(chunks) of Python, not O(samples)), which
-    is robust to short final chunks where fixed-stride slicing would misalign.
+    Both halves come from the same rows. ``chunk_ids`` are the anchor chunks the driver
+    plans and fetches; ``read_keys`` are the ``(path, chunk)`` slots the consumer waits on
+    and releases, which a windowed view can push outside ``chunk_ids`` entirely. Deriving
+    them together, once, is the point: they were two derivations from two different inputs,
+    and on any windowed view they disagreed (#68).
     """
-    if not len(order):
-        return []
-    cids = order[:, 0].astype(np.int64)
-    _, first_pos = np.unique(cids, return_index=True)
-    appearance = cids[np.sort(first_pos)]  # chunk ids in order of first appearance
-    block_of = np.full(int(cids.max()) + 1, -1, dtype=np.int64)
-    block_of[appearance] = np.arange(len(appearance)) // block_chunks
-    block_per_row = block_of[cids]
-    starts = [0, *(np.flatnonzero(np.diff(block_per_row) != 0) + 1).tolist(), len(order)]
-    return [
-        (starts[k], starts[k + 1], appearance[k * block_chunks : (k + 1) * block_chunks])
-        for k in range(len(starts) - 1)
-    ]
+
+    start: int
+    stop: int
+    chunk_ids: np.ndarray
+    read_keys: set[tuple[str, int]]
 
 
 def read_ahead_bound(
@@ -391,7 +384,7 @@ class InSituDataset:
             ids = self.manifest.chunks[split.value]
         return np.asarray(ids, dtype=np.int64)
 
-    def _draw_order(self, split: SplitName | None, shuffle: bool) -> np.ndarray:
+    def _draw_order(self, split: SplitName | None, shuffle: bool) -> DrawOrder:
         chunk_ids = self._chunk_ids(split)
         spc = self._ref_spc  # the manifest's anchor grid, shared by every variable
         n_samples = self.manifest.n_samples
@@ -405,19 +398,31 @@ class InSituDataset:
                 epoch=self._epoch,
             )
         else:
-            order = sequential_order(chunk_ids, spc, n_samples)
+            order = sequential_order(chunk_ids, spc, n_samples, block_chunks=self.block_chunks)
         return self._drop_edge_anchors(order, spc, n_samples)
 
-    def _drop_edge_anchors(self, order: np.ndarray, spc: int, n_samples: int) -> np.ndarray:
+    def _drop_edge_anchors(self, order: DrawOrder, spc: int, n_samples: int) -> DrawOrder:
         """Keep only anchors whose every windowed read ``anchor + offset`` is on the
         array. Offset 0 (no window) keeps the whole order. Anchors are dropped, not
-        their chunks, so an edge chunk still contributes its interior anchors."""
+        their chunks, so an edge chunk still contributes its interior anchors -- and the
+        block that held them narrows rather than the blocks being re-cut around the gap."""
         offsets = [g.offset for g in self.geometries.values()]
         lo, hi = valid_anchor_range(offsets, n_samples)
         if lo == 0 and hi == n_samples:
             return order
-        anchor = order[:, 0] * spc + order[:, 1]
-        return order[(anchor >= lo) & (anchor < hi)]
+        anchor = order.rows[:, 0] * spc + order.rows[:, 1]
+        return order.keep((anchor >= lo) & (anchor < hi))
+
+    def _blocks(self, order: DrawOrder, spc: int) -> list[_Block]:
+        """The pass's blocks, each derived once from the rows the builder assigned it."""
+        blocks = []
+        for index in range(order.n_blocks):
+            start, stop = order.block(index)
+            rows = order.rows[start:stop]
+            blocks.append(
+                _Block(start, stop, np.unique(rows[:, 0]), self._block_read_keys(rows, spc))
+            )
+        return blocks
 
     def _block_read_keys(self, block_rows: np.ndarray, spc: int) -> set[tuple[str, int]]:
         """The ``(path, chunk)`` slots a block's anchors read across all variables --
@@ -450,8 +455,9 @@ class InSituDataset:
         """
         spc = self._ref_spc  # the manifest anchor grid, shared by every variable
         order = self._draw_order(split, shuffle)
-        blocks = _partition_blocks(order, self.block_chunks)
-        ordered_chunks = [int(c) for _rstart, _rstop, cids in blocks for c in cids]
+        rows = order.rows
+        blocks = self._blocks(order, spc)
+        ordered_chunks = [int(c) for block in blocks for c in block.chunk_ids]
 
         # One owner per pass, minted here and threaded through this iteration's scheduler
         # (admission pins) and its producer (block pins). Scoping references this way is
@@ -483,7 +489,7 @@ class InSituDataset:
         # block (shuffle permutes chunk order), and the driver fetches each chunk only
         # once, so a chunk must stay resident from admit until its *last* referencing
         # block drains. Release each chunk exactly there (last_use).
-        block_keys = [self._block_read_keys(order[rs:re], spc) for rs, re, _ in blocks]
+        block_keys = [block.read_keys for block in blocks]
         release: list[set[tuple[str, int]]] = [set() for _ in blocks]
         last_use: dict[tuple[str, int], int] = {}
         for bi, keys in enumerate(block_keys):
@@ -507,8 +513,8 @@ class InSituDataset:
             # with three shapes the retrace cache never settles).
             #
             # Blocks stay exactly what they were -- contiguous row ranges over disjoint
-            # chunks -- and `order` was always one flat array for the epoch, so a batch that
-            # crosses a boundary is just `order[start : start + bs]` not being truncated.
+            # chunks -- and the rows are one flat array for the epoch, so a batch that
+            # crosses a boundary is just `rows[start : start + bs]` not being truncated.
             # What the boundary needs is bookkeeping, tracked as two monotone frontiers over
             # the block list: `ready` (waited) and `freed` (released). Both only advance, and
             # each block passes through each exactly once, so this stays O(blocks) of Python.
@@ -516,21 +522,21 @@ class InSituDataset:
             ready = freed = 0
             try:
                 sched.start(ordered_chunks, spc)
-                for start in range(0, len(order), bs):
+                for start in range(0, len(rows), bs):
                     if stop.is_set():
                         return
-                    stop_row = min(start + bs, len(order))
+                    stop_row = min(start + bs, len(rows))
                     # Wait every block this batch draws from. A batch spans at most two
                     # (bs <= a block's rows in any sane configuration, and the loop is
                     # correct regardless): a block's batches draw across its whole
                     # read-union, so it must be assembled -- and claimed by the driver, see
                     # ChunkPool.wait_ready -- before gathering. Each wait is cheap once ready.
-                    while ready < len(blocks) and blocks[ready][0] < stop_row:
+                    while ready < len(blocks) and blocks[ready].start < stop_row:
                         for path, cid in block_keys[ready]:
                             sched.pool.wait_ready(path, cid, owner)
                         ready += 1
                     g0 = time.thread_time()
-                    batch = sched.pool.gather(order[start:stop_row], self.variables, spc)
+                    batch = sched.pool.gather(rows[start:stop_row], self.variables, spc)
                     # thread_time, not perf_counter: gather is work this thread does, and a
                     # wall clock here would bill it for whatever else held the GIL.
                     stats.gather_s += time.thread_time() - g0
@@ -545,7 +551,7 @@ class InSituDataset:
                     # into a read-ahead stall via `try_admit` parking on a full budget. Safe
                     # this early because `gather` COPIES out of the slots, so the batch never
                     # aliases chunk memory and the reference is already dead weight.
-                    while freed < len(blocks) and blocks[freed][1] <= stop_row:
+                    while freed < len(blocks) and blocks[freed].stop <= stop_row:
                         sched.unpin_block(release[freed])
                         freed += 1
                     b0 = time.thread_time()

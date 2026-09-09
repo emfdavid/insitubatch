@@ -19,6 +19,7 @@ from .pool import ChunkPool
 from .runtime import Depths, PassStats, StageTimes, bottleneck
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import (
+    DrawOrder,
     block_shuffled_order,
     chunk_permutation,
     sequential_order,
@@ -77,6 +78,7 @@ __all__ = [
     "as_tf_dataset",
     "as_torch",
     "close_store",
+    "DrawOrder",
     "block_shuffled_order",
     "bottleneck",
     "build_stored_chunk_reads",

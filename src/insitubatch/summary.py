@@ -368,7 +368,7 @@ def describe(ds: InSituDataset, *, iterations: int = 1) -> DatasetReport:
     }
 
     order = ds._draw_order(SplitName.TRAIN, ds.shuffle)
-    quality = shuffle_quality(order, ds._ref_spc) if len(order) > 1 else None
+    quality = shuffle_quality(order.rows, ds._ref_spc) if len(order) > 1 else None
 
     cfg = ConfigReport(
         batch_size=ds.batch_size,

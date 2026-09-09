@@ -37,8 +37,8 @@ import pytest
 
 from insitubatch import obstore_store, open_geometries, split_by_chunk
 from insitubatch.plan import build_stored_chunk_reads
-from insitubatch.shuffle import chunk_permutation
-from insitubatch.source import InSituDataset, _partition_blocks, read_ahead_bound
+from insitubatch.shuffle import DrawOrder, chunk_permutation
+from insitubatch.source import InSituDataset, _Block, read_ahead_bound
 from insitubatch.types import ArrayGeometry, SplitName
 
 Key = tuple[str, int]
@@ -138,26 +138,27 @@ WINDOWED = [c for c in CASES if any(o != 0 for o in c.offsets)]
 
 @dataclass
 class Pass:
-    """One epoch's draw order and the block structure the engine derives from it."""
+    """One epoch's draw order and the blocks the engine walks it in."""
 
     ds: InSituDataset
-    order: np.ndarray
-    blocks: list[tuple[int, int, np.ndarray]]
+    order: DrawOrder
+    blocks: list[_Block]
     ref_spc: int
 
     def rows(self, bi: int) -> np.ndarray:
-        start, stop, _ = self.blocks[bi]
-        return self.order[start:stop]
+        block = self.blocks[bi]
+        return self.order.rows[block.start : block.stop]
 
     def declared(self, bi: int) -> set[Key]:
-        """The chunks the *driver* plans for block ``bi`` -- expanded from its chunk ids."""
-        _s, _e, cids = self.blocks[bi]
-        reads = build_stored_chunk_reads(cids, self.ds.geometries, self.ref_spc)
+        """The slots the *driver* plans for block ``bi`` -- expanded from its chunk ids."""
+        reads = build_stored_chunk_reads(
+            self.blocks[bi].chunk_ids, self.ds.geometries, self.ref_spc
+        )
         return {(r.array, r.chunk_index) for r in reads}
 
     def awaited(self, bi: int) -> set[Key]:
-        """The chunks the *consumer* pins and releases for block ``bi``."""
-        return self.ds._block_read_keys(self.rows(bi), self.ref_spc)
+        """The slots the *consumer* pins and releases for block ``bi``."""
+        return self.blocks[bi].read_keys
 
 
 @pytest.fixture
@@ -182,7 +183,8 @@ def build_pass(write_zarr):
         made.append(ds)
         ds.set_epoch(0)
         order = ds._draw_order(SplitName.TRAIN, shuffle=case.shuffle)
-        return Pass(ds, order, _partition_blocks(order, ds.block_chunks), base.sample_chunk_size)
+        spc = base.sample_chunk_size
+        return Pass(ds, order, ds._blocks(order, spc), spc)
 
     yield _build
     for ds in made:
@@ -207,9 +209,8 @@ def test_the_reference_resolves_a_hand_computed_case() -> None:
 def test_the_reference_agrees_with_the_engine_where_nothing_is_dropped(build_pass) -> None:
     """The control for the oracle: with no window the engine's own math is known-good."""
     p = build_pass(Case("plain", n=256, spc=4, block_chunks=2, offsets=(0,)))
-    assert _reference_read_keys(p.order, p.ds.geometries, p.ref_spc) == p.awaited(0) | set().union(
-        *(p.awaited(bi) for bi in range(len(p.blocks)))
-    )
+    everything = set().union(*(p.awaited(bi) for bi in range(len(p.blocks))))
+    assert _reference_read_keys(p.order.rows, p.ds.geometries, p.ref_spc) == everything
 
 
 def test_the_peak_simulation_matches_a_hand_computed_schedule() -> None:
@@ -234,26 +235,31 @@ def test_blocks_tile_the_draw_order(build_pass, case: Case) -> None:
     """Row ranges partition the order: contiguous, gapless, covering every drawn row."""
     p = build_pass(case)
     assert p.blocks, "a non-empty split must produce at least one block"
-    assert p.blocks[0][0] == 0
-    assert p.blocks[-1][1] == len(p.order)
-    for (_s, stop, _c), (nxt, _e, _d) in zip(p.blocks, p.blocks[1:], strict=False):
-        assert stop == nxt
+    assert p.blocks[0].start == 0
+    assert p.blocks[-1].stop == len(p.order)
+    for block, nxt in zip(p.blocks, p.blocks[1:], strict=False):
+        assert block.stop == nxt.start
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c.id for c in CASES])
-def test_a_block_declares_the_chunks_its_own_rows_draw_from(build_pass, case: Case) -> None:
-    """The anchor chunks a block names must be the ones its rows actually draw from.
+def test_each_drawn_chunk_belongs_to_exactly_one_block(build_pass, case: Case) -> None:
+    """No chunk's rows straddle a boundary, and every drawn chunk is in some block.
 
-    This is the identity of a block. Everything downstream -- what to fetch, in what order,
-    what to pin, when to release -- is keyed on it.
+    Asserting instead that a block's chunk ids equal its own rows' chunks would be
+    tautological -- one is derived from the other. What is *not* given is that the
+    boundaries fall where no chunk spans two of them: a chunk in two blocks is pinned by
+    both and released by whichever drains last, which is how a shared residency becomes a
+    reference nobody returns.
     """
     p = build_pass(case)
-    for bi, (start, stop, cids) in enumerate(p.blocks):
-        drawn = {int(c) for c in p.order[start:stop, 0]}
-        assert drawn == {int(c) for c in cids}, (
-            f"block {bi}: rows draw from chunks {sorted(drawn)}, "
-            f"but the block declares {sorted(int(c) for c in cids)}"
+    seen: set[int] = set()
+    for bi, block in enumerate(p.blocks):
+        ids = {int(c) for c in block.chunk_ids}
+        assert seen.isdisjoint(ids), (
+            f"block {bi} shares chunks {sorted(seen & ids)} with an earlier block"
         )
+        seen |= ids
+    assert seen == {int(c) for c in p.order.rows[:, 0]}
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c.id for c in CASES])
@@ -273,13 +279,17 @@ def test_blocks_are_slices_of_the_epoch_chunk_permutation(build_pass, case: Case
     p = build_pass(case)
     ids = np.asarray(p.ds.manifest.chunks["train"], dtype=np.int64)
     laid_down = chunk_permutation(ids, seed=p.ds.seed, epoch=0) if case.shuffle else ids
-    drawn = {int(c) for c in p.order[:, 0]}  # edge-anchor drop can empty a chunk entirely
-    surviving = [int(c) for c in laid_down if int(c) in drawn]
-    expected = [
-        set(surviving[k : k + case.block_chunks])
-        for k in range(0, len(surviving), case.block_chunks)
+    drawn = {int(c) for c in p.order.rows[:, 0]}  # edge-anchor drop can empty a chunk
+    # Group the permutation *first*, then remove what the drop took. Filtering before
+    # grouping would repack the survivors into fresh runs -- which is the defect, not the
+    # specification: a block that loses a chunk narrows, it does not borrow from its
+    # neighbour, and a block that loses all of them disappears.
+    groups = [
+        set(int(c) for c in laid_down[k : k + case.block_chunks]) & drawn
+        for k in range(0, len(laid_down), case.block_chunks)
     ]
-    got = [{int(c) for c in cids} for _s, _e, cids in p.blocks]
+    expected = [g for g in groups if g]
+    got = [{int(c) for c in block.chunk_ids} for block in p.blocks]
     # Membership, not order within a block: the rows are shuffled together, so which of a
     # block's chunks is named first carries no meaning and the engine reports them by first
     # appearance. The sequence *of* blocks does carry meaning and is compared.
@@ -332,13 +342,13 @@ def test_every_drawn_chunk_is_planned_exactly_once(build_pass, case: Case) -> No
     chunk admitted twice is a reference nobody returns.
     """
     p = build_pass(case)
-    ordered = [int(c) for _s, _e, cids in p.blocks for c in cids]
+    ordered = [int(c) for block in p.blocks for c in block.chunk_ids]
     assert len(ordered) == len(set(ordered)), "a chunk is planned by more than one block"
     planned = {
         (r.array, r.chunk_index)
         for r in build_stored_chunk_reads(ordered, p.ds.geometries, p.ref_spc)
     }
-    assert _reference_read_keys(p.order, p.ds.geometries, p.ref_spc) <= planned
+    assert _reference_read_keys(p.order.rows, p.ds.geometries, p.ref_spc) <= planned
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c.id for c in CASES])

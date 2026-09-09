@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **A shuffle-block's chunks were reconstructed from the draw order, and on any windowed
+  view the reconstruction was wrong (#68).** `_partition_blocks` re-derived block membership
+  by repacking the surviving chunks into fresh groups of `block_chunks`, but the rows stayed
+  laid out in the original grouping. Once `valid_anchor_range` dropped a whole chunk -- which
+  any lead offset does -- the two shifted against each other: on a 256-sample store with a
+  three-chunk lead, 77 blocks were recovered where 32 existed, and the chunks a block named
+  were a different partition from the chunks its own rows drew. The information to do it
+  correctly is not in the order at all, since a two-chunk block that lost a chunk is
+  indistinguishable from a one-chunk block, so the order builders now return the bounds they
+  lay down (`DrawOrder`) and dropping rows narrows a block instead of re-cutting them all.
+
+  It bit nobody yet, and that is the point: the planner expands each anchor into every chunk
+  that anchor reads, and retention pins a chunk to its last use, so misattribution changed no
+  sample and -- measured -- delayed no fetch (0 of 77 blocks fetch-complete later than their
+  own anchors, against 0 of 32 on the control). It was fatal only to the next change: per-block
+  release (#66) plans from the block's chunks and releases the block's read keys, so every
+  disagreement is a read-ahead permit taken and never returned. This is the third time the
+  planner has disagreed with the rest of the system about what a read is (#56 was the last).
+
+  `block_shuffled_order` and `sequential_order` now return a `DrawOrder` rather than a bare
+  array; its `.rows` is the array they used to return, and `sequential_order` takes
+  `block_chunks` so both orders carry one block definition.
+
 - **A fetch-ahead permit deficit hung the pass with nothing to read.** Bounded read-ahead
   takes one permit per chunk and gets it back from the consumer's `unpin_block`, so a
   consumer that cannot reach its next unpin never returns one. That wait was unbounded:
