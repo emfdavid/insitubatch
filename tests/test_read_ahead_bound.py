@@ -86,54 +86,52 @@ def test_a_single_block_still_admits_something() -> None:
 # -- the harness: can we still catch a wrong bound? --------------------------
 
 
-def test_an_undersized_bound_wedges_the_pass(write_zarr) -> None:
-    """Halve the computed bound and the pass stops making progress.
+def test_an_undersized_bound_raises_instead_of_wedging(write_zarr) -> None:
+    """A permit deficit must be diagnosable, not a silent hang.
 
-    `read_ahead_chunks` is deliberately not a user knob -- there is no value a caller
-    could choose that beats the computed one, and a too-small one deadlocks. It stays on
-    `SchedulerConfig` so this test can set one anyway: without a way to be wrong, none of
-    the cases above would be shown to matter.
+    Every other wait in the scheduler is bounded and proves itself terminal before giving
+    up -- that is what turns a stall into `residency budget exhausted` with a reason. The
+    fetch-ahead permit is a second thing a driver can wait on forever, so it needs the same
+    treatment: without it, any miscount in the permit accounting presents as three idle
+    threads and no message, which is the failure mode the starvation detector exists to
+    replace.
 
-    The fixture is sized so a correct run finishes in well under a second; the wait below
-    is two orders of magnitude longer, so this asserts a wedge rather than slowness.
+    `read_ahead_chunks` is not a user knob -- there is no value a caller could choose that
+    beats the computed one. It stays settable so this test can supply a deficit at all.
     """
     url, _ = write_zarr(n=128, spc=4, inner=(4, 4))
     geometries = open_geometries(obstore_store(url))
     manifest = split_by_chunk(geometries["t2m"], fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        geometries=geometries,
+        batch_size=8,
+        block_chunks=4,
+        shuffle=True,
+        seed=0,
+    )
+    ds.scheduler_config = SchedulerConfig(
+        max_inflight=ds.scheduler_config.max_inflight, read_ahead_chunks=2
+    )
+    ds.set_epoch(0)
 
-    def drain(read_ahead: int | None) -> bool:
-        ds = InSituDataset(
-            obstore_store(url),
-            manifest,
-            geometries=geometries,
-            batch_size=8,
-            block_chunks=4,
-            shuffle=True,
-            seed=0,
-        )
-        if read_ahead is not None:
-            ds.scheduler_config = SchedulerConfig(
-                max_inflight=ds.scheduler_config.max_inflight, read_ahead_chunks=read_ahead
-            )
-        ds.set_epoch(0)
-        done = threading.Event()
+    result: dict[str, object] = {}
 
-        def body() -> None:
-            try:
-                for _batch in ds.train:
-                    pass
-            finally:
-                done.set()
+    def body() -> None:
+        try:
+            for _batch in ds.train:
+                pass
+            result["outcome"] = "completed"
+        except Exception as exc:  # noqa: BLE001 - the outcome is what is under test
+            result["outcome"] = exc
 
-        threading.Thread(target=body, daemon=True).start()
-        finished = done.wait(20)
-        if not finished:
-            # Close the pool so the wedged pass is not left parked on the shared loop for
-            # the rest of the session -- a leaked driver task is exactly the kind of
-            # cross-test interference the free-threaded job would surface as a mystery.
-            ds.close()
-            done.wait(5)
-        return finished
+    worker = threading.Thread(target=body, daemon=True)
+    worker.start()
+    worker.join(30)
 
-    assert drain(None), "the computed bound must let a pass finish"
-    assert not drain(2), "a bound below the floor must wedge -- else nothing above matters"
+    assert not worker.is_alive(), "an undersized bound hung instead of reporting"
+    assert isinstance(result["outcome"], Exception), f"expected a raise, got {result['outcome']}"
+    assert "read-ahead" in str(result["outcome"]), (
+        f"the error must name the fetch-ahead bound, not something else: {result['outcome']}"
+    )
