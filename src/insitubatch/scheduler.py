@@ -315,6 +315,11 @@ class Scheduler:
         # it cancels unrelated zarr-sync work mid-flight. Mutated only on the loop thread
         # (create_task and the done-callback both run there), so it needs no lock.
         self._tasks: set[asyncio.Task] = set()
+        # Tile tasks only, and every one of them from creation until it finishes. Separate
+        # from `_tasks` because the two answer different questions: `_tasks` is "what must
+        # close() cancel" (the driver included), this is "is a delivery still coming" --
+        # which is what makes an admission stall non-terminal (see _starvation).
+        self._tiles: set[asyncio.Task] = set()
         self._loop.call_soon_threadsafe(self._setup)
         self._ready.wait(timeout=10)
 
@@ -460,7 +465,9 @@ class Scheduler:
                     continue  # cross-epoch hit: prepped chunk already resident, no fetch
                 task = asyncio.create_task(self._one(read))
                 self._tasks.add(task)
+                self._tiles.add(task)
                 task.add_done_callback(self._tasks.discard)
+                task.add_done_callback(self._tiles.discard)
                 tasks.append(task)
             await asyncio.gather(*tasks)
         except BaseException:
@@ -506,6 +513,15 @@ class Scheduler:
                 # parked before proving itself fatal -- that number is the evidence.
                 self.stats.admission_parked_s += time.perf_counter() - t0
 
+    def _delivery_pending(self) -> bool:
+        """Is any tile still on its way to a slot?
+
+        Every tile task lives in :attr:`_tiles` from creation until it finishes, so an
+        unfinished one means a delivery is coming -- whether it is fetching, decoding, or
+        merely queued behind ``max_inflight``.
+        """
+        return any(not task.done() for task in list(self._tiles))
+
     def _starvation(self, array: str, chunk_index: int) -> RuntimeError | None:
         """The error for a *provably* unbreakable admission stall, else ``None``.
 
@@ -513,8 +529,11 @@ class Scheduler:
 
         * ``try_admit`` just failed -- the budget is full of in-flight or referenced
           slots, so no eviction can make room.
-        * nothing is in flight -- no delivery is pending, so no slot can become ready
-          and satisfy a waiter on its own.
+        * no tile task is outstanding -- no delivery is pending, so no slot can become
+          ready and satisfy a waiter on its own. Read off the tasks rather than
+          ``_inflight_now``, which counts only tiles that have *acquired* the concurrency
+          semaphore: a created-but-queued task delivers just as surely, and at
+          ``max_inflight=1`` almost every tile is queued rather than running.
         * a consumer is blocked in ``wait_ready`` -- and a blocked consumer never
           reaches its next ``unpin_block``, so the one thing that could free budget
           will not happen.
@@ -527,7 +546,7 @@ class Scheduler:
         A merely slow consumer registers no waiter (it is computing, not blocked) or
         has work in flight, so it never trips this.
         """
-        if self._inflight_now:
+        if self._delivery_pending():
             return None
         waiting = self.pool.blocked_waiters()
         if not waiting:

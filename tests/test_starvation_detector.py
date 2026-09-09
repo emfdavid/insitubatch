@@ -24,7 +24,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from insitubatch import obstore_store, open_geometries, split_by_chunk
 from insitubatch.pool import ChunkPool
+from insitubatch.scheduler import Scheduler
+from insitubatch.source import InSituDataset
 from insitubatch.types import ArrayGeometry
 
 ARRAY, CID, OWNER = "t2m", 3, 1
@@ -100,3 +103,81 @@ def test_a_failed_chunk_does_not_block(pool: ChunkPool) -> None:
     _register_waiter(pool, (ARRAY, CID), OWNER)
 
     assert pool.blocked_waiters() == []
+
+
+# -- premise 2: "nothing in flight" must mean "no delivery pending" -----------
+
+
+def test_a_queued_tile_task_counts_as_delivery_pending(write_zarr) -> None:
+    """`max_inflight=1` serialises fetches, so the gap between one tile releasing the
+    semaphore and the next acquiring it is wide -- and `_inflight_now` counts only tasks
+    that have acquired it. A run whose deliveries are merely *queued* is not stalled.
+
+    Observed on a real store at `max_inflight=1`: the detector fired with
+    `inflight_now=0`, 28 tile tasks created and unfinished, and its one waiter on a chunk
+    in state FILLING that one of those 28 was about to fill.
+    """
+    url, _ = write_zarr(n=512, spc=1, inner=(8, 8))
+    geometries = open_geometries(obstore_store(url))
+    manifest = split_by_chunk(geometries["t2m"], fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        geometries=geometries,
+        batch_size=16,
+        block_chunks=4,
+        max_inflight=1,
+        shuffle=True,
+        seed=0,
+    )
+    ds.set_epoch(0)
+
+    got = sum(int(b.arrays["t2m"].shape[0]) for b in ds.train)
+    assert got == 512
+
+
+# -- premise 2, at the level the detector reads it ---------------------------
+
+
+class _UnfinishedTask:
+    """Stands in for a tile task that has been created and has not finished.
+
+    A real one needs a running loop and a store to fetch from; the detector only ever
+    asks `done()`, and *that* is the whole question -- whether a delivery is still coming.
+    """
+
+    def done(self) -> bool:
+        return False
+
+
+def _scheduler(write_zarr, pool_out: list[ChunkPool]) -> Scheduler:
+    url, _ = write_zarr(n=32, spc=4, inner=(4, 4))
+    geometries = open_geometries(obstore_store(url))
+    pool = ChunkPool(geometries)
+    pool_out.append(pool)
+    return Scheduler(obstore_store(url), geometries, pool)
+
+
+def test_a_queued_tile_task_is_not_a_terminal_stall(write_zarr) -> None:
+    """A stall with deliveries outstanding is a slow run, not a wedged one."""
+    pools: list[ChunkPool] = []
+    sched = _scheduler(write_zarr, pools)
+    pool = pools[0]
+    _register_waiter(pool, ("t2m", 5), OWNER)  # genuinely blocked: never admitted
+    sched._tiles.add(_UnfinishedTask())  # type: ignore[arg-type]
+
+    assert sched._starvation("t2m", 5) is None
+
+
+def test_a_stall_with_nothing_outstanding_is_still_terminal(write_zarr) -> None:
+    """The control: with no delivery coming and a genuinely blocked waiter, it must raise.
+
+    Without this, "never report a stall" would satisfy the test above and turn every real
+    deadlock back into the silent hang the detector exists to replace.
+    """
+    pools: list[ChunkPool] = []
+    sched = _scheduler(write_zarr, pools)
+    _register_waiter(pools[0], ("t2m", 5), OWNER)
+
+    err = sched._starvation("t2m", 5)
+    assert err is not None and "residency budget exhausted" in str(err)
