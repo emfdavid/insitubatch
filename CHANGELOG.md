@@ -449,6 +449,15 @@
   those is not actionable. AI-assisted contributions are welcome under an explicit
   *accountability* rule rather than an authorship one.
 
+- **The contributing guide told contributors to run three commands; CI runs five.**
+  `ruff format --check` and `mkdocs build --strict` were missing from
+  `docs/contributing.md` and the PR checklist, so a contributor could do exactly what the
+  guide said, see green locally, and still fail CI on a formatting diff that says nothing
+  about their change — which is what happened on our first outside contribution (#32). The
+  guide, the PR template and CLAUDE.md now list the same five commands. Pre-commit already
+  ran the formatter, so anyone who installed the hooks was covered; the gap was only ever
+  in the written path.
+
 ## 0.1.0 — 2026-07-06
 
 **The sample-geometry generalization + a stable public API.** insitubatch is no longer
