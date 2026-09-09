@@ -495,7 +495,7 @@ class Scheduler:
                     # exactly like an admission and released by the same `unpin_block`, so
                     # skipping it here would return permits we never took.
                     if self._ahead is not None:
-                        await self._ahead.acquire()
+                        await self._take_ahead(read.array, read.chunk_index)
                     hit = self.pool.pin_if_ready(read.array, read.chunk_index, self._owner)
                     if not hit:
                         await self._admit(read.array, read.chunk_index)  # may await an unpin
@@ -551,6 +551,50 @@ class Scheduler:
                 # In the `finally` so a terminal starvation still reports the time it
                 # parked before proving itself fatal -- that number is the evidence.
                 self.stats.admission_parked_s += time.perf_counter() - t0
+
+    async def _take_ahead(self, array: str, chunk_index: int) -> None:
+        """Take a fetch-ahead permit, proving a stall terminal rather than waiting forever.
+
+        Permits come back from the consumer's ``unpin_block``, so a consumer that cannot
+        reach its next unpin never returns one -- the same shape as an admission stall, and
+        it deserves the same treatment. Waiting unbounded here would turn any miscount in
+        the permit accounting into three idle threads and no message, which is the failure
+        the starvation detector exists to replace.
+        """
+        assert self._ahead is not None
+        while True:
+            try:
+                await asyncio.wait_for(self._ahead.acquire(), STARVATION_POLL_S)
+                return
+            except TimeoutError:
+                starved = self._ahead_starvation(array, chunk_index)
+                if starved is not None:
+                    # `from None` for the same reason as in :meth:`_admit`: the poll
+                    # timeout is how we got here, not why.
+                    raise starved from None
+
+    def _ahead_starvation(self, array: str, chunk_index: int) -> RuntimeError | None:
+        """The error for a permit stall that cannot break, else ``None``.
+
+        Terminal on the same two facts as :meth:`_starvation`: nothing is on its way to a
+        slot, and a consumer is blocked where it cannot reach the unpin that would hand a
+        permit back. The cause differs, so the message does -- the budget is not the
+        problem, the distance this pass may run ahead of itself is.
+        """
+        if self._delivery_pending():
+            return None
+        waiting = self.pool.blocked_waiters()
+        if not waiting:
+            return None
+        return RuntimeError(
+            f"read-ahead permits exhausted: cannot start chunk {chunk_index} of {array!r}. "
+            f"This pass may hold {self._config.read_ahead_chunks} chunk(s) ahead of its own "
+            f"consumer; every one is outstanding, nothing is in flight, and the consumer is "
+            f"blocked on {sorted(waiting)[:4]}, so no permit can come back. The bound is "
+            "computed from the plan (`read_ahead_bound`) and must cover one block's reads "
+            "plus the next block's; a smaller one -- or a release that hands back fewer "
+            "permits than were taken -- deadlocks the pass against its own limit."
+        )
 
     def _delivery_pending(self) -> bool:
         """Is any tile still on its way to a slot?

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **A fetch-ahead permit deficit hung the pass with nothing to read.** Bounded read-ahead
+  takes one permit per chunk and gets it back from the consumer's `unpin_block`, so a
+  consumer that cannot reach its next unpin never returns one. That wait was unbounded:
+  every other wait in the scheduler polls and proves itself terminal before giving up, but
+  this one presented as three idle threads, no log line, and no traceback -- the exact
+  failure the starvation detector was built to replace, reintroduced beside it. It bit
+  while developing per-block release, where a release that hands back fewer permits than
+  were taken is an easy mistake to make and, until now, an undiagnosable one. The wait is
+  now bounded and terminal on the same two facts as an admission stall (nothing in flight,
+  a consumer blocked where it cannot unpin), and it names the bound, the chunk, and what
+  the consumer is waiting on.
+
 - **The windowed residency clamp charged every *view* of an array, not every array.** With
   shuffle on, a windowed pass holds the split resident; that clamp multiplied the split by
   the number of variables, but `t2m.shift(0/24/240)` are three views of one array and the
