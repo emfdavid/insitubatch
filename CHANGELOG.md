@@ -486,7 +486,9 @@
   about their change — which is what happened on our first outside contribution (#32). The
   guide, the PR template and CLAUDE.md now list the same five commands. Pre-commit already
   ran the formatter, so anyone who installed the hooks was covered; the gap was only ever
-  in the written path.
+  in the written path — where the setup step described itself as "ruff + mypy", omitting
+  the formatter, and read as an optional convenience rather than the thing that keeps a
+  locally-green branch green in CI.
 
 ## 0.1.0 — 2026-07-06
 
