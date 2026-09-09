@@ -183,6 +183,20 @@ class SchedulerConfig:
     ~= max_inflight * stored_chunk_nbytes (+ transform scratch). Residency is
     bounded separately by the pool's byte budget (admission evicts unpinned-LRU)."""
 
+    read_ahead_chunks: int = 0
+    """How many chunks this iteration may hold ahead of its own consumer.
+
+    ``0`` leaves admission bounded only by the pool's byte budget, so one driver claims
+    the whole pool however large it is -- which starves any other iteration sharing it
+    (#64) and, on a generous budget, fetches the resident set before the consumer's first
+    batch. :class:`~insitubatch.source.InSituDataset` always supplies a value, computed by
+    :func:`~insitubatch.source.read_ahead_bound`; ``0`` is what a caller driving a
+    :class:`Scheduler` directly gets.
+
+    It must be **at least** that computed bound. Below it the consumer waits for a chunk
+    the driver is not permitted to admit -- a deadlock of our own making rather than the
+    budget's -- which is why a non-zero value here is a testing seam, not a tuning knob."""
+
     decode_threads: int = 0
     """Size of the decode pool (the GIL-releasing codec decode runs here). ``0`` = auto =
     ``min(32, cpu+4)``.
@@ -308,6 +322,7 @@ class Scheduler:
         self._loop = _get_loop()
         self._inflight: asyncio.Semaphore | None = None
         self._capacity: asyncio.Event | None = None  # set on unpin -> wakes a parked admit
+        self._ahead: asyncio.Semaphore | None = None  # fetch-ahead permits (read_ahead_chunks)
         self._open_lock: asyncio.Lock | None = None
         self._ready = threading.Event()
         # OUR tasks, and only ours. `asyncio.all_tasks(loop)` is the *whole loop's* task
@@ -336,6 +351,14 @@ class Scheduler:
         the loop default on our behalf.
         """
         self._inflight = asyncio.Semaphore(self._config.max_inflight)
+        # One permit per *chunk* this iteration has admitted and whose consumer has not
+        # yet released it, so it bounds distance from the consumer rather than residency.
+        # `None` leaves admission bounded by the pool's byte budget alone.
+        self._ahead = (
+            asyncio.Semaphore(self._config.read_ahead_chunks)
+            if self._config.read_ahead_chunks
+            else None
+        )
         self._capacity = asyncio.Event()
         self._open_lock = asyncio.Lock()
         self._ready.set()
@@ -427,6 +450,16 @@ class Scheduler:
         self.pool.unpin_keys(keys, self._owner)
         if self._capacity is not None:
             self._loop.call_soon_threadsafe(self._capacity.set)
+        if self._ahead is not None:
+            # One permit back per chunk released: `release[bi]` holds each key once, and the
+            # driver took exactly one permit for it, so the two counts cannot drift.
+            self._loop.call_soon_threadsafe(self._release_ahead, len(keys))
+
+    def _release_ahead(self, n: int) -> None:  # on the loop
+        """Hand back `n` fetch-ahead permits, one per chunk the consumer released."""
+        assert self._ahead is not None
+        for _ in range(n):
+            self._ahead.release()
 
     def _on_drive_done(self, fut: Future) -> None:
         # Cancellation is normal: close() cancels a still-finishing drive at epoch
@@ -457,6 +490,12 @@ class Scheduler:
                 key = (read.array, read.chunk_index)
                 hit = decided.get(key)
                 if hit is None:
+                    # One permit per chunk, taken before we reference it and
+                    # returned by the consumer's unpin. Hits take one too: a hit is pinned
+                    # exactly like an admission and released by the same `unpin_block`, so
+                    # skipping it here would return permits we never took.
+                    if self._ahead is not None:
+                        await self._ahead.acquire()
                     hit = self.pool.pin_if_ready(read.array, read.chunk_index, self._owner)
                     if not hit:
                         await self._admit(read.array, read.chunk_index)  # may await an unpin

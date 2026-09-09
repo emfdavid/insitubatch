@@ -33,6 +33,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from typing import TextIO
 
 import numpy as np
@@ -79,6 +80,49 @@ def _partition_blocks(order: np.ndarray, block_chunks: int) -> list[tuple[int, i
         (starts[k], starts[k + 1], appearance[k * block_chunks : (k + 1) * block_chunks])
         for k in range(len(starts) - 1)
     ]
+
+
+def read_ahead_bound(
+    block_keys: list[set[tuple[str, int]]], last_use: dict[tuple[str, int], int]
+) -> int:
+    """How many chunks a pass may hold ahead of its own consumer.
+
+    Computed, never configured. Below it the pass deadlocks against its own limit -- the
+    driver cannot admit the chunk the consumer is blocked on -- and above it admission is
+    bounded only by the pool, which is what lets one iteration claim the whole budget and
+    starve another (#64). Read-ahead depth is a cold-start knob rather than a throughput
+    one (see the benchmarks page), so there is no regime where a caller's number beats
+    this one.
+
+    The bound is, over blocks ``b``: everything still *live* at ``b`` -- first read at or
+    before it, last read at or after it -- plus the whole of block ``b+1``, which the
+    driver is permitted to be working on while the consumer gathers ``b``.
+
+    Both terms come from the read-unions the consumer actually waits on, because
+    ``block_chunks`` is the knob but not the count:
+
+    * a **windowed** variable reads ``anchor + offset``, so one chunk feeds several
+      blocks and is released only at the last of them -- its permit spans all of them;
+    * a variable chunked **finer than the reference grid** contributes several chunks per
+      anchor chunk, so a per-variable multiple of ``block_chunks`` under-counts it.
+    """
+    first_use: dict[tuple[str, int], int] = {}
+    for bi, keys in enumerate(block_keys):
+        for key in keys:
+            first_use.setdefault(key, bi)
+    opens = [0] * (len(block_keys) + 1)
+    closes = [0] * (len(block_keys) + 1)
+    for bi in first_use.values():
+        opens[bi] += 1
+    for bi in last_use.values():
+        closes[bi] += 1
+    live = peak = 0
+    for bi in range(len(block_keys)):
+        live += opens[bi]
+        nxt = len(block_keys[bi + 1]) if bi + 1 < len(block_keys) else 0
+        peak = max(peak, live + nxt)
+        live -= closes[bi]
+    return max(peak, 1)
 
 
 class InSituDataset:
@@ -448,6 +492,11 @@ class InSituDataset:
         for key, bi in last_use.items():
             release[bi].add(key)
 
+        # Computed, not configured (see `read_ahead_bound`). A non-zero value on the
+        # config is honoured so a test can supply a deliberately wrong one: a bound that
+        # cannot be wrong is a bound nothing proves the need for.
+        ahead = self.scheduler_config.read_ahead_chunks or read_ahead_bound(block_keys, last_use)
+
         def produce(sched: Scheduler) -> None:
             # Batches are cut over the WHOLE epoch order, not per block. Cutting them per
             # block (`range(rstart, rstop, bs)`) made every block whose row count was not a
@@ -514,7 +563,7 @@ class InSituDataset:
                 self.store,
                 self.geometries,
                 self._pool,
-                self.scheduler_config,
+                replace(self.scheduler_config, read_ahead_chunks=ahead),
                 owner=owner,
                 stats=stats,
             ) as sched:

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **One iteration could claim the entire chunk pool, so `zip(ds.train, ds.val)` deadlocked
+  at any budget (#64).** Admission parked only when the pool's byte budget was full, never
+  when a driver ran far ahead of its own consumer, so a driver walked its plan pinning
+  chunks until it held the whole pool: measured on a public GCS store, one owner held 32,
+  48, 64, 128 and 256 slots at 2x through 16x its 16-chunk working set, while the second
+  iteration acquired *none*. Raising `cache_budget_bytes` — what the error message advised
+  — enlarged the over-claim; the first budget that could have worked was one holding the
+  whole 19.9 GB split for a 66 MB working set. A pass now takes one fetch-ahead permit per
+  chunk, returned when its consumer releases that chunk, so it may run at most its own
+  working set ahead. Concurrent iterations work at the documented floor, and a single
+  iteration stops fetching the resident set before its first batch: on `era5_c8` over
+  in-region GCS with a 13.3 GB budget (GCP n2-standard-8, `block_chunks=16`,
+  `batch_size=32`, arms alternated three times in one session) time-to-first-batch went
+  from 965–10094 ms to 621–665 ms and throughput from 400–562 MB/s to 1082–1152 MB/s.
+
+  The bound is computed, never configured (`read_ahead_bound`), because there is no value
+  a caller could choose that beats it: below it the pass deadlocks against its own limit,
+  above it is the behaviour just described. `2 x block_chunks` is *not* that bound — a
+  windowed variable's chunk feeds several blocks and is released only at the last of them,
+  and a variable chunked finer than the reference grid contributes several chunks per
+  anchor chunk. Each of those found the rule by hanging the suite, and each now has a test.
+
+
 - **A healthy run could be killed with "residency budget exhausted ... this would hang".**
   `Scheduler._starvation` turns an admission stall into a raise rather than a hang, and it
   proves the stall terminal from three facts, the third being "a consumer is blocked in
