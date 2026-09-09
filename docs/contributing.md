@@ -96,9 +96,14 @@ tool versions, so nothing drifts between your machine and CI.
 ```bash
 git clone https://github.com/emfdavid/insitubatch.git
 cd insitubatch
-uv sync                    # core engine + dev tools
-uv run pre-commit install  # ruff + mypy on every commit
+uv sync                          # core engine + dev tools
+uv run pre-commit install        # ruff check + ruff format + mypy on every commit
 ```
+
+**Install the hooks.** They run the same ruff and mypy CI runs, and the formatter rewrites
+in place rather than reporting — so the one CI failure that tells you nothing about your
+change, a formatting diff, cannot reach you. Skipping them is the most common way a branch
+that is green locally goes red in CI.
 
 Extras, one at a time (see the framework caveat below):
 
@@ -196,8 +201,8 @@ link those by GitHub URL, as the existing pages do.
   under `-O`).
 - **mypy is clean and enforced.** Keep it that way: precise types, not `Any`, except for
   genuine third-party passthrough kwargs.
-- **ruff** with `E, F, I, UP, B, SIM` at line length 100. `uv run pre-commit install` makes
-  this automatic.
+- **ruff** with `E, F, I, UP, B, SIM` at line length 100, and `ruff format` for layout.
+  `uv run pre-commit install` makes both automatic.
 - **Comments explain *why*.** The codebase is dense with rationale for decisions that look
   arbitrary until you know what they route around. Match that; a comment restating the code
   is noise, a comment naming the failure mode is the point.
