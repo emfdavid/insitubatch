@@ -129,13 +129,24 @@ fastest way to find which file owns what.
 
 ## Running the tests
 
-The three commands CI runs, and the ones a reviewer will expect to be green:
+The four commands CI runs, and the ones a reviewer will expect to be green:
 
 ```bash
 uv run ruff check src tests bench examples
+uv run ruff format --check src tests bench examples
 uv run mypy src bench examples
 uv run pytest -q
 ```
+
+`--check` only reports; `uv run ruff format src tests bench examples` rewrites. The
+pre-commit hooks above format every commit for you, so this is the check most easily
+missed by anyone who has not installed them — and formatting is the one CI failure that
+tells you nothing about your change.
+
+**Tests that read a live cloud store** are marked `remote` and skipped unless you pass
+`--remote`. A run that skips them is a complete run: CI does not pass the flag either,
+because a public bucket going away must not turn into a red build for a contributor who
+changed nothing.
 
 **One framework per environment.** This is the single most common way a new contributor's
 run breaks, and it is not an insitubatch limitation. torch, JAX and TensorFlow cannot
@@ -160,6 +171,18 @@ publishes chunk readiness across threads, run the free-threaded job too — the 
 lock discipline and its cross-thread readiness signalling are exactly what it exercises. The full recipe (a separate
 `.venv-ft`, and why you must assert the GIL is actually off before trusting the run) is in
 the [README](https://github.com/emfdavid/insitubatch#free-threaded-313t). CI mirrors it.
+
+**The docs site is CI too.** `mkdocs build --strict` runs on every pull request, and
+`--strict` promotes a broken link or an orphaned page to a build failure — so a
+docs-only change can fail CI while every command above is green:
+
+```bash
+uv sync --extra docs
+uv run mkdocs build --strict
+```
+
+Pages under `docs/` cannot relatively link root files (`DESIGN.md`, `GOVERNANCE.md`);
+link those by GitHub URL, as the existing pages do.
 
 ## Code standards
 

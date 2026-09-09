@@ -26,8 +26,9 @@
 
 - [ ] Tests added or updated — for a **bug fix**, a test that reproduces it and failed before
       this change
-- [ ] `uv run ruff check src tests bench examples`, `uv run mypy src bench examples` and
-      `uv run pytest -q` are green locally
+- [ ] `uv run ruff check src tests bench examples`, `uv run ruff format --check src tests
+      bench examples`, `uv run mypy src bench examples` and `uv run pytest -q` are green
+      locally (`uv run --extra docs mkdocs build --strict` too, if you touched `docs/`)
 - [ ] Docstrings and API docs for any new or changed public surface
 - [ ] User-facing behavior documented in `docs/*.md`
 - [ ] A bullet added under `## Unreleased` in `CHANGELOG.md`
