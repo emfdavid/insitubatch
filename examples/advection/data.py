@@ -287,6 +287,12 @@ def evaluate(view: Iterable[Batch], predict: Callable[[Batch], np.ndarray]) -> t
         preds.append(predict(batch))
         targets.append(target)
         persists.append(persistence)
+    if not preds:
+        raise RuntimeError(
+            "no batches to evaluate: the split this view covers is empty. A small store "
+            "rounds a 10% split to zero chunks -- raise --n-steps, or widen the split's "
+            "fraction. Reporting skill over no samples would be worse than stopping here."
+        )
     pred, target, persistence = (np.concatenate(a) for a in (preds, targets, persists))
     return rmse(pred, target), rmse(persistence, target)
 
