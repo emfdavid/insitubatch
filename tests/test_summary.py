@@ -347,3 +347,68 @@ def test_chunk_bytes_does_not_vary_with_the_final_short_chunk() -> None:
     g = _geom((9, 3), (4, 2))  # 9 samples in chunks of 4: the last holds 1
     assert g.n_chunks == 3
     assert g.chunk_bytes == 2 * (4 * 2) * 4
+
+
+# --- the residency floor is sized by the offsets, not by the distance between them ------
+
+
+def test_sparse_leads_cost_what_they_read_not_the_distance_between_them():
+    """Two forecast leads are two reads, however far apart they sit.
+
+    The floor was derived from `max(offset) - min(offset)`, so `{0, 240}` on a
+    one-sample-per-chunk store reserved for a 240-wide window -- against the two chunks an
+    anchor genuinely needs. Sizing by the span makes the budget a function of *which*
+    leads you train on rather than *how many*, and an explicit budget covering the real
+    need is then rejected as below the floor (#27).
+    """
+    g = _geom((256, 4, 4), (1, 4, 4))
+    manifest = split_by_chunk(g)
+
+    def floor(offsets):
+        geoms = [g.shift(o) for o in offsets]
+        return working_set_bytes(
+            geoms, geoms, manifest, block_chunks=4, ref_spc=1, shuffle=False, assembles=False
+        )
+
+    assert floor([0, 24]) == floor([0, 240]), "the span must not enter the floor"
+    assert floor([0, 24, 48]) == floor([0, 24, 2400]), "nor with more leads"
+    # and more leads *do* cost more -- the count is what matters
+    assert floor([0, 24, 48]) > floor([0, 24])
+
+
+def test_an_offset_that_straddles_a_chunk_boundary_costs_two_chunks():
+    """`spc=4`: a shift of a whole chunk reads one, a shift inside one reads two.
+
+    The control for the test above -- if the floor ignored offsets entirely it would also
+    be span-independent, and would under-provision every misaligned window.
+    """
+    g = _geom((256, 4, 4), (4, 4, 4))
+    manifest = split_by_chunk(g)
+
+    def floor(offset):
+        geoms = [g.shift(offset)]
+        return working_set_bytes(
+            geoms, geoms, manifest, block_chunks=4, ref_spc=4, shuffle=False, assembles=False
+        )
+
+    assert floor(4) == floor(0), "a whole-chunk shift stays within one chunk per anchor"
+    assert floor(2) == 2 * floor(0), "a shift inside a chunk straddles exactly one boundary"
+
+
+def test_a_variable_chunked_finer_than_the_reference_is_not_widened_by_the_span():
+    """The same defect lived in the non-uniform-spc branch as `samples + span`.
+
+    A shift moves *which* of a variable's chunks are read, not how many, so the window it
+    covers is the same width wherever it starts.
+    """
+    coarse = _geom((256, 4, 4), (8, 4, 4))
+    fine = _geom((256, 4, 4), (2, 4, 4))
+    manifest = split_by_chunk(coarse)
+
+    def floor(offset):
+        geoms = [coarse, fine.shift(offset)]
+        return working_set_bytes(
+            geoms, geoms, manifest, block_chunks=4, ref_spc=8, shuffle=False, assembles=False
+        )
+
+    assert floor(240) == floor(8), "a distant lead costs the same as a near one"
