@@ -14,6 +14,16 @@
   a consumer blocked where it cannot unpin), and it names the bound, the chunk, and what
   the consumer is waiting on.
 
+- **Iterating an empty split raised `ValueError: need at least one array to concatenate`.**
+  `fractions=(1.0, 0.0, 0.0)` is an ordinary request -- train on everything, hold nothing
+  back -- and any store small enough that 10% rounds to zero chunks produces the same shape
+  by accident. Both draw orders then reached `np.concatenate([])`, and the error named
+  neither the split nor the dataset, only numpy. It is what the advection and SDSS examples
+  do the moment their synthetic store is shrunk, which is the first thing anyone tries. An
+  empty split now yields nothing, the way an empty list does: the manifest recorded it as
+  empty because it was asked to, so this is not a contract that cannot be honoured. The two
+  examples that then divided by no samples say so in their own words rather than in numpy's.
+
 - **The windowed residency clamp charged every *view* of an array, not every array.** With
   shuffle on, a windowed pass holds the split resident; that clamp multiplied the split by
   the number of variables, but `t2m.shift(0/24/240)` are three views of one array and the

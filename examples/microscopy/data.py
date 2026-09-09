@@ -286,6 +286,12 @@ def evaluate(view: Iterable[Batch], predict: Callable[[Batch], np.ndarray]) -> t
         preds.append(predict(batch))
         targets.append(target)
         otsus.append(otsu_foreground(batch))
+    if not preds:
+        raise RuntimeError(
+            "no batches to evaluate: the split this view covers is empty. A small store "
+            "rounds a 10% split to zero chunks -- raise --n-planes, or widen the split's "
+            "fraction. Reporting IoU over no samples would be worse than stopping here."
+        )
     pred, target, otsu = (np.concatenate(a) for a in (preds, targets, otsus))
     return iou(pred, target), iou(otsu, target)
 

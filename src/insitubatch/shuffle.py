@@ -40,6 +40,11 @@ def _chunk_rows(chunk_id: int, samples_per_chunk: int, n_samples: int) -> np.nda
     return np.stack([np.full(clen, chunk_id), np.arange(clen)], axis=1)
 
 
+# The shape every draw order carries: (N, 2) of [chunk_id, within]. Callers index column
+# 0, so an empty order has to keep the second axis or it breaks them differently.
+_EMPTY_ORDER = np.empty((0, 2), dtype=np.int64)
+
+
 def block_shuffled_order(
     chunk_ids: np.ndarray,
     samples_per_chunk: int,
@@ -56,6 +61,8 @@ def block_shuffled_order(
     length, used to size a short final chunk correctly. Returns an array of shape
     ``(N, 2)`` where ``N`` is the number of samples covered by ``chunk_ids``.
     """
+    if not len(chunk_ids):
+        return _EMPTY_ORDER.copy()  # an empty split yields nothing; see sequential_order
     perm = chunk_permutation(chunk_ids, seed=seed, epoch=epoch)
     rng = np.random.default_rng((seed, epoch, 7919))
 
@@ -79,7 +86,13 @@ def sequential_order(
 
     Used when ``shuffle=False`` (eval / inference / reconstruction): chunks in the
     given order, samples in order within each. Honours a short final chunk.
+
+    No chunks is an empty order of the same shape, not an error: a split can hold nothing
+    because it was asked to (``fractions=(1.0, 0.0, 0.0)``) or because a small store
+    rounded it to zero, and iterating it should yield nothing the way an empty list does.
     """
+    if not len(chunk_ids):
+        return _EMPTY_ORDER.copy()
     return np.concatenate(
         [_chunk_rows(int(cid), samples_per_chunk, n_samples) for cid in chunk_ids], axis=0
     )
