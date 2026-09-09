@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **The residency floor was sized by the distance between offsets, so sparse forecast
+  leads reserved memory nobody needed (#27).** `working_set_bytes` derived a single
+  `window_factor` from `max(offset) - min(offset)` and applied it to every variable, so
+  leads `{0, 24, 240}` on a one-sample-per-chunk store were charged for a 240-wide window
+  rather than the three chunks an anchor reads. Measured on a 2048-chunk store: the floor
+  came to 46,464 chunk-equivalents against a 1,638-chunk train split and a measured live
+  set of 1,280 -- **28x the whole dataset**. It was not merely wasteful: an explicit
+  `cache_budget_bytes` of twice the real need was *rejected* as below the floor, so the
+  forecast-lead configuration could not be run with a sane budget at all. Each variable is
+  now charged for what its own offset reads -- one chunk per anchor when the shift is a
+  whole number of chunks, two when it straddles a boundary -- and the same span term is
+  gone from the non-uniform-chunk-size branch, where a shift moves *which* chunks a
+  variable reads rather than how many. Sparse leads now size to 4,914; the estimate no
+  longer depends on which leads you train on, only how many.
+
 - **One iteration could claim the entire chunk pool, so `zip(ds.train, ds.val)` deadlocked
   at any budget (#64).** Admission parked only when the pool's byte budget was full, never
   when a driver ran far ahead of its own consumer, so a driver walked its plan pinning

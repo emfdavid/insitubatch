@@ -173,7 +173,6 @@ def working_set_bytes(
     that grows (or shrinks) the data changes the footprint the budget must hold.
     """
     offsets = [g.offset for g in geoms]
-    span = max(offsets) - min(offsets)
     windowed = any(o != 0 for o in offsets)
     uniform_spc = len({g.sample_chunk_size for g in geoms}) == 1
 
@@ -183,13 +182,21 @@ def working_set_bytes(
     pairs = list(zip(geoms, out_geoms, strict=True))
     if uniform_spc:
         # Every variable's chunk aligns to the reference grid, so a block reads exactly its
-        # own chunks. A windowed read straddles at most one boundary, so an anchor chunk's
-        # read-union spans 2 + ceil(span/spc) chunks per variable; with every offset 0 the
-        # factor is 1 -- the plain 2 * block_chunks working set.
+        # own chunks. Each variable is charged for what *its own* offset reads: an anchor
+        # chunk's `spc` consecutive samples, shifted by that offset, land in one chunk when
+        # the shift is a whole number of chunks and straddle exactly one boundary otherwise.
+        #
+        # Per variable, deliberately. The distance between *different* variables' offsets
+        # says nothing about how many chunks either of them needs: forecast leads
+        # `{24h, 240h}` on a one-sample-per-chunk store are two reads, not 216.
         spc0 = geoms[0].sample_chunk_size
-        window_factor = 2 + (-(-span // spc0)) if windowed else 1
+
+        def chunks_per_anchor(g: ArrayGeometry) -> int:
+            return 1 if g.offset % spc0 == 0 else 2
+
         per_chunk_all_vars = sum(bytes_per_chunk(g, o) for g, o in pairs)
-        working_set = 2 * block_chunks * window_factor * per_chunk_all_vars
+        per_anchor_all_vars = sum(chunks_per_anchor(g) * bytes_per_chunk(g, o) for g, o in pairs)
+        working_set = 2 * block_chunks * per_anchor_all_vars
         if windowed and shuffle:
             # Shuffle permutes chunk order, so a windowed read can spill into chunks owned by
             # any other block: a chunk admitted early may be needed late. Until bounded
@@ -203,10 +210,15 @@ def working_set_bytes(
 
     # Non-uniform chunk size: a variable maps the reference anchor grid onto its own chunks,
     # so a block touches a variable-specific chunk count. A 2-block read-ahead window of
-    # 2*block_chunks*ref_spc anchor samples (plus the offset span) covers, per variable,
-    # ceil(window/spc)+1 of its chunks (the +1 for boundary misalignment).
+    # 2*block_chunks*ref_spc anchor samples covers, per variable, ceil(window/spc)+1 of its
+    # chunks (the +1 for boundary misalignment).
+    #
+    # The window is not widened by the offset span. A shift moves *which* chunks a variable
+    # reads, not how many: the same `window` consecutive samples land in the same count of
+    # its chunks wherever they start, and the +1 already pays for the misalignment. Adding
+    # the span charged every variable for the distance to the furthest *other* offset.
     def var_bytes(g: ArrayGeometry, o: ArrayGeometry, samples: int) -> int:
-        n_chunks = -(-(samples + span) // g.sample_chunk_size) + 1
+        n_chunks = -(-samples // g.sample_chunk_size) + 1
         return n_chunks * bytes_per_chunk(g, o)
 
     window_samples = 2 * block_chunks * ref_spc
