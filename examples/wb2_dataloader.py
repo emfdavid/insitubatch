@@ -103,9 +103,7 @@ def _subregion_crop(var: str, subregion: tuple[int, int], seed: int) -> Callable
         # instead of walking every axis element by element; the ellipsis
         # puts the broadcast batch dims first and keeps the middle dims in
         # place, so no reshape is needed.
-        windows = np.lib.stride_tricks.sliding_window_view(
-            a, (h, w), axis=(-2, -1)
-        )
+        windows = np.lib.stride_tricks.sliding_window_view(a, (h, w), axis=(-2, -1))
         batch.arrays[var] = windows[np.arange(b_size), ..., i, j, :, :]
         return batch
 
