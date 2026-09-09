@@ -25,6 +25,19 @@
   array; its `.rows` is the array they used to return, and `sequential_order` takes
   `block_chunks` so both orders carry one block definition.
 
+- **The fetch-ahead permit stall judged itself by another iteration's blocked consumer, so
+  `zip(ds.train, ds.val)` started raising on runs that were fine.** Bounding that wait (a
+  fix earlier in this release) proved a stall terminal from two facts: nothing in flight,
+  and a consumer blocked where it cannot unpin. It read the second from the pool's waiters
+  across *every* owner -- which is right for an admission stall, because the byte budget is
+  shared and another pass's blocked consumer is holding some of it, and wrong for a permit,
+  which belongs to one scheduler and comes back only from that pass's own `unpin_block`.
+  Interleaving two passes makes that overlap the ordinary case rather than a rare one, so
+  the pass that was running fine reported `read-ahead permits exhausted` because the other
+  one happened to be mid-wait. Measured over a 48-cell residency matrix on GCS, 8 cells
+  went from `ok` to raising, every one of them a `zip` cell; no single-iteration cell was
+  affected. The permit stall now asks only about its own waiters.
+
 - **A fetch-ahead permit deficit hung the pass with nothing to read.** Bounded read-ahead
   takes one permit per chunk and gets it back from the consumer's `unpin_block`, so a
   consumer that cannot reach its next unpin never returns one. That wait was unbounded:

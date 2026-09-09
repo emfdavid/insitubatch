@@ -576,14 +576,20 @@ class Scheduler:
     def _ahead_starvation(self, array: str, chunk_index: int) -> RuntimeError | None:
         """The error for a permit stall that cannot break, else ``None``.
 
-        Terminal on the same two facts as :meth:`_starvation`: nothing is on its way to a
-        slot, and a consumer is blocked where it cannot reach the unpin that would hand a
-        permit back. The cause differs, so the message does -- the budget is not the
-        problem, the distance this pass may run ahead of itself is.
+        Terminal on two facts: nothing is on its way to a slot, and *this pass's own*
+        consumer is blocked where it cannot reach the unpin that would hand a permit back.
+        The cause differs from an admission stall, so the message does -- the budget is not
+        the problem, the distance this pass may run ahead of itself is.
+
+        Own, emphatically. :meth:`_starvation` judges the shared byte budget and so reads
+        every owner's waiters; a permit is this Scheduler's alone, so another pass being
+        parked in ``wait_ready`` says nothing about whether ours can proceed.
+        ``zip(ds.train, ds.val)`` interleaves two passes by construction, which makes that
+        overlap the common case rather than a rare one.
         """
         if self._delivery_pending():
             return None
-        waiting = self.pool.blocked_waiters()
+        waiting = self.pool.blocked_waiters(self._owner)
         if not waiting:
             return None
         return RuntimeError(

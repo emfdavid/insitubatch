@@ -181,3 +181,54 @@ def test_a_stall_with_nothing_outstanding_is_still_terminal(write_zarr) -> None:
 
     err = sched._starvation("t2m", 5)
     assert err is not None and "residency budget exhausted" in str(err)
+
+
+# -- premise 3: the blocked consumer that matters is *this* pass's -----------
+#
+# `_starvation` reads the pool's waiters pool-wide on purpose: an admission stall is about
+# the shared byte budget, and another iteration's blocked consumer is holding some of it.
+# A fetch-ahead permit is the opposite -- `_ahead` belongs to one Scheduler and is handed
+# back only by that pass's own `unpin_block` -- so another pass being blocked says nothing
+# about whether ours can proceed.
+
+
+def test_another_passs_blocked_consumer_is_not_our_permit_stall(write_zarr) -> None:
+    """Two iterations over one pool are the normal case, not the pathological one.
+
+    `zip(ds.train, ds.val)` interleaves two passes by construction, so at any instant one
+    of them is very likely parked in `wait_ready` while the other's driver wants a permit.
+    Reading the waiters pool-wide made that ordinary overlap terminal: the pass that was
+    running fine raised "read-ahead permits exhausted" because the *other* one was mid-wait.
+    """
+    pools: list[ChunkPool] = []
+    sched = _scheduler(write_zarr, pools)
+    other = pools[0].new_owner()
+    assert other != sched.owner
+    _register_waiter(pools[0], ("t2m", 5), owner=other)
+
+    assert sched._ahead_starvation("t2m", 5) is None
+
+
+def test_our_own_blocked_consumer_is_a_permit_stall(write_zarr) -> None:
+    """The control: a pass whose own consumer cannot unpin will never see a permit again.
+
+    Without this, "never report a permit stall" would satisfy the test above and restore
+    the unbounded wait -- three idle threads and no message -- that the bound replaced.
+    """
+    pools: list[ChunkPool] = []
+    sched = _scheduler(write_zarr, pools)
+    _register_waiter(pools[0], ("t2m", 5), owner=sched.owner)
+
+    err = sched._ahead_starvation("t2m", 5)
+    assert err is not None and "read-ahead permits exhausted" in str(err)
+
+
+def test_a_permit_stall_with_a_delivery_coming_is_not_terminal(write_zarr) -> None:
+    """The other control, unchanged from the admission detector: a delivery in flight
+    will land, be gathered and unpinned, and hand a permit back."""
+    pools: list[ChunkPool] = []
+    sched = _scheduler(write_zarr, pools)
+    _register_waiter(pools[0], ("t2m", 5), owner=sched.owner)
+    sched._tiles.add(_UnfinishedTask())  # type: ignore[arg-type]
+
+    assert sched._ahead_starvation("t2m", 5) is None

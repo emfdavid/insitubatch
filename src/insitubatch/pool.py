@@ -955,9 +955,9 @@ class ChunkPool:
             return True  # the wait raises rather than returns, but it does not block
         return slot.state is SlotState.READY and self._pinned.get(key, {}).get(owner, 0) > 0
 
-    def blocked_waiters(self) -> list[tuple[str, int]]:
+    def blocked_waiters(self, owner: int | None = None) -> list[tuple[str, int]]:
         """``(path, chunk_index)`` keys a thread is blocked on in :meth:`wait_ready` **and
-        cannot yet proceed**.
+        cannot yet proceed**, across every owner or within ``owner`` alone.
 
         A waiter whose condition already holds is excluded, even though its thread is
         still parked: it is registered until the OS reschedules it, and reporting it as
@@ -965,9 +965,21 @@ class ChunkPool:
         "no tile in flight" to prove a stall terminal (:meth:`Scheduler._starvation`), and
         that proof is only as sound as this list -- a waiter that is about to wake up,
         gather and unpin is precisely the thing that *will* free budget. Read-only snapshot.
+
+        ``owner`` narrows it to one pass, and which of the two a caller wants follows from
+        what it is waiting on. The byte budget is shared, so an admission stall is rightly
+        judged against every owner: another iteration's blocked consumer is holding budget
+        we need. A fetch-ahead permit is not shared -- it belongs to one
+        :class:`~insitubatch.scheduler.Scheduler` and comes back only from that pass's own
+        ``unpin_block`` -- so a permit stall must ask only about its own waiters
+        (:meth:`Scheduler._ahead_starvation`).
         """
         with self._cv:
-            return [key for key, owner in self._waiting if not self._wait_satisfied(key, owner)]
+            return [
+                key
+                for key, who in self._waiting
+                if (owner is None or who == owner) and not self._wait_satisfied(key, who)
+            ]
 
     # -- admission / pinning / eviction -------------------------------------
 
