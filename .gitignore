@@ -28,3 +28,7 @@ site/
 
 # local backlog scratch (not tracked)
 ISSUES.md
+
+# Working notes for a design in progress: superseded the moment the code lands, and the
+# rules in CLAUDE.md send the parts worth keeping to DESIGN.md or CHANGELOG.md instead.
+design-notes/
