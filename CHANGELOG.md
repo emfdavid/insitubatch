@@ -20,6 +20,18 @@
   waiter that genuinely cannot is reported. A real deadlock still raises: the detector polls,
   and an unsatisfiable waiter stays unsatisfiable.
 
+- **The same false verdict had a second cause: a queued delivery counted as no delivery.**
+  `_starvation`'s other premise -- "nothing is in flight, so no slot can become ready" --
+  was read off `_inflight_now`, which counts only tiles that have *acquired* the
+  `max_inflight` semaphore. A tile task that is created and waiting its turn delivers just
+  as surely, and at `max_inflight=1` almost every tile is queued rather than running: on a
+  public GCS store a single iteration with an automatically sized budget was killed with
+  28 tile tasks outstanding and its one waiter on a chunk in state FILLING that one of
+  those 28 was about to fill. The premise is now read off the tile tasks themselves, so a
+  stall with deliveries outstanding is what it always was -- a slow run, not a wedged one.
+  Found by sweeping loader configurations against a real store; it does not reproduce on a
+  local fixture, where the fetch is too fast to leave anything queued.
+
 - **Breaking out of a loader loop early permanently burned part of the chunk pool, and a
   later epoch then died with "residency budget exhausted ... this would hang".** A pass
   released its references *inside* the scheduler's `with` block -- before the scheduler was
