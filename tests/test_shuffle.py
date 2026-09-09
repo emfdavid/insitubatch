@@ -24,7 +24,7 @@ def test_permutation_is_deterministic_per_epoch() -> None:
 def test_order_covers_every_sample_exactly_once() -> None:
     ids = np.arange(20)
     spc, n = 8, 20 * 8
-    order = block_shuffled_order(ids, spc, n, block_chunks=4, seed=0, epoch=0)
+    order = block_shuffled_order(ids, spc, n, block_chunks=4, seed=0, epoch=0).rows
     assert order.shape == (n, 2)
     ranks = order[:, 0] * spc + order[:, 1]
     assert np.array_equal(np.sort(ranks), np.arange(n))
@@ -34,7 +34,7 @@ def test_order_handles_partial_final_chunk() -> None:
     # 5 chunks, spc=8, but only 37 samples -> last chunk holds 5, not 8.
     ids = np.arange(5)
     spc, n = 8, 37
-    order = block_shuffled_order(ids, spc, n, block_chunks=2, seed=0, epoch=0)
+    order = block_shuffled_order(ids, spc, n, block_chunks=2, seed=0, epoch=0).rows
     assert order.shape == (n, 2)
     ranks = order[:, 0] * spc + order[:, 1]
     assert np.array_equal(np.sort(ranks), np.arange(n))  # no out-of-range indices
@@ -45,7 +45,7 @@ def test_order_handles_partial_final_chunk() -> None:
 def test_sequential_order_is_in_order_and_complete() -> None:
     ids = np.arange(5)
     spc, n = 8, 37
-    order = sequential_order(ids, spc, n)
+    order = sequential_order(ids, spc, n, block_chunks=2).rows
     ranks = order[:, 0] * spc + order[:, 1]
     assert ranks.tolist() == list(range(n))  # strictly in order, no shuffle
 
@@ -54,9 +54,9 @@ def test_bigger_blocks_improve_shuffle_quality() -> None:
     ids = np.arange(64)
     spc, n = 16, 64 * 16
     q_small = shuffle_quality(
-        block_shuffled_order(ids, spc, n, block_chunks=1, seed=0, epoch=0), spc
+        block_shuffled_order(ids, spc, n, block_chunks=1, seed=0, epoch=0).rows, spc
     )
     q_large = shuffle_quality(
-        block_shuffled_order(ids, spc, n, block_chunks=32, seed=0, epoch=0), spc
+        block_shuffled_order(ids, spc, n, block_chunks=32, seed=0, epoch=0).rows, spc
     )
     assert q_large > q_small  # wider block -> closer to global mixing

@@ -62,9 +62,11 @@ def test_an_empty_split_is_repeatable(dataset) -> None:
 def test_the_order_builders_accept_no_chunks(order_fn) -> None:
     """Both draw orders, since `shuffle` picks between them and either can meet an empty split."""
     empty = np.array([], dtype=np.int64)
-    kwargs = {"block_chunks": 4, "seed": 0, "epoch": 0} if order_fn is block_shuffled_order else {}
+    kwargs = {"seed": 0, "epoch": 0} if order_fn is block_shuffled_order else {}
 
-    order = order_fn(empty, 4, 64, **kwargs)
+    order = order_fn(empty, 4, 64, block_chunks=4, **kwargs)
 
     assert len(order) == 0
-    assert order.ndim == 2 and order.shape[1] == 2, "shape must stay (N, 2) so callers can index"
+    assert order.n_blocks == 0, "no chunks is no blocks, not one empty one"
+    rows = order.rows
+    assert rows.ndim == 2 and rows.shape[1] == 2, "shape must stay (N, 2) so callers can index"

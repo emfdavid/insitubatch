@@ -16,34 +16,65 @@ from insitubatch import (
     open_geometries,
     split_by_chunk,
 )
-from insitubatch.shuffle import block_shuffled_order
-from insitubatch.source import InSituDataset, _partition_blocks
+from insitubatch.shuffle import block_shuffled_order, sequential_order
+from insitubatch.source import InSituDataset
 
 
-def test_partition_blocks_covers_disjoint_contiguous_blocks() -> None:
-    # 10 chunks x 4 samples, block_chunks=3 -> blocks of 3,3,3,1 chunks.
+def test_the_builder_lays_down_blocks_of_block_chunks_each() -> None:
+    """The order carries its own block bounds: contiguous, gapless, and correctly sized.
+
+    10 chunks x 4 samples at ``block_chunks=3`` -> blocks of 3, 3, 3, 1 chunks. The bounds
+    come from the builder that grouped the permutation, so nothing downstream has to infer
+    them from the rows -- which, once a windowed view drops anchors, is not possible (#68).
+    """
     chunk_ids = np.arange(10, dtype=np.int64)
     order = block_shuffled_order(chunk_ids, 4, 40, block_chunks=3, seed=0, epoch=0)
-    blocks = _partition_blocks(order, block_chunks=3)
 
-    assert [len(b[2]) for b in blocks] == [3, 3, 3, 1]  # chunk counts per block
-    # Row ranges tile the whole order contiguously, and chunk sets are disjoint.
-    assert blocks[0][0] == 0 and blocks[-1][1] == len(order)
+    assert order.n_blocks == 4
+    assert [order.block(i)[1] - order.block(i)[0] for i in range(4)] == [12, 12, 12, 4]
+    assert order.block(0)[0] == 0
+    assert order.block(3)[1] == len(order)
+
     seen: set[int] = set()
     prev_stop = 0
-    for rstart, rstop, chunks in blocks:
-        assert rstart == prev_stop
-        prev_stop = rstop
-        ids = {int(c) for c in chunks}
+    for i in range(order.n_blocks):
+        start, stop = order.block(i)
+        assert start == prev_stop
+        prev_stop = stop
+        ids = {int(c) for c in order.rows[start:stop, 0]}
         assert seen.isdisjoint(ids)
-        # every row in this block draws only from this block's chunks
-        assert set(int(c) for c in order[rstart:rstop, 0]) == ids
         seen |= ids
     assert seen == set(range(10))
 
 
-def test_partition_blocks_empty() -> None:
-    assert _partition_blocks(np.empty((0, 2), dtype=np.int64), block_chunks=4) == []
+def test_dropping_rows_narrows_a_block_rather_than_re_cutting_them() -> None:
+    """A block that loses rows keeps its identity; one that loses all of them goes away.
+
+    This is what a reconstruction cannot do. Re-deriving the grouping from the survivors
+    repacks them into fresh runs of ``block_chunks``, so a block that lost a chunk silently
+    borrows one from its neighbour -- self-consistent, and not the blocks the shuffle laid
+    down (#68).
+    """
+    order = block_shuffled_order(
+        np.arange(10, dtype=np.int64), 4, 40, block_chunks=3, seed=0, epoch=0
+    )
+    keep = np.ones(len(order), dtype=bool)
+    keep[: order.block(0)[1]] = False  # the whole of block 0
+    keep[order.block(1)[0] + 1] = False  # one row of block 1
+
+    narrowed = order.keep(keep)
+
+    assert narrowed.n_blocks == 3, "the emptied block is dropped, the others survive"
+    assert len(narrowed) == len(order) - 12 - 1
+    assert narrowed.block(0)[1] - narrowed.block(0)[0] == 11  # block 1, one row lighter
+    assert narrowed.block(0)[0] == 0 and narrowed.block(2)[1] == len(narrowed)
+
+
+def test_an_empty_order_has_no_blocks() -> None:
+    empty = sequential_order(np.empty(0, dtype=np.int64), 4, 40, block_chunks=4)
+    assert empty.n_blocks == 0
+    assert len(empty) == 0
+    assert empty.rows.shape == (0, 2)
 
 
 def test_unequal_sample_length_raises(tmp_path) -> None:
