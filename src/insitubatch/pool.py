@@ -464,15 +464,14 @@ class _TileWrite:
 
 @dataclass(slots=True)
 class PassCounters:
-    """One iteration's own view of the pool, so a report is about the pass that made it.
+    """One iteration's own view of the pool: what *this* pass hit, missed, held and evicted.
 
-    The pool's totals answer a different question -- what the *pool* did, across every
-    iteration sharing it -- and both are worth having. What is not worth having is one
-    labelled as the other: with two iterations live, pool totals attributed to a split are
-    the union of both passes' work under one pass's name (#81).
+    Minted with an owner and dropped with it, so the figures a pass reports are the figures it
+    made. The pool's totals answer the neighbouring question -- what the pool did, across every
+    iteration sharing it -- and both are worth having under their own names.
 
-    ``max_resident`` here is how many chunks this owner held at once, not how many the pool
-    did. Those differ precisely when it matters.
+    ``max_resident`` is how many chunks this owner held at once, not how many the pool did.
+    Several iterations share a pool, so those differ exactly when there is more than one.
     """
 
     hits: int = 0
@@ -1363,12 +1362,10 @@ class ChunkPool:
     def reset_epoch_counters(self) -> None:
         """Zero the batch-buffer counters at a pass boundary.
 
-        The chunk counters are deliberately *not* reset: they are the pool's running
-        totals, and a pool is shared by every iteration open on it. Zeroing them at one
-        pass's start threw away what another pass had accumulated, which is how a pass came
-        to report a number belonging to neither (#81). A pass's own figures come from its
-        :class:`PassCounters`, minted with its owner and dropped with it; these are the
-        pool's, and they only mean anything cumulatively.
+        The chunk counters are deliberately *not* reset here: they are the pool's running
+        totals, and a pool is shared by every iteration open on it, so they mean something
+        only cumulatively. A pass's own figures come from its :class:`PassCounters`, minted
+        with its owner and dropped with it.
 
         ``manifest_entries`` is load-time state and deliberately survives.
         """
