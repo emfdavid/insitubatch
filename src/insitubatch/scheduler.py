@@ -62,6 +62,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -323,6 +324,9 @@ class Scheduler:
         self._inflight: asyncio.Semaphore | None = None
         self._capacity: asyncio.Event | None = None  # set on unpin -> wakes a parked admit
         self._ahead: asyncio.Semaphore | None = None  # fetch-ahead permits (read_ahead_chunks)
+        # Outstanding tile tasks per chunk, this scheduler's only. A second block reading a
+        # chunk we are still fetching does not fetch it again.
+        self._fetching: dict[tuple[str, int], int] = {}
         self._open_lock: asyncio.Lock | None = None
         self._ready = threading.Event()
         # OUR tasks, and only ours. `asyncio.all_tasks(loop)` is the *whole loop's* task
@@ -510,18 +514,25 @@ class Scheduler:
                     current_hit = self.pool.pin_if_ready(read.array, read.chunk_index, self._owner)
                     if not current_hit:
                         await self._admit(read.array, read.chunk_index)  # may await an unpin
-                        # A chunk two blocks read is admitted once per block, and the second
-                        # admission can land while the first block's tiles are still in
-                        # flight. Their writers will publish the slot; fetching it again
-                        # would duplicate the fetch and the decode.
-                        current_hit = self.pool.delivery_underway(read.array, read.chunk_index)
+                        # A chunk two blocks read is admitted once per block, and the
+                        # second admission can land while *our own* earlier tiles for it
+                        # are still in flight; fetching them again duplicates the work.
+                        #
+                        # Our own, strictly. The pool counts writers without recording
+                        # whose they are, so skipping on any writer lets one pass rely on
+                        # another's fetch -- and a pass abandoned mid-fetch unwinds without
+                        # delivering, leaving the other waiting on a delivery nobody will
+                        # make. A pass may only stand on its own outstanding work.
+                        current_hit = key in self._fetching
                 if current_hit:
                     continue  # already resident, or on its way -- nothing for us to fetch
                 task = asyncio.create_task(self._one(read))
                 self._tasks.add(task)
                 self._tiles.add(task)
+                self._fetching[key] = self._fetching.get(key, 0) + 1
                 task.add_done_callback(self._tasks.discard)
                 task.add_done_callback(self._tiles.discard)
+                task.add_done_callback(partial(self._fetch_done, key))
                 tasks.append(task)
             await asyncio.gather(*tasks)
         except BaseException:
@@ -566,6 +577,14 @@ class Scheduler:
                 # In the `finally` so a terminal starvation still reports the time it
                 # parked before proving itself fatal -- that number is the evidence.
                 self.stats.admission_parked_s += time.perf_counter() - t0
+
+    def _fetch_done(self, key: tuple[str, int], _task: object) -> None:
+        """One tile task for ``key`` has ended; forget it once none of ours remain."""
+        remaining = self._fetching.get(key, 0) - 1
+        if remaining > 0:
+            self._fetching[key] = remaining
+        else:
+            self._fetching.pop(key, None)
 
     async def _take_ahead(self, array: str, chunk_index: int) -> None:
         """Take a fetch-ahead permit, proving a stall terminal rather than waiting forever.

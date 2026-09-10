@@ -189,58 +189,46 @@ def test_a_re_read_is_served_from_the_cache_rather_than_refetched(windowed, tmp_
     assert hit_rate > 0.3, f"re-reads must come from the cache, not the store: {hit_rate:.0%}"
 
 
-# -- the predicate that stops a second block refetching tiles already on their way ------
+# -- a pass may only stand on its own outstanding fetches --------------------
 
 
-def _pool_with_one_chunk():
-    from insitubatch.pool import ChunkPool
+def test_a_pass_does_not_skip_a_fetch_on_another_passs_writer(write_zarr) -> None:
+    """Two iterations share a pool, and one may be abandoned at any moment.
+
+    Skipping a fetch because *some* writer holds the slot reads a shared counter as if it
+    were a promise. It is not: a pass abandoned mid-fetch unwinds without delivering, and
+    the slot is left FILLING with nothing coming -- while the other pass, having skipped,
+    waits on it forever. `ChunkPool` records how many writers a slot has and not whose they
+    are, so the only sound basis for skipping is a scheduler's own outstanding work.
+
+    Driven through the pool directly: the window is a cancellation between one pass's write
+    starting and its delivery, and racing a real scheduler into it is exactly the flakiness
+    these tests avoid.
+    """
+    from insitubatch.pool import ChunkPool, SlotState
     from insitubatch.types import ArrayGeometry
 
     geom = ArrayGeometry(path="t2m", shape=(32, 4, 4), chunks=(4, 4, 4), dtype=np.dtype("f4"))
-    return ChunkPool({"t2m": geom}), geom
+    pool = ChunkPool({"t2m": geom})
+    abandoned, live = pool.new_owner(), pool.new_owner()
 
+    assert pool.try_admit("t2m", 3, abandoned)
+    writing = pool.tile_write("t2m", 3, ())
+    writing.__enter__()  # the abandoned pass's tile task is in flight
+    assert pool.try_admit("t2m", 3, live)  # the live pass references the same chunk
+    writing.__exit__(None, None, None)  # cancelled: unwinds without delivering
+    pool.release_owner(abandoned)  # its teardown, after `Scheduler.close` drained it
 
-def test_delivery_underway_is_false_for_a_slot_nobody_has_admitted() -> None:
-    pool, _ = _pool_with_one_chunk()
-    assert pool.delivery_underway("t2m", 3) is False
+    slot = pool._slots.get(("t2m", 3))
+    assert slot is not None and slot.state is SlotState.FILLING, (
+        "the live pass still references it, so it is not reclaimed"
+    )
+    assert slot.writers == 0 and slot.pending > 0, "nothing is coming for this slot"
+    assert not pool.is_ready("t2m", 3)
 
-
-def test_delivery_underway_is_true_while_a_writer_holds_the_slot() -> None:
-    """The case the policy needs: block i's tiles are in flight when block i+1 admits."""
-    pool, geom = _pool_with_one_chunk()
-    owner = pool.new_owner()
-    assert pool.try_admit("t2m", 3, owner)
-    with pool.tile_write("t2m", 3, ()):
-        assert pool.delivery_underway("t2m", 3) is True
-
-
-def test_delivery_underway_is_true_once_the_slot_is_ready() -> None:
-    pool, geom = _pool_with_one_chunk()
-    owner = pool.new_owner()
-    assert pool.try_admit("t2m", 3, owner)
-    pool.deliver_tile("t2m", 3, (), np.zeros(geom.tile_shape(), dtype="f4"))
-    assert pool.delivery_underway("t2m", 3) is True
-
-
-def test_an_abandoned_partial_is_not_underway(caplog) -> None:
-    """The control, and the one that would hang if it were wrong.
-
-    A slot left FILLING by a cancelled pass has no writer and will never complete on its
-    own. Reporting it as underway would make the next pass skip the fetch and then wait
-    for a delivery nobody is going to make.
-    """
-    pool, _ = _pool_with_one_chunk()
-    owner = pool.new_owner()
-    assert pool.try_admit("t2m", 3, owner)  # allocated, never written
-
-    assert pool.delivery_underway("t2m", 3) is False
-
-
-def test_a_failed_slot_is_not_underway() -> None:
-    """A poisoned slot is dropped so a later pass can refetch; it is not a delivery."""
-    pool, _ = _pool_with_one_chunk()
-    owner = pool.new_owner()
-    assert pool.try_admit("t2m", 3, owner)
-    pool.fail("t2m", 3, RuntimeError("bad chunk"))
-
-    assert pool.delivery_underway("t2m", 3) is False
+    # The live pass must therefore be the one to fill it. Nothing on the pool may tell it
+    # that a delivery is on the way, because none is.
+    assert not hasattr(pool, "delivery_underway"), (
+        "a pool-wide 'a writer holds this' query cannot answer 'will it be delivered' -- "
+        "the writer may belong to a pass that is being torn down"
+    )

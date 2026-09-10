@@ -20,11 +20,17 @@
 
   A chunk two blocks read is admitted once per block, and the driver may run three blocks
   ahead of its consumer, so the second admission can land while the first block's tiles are
-  still in flight. The driver now skips a fetch whose delivery is already underway, which
-  took duplicate concurrent tile fetches from 2.3% to 0.8% on a 16-tile-per-chunk geometry.
-  The duplicates were never a correctness problem -- a slot publishes only when quiescent,
-  so a duplicate's own writer holds it open until it lands -- but a duplicate fetch is a
-  refetch, which is the cost this policy exists to avoid.
+  still in flight -- which had it fetching them a second time, 2.3% of all fetches on a
+  16-tile-per-chunk geometry. Never a correctness problem (a slot publishes only when
+  quiescent, so the duplicate's own writer holds it open until it lands), but a duplicate
+  fetch is a refetch, and avoiding refetches is the whole point of the policy. The driver
+  now skips a chunk it already has tile tasks outstanding for, which removes all of them.
+
+  Its own tasks, strictly. `ChunkPool` records how many writers a slot has and not whose
+  they are, so skipping on any writer lets one pass rely on another's fetch -- and a pass
+  abandoned mid-fetch unwinds without delivering, leaving the slot FILLING with nothing
+  coming and the other pass waiting on it forever. Two concurrent iterations sharing a pool
+  is the ordinary case, and either may be abandoned by an early `break`.
 
   The per-epoch line now reports re-reads and evictions whenever they are non-zero. A hit rate
   alone cannot show this -- a re-read served from the cache counts as a hit -- so rising
