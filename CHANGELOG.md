@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **A loop with no training step could be told its training step was the bottleneck.**
+  `bottleneck()` read the batch queue before asking whether the caller's loop body did any
+  work, so a `for batch in ds.train: pass` whose queue happened to look fed was answered with
+  "the loader kept up and your training step is the constraint" -- advice to tune a knob that
+  is not there. The `consumer_idle` branch below it was guarded by the premise that such a
+  loop *cannot* keep the queue fed; on a free-threaded build it can, because a GIL-releasing
+  `chunk_transform` runs alongside the consumer. It presented as a test that passed and
+  failed on identical code, with a 19-microsecond loop body reported as the constraint. The
+  idle case is known before the queue is consulted, so it is answered first, and the verdict
+  no longer depends on how the producer threads interleave.
+
 - **A windowed, shuffled pass held close to the whole train split resident (#66).** A windowed
   view reads `anchor + offset` and shuffle permutes chunk order, so a chunk one block reads can
   be needed again most of an epoch later; held from first use to last, residency was the split

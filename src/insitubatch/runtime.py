@@ -179,10 +179,13 @@ class PassStats:
 def bottleneck(stats: PassStats) -> tuple[Stage, str]:
     """Which stage limited this pass, and what to do about it.
 
-    The rule reads the batch queue first, because a full queue settles the question: every
-    producer stage kept up and the consumer is the constraint, which is the state you want.
-    Only once the queue is *repeatedly* empty is there a producer stage to accuse, and then
-    the accusation comes from which one spent the time -- not from which one feels slow.
+    A caller whose loop body does essentially nothing is answered first: with no training
+    step there is no "the consumer is the constraint" to reach, whatever the queue looks
+    like. Otherwise the rule reads the batch queue, because a full queue settles the
+    question: every producer stage kept up and the consumer is the constraint, which is the
+    state you want. Only once the queue is *repeatedly* empty is there a producer stage to
+    accuse, and then the accusation comes from which one spent the time -- not from which
+    one feels slow.
 
     Returns ``("unknown", ...)`` rather than guessing when the evidence does not separate
     the candidates: no samples, or no stage clearly dominant. A confident wrong answer here
@@ -192,16 +195,13 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
     if not d.batch_queue_samples:
         return "unknown", "no consumer samples: the pass ended before any batch was taken."
     saturated = d.inflight_peak >= d.max_inflight > 0
-    if d.fed_frac >= FULL_ENOUGH:
-        return (
-            "consumer",
-            "the batch queue stayed fed, so the loader kept up and your training step is "
-            "the constraint. This is the desired steady state -- nothing to tune here.",
-        )
     if stats.consumer_idle:
-        # Not a hedge: with no training step the queue *cannot* stay fed, so its depth
-        # carries no signal and the starvation thresholds below would fire on every such
-        # loop. Name what limits raw throughput and say plainly what the number means.
+        # Asked before the queue, because "the loader kept up, so your training step is the
+        # constraint" is only an answer where a training step exists. A loop with no body
+        # takes batches as fast as they are produced; whether the queue still reads as fed
+        # is then a matter of how the producer threads interleave, and the starvation
+        # thresholds below would fire on every such loop besides. Name what limits raw
+        # throughput and say plainly what the number means.
         top, why = _dominant(t, saturated)
         share = t.consumer_s / stats.wall_s if stats.wall_s else 0.0
         return top, (
@@ -209,6 +209,12 @@ def bottleneck(stats: PassStats) -> tuple[Stage, str]:
             f"({share:.0%}), so the loader is nearly the whole program and the batch queue "
             "cannot stay fed however fast it gets -- read this as a throughput measurement, "
             f"not a starved pipeline. What limits that throughput is: {why}"
+        )
+    if d.fed_frac >= FULL_ENOUGH:
+        return (
+            "consumer",
+            "the batch queue stayed fed, so the loader kept up and your training step is "
+            "the constraint. This is the desired steady state -- nothing to tune here.",
         )
     if d.starved_frac < STARVED_ENOUGH:
         return (
