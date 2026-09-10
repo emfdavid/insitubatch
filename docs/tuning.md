@@ -470,12 +470,16 @@ Note `wait fetch` **rises** as the pass gets faster (14.06s at `max_inflight=1`,
 total is task-seconds against a 1.1s wall. Read the ratios between stages, never any stage
 against the clock.
 
+The rows are in precedence order: a loop body that does essentially nothing is answered
+first, because "the loader kept up, so your training step is the constraint" is only an
+answer where a training step exists.
+
 | what the report shows | limiting stage | what to do |
 |---|---|---|
+| `consumer_s` is a few % of wall | *the dominant producer stage, reported not diagnosed* | your loop has no real training step, so read this as a throughput measurement rather than a starved pipeline |
 | batch queue **fed** (`fed_frac` high) | `consumer` | nothing — the loader kept up and your training step is the constraint. This is the goal |
 | queue empty, `fetch_wait_s` dominant | `store` | raise `max_inflight`; check the store is in-region and on the fast backend |
 | as above, **and `inflight_peak == max_inflight`** | `store` | same, but re-measure: if throughput stops improving the network is the floor, not a knob left unturned |
-| queue empty but `consumer_s` is a few % of wall | *reported, not diagnosed* | your loop has no real training step, so the queue cannot stay fed; read throughput instead |
 | queue empty, `decode_s` / `assemble_s` dominant | `decode` | raise `decode_threads`; check the `chunk_transform` is vectorized numpy that releases the GIL |
 | queue empty, `admission_parked_s` dominant | `residency` | raise `cache_budget_bytes`, or lower `batch_size` / `block_chunks` / concurrent iterations |
 | queue empty, `gather_s` / `batch_transform_s` dominant | `gather` | check the gather run length in `describe()`, and any `batch_transform` |

@@ -67,6 +67,62 @@ def test_a_fed_queue_blames_the_consumer():
     assert "desired steady state" in why
 
 
+def test_a_fed_queue_does_not_blame_a_loop_body_that_does_nothing():
+    """`for batch in ds.train: pass` has no training step to be the constraint.
+
+    The fed-queue verdict reads a full queue as "the loader kept up, so your training step
+    is the constraint". That is the right reading only when there *is* a training step. A
+    loop with no body takes batches as fast as they are produced, and whether the queue
+    still looks fed is a matter of how the producer threads happen to interleave -- on a
+    free-threaded build a GIL-releasing transform runs alongside the consumer and the queue
+    can stay fed with a loop body of 19 microseconds.
+
+    Telling that caller to look at their training step sends them to tune a knob they do
+    not have, and the verdict flips run to run on identical code. An idle consumer is known
+    before the queue is consulted, so it is answered first.
+    """
+    stats = _stats(
+        wall_s=0.41,
+        depths={
+            "batch_queue_capacity": 2,
+            "batch_queue_samples": 10,
+            "batch_queue_full_enough": 9,  # fed, by the accident of interleaving
+            "batch_queue_empty": 1,
+        },
+        times={"assemble_s": 0.37, "decode_s": 0.011, "consumer_s": 0.000019},
+    )
+    assert stats.consumer_idle, "the fixture must be the no-training-step case"
+
+    stage, why = bottleneck(stats)
+
+    assert stage == "decode", why
+    assert "training step is the constraint" not in why
+
+
+def test_a_fed_queue_still_blames_a_consumer_that_is_doing_work():
+    """The control: a real training step keeps the fed-queue verdict.
+
+    Without this, answering the idle case first could quietly swallow the state the whole
+    rule exists to recognise -- the loader keeping up with a caller who is genuinely busy.
+    """
+    stats = _stats(
+        wall_s=1.0,
+        depths={
+            "batch_queue_capacity": 2,
+            "batch_queue_samples": 100,
+            "batch_queue_full_enough": 90,
+            "batch_queue_empty": 2,
+        },
+        times={"assemble_s": 0.05, "consumer_s": 0.8},
+    )
+    assert not stats.consumer_idle
+
+    stage, why = bottleneck(stats)
+
+    assert stage == "consumer"
+    assert "desired steady state" in why
+
+
 def test_rare_starvation_is_noise_not_a_bottleneck():
     stats = _stats(
         depths={"batch_queue_capacity": 2, "batch_queue_samples": 100, "batch_queue_empty": 5},
