@@ -336,6 +336,7 @@ class InSituDataset:
             chunk_transforms=self.chunk_transforms,
             backing_dir=cache_dir,
             budget_bytes=self.cache_budget_bytes,
+            iteration_bytes=working_set,
             persist=persist,
             readonly_cache=readonly_cache,
             reset_stale_cache=reset_stale_cache,
