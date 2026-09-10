@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **A pass's report described the pool, not the pass (#81).** Every counter behind `PassStats`
+  and the per-epoch line -- hits, misses, residency peak, re-reads, evictions -- lived on the
+  `ChunkPool`, which several iterations hold at once, and `reset_epoch_counters()` ran at each
+  pass's *start*. So with `zip(ds.train, ds.val)` the second pass zeroed the first's totals
+  mid-flight and then reported the union under its own split's name: a `val` pass whose true
+  residency peak is 4 reported 35, and a `train` split that misses 102 chunks alone reported 29.
+  Those are the numbers someone sizing a budget acts on.
+
+  Each iteration now carries its own `PassCounters`, minted with its owner and dropped with it,
+  and the report reads those. The pool keeps its totals -- a genuinely different question, and
+  the only one an eviction or a peak co-residency belongs to -- but they are cumulative now
+  rather than reset by whichever pass started last.
+
 - **A released spill could unpin a chunk out from under the block that still needed it (#79).**
   The driver decides admission once per *run* of tiles naming one chunk, since reads are
   chunk-major. Under release-and-re-read the plan emits a chunk once per block that reads it --

@@ -77,7 +77,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Collection, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import cast
@@ -462,6 +462,36 @@ class _TileWrite:
         self.pool._advance(self.array, self.chunk_index)
 
 
+@dataclass(slots=True)
+class PassCounters:
+    """One iteration's own view of the pool, so a report is about the pass that made it.
+
+    The pool's totals answer a different question -- what the *pool* did, across every
+    iteration sharing it -- and both are worth having. What is not worth having is one
+    labelled as the other: with two iterations live, pool totals attributed to a split are
+    the union of both passes' work under one pass's name (#81).
+
+    ``max_resident`` here is how many chunks this owner held at once, not how many the pool
+    did. Those differ precisely when it matters.
+    """
+
+    hits: int = 0
+    misses: int = 0
+    rereads: int = 0
+    evictions: int = 0
+    revive_mismatch: int = 0
+    revive_missing: int = 0
+    resident: int = 0  # live count of chunks this owner references
+    resident_bytes: int = 0
+    max_resident: int = 0
+    max_resident_bytes: int = 0
+    seen: set[tuple[str, int]] = field(default_factory=set)
+
+    def _note_resident(self) -> None:
+        self.max_resident = max(self.max_resident, self.resident)
+        self.max_resident_bytes = max(self.max_resident_bytes, self.resident_bytes)
+
+
 class ChunkPool:
     """Byte-budgeted pool of outer-chunk slots, keyed ``(array, chunk_index)``.
 
@@ -602,7 +632,6 @@ class ChunkPool:
         self.revive_missing = 0  # persisted entry whose .npy was unreadable/gone
         self.evictions = 0  # ready slots dropped to make room -- the cost side of a small budget
         self.rereads = 0  # chunks admitted again in the same pass after being released
-        self._seen_this_pass: set[tuple[str, int]] = set()  # for rereads; cleared per pass
         self.manifest_entries = 0
         # Cross-run persistence: keep slot files past close, write a manifest of completed
         # entries, and revive them on reopen. Requires a dir to keep the files in. The dir
@@ -687,6 +716,9 @@ class ChunkPool:
         # that starves before it can pin anything is exactly the case the starvation
         # diagnostic has to name, and counting pin-holders would miss it.
         self._owners: set[int] = set()
+        # Per-iteration counters, minted with the owner and dropped with it. A pass reads
+        # its own before teardown; nothing else may.
+        self._per_owner: dict[int, PassCounters] = {}
         self._cv = threading.Condition(threading.Lock())
         self._error: BaseException | None = None  # global poison (driver death)
         self.max_resident = 0  # peak distinct outer chunk positions held at once
@@ -882,7 +914,15 @@ class ChunkPool:
             self._refuse_if_budget_cannot_hold(len(self._owners) + 1)
             self._owner_seq += 1
             self._owners.add(self._owner_seq)
+            self._per_owner[self._owner_seq] = PassCounters()
             return self._owner_seq
+
+    def counters(self, owner: int) -> PassCounters:
+        """This owner's counters. Read before its :meth:`release_owner`, which drops them."""
+        return self._per_owner.get(owner, PassCounters())
+
+    def _count(self, owner: int) -> PassCounters:  # call under the lock
+        return self._per_owner.setdefault(owner, PassCounters())
 
     def _refuse_if_budget_cannot_hold(self, iterations: int) -> None:  # call under the lock
         """Raise when the budget cannot hold ``iterations`` working sets at once.
@@ -1023,7 +1063,7 @@ class ChunkPool:
 
     # -- admission / pinning / eviction -------------------------------------
 
-    def _note_touch(self, key: tuple[str, int]) -> None:  # call under the lock
+    def _note_touch(self, key: tuple[str, int], owner: int) -> None:  # call under the lock
         """Count a chunk this pass has already taken once as a re-read.
 
         Called from every path that *takes* a chunk for this pass -- "already resident",
@@ -1035,10 +1075,12 @@ class ChunkPool:
         spill it is the number a reader needs to judge the trade: a re-read of a persisted
         slot is a local read of decoded bytes; one that is not is a refetch.
         """
-        if key in self._seen_this_pass:
+        counters = self._count(owner)
+        if key in counters.seen:
             self.rereads += 1
+            counters.rereads += 1
         else:
-            self._seen_this_pass.add(key)
+            counters.seen.add(key)
 
     def try_admit(self, array: str, chunk_index: int, owner: int) -> bool:
         """Reserve + allocate + reference one outer-chunk slot, evicting ready-LRU for room.
@@ -1076,7 +1118,7 @@ class ChunkPool:
                 # Already resident (in-flight, or a ready cross-epoch hit) -> incref and
                 # reuse. A FAILED slot is NOT reusable: it quiesces and is dropped, so a
                 # later epoch refetches instead of re-raising a stale error forever.
-                self._note_touch(key)
+                self._note_touch(key, owner)
                 self._pin(key, owner)  # the pin IS this owner's claim (see wait_ready)
                 self._cv.notify_all()  # a ready hit may now satisfy a waiter
                 return True
@@ -1084,16 +1126,18 @@ class ChunkPool:
                 # A read-only opener never allocates: the cache is its whole supply. A miss
                 # is the `readonly_cache` contract turning out to be false, so say so --
                 # raising is what makes it a contract rather than a silent slow path.
-                if not self._revive(key):
+                if not self._revive(key, owner):
                     raise self._readonly_miss(array, chunk_index)
                 self.hits += 1  # revived from disk -> no fetch (as in pin_if_ready)
-                self._note_touch(key)
+                self._count(owner).hits += 1
+                self._note_touch(key, owner)
                 self._pin(key, owner)
                 self._cv.notify_all()
                 return True
-            if not self._make_room(nbytes):
+            if not self._make_room(nbytes, owner):
                 return False
             self.misses += 1  # a fresh slot allocated to fetch -> a cache miss
+            self._count(owner).misses += 1
             scratch = (
                 np.empty(src.slot_shape(chunk_index), dtype=src.dtype)
                 if self._reshapes[array]
@@ -1118,7 +1162,13 @@ class ChunkPool:
                 scratch=scratch,
             )
             self._bytes += nbytes
-            self._note_touch(key)
+            # A consumer may have pinned this key before it was allocated (`pin_keys`), and
+            # charged 0 bytes for it then. Now that the slot exists, charge every holder.
+            for held_by in self._pinned.get(key, {}):
+                held = self._count(held_by)
+                held.resident_bytes += nbytes
+                held._note_resident()
+            self._note_touch(key, owner)
             self._pin(key, owner)
             self.max_resident = max(self.max_resident, len(self._positions()))
             self.max_resident_bytes = max(self.max_resident_bytes, self._bytes)
@@ -1144,15 +1194,18 @@ class ChunkPool:
         with self._cv:
             key = (array, chunk_index)
             slot = self._slots.get(key)
-            if not (slot is not None and slot.state is SlotState.READY) and not self._revive(key):
+            if not (slot is not None and slot.state is SlotState.READY) and not self._revive(
+                key, owner
+            ):
                 return False
             self.hits += 1  # resident (cross-epoch) or revived (cross-run) -> no fetch
-            self._note_touch(key)
+            self._count(owner).hits += 1
+            self._note_touch(key, owner)
             self._pin(key, owner)  # the pin IS this owner's claim; publish it
             self._cv.notify_all()
             return True
 
-    def _revive(self, key: tuple[str, int]) -> bool:  # call under the lock
+    def _revive(self, key: tuple[str, int], owner: int) -> bool:  # call under the lock
         """Bring a persisted on-disk chunk back as a ready slot (a cross-run hit).
 
         Returns ``True`` iff the slot is now resident + ready. Validates the stored
@@ -1174,6 +1227,7 @@ class ChunkPool:
             data = np.lib.format.open_memmap(self._dir / fname, mode="r")
         except (OSError, ValueError) as exc:
             self.revive_missing += 1
+            self._count(owner).revive_missing += 1
             logger.debug("cache: persisted %s unreadable (%s); refetching", key, exc)
             self._persisted.pop(key, None)
             return False
@@ -1182,6 +1236,7 @@ class ChunkPool:
         want_dtype = geom.dtype if geom is not None else None
         if geom is None or data.shape != want_shape or data.dtype != want_dtype:
             self.revive_mismatch += 1
+            self._count(owner).revive_mismatch += 1
             logger.debug(
                 "cache: persisted %s shape/dtype %s/%s != current %s/%s; refetching",
                 key,
@@ -1194,7 +1249,7 @@ class ChunkPool:
             self._persisted.pop(key, None)
             return False
         nbytes = int(data.nbytes)
-        if not self._make_room(nbytes):
+        if not self._make_room(nbytes, owner):
             del data
             return False
         # A revived chunk enters the SAME lifecycle at a later state rather than being a
@@ -1297,28 +1352,37 @@ class ChunkPool:
             ]:
                 self._drop(key)  # an abandoned partial can never be a valid cache entry
             self._owners.discard(owner)  # this iteration is done; it no longer counts
+            self._per_owner.pop(owner, None)
             self._cv.notify_all()  # freed budget may unpark an admission
 
     def reset_epoch_counters(self) -> None:
-        """Zero the per-epoch observability counters at a pass boundary.
+        """Zero the batch-buffer counters at a pass boundary.
 
-        Split out of the old ``unpin_all``: releasing references and resetting counters
-        are unrelated jobs on different clocks (one belongs to an iteration's teardown,
-        the other to a pass's start), and bundling them is why the reset used to force a
-        global unpin. ``manifest_entries`` is load-time state and deliberately survives.
+        The chunk counters are deliberately *not* reset: they are the pool's running
+        totals, and a pool is shared by every iteration open on it. Zeroing them at one
+        pass's start threw away what another pass had accumulated, which is how a pass came
+        to report a number belonging to neither (#81). A pass's own figures come from its
+        :class:`PassCounters`, minted with its owner and dropped with it; these are the
+        pool's, and they only mean anything cumulatively.
+
+        ``manifest_entries`` is load-time state and deliberately survives.
         """
         with self._cv:
-            self.hits = self.misses = 0
-            self.max_resident = self.max_resident_bytes = 0  # peaks are per-pass too
-            self.revive_mismatch = self.revive_missing = 0
-            self.evictions = self.rereads = 0
-            self._seen_this_pass.clear()
-            self._buffers.reset_counters()  # batch outputs too -- same epoch boundary
+            self._buffers.reset_counters()
 
     def _pin(self, key: tuple[str, int], owner: int) -> None:  # call under the lock
         owners = self._pinned.setdefault(key, {})
+        first = owners.get(owner, 0) == 0
         owners[owner] = owners.get(owner, 0) + 1
-        if key in self._slots:
+        slot = self._slots.get(key)
+        if first:
+            # This owner's residency, which is what its own report is about. A second
+            # reference to a chunk it already holds costs it nothing more.
+            counters = self._count(owner)
+            counters.resident += 1
+            counters.resident_bytes += slot.nbytes if slot is not None else 0
+            counters._note_resident()
+        if slot is not None:
             self._slots.move_to_end(key)  # MRU (the slot may not be allocated yet)
 
     def _unpin_one(self, key: tuple[str, int], owner: int) -> None:  # call under the lock
@@ -1328,12 +1392,17 @@ class ChunkPool:
         n = owners.get(owner, 0)
         if n <= 1:
             owners.pop(owner, None)
+            if n == 1:
+                slot = self._slots.get(key)
+                counters = self._count(owner)
+                counters.resident -= 1
+                counters.resident_bytes -= slot.nbytes if slot is not None else 0
         else:
             owners[owner] = n - 1
         if not owners:
             self._pinned.pop(key, None)
 
-    def _make_room(self, nbytes: int) -> bool:  # call under the lock
+    def _make_room(self, nbytes: int, owner: int) -> bool:  # call under the lock
         if self._budget is None:
             return True
         while self._bytes + nbytes > self._budget:
@@ -1343,6 +1412,7 @@ class ChunkPool:
             if victim is None:  # everything resident is in-flight or pinned -> no room
                 return False
             self.evictions += 1
+            self._count(owner).evictions += 1
             self._drop(victim)
         return True
 
