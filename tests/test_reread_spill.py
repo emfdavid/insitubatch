@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pytest
 
 from insitubatch import obstore_store, open_geometries, split_by_chunk
@@ -186,3 +187,60 @@ def test_a_re_read_is_served_from_the_cache_rather_than_refetched(windowed, tmp_
 
     assert rereads > 0, "the fixture must actually re-read, or this asserts nothing"
     assert hit_rate > 0.3, f"re-reads must come from the cache, not the store: {hit_rate:.0%}"
+
+
+# -- the predicate that stops a second block refetching tiles already on their way ------
+
+
+def _pool_with_one_chunk():
+    from insitubatch.pool import ChunkPool
+    from insitubatch.types import ArrayGeometry
+
+    geom = ArrayGeometry(path="t2m", shape=(32, 4, 4), chunks=(4, 4, 4), dtype=np.dtype("f4"))
+    return ChunkPool({"t2m": geom}), geom
+
+
+def test_delivery_underway_is_false_for_a_slot_nobody_has_admitted() -> None:
+    pool, _ = _pool_with_one_chunk()
+    assert pool.delivery_underway("t2m", 3) is False
+
+
+def test_delivery_underway_is_true_while_a_writer_holds_the_slot() -> None:
+    """The case the policy needs: block i's tiles are in flight when block i+1 admits."""
+    pool, geom = _pool_with_one_chunk()
+    owner = pool.new_owner()
+    assert pool.try_admit("t2m", 3, owner)
+    with pool.tile_write("t2m", 3, ()):
+        assert pool.delivery_underway("t2m", 3) is True
+
+
+def test_delivery_underway_is_true_once_the_slot_is_ready() -> None:
+    pool, geom = _pool_with_one_chunk()
+    owner = pool.new_owner()
+    assert pool.try_admit("t2m", 3, owner)
+    pool.deliver_tile("t2m", 3, (), np.zeros(geom.tile_shape(), dtype="f4"))
+    assert pool.delivery_underway("t2m", 3) is True
+
+
+def test_an_abandoned_partial_is_not_underway(caplog) -> None:
+    """The control, and the one that would hang if it were wrong.
+
+    A slot left FILLING by a cancelled pass has no writer and will never complete on its
+    own. Reporting it as underway would make the next pass skip the fetch and then wait
+    for a delivery nobody is going to make.
+    """
+    pool, _ = _pool_with_one_chunk()
+    owner = pool.new_owner()
+    assert pool.try_admit("t2m", 3, owner)  # allocated, never written
+
+    assert pool.delivery_underway("t2m", 3) is False
+
+
+def test_a_failed_slot_is_not_underway() -> None:
+    """A poisoned slot is dropped so a later pass can refetch; it is not a delivery."""
+    pool, _ = _pool_with_one_chunk()
+    owner = pool.new_owner()
+    assert pool.try_admit("t2m", 3, owner)
+    pool.fail("t2m", 3, RuntimeError("bad chunk"))
+
+    assert pool.delivery_underway("t2m", 3) is False

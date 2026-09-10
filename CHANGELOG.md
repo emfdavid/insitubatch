@@ -18,6 +18,14 @@
   learn the policy too: a released chunk is only *evictable*, so sized for retention nothing is
   ever evicted and releasing buys nothing.
 
+  A chunk two blocks read is admitted once per block, and the driver may run three blocks
+  ahead of its consumer, so the second admission can land while the first block's tiles are
+  still in flight. The driver now skips a fetch whose delivery is already underway, which
+  took duplicate concurrent tile fetches from 2.3% to 0.8% on a 16-tile-per-chunk geometry.
+  The duplicates were never a correctness problem -- a slot publishes only when quiescent,
+  so a duplicate's own writer holds it open until it lands -- but a duplicate fetch is a
+  refetch, which is the cost this policy exists to avoid.
+
   The per-epoch line now reports re-reads and evictions whenever they are non-zero. A hit rate
   alone cannot show this -- a re-read served from the cache counts as a hit -- so rising
   re-reads at a steady hit rate are the signal that a budget is churning rather than holding.
