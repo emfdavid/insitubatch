@@ -259,18 +259,14 @@ class InSituDataset:
         # The last completed pass, or None before one finishes. Per pass, not per epoch: a
         # training epoch iterates train then val over one pool, and averaging two passes
         # with different shapes into one report is how a number stops meaning anything.
-        # A windowed shuffled pass holds a chunk from its first use to its last, which under
-        # a chunk permutation is most of an epoch -- so residency is close to the whole split
-        # (#66). Releasing each block's chunks when that block drains returns residency to the
-        # two-block floor, at the cost of admitting a chunk again when a later block reads it.
+        # Release each block's chunks as that block drains, and admit a chunk again when a
+        # later block reads it: residency is the three-block floor rather than the split a
+        # windowed shuffled pass would otherwise hold (#66).
         #
-        # A rule, not a knob, and it keys on `persist` rather than on `cache_dir`. Only a
-        # persisted slot survives its own eviction as a revivable file: with `cache_dir`
-        # alone the mmap backing is unlinked on eviction, so the second admission refetches
-        # and re-decodes. Measured on a 256-chunk windowed split, 249 re-reads served 2% from
-        # cache without `persist` and 49% with it -- the difference between the trade this
-        # policy assumes and the opposite one. Where the cheap path does not exist, retention
-        # is the better deal, so this turns on exactly where it does.
+        # A rule, not a knob, and it asks for `persist` because that is what makes the second
+        # admission cheap: a persisted slot survives its own eviction as a revivable file, so
+        # the re-read is a local read of decoded bytes. Retention is the better trade
+        # wherever that is not true, which is every other configuration.
         windowed = any(g.offset != 0 for g in self.geometries.values())
         self.reread_spill = persist and windowed and shuffle
         self.last_pass: PassStats | None = None
