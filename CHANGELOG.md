@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **A windowed split could hold chunks and draw nothing, and only an empty iterator said so.**
+  A windowed view reads `anchor + offset`, so anchors whose window runs off the array are
+  dropped; a split lying entirely in that tail keeps its chunks and yields no batches. That is
+  a different cause from a split that rounded to zero chunks, with the same symptom, and the
+  chunk counts in `describe()` could not tell them apart. The report now carries
+  `drawable_samples` per split, `print_summary()` shows it beside the chunk count on windowed
+  runs, and a split with chunks but nothing to draw is a `split-yields-nothing` warning naming
+  the offsets responsible. A split asked to be empty is not a finding and is not warned about.
+
+- **`examples/advection` trained a whole epoch before finding it had nothing to score (#71).**
+  `--n-steps 192` on the default 10% split gives the val split no chunks; `--n-steps 256` gives
+  it a chunk whose every anchor the 24-step target drops. Either way the run built the store,
+  trained, validated, and only then raised from `evaluate` -- discarding all of it to report a
+  fact its arguments had already fixed. Both are now refused at setup, from the engine's own
+  `drawable_samples`, and the message names the smallest sample-axis length that works, solved
+  against the same split and window arithmetic rather than quoted as a constant.
+
 - **A loop with no training step could be told its training step was the bottleneck.**
   `bottleneck()` read the batch queue before asking whether the caller's loop body did any
   work, so a `for batch in ds.train: pass` whose queue happened to look fed was answered with

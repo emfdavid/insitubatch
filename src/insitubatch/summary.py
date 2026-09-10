@@ -26,7 +26,7 @@ import numpy as np
 
 from .pool import slot_charge_bytes
 from .shuffle import shuffle_quality
-from .split import SplitManifest
+from .split import SplitManifest, valid_anchor_range
 from .transforms import transform_scope, unwrap_transform
 from .types import ArrayGeometry, SplitName
 
@@ -105,6 +105,7 @@ class ConfigReport(TypedDict):
     samples_per_chunk: int
     n_chunks: dict[str, int]
     split_chunks: dict[str, int]
+    drawable_samples: dict[str, int]
     shuffle_quality: float | None
 
 
@@ -289,6 +290,27 @@ def _variable_report(
     )
 
 
+def drawable_samples(geoms: dict[str, ArrayGeometry], manifest: SplitManifest) -> dict[str, int]:
+    """How many anchors each split can actually draw, per split name.
+
+    A split's chunk count is not the answer when the views are windowed: a variable reads
+    ``anchor + offset``, so anchors whose window runs off the array are dropped, and a split
+    lying entirely in that tail keeps its chunks and yields nothing. The two are different
+    failures with the same symptom -- an iterator that produces no batches -- and only this
+    number separates them.
+    """
+    ref = next(iter(geoms.values()))
+    lo, hi = valid_anchor_range([g.offset for g in geoms.values()], ref.n_samples)
+    out: dict[str, int] = {}
+    for name, ids in manifest.chunks.items():
+        total = 0
+        for cid in ids:
+            span = ref.samples_in_chunk(cid)
+            total += max(0, min(hi, span.stop) - max(lo, span.start))
+        out[name] = total
+    return out
+
+
 def _notes(variables: dict[str, VariableReport], cfg: ConfigReport) -> list[Note]:
     """Say when a layout is a problem, and why. This is the point of the report.
 
@@ -346,6 +368,24 @@ def _notes(variables: dict[str, VariableReport], cfg: ConfigReport) -> list[Note
                 )
             )
 
+    for name, drawable in cfg["drawable_samples"].items():
+        if drawable or not cfg["split_chunks"][name]:
+            continue  # a split asked to be empty is not a finding; one that cannot draw is
+        globals_.append(
+            Note(
+                code="split-yields-nothing",
+                severity="warn",
+                subject=name,
+                message=(
+                    f"the {name} split holds {cfg['split_chunks'][name]} chunk(s) but can "
+                    f"draw no samples: every anchor in it is dropped by the window "
+                    f"{sorted(set(cfg['offsets'].values()))}, which reaches past the array. "
+                    "Iterating it yields nothing. Widen the split, or move it away from the "
+                    "array's edge."
+                ),
+            )
+        )
+
     if cfg["block_chunks"] != cfg["block_chunks_requested"]:
         globals_.append(
             Note(
@@ -400,6 +440,7 @@ def describe(ds: InSituDataset, *, iterations: int = 1) -> DatasetReport:
         samples_per_chunk=ds._ref_spc,
         n_chunks={label: v["n_chunks"] for label, v in variables.items()},
         split_chunks={name: len(ids) for name, ids in ds.manifest.chunks.items()},
+        drawable_samples=drawable_samples(ds.geometries, ds.manifest),
         shuffle_quality=quality,
     )
 
@@ -523,7 +564,10 @@ def print_summary(report: DatasetReport, file: TextIO | None = None) -> None:
         f"   shuffle pool {cfg['block_chunks'] * spc} samples"
         f" for a {cfg['batch_size']}-sample batch"
     )
-    splits = "  ".join(f"{k} {n}" for k, n in cfg["split_chunks"].items())
+    splits = "  ".join(
+        f"{k} {n}" + (f" ({cfg['drawable_samples'][k]} drawable)" if cfg["windowed"] else "")
+        for k, n in cfg["split_chunks"].items()
+    )
     out.append(f"  splits (chunks)  {splits}")
     cache = cfg["cache_dir"] or "heap"
     # read-only is worth a line of its own: it changes what the run *does* (serves only what

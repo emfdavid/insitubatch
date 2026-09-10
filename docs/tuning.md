@@ -293,6 +293,21 @@ tiles — so for anything but a single-variable run, ask
 [`describe()`](api.md#insitubatch.InSituDataset.describe), which reports the number the
 engine will actually use rather than one you assembled by hand.
 
+### A windowed split can hold chunks and still draw nothing
+
+A windowed view reads `anchor + offset`, so anchors whose window runs off the array are
+dropped. A split lying entirely in that tail keeps its chunks and yields no batches — the same
+symptom as a split that rounded to zero chunks, and a different cause. `describe()` reports
+both numbers, and `print_summary()` shows them side by side whenever the views are windowed:
+
+```
+splits (chunks)  train 5 (232 drawable)  val 1 (0 drawable)  test 0 (0 drawable)
+```
+
+A split with chunks but nothing drawable is a `split-yields-nothing` warning, naming the
+offsets responsible. A split you asked to be empty — `fractions=(1.0, 0.0, 0.0)` — is not a
+finding and is not warned about.
+
 ### Two iterations at once are refused, not left to stall
 
 Every active iteration holds its own references, so N of them need N floors. The budget is
