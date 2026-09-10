@@ -23,14 +23,18 @@ these tests pin that the number is reported.
 from __future__ import annotations
 
 import logging
+import tempfile
 
 import numpy as np
 import pytest
 
 from insitubatch import obstore_store, open_geometries, split_by_chunk
+from insitubatch.plan import build_stored_chunk_reads
 from insitubatch.source import InSituDataset
+from insitubatch.types import SplitName
 
 N, SPC = 256, 4
+_TMP = tempfile.mkdtemp()
 
 
 @pytest.fixture
@@ -232,3 +236,94 @@ def test_a_pass_does_not_skip_a_fetch_on_another_passs_writer(write_zarr) -> Non
         "a pool-wide 'a writer holds this' query cannot answer 'will it be delivered' -- "
         "the writer may belong to a pass that is being torn down"
     )
+
+
+# -- a block boundary is an admission boundary -------------------------------
+
+
+def test_a_chunk_ending_one_block_and_starting_the_next_is_admitted_twice(
+    write_zarr, tmp_path
+) -> None:
+    """The driver's per-chunk admission must not merge across a block boundary.
+
+    Reads are chunk-major, so `_drive` decides admission once per run of tiles belonging to
+    one chunk. Under a released spill the plan deliberately emits a chunk once per block that
+    reads it -- and when a chunk is the *last* read of one block and the *first* of the next,
+    those two emissions are adjacent. Merged, they take one permit and one reference where the
+    consumer will release two: the first block's release unpins the chunk out from under the
+    second, whose wait can then never be satisfied.
+
+    The geometry is the one that produces the collision: a lead of exactly three chunks with
+    two-chunk blocks, so a block's spill lands on the chunk the next block opens with. Counted
+    from the plan rather than driven, so it does not depend on how the threads interleave.
+    """
+    url, _ = write_zarr(n=800, spc=8, inner=(4, 4))
+    base = open_geometries(obstore_store(url))["t2m"]
+    manifest = split_by_chunk(base, fractions=(0.8, 0.1, 0.1))
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        geometries={"now": base, "next": base.shift(24)},
+        batch_size=16,
+        block_chunks=2,
+        shuffle=True,
+        seed=0,
+        cache_dir=str(tmp_path / "c"),
+        persist=True,
+    )
+    try:
+        assert ds.reread_spill, "the fixture must be the released-spill case"
+        ds.set_epoch(0)
+        spc = ds._ref_spc
+        blocks = ds._blocks(ds._draw_order(SplitName.TRAIN, True), spc)
+        plan = build_stored_chunk_reads(
+            [int(c) for b in blocks for c in b.chunk_ids],
+            ds.geometries,
+            spc,
+            groups=[len(b.chunk_ids) for b in blocks],
+        )
+        # Count admissions the way `_drive` does: one per run of tiles naming the same
+        # chunk, with a run ended by a block boundary whatever chunk it names.
+        starts, runs, prev = set(plan.block_starts), 0, None
+        for index, r in enumerate(plan.reads):
+            key = (r.array, r.chunk_index)
+            if index in starts:
+                prev = None
+            if key != prev:
+                runs += 1
+                prev = key
+        owed = sum(len(b.read_keys) for b in blocks)
+        assert runs == owed, (
+            f"the driver sees {runs} chunk-runs but the consumer releases {owed} keys: "
+            f"{owed - runs} admission(s) merged across a block boundary"
+        )
+    finally:
+        ds.close()
+
+
+def test_a_lead_landing_on_the_next_blocks_first_chunk_still_drains(write_zarr, tmp_path) -> None:
+    """The same geometry, end to end: it must deliver every sample rather than wedge.
+
+    Reported rather than hung (the fetch-ahead wait is bounded), but a run that stops is a
+    run that stops.
+    """
+    url, _ = write_zarr(n=800, spc=8, inner=(4, 4))
+    base = open_geometries(obstore_store(url))["t2m"]
+    manifest = split_by_chunk(base, fractions=(0.8, 0.1, 0.1))
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        geometries={"now": base, "next": base.shift(24)},
+        batch_size=16,
+        block_chunks=2,
+        shuffle=True,
+        seed=0,
+        cache_dir=str(tmp_path / "c"),
+        persist=True,
+    )
+    try:
+        ds.set_epoch(0)
+        drawn = sum(int(b.arrays["now"].shape[0]) for b in ds.train)
+        assert drawn == 640
+    finally:
+        ds.close()

@@ -156,7 +156,7 @@ def test_planner_matches_zarr_indexing_per_anchor(geom: ArrayGeometry, ref_spc: 
 def test_build_stored_chunk_reads_matches_zarr_indexing(geom: ArrayGeometry, ref_spc: int) -> None:
     """The full planner entry point resolves the same stored-chunk set over all anchors."""
     anchors = list(range(_n_ref_chunks(geom, ref_spc)))
-    got = {r.coords for r in build_stored_chunk_reads(anchors, {geom.path: geom}, ref_spc)}
+    got = {r.coords for r in build_stored_chunk_reads(anchors, {geom.path: geom}, ref_spc).reads}
     expected: set[tuple[int, ...]] = set()
     for anchor in anchors:
         expected |= _planner_chunk_coords(geom, anchor, ref_spc)
@@ -200,7 +200,7 @@ def test_scattered_sample_read_amplification() -> None:
     # ...but the cost is IO, not indices: serving those picks reads every touched
     # chunk whole -- a strict superset of the samples actually wanted.
     geom = ArrayGeometry("a", (n, inner), (spc, inner), f4)
-    reads = build_stored_chunk_reads(sorted(touched), {geom.path: geom}, spc)
+    reads = build_stored_chunk_reads(sorted(touched), {geom.path: geom}, spc).reads
     read_samples: set[int] = set()
     for r in reads:
         read_samples |= set(geom.samples_in_chunk(r.chunk_index))

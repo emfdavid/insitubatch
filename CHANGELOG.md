@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **A released spill could unpin a chunk out from under the block that still needed it (#79).**
+  The driver decides admission once per *run* of tiles naming one chunk, since reads are
+  chunk-major. Under release-and-re-read the plan emits a chunk once per block that reads it --
+  and when a chunk is the last read of one block and the first of the next, those two emissions
+  are adjacent and the run-detection merged them. One reference was taken where the consumer
+  would release two, so the first block's release dropped the refcount to zero and the second
+  block's wait could never be satisfied. It presented as `read-ahead permits exhausted`, because
+  the block that never drained never handed its permits back.
+
+  It needed a lead landing exactly on the next block's opening chunk, so it was narrow but not
+  rare: 4 of 96 cells in a residency matrix over GCS, including a single-iteration one. The plan
+  now returns the read-index where each block begins, and crossing one ends the current run
+  whatever chunk it names -- the boundaries come from whoever laid them down rather than being
+  inferred from the reads, which is not possible here: two adjacent runs of one chunk are
+  indistinguishable from one.
+
 - **A windowed split could hold chunks and draw nothing, and only an empty iterator said so.**
   A windowed view reads `anchor + offset`, so anchors whose window runs off the array are
   dropped; a split lying entirely in that tail keeps its chunks and yields no batches. That is
