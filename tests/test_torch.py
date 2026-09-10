@@ -46,3 +46,32 @@ def test_as_torch_dataloader_roundtrip(write_zarr) -> None:
     loader = DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)
     recon = torch.cat([b["t2m"] for b in loader], dim=0).numpy()
     np.testing.assert_array_equal(recon, src)  # shuffle=False + all chunks -> src in order
+
+
+def test_as_torch_accepts_a_device(write_zarr) -> None:
+    """`as_torch(view, device=...)` must not raise on the way in.
+
+    `device=` is the documented route to page-locked buffers (docs/benchmarks.md), but every
+    `as_torch` call in the tests, the README and docs/index.md omits it -- so the branch that
+    decides whether to pin had never been executed. It names `torch`, which this module
+    imports only under `TYPE_CHECKING`, so any non-None device raised
+    `NameError: name 'torch' is not defined` before a single batch was drawn.
+
+    `"cpu"` rather than `"cuda"` deliberately: the defect is naming `torch` at all, not
+    anything about CUDA, so the guard has to run on every box rather than only where a
+    driver exists. `device=None` is exercised by the round-trip test above and was never
+    affected -- which is exactly why this went a month unnoticed.
+    """
+    url, _ = write_zarr(n=64, spc=4, inner=(4, 4))
+    geometries = open_geometries(obstore_store(url))
+    manifest = split_by_chunk(geometries["t2m"], fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        obstore_store(url), manifest, geometries=geometries, batch_size=8, block_chunks=2
+    )
+    ds.set_epoch(0)
+    try:
+        first = next(iter(as_torch(ds.train, device="cpu")))
+        assert first["t2m"].shape[0] == 8
+        assert first["t2m"].device.type == "cpu"
+    finally:
+        ds.close()
