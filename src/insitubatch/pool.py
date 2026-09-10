@@ -599,6 +599,9 @@ class ChunkPool:
         self.misses = 0
         self.revive_mismatch = 0  # persisted entry whose stored shape/dtype no longer matches
         self.revive_missing = 0  # persisted entry whose .npy was unreadable/gone
+        self.evictions = 0  # ready slots dropped to make room -- the cost side of a small budget
+        self.rereads = 0  # chunks admitted again in the same pass after being released
+        self._seen_this_pass: set[tuple[str, int]] = set()  # for rereads; cleared per pass
         self.manifest_entries = 0
         # Cross-run persistence: keep slot files past close, write a manifest of completed
         # entries, and revive them on reopen. Requires a dir to keep the files in. The dir
@@ -983,6 +986,24 @@ class ChunkPool:
 
     # -- admission / pinning / eviction -------------------------------------
 
+    def _note_touch(self, key: tuple[str, int]) -> None:  # call under the lock
+        """Count a chunk this pass has already taken once as a re-read.
+
+        Called where the driver actually *takes* a chunk -- every path that references one
+        for this pass, and no path that merely asks whether it could. A take is one of "the
+        slot was already resident", "it was revived from disk" or "a fresh slot was
+        allocated", so noting it anywhere earlier counts the failed `pin_if_ready` that
+        precedes an admission as a second take, and every chunk looks re-read.
+
+        Under retention a chunk is taken once per pass and this stays zero. Under a released
+        spill it is the number a reader needs to judge the trade: a re-read of a persisted
+        slot is a local read of decoded bytes; one that is not is a refetch.
+        """
+        if key in self._seen_this_pass:
+            self.rereads += 1
+        else:
+            self._seen_this_pass.add(key)
+
     def try_admit(self, array: str, chunk_index: int, owner: int) -> bool:
         """Reserve + allocate + reference one outer-chunk slot, evicting ready-LRU for room.
 
@@ -1019,6 +1040,7 @@ class ChunkPool:
                 # Already resident (in-flight, or a ready cross-epoch hit) -> incref and
                 # reuse. A FAILED slot is NOT reusable: it quiesces and is dropped, so a
                 # later epoch refetches instead of re-raising a stale error forever.
+                self._note_touch(key)
                 self._pin(key, owner)  # the pin IS this owner's claim (see wait_ready)
                 self._cv.notify_all()  # a ready hit may now satisfy a waiter
                 return True
@@ -1029,6 +1051,7 @@ class ChunkPool:
                 if not self._revive(key):
                     raise self._readonly_miss(array, chunk_index)
                 self.hits += 1  # revived from disk -> no fetch (as in pin_if_ready)
+                self._note_touch(key)
                 self._pin(key, owner)
                 self._cv.notify_all()
                 return True
@@ -1059,6 +1082,7 @@ class ChunkPool:
                 scratch=scratch,
             )
             self._bytes += nbytes
+            self._note_touch(key)
             self._pin(key, owner)
             self.max_resident = max(self.max_resident, len(self._positions()))
             self.max_resident_bytes = max(self.max_resident_bytes, self._bytes)
@@ -1087,6 +1111,7 @@ class ChunkPool:
             if not (slot is not None and slot.state is SlotState.READY) and not self._revive(key):
                 return False
             self.hits += 1  # resident (cross-epoch) or revived (cross-run) -> no fetch
+            self._note_touch(key)
             self._pin(key, owner)  # the pin IS this owner's claim; publish it
             self._cv.notify_all()
             return True
@@ -1250,6 +1275,8 @@ class ChunkPool:
             self.hits = self.misses = 0
             self.max_resident = self.max_resident_bytes = 0  # peaks are per-pass too
             self.revive_mismatch = self.revive_missing = 0
+            self.evictions = self.rereads = 0
+            self._seen_this_pass.clear()
             self._buffers.reset_counters()  # batch outputs too -- same epoch boundary
 
     def _pin(self, key: tuple[str, int], owner: int) -> None:  # call under the lock
@@ -1279,6 +1306,7 @@ class ChunkPool:
             victim = next((k for k, sl in self._slots.items() if self._evictable(k, sl)), None)
             if victim is None:  # everything resident is in-flight or pinned -> no room
                 return False
+            self.evictions += 1
             self._drop(victim)
         return True
 

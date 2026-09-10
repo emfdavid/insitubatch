@@ -282,6 +282,8 @@ costs, then check that against the memory you actually have:
 geom = open_geometries(store, variables=["temperature_2m"])["temperature_2m"]
 geom.chunk_bytes                      # bytes one sample-axis chunk occupies once resident
 2 * block_chunks * geom.chunk_bytes   # the floor: current block + one read-ahead
+                                      # (3 blocks when a windowed shuffled pass
+                                      #  releases its spill -- see below)
 ```
 
 Compare that with `free -h` (the `available` column, not `free`) and leave room for the
@@ -290,6 +292,35 @@ a `chunk_transform` can make the transformed output the binding term instead of 
 tiles — so for anything but a single-variable run, ask
 [`describe()`](api.md#insitubatch.InSituDataset.describe), which reports the number the
 engine will actually use rather than one you assembled by hand.
+
+### Windowed and shuffled: hold the split, or release and re-read
+
+A windowed view reads `anchor + offset`, and shuffle permutes chunk order, so a chunk one
+block reads may be needed again many blocks later. Held from first use to last, that makes
+the resident set close to the whole train split rather than two blocks — the cost of
+decode-once when several views share one array.
+
+Passing `persist=True` (with a `cache_dir`) changes the trade automatically: each block's
+chunks are handed back as that block drains, and a chunk a later block needs is admitted
+again from the on-disk cache. Residency falls to the three-block floor. Measured on a
+256-chunk split with a three-chunk lead, the floor goes from 259 chunks to 12, and from 316
+to 18 for leads `{0, 24, 240}` — with the same samples delivered.
+
+It is a rule rather than a knob because it is only a good trade when the second admission is
+local. `persist=True` is what makes an evicted slot revivable; with `cache_dir` alone the
+backing is unlinked on eviction and the re-read pays the fetch and the decode again. Put the
+cache on NVMe.
+
+The per-epoch summary reports the churn, because a hit rate cannot show it — a re-read served
+from the cache counts as a hit:
+
+```
+epoch 0 (train): chunks 246/502 hit (49%), peak resident 12,
+                 249 re-read (spill released per block, revived from the cache), 479 evicted
+```
+
+Rising re-reads at a steady hit rate mean the budget is churning rather than holding, and the
+floor is the number to raise.
 
 **Do not compute this as `sample_chunk_size × prod(inner_shape) × itemsize`.** Residency is
 the array's stored *tiles*, kept whole: a grid that does not divide the array evenly still

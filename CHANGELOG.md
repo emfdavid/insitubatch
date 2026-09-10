@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **A windowed, shuffled pass held close to the whole train split resident (#66).** A windowed
+  view reads `anchor + offset` and shuffle permutes chunk order, so a chunk one block reads can
+  be needed again most of an epoch later; held from first use to last, residency was the split
+  rather than two blocks. That is decode-once, and it is the right trade only while the split
+  fits. With `persist=True` each block now hands its chunks back as it drains and a later block
+  re-admits them from the on-disk cache. Measured on a 256-chunk split: the floor falls from 259
+  chunks to 12 for a three-chunk lead, and 316 to 18 for leads `{0, 24, 240}`, delivering the
+  same samples.
+
+  A rule rather than a knob, and it keys on `persist` rather than on `cache_dir` -- only a
+  persisted slot survives its own eviction as a revivable file. With `cache_dir` alone the
+  backing is unlinked when the slot is evicted, so the same 249 re-reads were served 2% from
+  cache instead of 49%, which is the opposite of the trade the policy assumes. The floor had to
+  learn the policy too: a released chunk is only *evictable*, so sized for retention nothing is
+  ever evicted and releasing buys nothing.
+
+  The per-epoch line now reports re-reads and evictions whenever they are non-zero. A hit rate
+  alone cannot show this -- a re-read served from the cache counts as a hit -- so rising
+  re-reads at a steady hit rate are the signal that a budget is churning rather than holding.
+
 - **A shuffle-block's chunks were reconstructed from the draw order, and on any windowed
   view the reconstruction was wrong (#68).** `_partition_blocks` re-derived block membership
   by repacking the surviving chunks into fresh groups of `block_chunks`, but the rows stayed

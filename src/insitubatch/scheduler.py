@@ -430,7 +430,13 @@ class Scheduler:
         """
         return self._owner
 
-    def start(self, chunk_ids: Sequence[int] | np.ndarray, ref_spc: int) -> Future:
+    def start(
+        self,
+        chunk_ids: Sequence[int] | np.ndarray,
+        ref_spc: int,
+        *,
+        groups: Sequence[int] | None = None,
+    ) -> Future:
         """Begin streaming the stored chunks of ``chunk_ids`` (priority order).
 
         ``chunk_ids`` are in the reference (manifest) grid; ``ref_spc`` is that grid's
@@ -438,7 +444,7 @@ class Scheduler:
         Returns the driver future; a failure there poisons the pool so consumers
         re-raise. The consumer drives demand independently via :attr:`pool`.
         """
-        reads = build_stored_chunk_reads(chunk_ids, self._geometries, ref_spc)
+        reads = build_stored_chunk_reads(chunk_ids, self._geometries, ref_spc, groups=groups)
         fut = asyncio.run_coroutine_threadsafe(self._drive(reads), self._loop)
         fut.add_done_callback(self._on_drive_done)
         return fut
@@ -480,7 +486,12 @@ class Scheduler:
         # (path, chunk) is first-seen on its first tile. Residency is held by the
         # consumer's per-block pins, not here -- admission only allocates the slot, and
         # a not-ready (in-flight) slot is eviction-protected until its fetch completes.
-        decided: dict[tuple[str, int], bool] = {}
+        # Reads are chunk-major, so an admission decision only has to survive the run of
+        # tiles belonging to one chunk. Holding it for the whole pass would skip the second
+        # admission of a chunk a later block reads again, which is what a released spill
+        # depends on.
+        current: tuple[str, int] | None = None
+        current_hit = False
         tasks: list[asyncio.Task] = []
         me = asyncio.current_task()
         if me is not None:
@@ -488,19 +499,18 @@ class Scheduler:
         try:
             for read in reads:
                 key = (read.array, read.chunk_index)
-                hit = decided.get(key)
-                if hit is None:
+                if key != current:
+                    current = key
                     # One permit per chunk, taken before we reference it and
                     # returned by the consumer's unpin. Hits take one too: a hit is pinned
                     # exactly like an admission and released by the same `unpin_block`, so
                     # skipping it here would return permits we never took.
                     if self._ahead is not None:
                         await self._take_ahead(read.array, read.chunk_index)
-                    hit = self.pool.pin_if_ready(read.array, read.chunk_index, self._owner)
-                    if not hit:
+                    current_hit = self.pool.pin_if_ready(read.array, read.chunk_index, self._owner)
+                    if not current_hit:
                         await self._admit(read.array, read.chunk_index)  # may await an unpin
-                    decided[key] = hit
-                if hit:
+                if current_hit:
                     continue  # cross-epoch hit: prepped chunk already resident, no fetch
                 task = asyncio.create_task(self._one(read))
                 self._tasks.add(task)
