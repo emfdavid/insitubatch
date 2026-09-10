@@ -51,11 +51,9 @@ _EMPTY_ORDER = np.empty((0, 2), dtype=np.int64)
 class DrawOrder:
     """One epoch's ``[chunk_id, within]`` draw rows, and the shuffle-blocks holding them.
 
-    The blocks are *laid down* here, by the builder that creates them, and travel with the
-    rows. They are not inferred from the rows afterwards, because in general they cannot
-    be: once a windowed view's edge anchors are dropped, a two-chunk block that lost a
-    chunk is indistinguishable from a one-chunk block, and any reconstruction has to guess
-    (#68). Dropping rows shrinks the block that held them; it never re-cuts the blocks.
+    The blocks are laid down by the builder that creates them and travel with the rows, so
+    every consumer reads one account of where a block begins and ends. Dropping rows narrows
+    the block that held them and leaves its neighbours' membership untouched.
 
     ``bounds`` holds ``n_blocks + 1`` row offsets, so block ``i`` is
     ``rows[bounds[i] : bounds[i + 1]]``. Blocks are contiguous, gapless, and cover every
@@ -79,9 +77,9 @@ class DrawOrder:
     def keep(self, mask: np.ndarray) -> DrawOrder:
         """Drop the rows ``mask`` excludes, narrowing the blocks that held them.
 
-        A block emptied outright is dropped -- it names no chunks and does no work -- but
-        the blocks around it keep their identity, which is the whole point of carrying the
-        bounds rather than re-deriving them from what survived.
+        A block emptied outright is dropped: it names no chunks and does no work. Every
+        other block keeps its membership, its row range shifted by the number of rows
+        removed ahead of it.
         """
         kept = np.flatnonzero(mask)
         # searchsorted maps an old row offset to the number of surviving rows before it,

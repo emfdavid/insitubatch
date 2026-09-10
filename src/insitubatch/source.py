@@ -62,11 +62,10 @@ DEFAULT_MAX_INFLIGHT = 32
 class _Block:
     """One shuffle-block: where its rows are, what it draws from, and what it reads.
 
-    Both halves come from the same rows. ``chunk_ids`` are the anchor chunks the driver
-    plans and fetches; ``read_keys`` are the ``(path, chunk)`` slots the consumer waits on
-    and releases, which a windowed view can push outside ``chunk_ids`` entirely. Deriving
-    them together, once, is the point: they were two derivations from two different inputs,
-    and on any windowed view they disagreed (#68).
+    ``chunk_ids`` are the anchor chunks the driver plans and fetches; ``read_keys`` are the
+    ``(path, chunk)`` slots the consumer waits on and releases, which a windowed view can
+    push outside ``chunk_ids`` entirely. Both are derived from this block's own rows, here
+    and only here, so the driver and the consumer share one account of what the block covers.
     """
 
     start: int
@@ -404,8 +403,8 @@ class InSituDataset:
     def _drop_edge_anchors(self, order: DrawOrder, spc: int, n_samples: int) -> DrawOrder:
         """Keep only anchors whose every windowed read ``anchor + offset`` is on the
         array. Offset 0 (no window) keeps the whole order. Anchors are dropped, not
-        their chunks, so an edge chunk still contributes its interior anchors -- and the
-        block that held them narrows rather than the blocks being re-cut around the gap."""
+        their chunks, so an edge chunk still contributes its interior anchors, and the block
+        that held a dropped anchor narrows by exactly that row."""
         offsets = [g.offset for g in self.geometries.values()]
         lo, hi = valid_anchor_range(offsets, n_samples)
         if lo == 0 and hi == n_samples:
