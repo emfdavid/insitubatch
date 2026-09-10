@@ -21,6 +21,8 @@ def build_stored_chunk_reads(
     chunk_ids: Sequence[int] | np.ndarray,
     geometries: dict[str, ArrayGeometry],
     ref_spc: int,
+    *,
+    groups: Sequence[int] | None = None,
 ) -> list[StoredChunkRead]:
     """Expand outer chunk ids into deduped stored-chunk reads, in priority order.
 
@@ -47,10 +49,27 @@ def build_stored_chunk_reads(
     differently from the reference maps those anchor samples onto *its own* chunks -- so one
     anchor chunk expands to the (offset-shifted) chunks each variable needs. With every
     ``offset == 0`` and a uniform chunk size this is exactly ``anchor chunk -> itself``.
+    ``groups`` scopes that dedup to consecutive runs of ``chunk_ids`` -- the consumer's
+    shuffle-blocks -- rather than the whole pass. A chunk that two blocks read is then
+    admitted once *per block*, which is what lets the consumer release it when its block
+    drains and have it re-admitted later; the pool serves that second admission from
+    residency or from ``cache_dir``, and re-reads it only if neither holds it.
+
+    Per block rather than per anchor, deliberately: the consumer releases each of a block's
+    keys once, so admitting a key twice inside one block would leave a reference nobody
+    returns -- and a slot pinned forever is a starved pass, not a slow one.
     """
     reads: list[StoredChunkRead] = []
     seen: set[StoredChunkRead] = set()
-    for cid in chunk_ids:
+    boundaries: set[int] = set()
+    if groups:
+        at = 0
+        for n in groups:
+            boundaries.add(at)
+            at += n
+    for i, cid in enumerate(chunk_ids):
+        if i in boundaries:
+            seen.clear()  # a new block admits what it reads
         for geom in geometries.values():
             for read_cid in _read_chunks(geom, int(cid), ref_spc):
                 for inner in geom.inner_coords():

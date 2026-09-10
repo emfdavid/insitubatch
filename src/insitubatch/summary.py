@@ -156,6 +156,7 @@ def working_set_bytes(
     ref_spc: int,
     shuffle: bool,
     assembles: bool,
+    releases_spill: bool = False,
 ) -> int:
     """The residency floor: what must be co-resident for one iteration to make progress.
 
@@ -163,6 +164,15 @@ def working_set_bytes(
     across a whole block. Windows widen it (a windowed read crosses chunk boundaries), and
     shuffle plus windows widen it to the whole split, because a shuffled windowed read can
     spill into a chunk owned by any other block.
+
+    ``releases_spill`` says the pass hands each block's chunks back as that block drains
+    (:attr:`InSituDataset.reread_spill`), so nothing is held for a later block and the split
+    no longer has to be resident. The floor is then three blocks rather than two: a block is
+    released only after the batch draining it has gathered, while the wait for the next block
+    happens before, so a batch on a boundary transiently holds the block behind it, the one it
+    gathers, and the one it awaits. The floor must match what the pass will actually hold --
+    under-provisioning starves it mid-epoch, which fails like a hang rather than like a
+    shortage.
 
     Charged with :func:`~insitubatch.pool.slot_charge_bytes`, which is what the pool will
     actually charge -- sizing from the assembled shape while the pool charges stored tiles
@@ -195,14 +205,15 @@ def working_set_bytes(
             return 1 if g.offset % spc0 == 0 else 2
 
         per_anchor_all_vars = sum(chunks_per_anchor(g) * bytes_per_chunk(g, o) for g, o in pairs)
-        working_set = 2 * block_chunks * per_anchor_all_vars
-        if windowed and shuffle:
+        blocks_resident = 3 if releases_spill else 2
+        working_set = blocks_resident * block_chunks * per_anchor_all_vars
+        if windowed and shuffle and not releases_spill:
             # Shuffle permutes chunk order, so a windowed read can spill into chunks owned by
-            # any other block: a chunk admitted early may be needed late. Until bounded
-            # residency (re-fetch the spill) lands, hold the whole split resident -- decode-
-            # once, the accepted memory cost of windows (spill to NVMe via cache_dir on large
-            # splits). Only `.train` shuffles (eval views are sequential and spill only
-            # locally), so size to the train split.
+            # any other block: a chunk admitted early may be needed late. Holding the whole
+            # split resident is decode-once, the memory cost of windows when the spill is
+            # retained; `releases_spill` is the other trade and skips this clamp entirely.
+            # Only `.train` shuffles (eval views are sequential and spill only locally), so
+            # size to the train split.
             #
             # Counted once per *array*, not once per view. The pool keys slots by
             # `(path, chunk)` and the planner collapses several windowed views of one array
@@ -403,6 +414,7 @@ def describe(ds: InSituDataset, *, iterations: int = 1) -> DatasetReport:
         ref_spc=ds._ref_spc,
         shuffle=ds.shuffle,
         assembles=assembles,
+        releases_spill=ds.reread_spill,
     )
     inflight = cfg["max_inflight"] * max(v["stored_chunk_bytes"] for v in variables.values())
     batch_bytes = sum(

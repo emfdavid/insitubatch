@@ -259,6 +259,20 @@ class InSituDataset:
         # The last completed pass, or None before one finishes. Per pass, not per epoch: a
         # training epoch iterates train then val over one pool, and averaging two passes
         # with different shapes into one report is how a number stops meaning anything.
+        # A windowed shuffled pass holds a chunk from its first use to its last, which under
+        # a chunk permutation is most of an epoch -- so residency is close to the whole split
+        # (#66). Releasing each block's chunks when that block drains returns residency to the
+        # two-block floor, at the cost of admitting a chunk again when a later block reads it.
+        #
+        # A rule, not a knob, and it keys on `persist` rather than on `cache_dir`. Only a
+        # persisted slot survives its own eviction as a revivable file: with `cache_dir`
+        # alone the mmap backing is unlinked on eviction, so the second admission refetches
+        # and re-decodes. Measured on a 256-chunk windowed split, 249 re-reads served 2% from
+        # cache without `persist` and 49% with it -- the difference between the trade this
+        # policy assumes and the opposite one. Where the cheap path does not exist, retention
+        # is the better deal, so this turns on exactly where it does.
+        windowed = any(g.offset != 0 for g in self.geometries.values())
+        self.reread_spill = persist and windowed and shuffle
         self.last_pass: PassStats | None = None
         self._on_bad_chunk = on_bad_chunk
 
@@ -284,6 +298,7 @@ class InSituDataset:
             ref_spc=self._ref_spc,
             shuffle=self.shuffle,
             assembles=bool(self.chunk_transforms),
+            releases_spill=self.reread_spill,
         )
         # Sized for ONE iteration, deliberately. Every active iteration shares this pool and
         # holds its own references, so N concurrent iterations need ~N x this -- but the engine
@@ -496,11 +511,26 @@ class InSituDataset:
                 last_use[key] = bi  # later block overwrites -> ends on the max index
         for key, bi in last_use.items():
             release[bi].add(key)
+        if self.reread_spill:
+            # Every block hands back everything it read, so nothing is held for a later one:
+            # a chunk two blocks apart is admitted twice, and the pool serves the second from
+            # residency or from cache_dir.
+            release = [set(keys) for keys in block_keys]
 
         # Computed, not configured (see `read_ahead_bound`). A non-zero value on the
         # config is honoured so a test can supply a deliberately wrong one: a bound that
         # cannot be wrong is a bound nothing proves the need for.
-        ahead = self.scheduler_config.read_ahead_chunks or read_ahead_bound(block_keys, last_use)
+        if self.reread_spill:
+            # Three consecutive blocks, not the plan's live set. Nothing is held for a later
+            # block, so the long lifetimes that make the retained bound large do not arise --
+            # but a block is released only *after* the batch draining it has gathered, while
+            # the wait for the next block happens before, so a batch straddling a boundary
+            # transiently holds the block behind it, the one it gathers, and the one it awaits.
+            sizes = [len(keys) for keys in block_keys] or [1]
+            computed = max(sum(sizes[i : i + 3]) for i in range(max(len(sizes) - 2, 1)))
+        else:
+            computed = read_ahead_bound(block_keys, last_use)
+        ahead = self.scheduler_config.read_ahead_chunks or computed
 
         def produce(sched: Scheduler) -> None:
             # Batches are cut over the WHOLE epoch order, not per block. Cutting them per
@@ -520,7 +550,11 @@ class InSituDataset:
             bs = self.batch_size
             ready = freed = 0
             try:
-                sched.start(ordered_chunks, spc)
+                sched.start(
+                    ordered_chunks,
+                    spc,
+                    groups=[len(b.chunk_ids) for b in blocks] if self.reread_spill else None,
+                )
                 for start in range(0, len(rows), bs):
                     if stop.is_set():
                         return
@@ -698,14 +732,23 @@ class InSituDataset:
         if not logger.isEnabledFor(logging.INFO):
             return  # skip the snapshot, which takes the buffer pool's lock
         reads = pool.hits + pool.misses
+        # Re-reads and evictions appear whenever they are non-zero, not only under a released
+        # spill: a chunk taken twice in one pass, or a ready slot dropped to make room, is the
+        # budget being too small for the working set -- and a hit rate alone cannot show it,
+        # because a re-read served from cache_dir counts as a hit.
+        churn = ""
+        if pool.rereads or pool.evictions:
+            why = " (spill released per block, revived from the cache)" if self.reread_spill else ""
+            churn = f", {pool.rereads} re-read{why}, {pool.evictions} evicted"
         logger.info(
-            "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s; batch buffers %s",
+            "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s%s; batch buffers %s",
             self._epoch,
             split or "all",
             pool.hits,
             reads,
             100 * pool.hits / reads if reads else 0.0,
             pool.max_resident,
+            churn,
             f", {len(self.bad_chunks)} bad chunks" if self.bad_chunks else "",
             pool.buffer_stats().summary(),
         )
