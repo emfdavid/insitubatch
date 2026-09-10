@@ -315,6 +315,7 @@ def as_torch(
     kernel cannot reclaim it); past that buffers are pageable again, with one warning.
     """
     try:
+        import torch
         from torch.utils.data import IterableDataset
     except ImportError as exc:  # pragma: no cover - torch-less installs
         raise _missing("PyTorch", "torch") from exc

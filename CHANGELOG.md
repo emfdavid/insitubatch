@@ -38,6 +38,16 @@
   went from `ok` to raising, every one of them a `zip` cell; no single-iteration cell was
   affected. The permit stall now asks only about its own waiters.
 
+- **`as_torch(view, device=...)` raised `NameError: name 'torch' is not defined` before
+  drawing a batch.** The branch deciding whether to page-lock the batch buffers tests
+  `torch.device(device).type == "cuda"`, but `frameworks.py` imports `torch` only under
+  `TYPE_CHECKING` -- the other functions in the module each import it locally, and this one
+  did not. Any non-`None` device failed, `"cpu"` included; `device=None` was unaffected,
+  which is why it survived a month. Every `as_torch` call in the tests, the README and
+  `docs/index.md` omits `device=`, so the one form under test was the one form that worked,
+  while `docs/benchmarks.md` points at `device=` as the way to get pinned buffers. Present
+  since the buffer-liveness fix in v0.1.x; found running the GPU examples on an L4.
+
 - **A fetch-ahead permit deficit hung the pass with nothing to read.** Bounded read-ahead
   takes one permit per chunk and gets it back from the consumer's `unpin_block`, so a
   consumer that cannot reach its next unpin never returns one. That wait was unbounded:
