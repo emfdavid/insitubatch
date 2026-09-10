@@ -151,10 +151,8 @@ class Pass:
 
     def declared(self, bi: int) -> set[Key]:
         """The slots the *driver* plans for block ``bi`` -- expanded from its chunk ids."""
-        reads = build_stored_chunk_reads(
-            self.blocks[bi].chunk_ids, self.ds.geometries, self.ref_spc
-        )
-        return {(r.array, r.chunk_index) for r in reads}
+        plan = build_stored_chunk_reads(self.blocks[bi].chunk_ids, self.ds.geometries, self.ref_spc)
+        return {(r.array, r.chunk_index) for r in plan.reads}
 
     def awaited(self, bi: int) -> set[Key]:
         """The slots the *consumer* pins and releases for block ``bi``."""
@@ -346,7 +344,7 @@ def test_every_drawn_chunk_is_planned_exactly_once(build_pass, case: Case) -> No
     assert len(ordered) == len(set(ordered)), "a chunk is planned by more than one block"
     planned = {
         (r.array, r.chunk_index)
-        for r in build_stored_chunk_reads(ordered, p.ds.geometries, p.ref_spc)
+        for r in build_stored_chunk_reads(ordered, p.ds.geometries, p.ref_spc).reads
     }
     assert _reference_read_keys(p.order.rows, p.ds.geometries, p.ref_spc) <= planned
 

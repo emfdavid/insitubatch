@@ -11,10 +11,27 @@ gather straight from those tiles by ``(chunk_id, within)`` draw rows.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
 from .types import ArrayGeometry, StoredChunkRead
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkReadPlan:
+    """What to fetch, in order, and where each shuffle-block's reads begin.
+
+    ``block_starts`` is empty when the reads are deduplicated over the whole pass; with
+    ``groups`` it holds one index per block. A driver that admits per chunk-run needs these
+    to know where one block's claims end and the next one's begin.
+    """
+
+    reads: list[StoredChunkRead]
+    block_starts: list[int]
+
+    def __len__(self) -> int:
+        return len(self.reads)
 
 
 def build_stored_chunk_reads(
@@ -23,7 +40,7 @@ def build_stored_chunk_reads(
     ref_spc: int,
     *,
     groups: Sequence[int] | None = None,
-) -> list[StoredChunkRead]:
+) -> ChunkReadPlan:
     """Expand outer chunk ids into deduped stored-chunk reads, in priority order.
 
     There is no gather map: the scheduler delivers tiles into per-outer-chunk slots
@@ -50,16 +67,25 @@ def build_stored_chunk_reads(
     anchor chunk expands to the (offset-shifted) chunks each variable needs. With every
     ``offset == 0`` and a uniform chunk size this is exactly ``anchor chunk -> itself``.
     ``groups`` scopes that dedup to consecutive runs of ``chunk_ids`` -- the consumer's
-    shuffle-blocks -- rather than the whole pass. A chunk that two blocks read is then
-    admitted once *per block*, which is what lets the consumer release it when its block
-    drains and have it re-admitted later; the pool serves that second admission from
-    residency or from ``cache_dir``, and re-reads it only if neither holds it.
+    shuffle-blocks -- rather than the whole pass, and the returned ``block_starts`` say
+    where each block's reads begin. A chunk that two blocks read is then admitted once *per
+    block*, which is what lets the consumer release it when its block drains and have it
+    re-admitted later; the pool serves that second admission from residency or from
+    ``cache_dir``, and re-reads it only if neither holds it.
 
     Per block rather than per anchor, deliberately: the consumer releases each of a block's
     keys once, so admitting a key twice inside one block would leave a reference nobody
     returns -- and a slot pinned forever is a starved pass, not a slow one.
+
+    The boundaries are returned rather than left to be recovered from the reads, because
+    they cannot be: the driver decides admission once per *run* of tiles belonging to one
+    chunk, and a chunk that ends one block and opens the next produces two adjacent runs
+    that are indistinguishable from one. Merging them takes a single reference where the
+    consumer will release two, and the first release unpins the chunk out from under the
+    second block.
     """
     reads: list[StoredChunkRead] = []
+    block_starts: list[int] = []
     seen: set[StoredChunkRead] = set()
     boundaries: set[int] = set()
     if groups:
@@ -70,6 +96,7 @@ def build_stored_chunk_reads(
     for i, cid in enumerate(chunk_ids):
         if i in boundaries:
             seen.clear()  # a new block admits what it reads
+            block_starts.append(len(reads))
         for geom in geometries.values():
             for read_cid in _read_chunks(geom, int(cid), ref_spc):
                 for inner in geom.inner_coords():
@@ -77,7 +104,7 @@ def build_stored_chunk_reads(
                     if read not in seen:
                         seen.add(read)
                         reads.append(read)
-    return reads
+    return ChunkReadPlan(reads, block_starts)
 
 
 def _read_chunks(geom: ArrayGeometry, anchor_chunk: int, ref_spc: int) -> range:

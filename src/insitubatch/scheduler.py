@@ -73,7 +73,7 @@ from zarr.core.buffer import default_buffer_prototype
 from zarr.core.chunk_utils import ChunkTransform
 from zarr.core.sync import _get_loop
 
-from .plan import build_stored_chunk_reads
+from .plan import ChunkReadPlan, build_stored_chunk_reads
 from .pool import ChunkPool
 from .runtime import StatsCollector
 from .store import _storage_chunks
@@ -448,8 +448,8 @@ class Scheduler:
         Returns the driver future; a failure there poisons the pool so consumers
         re-raise. The consumer drives demand independently via :attr:`pool`.
         """
-        reads = build_stored_chunk_reads(chunk_ids, self._geometries, ref_spc, groups=groups)
-        fut = asyncio.run_coroutine_threadsafe(self._drive(reads), self._loop)
+        plan = build_stored_chunk_reads(chunk_ids, self._geometries, ref_spc, groups=groups)
+        fut = asyncio.run_coroutine_threadsafe(self._drive(plan), self._loop)
         fut.add_done_callback(self._on_drive_done)
         return fut
 
@@ -483,7 +483,7 @@ class Scheduler:
 
     # -- async internals ----------------------------------------------------
 
-    async def _drive(self, reads: list[StoredChunkRead]) -> None:
+    async def _drive(self, plan: ChunkReadPlan) -> None:
         await self._ensure_arrays()
         # Per (path, chunk): decided[k] = True if it was a cache hit (skip its tiles),
         # False if a miss we admitted (fetch its tiles). reads are chunk-major so a
@@ -492,7 +492,11 @@ class Scheduler:
         # a not-ready (in-flight) slot is eviction-protected until its fetch completes.
         # Reads are chunk-major, so an admission decision is scoped to the run of tiles
         # belonging to one chunk. A released spill admits a chunk once per block that reads
-        # it, and each of those admissions is its own decision.
+        # it, and each of those admissions is its own decision -- including when the same
+        # chunk ends one block and opens the next, where the two runs are adjacent and
+        # otherwise indistinguishable from one. `block_starts` is where the plan says a
+        # block begins; crossing one ends the current run whatever chunk it names.
+        reads, block_starts = plan.reads, set(plan.block_starts)
         current: tuple[str, int] | None = None
         current_hit = False
         tasks: list[asyncio.Task] = []
@@ -500,8 +504,10 @@ class Scheduler:
         if me is not None:
             self._tasks.add(me)  # so _shutdown can cancel the driver itself
         try:
-            for read in reads:
+            for index, read in enumerate(reads):
                 key = (read.array, read.chunk_index)
+                if index in block_starts:
+                    current = None  # a new block claims what it reads, on its own reference
                 if key != current:
                     current = key
                     # One permit per chunk, taken before we reference it and
