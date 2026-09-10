@@ -8,6 +8,8 @@ driven advection that windowed, multi-variable, no-reshard sampling makes availa
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 
@@ -108,3 +110,55 @@ def test_tf_beats_persistence(synth_store) -> None:
 
     model_rmse, persistence_rmse = train(_dataset(synth_store), epochs=8)
     assert model_rmse < persistence_rmse
+
+
+# -- a store too small to be scored is refused before it is trained on -------
+
+
+@pytest.mark.parametrize(
+    "n_steps,why",
+    [
+        (192, "the 10% split rounds to zero chunks"),
+        (256, "the split gets a chunk, but the horizon drops every anchor in it"),
+    ],
+    ids=["no-chunks", "no-drawable-anchors"],
+)
+def test_a_store_too_small_to_score_is_refused_at_setup(tmp_path, n_steps, why) -> None:
+    """Both ways a small store runs out of evaluation data, caught before training.
+
+    Neither is worth an epoch to discover: the run would train, validate, and only then
+    reach `evaluate` with nothing to score, having kept none of it. Both are decided by the
+    arguments, so both are answered from them.
+    """
+    url = f"file://{tmp_path}/small.zarr"
+    make_advection_store(url, n_steps=n_steps, size=16, seed=0)
+
+    with pytest.raises(ValueError, match="the val split has nothing to draw") as exc:
+        forecast_dataset(url, batch_size=8)
+
+    msg = str(exc.value)
+    assert f"{n_steps} samples" in msg, why
+    assert "Use at least" in msg, "naming the size that works is what makes it actionable"
+
+
+def test_the_size_the_refusal_names_actually_works(tmp_path) -> None:
+    """The control, and the one that keeps the advice honest.
+
+    A remedy nobody checked is how a clear error message becomes a second wrong turn. The
+    number is computed against the same split and window arithmetic the run uses, so this
+    pins that the two agree.
+    """
+    url = f"file://{tmp_path}/small.zarr"
+    make_advection_store(url, n_steps=192, size=16, seed=0)
+    with pytest.raises(ValueError) as exc:
+        forecast_dataset(url, batch_size=8)
+    named = int(re.search(r"Use at least (\d+) samples", str(exc.value)).group(1))
+
+    bigger = f"file://{tmp_path}/big.zarr"
+    make_advection_store(bigger, n_steps=named, size=16, seed=0)
+    ds = forecast_dataset(bigger, batch_size=8)
+    try:
+        ds.set_epoch(0)
+        assert sum(int(b.arrays["t2m"].shape[0]) for b in ds.val) > 0
+    finally:
+        ds.close()

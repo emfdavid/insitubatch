@@ -458,3 +458,80 @@ def test_the_windowed_clamp_reaches_past_the_split_edges():
         )
 
     assert floor(far) > floor(near), "a wider reach touches more chunks and must be sized for"
+
+
+# -- a split that holds chunks and can still draw nothing --------------------
+
+
+def _windowed_report(write_zarr, *, n, spc, horizon, fractions=(0.8, 0.1, 0.1)):
+    url, _ = write_zarr(n=n, spc=spc, inner=(4, 4))
+    base = open_geometries(obstore_store(url))["t2m"]
+    geoms = {"now": base, "target": base.shift(horizon)}
+    ds = InSituDataset(
+        obstore_store(url),
+        split_by_chunk(base, fractions=fractions),
+        geometries=geoms,
+        batch_size=4,
+    )
+    try:
+        return ds.describe()
+    finally:
+        ds.close()
+
+
+def test_drawable_samples_counts_anchors_not_chunks(write_zarr) -> None:
+    """A windowed split can hold chunks and draw nothing, which chunk counts cannot show.
+
+    The target reads `anchor + horizon`, so anchors within `horizon` of the array's end are
+    dropped. A split lying entirely in that tail keeps its chunks and yields no batches --
+    the same symptom as a split that rounded to zero chunks, and a different cause.
+    """
+    report = _windowed_report(write_zarr, n=256, spc=48, horizon=24)
+    cfg = report["config"]
+
+    assert cfg["split_chunks"]["val"] == 1, "the split does have a chunk"
+    assert cfg["drawable_samples"]["val"] == 0, "and cannot draw a single anchor from it"
+    assert cfg["drawable_samples"]["train"] > 0
+
+
+def test_a_split_that_cannot_draw_is_a_warning(write_zarr) -> None:
+    report = _windowed_report(write_zarr, n=256, spc=48, horizon=24)
+
+    notes = [n for n in report["notes"] if n["code"] == "split-yields-nothing"]
+    assert [n["subject"] for n in notes] == ["val"]
+    assert notes[0]["severity"] == "warn"
+    assert "dropped by the window" in notes[0]["message"]
+
+
+def test_a_split_asked_to_be_empty_is_not_a_warning(write_zarr) -> None:
+    """The control: `fractions=(1.0, 0.0, 0.0)` is an ordinary request, not a finding.
+
+    Warning about it would fire on the most common configuration in the examples and teach
+    everyone to skip the notes section.
+    """
+    report = _windowed_report(write_zarr, n=256, spc=48, horizon=24, fractions=(1.0, 0.0, 0.0))
+
+    assert report["config"]["split_chunks"]["val"] == 0
+    assert not [n for n in report["notes"] if n["code"] == "split-yields-nothing"]
+
+
+def test_an_unwindowed_split_draws_every_sample_it_holds(write_zarr) -> None:
+    """The other control: with no window nothing is dropped, so chunks and anchors agree."""
+    url, _ = write_zarr(n=256, spc=48, inner=(4, 4))
+    base = open_geometries(obstore_store(url))["t2m"]
+    ds = InSituDataset(
+        obstore_store(url),
+        split_by_chunk(base, fractions=(0.8, 0.1, 0.1)),
+        geometries={"t2m": base},
+        batch_size=4,
+    )
+    try:
+        report = ds.describe()
+        cfg = report["config"]
+        assert not [n for n in report["notes"] if n["code"] == "split-yields-nothing"]
+    finally:
+        ds.close()
+
+    for name in cfg["split_chunks"]:
+        expected = sum(len(base.samples_in_chunk(c)) for c in ds.manifest.chunks[name])
+        assert cfg["drawable_samples"][name] == expected, name

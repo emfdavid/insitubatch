@@ -29,6 +29,7 @@ import zarr
 from zarr.abc.store import Store
 
 from insitubatch import (
+    ArrayGeometry,
     Batch,
     InSituDataset,
     arraylake_store,
@@ -37,6 +38,7 @@ from insitubatch import (
     open_geometries,
     split_by_chunk,
 )
+from insitubatch.summary import drawable_samples
 
 from .._logging import add_log_level, configure_logging
 
@@ -213,6 +215,64 @@ def _synthetic_ready(
         return False
 
 
+def _minimum_samples(
+    geom: ArrayGeometry, fractions: tuple[float, float, float], horizon: int
+) -> int:
+    """The smallest sample-axis length for which train *and* val can both be drawn.
+
+    Solved against the same `split_by_chunk` and `drawable_samples` the run will use, rather
+    than quoted as a constant, so it stays true if either changes. Pure integer work on a
+    stand-in geometry -- no store is opened.
+    """
+    step = geom.sample_chunk_size
+    for n in range(step, step * 64 + 1, step):
+        trial = ArrayGeometry(
+            path=geom.path, shape=(n, *geom.shape[1:]), chunks=geom.chunks, dtype=geom.dtype
+        )
+        views = {"now": trial, "target": trial.shift(horizon)}
+        drawable = drawable_samples(views, split_by_chunk(trial, fractions=fractions))
+        if all(drawable[name] > 0 for name in ("train", "val")):
+            return n
+    return 0  # nothing in range works -- the caller reports what it has instead
+
+
+def _require_drawable_splits(
+    ds: InSituDataset, geom: ArrayGeometry, horizon: int, fractions: tuple[float, float, float]
+) -> None:
+    """Refuse a geometry whose train or val view is empty, before any training runs.
+
+    Both are known from the arguments, so neither is worth an epoch to discover: the run
+    would train, validate, and only then reach `evaluate` with no batches to score.
+
+    The counts come from :func:`~insitubatch.summary.drawable_samples`, which is what the
+    engine itself reports -- a split can hold chunks and still draw nothing, because a
+    windowed target drops the anchors whose horizon runs off the array.
+    """
+    report = ds.describe()["config"]
+    drawable, chunks = report["drawable_samples"], report["split_chunks"]
+    empty = [name for name in ("train", "val") if not drawable[name]]
+    if not empty:
+        return
+    counts = ", ".join(
+        f"{name}={chunks[name]} chunk(s)/{drawable[name]} drawable samples"
+        for name in ("train", "val")
+    )
+    need = _minimum_samples(geom, fractions, horizon)
+    remedy = (
+        f"Use at least {need} samples on the sample axis (--n-steps for the synthetic store, "
+        f"--sample-range for a real one); you have {geom.n_samples}."
+        if need
+        else "Widen the sample axis (--n-steps / --sample-range) or change the split fractions."
+    )
+    raise ValueError(
+        f"the {' and '.join(empty)} split has nothing to draw, so this run could train but "
+        f"never be scored. {geom.n_samples} samples over chunks of {geom.sample_chunk_size} is "
+        f"{geom.n_chunks} chunk(s); split {fractions} gives {counts}. A {horizon}-step target "
+        f"also drops the last {horizon} anchors, which can empty a split that did get chunks. "
+        f"{remedy}"
+    )
+
+
 def forecast_dataset(
     store: Store,
     *,
@@ -240,10 +300,9 @@ def forecast_dataset(
     opened = open_geometries(store, variables=list(variables))
     geoms = {label: opened[var] for label, var in zip(LABELS, variables, strict=True)}
     geoms["target"] = opened[variables[0]].shift(horizon)
-    manifest = split_by_chunk(
-        opened[variables[0]], fractions=(0.8, 0.1, 0.1), sample_range=sample_range
-    )
-    return InSituDataset(
+    fractions = (0.8, 0.1, 0.1)
+    manifest = split_by_chunk(opened[variables[0]], fractions=fractions, sample_range=sample_range)
+    ds = InSituDataset(
         store,
         manifest,
         geometries=geoms,
@@ -252,6 +311,8 @@ def forecast_dataset(
         cache_dir=cache_dir,
         max_inflight=max_inflight,
     )
+    _require_drawable_splits(ds, opened[variables[0]], horizon, fractions)
+    return ds
 
 
 def inputs_and_targets(batch: Batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
