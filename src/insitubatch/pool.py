@@ -668,8 +668,8 @@ class ChunkPool:
         self._buffers = BatchBuffers()
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
         # What ONE iteration needs co-resident, so a second one can be refused at the
-        # boundary instead of stalling mid-epoch. 0 disables the check (a pool built
-        # without a floor cannot say what a second iteration would cost).
+        # boundary. 0 disables the check: a pool built without a floor cannot say what a
+        # second iteration would cost.
         self._iteration_bytes = iteration_bytes
         self._bytes = 0
         # OrderedDict in recency order (LRU front -> MRU back). Eviction targets only
@@ -1026,11 +1026,10 @@ class ChunkPool:
     def _note_touch(self, key: tuple[str, int]) -> None:  # call under the lock
         """Count a chunk this pass has already taken once as a re-read.
 
-        Called where the driver actually *takes* a chunk -- every path that references one
-        for this pass, and no path that merely asks whether it could. A take is one of "the
-        slot was already resident", "it was revived from disk" or "a fresh slot was
-        allocated", so noting it anywhere earlier counts the failed `pin_if_ready` that
-        precedes an admission as a second take, and every chunk looks re-read.
+        Called from every path that *takes* a chunk for this pass -- "already resident",
+        "revived from disk", "a fresh slot allocated" -- and from no path that merely asks
+        whether it could. A failed `pin_if_ready` precedes most admissions, so a take is
+        counted where it succeeds, not where it is attempted.
 
         Under retention a chunk is taken once per pass and this stays zero. Under a released
         spill it is the number a reader needs to judge the trade: a re-read of a persisted

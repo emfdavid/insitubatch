@@ -490,10 +490,9 @@ class Scheduler:
         # (path, chunk) is first-seen on its first tile. Residency is held by the
         # consumer's per-block pins, not here -- admission only allocates the slot, and
         # a not-ready (in-flight) slot is eviction-protected until its fetch completes.
-        # Reads are chunk-major, so an admission decision only has to survive the run of
-        # tiles belonging to one chunk. Holding it for the whole pass would skip the second
-        # admission of a chunk a later block reads again, which is what a released spill
-        # depends on.
+        # Reads are chunk-major, so an admission decision is scoped to the run of tiles
+        # belonging to one chunk. A released spill admits a chunk once per block that reads
+        # it, and each of those admissions is its own decision.
         current: tuple[str, int] | None = None
         current_hit = False
         tasks: list[asyncio.Task] = []
@@ -518,11 +517,11 @@ class Scheduler:
                         # second admission can land while *our own* earlier tiles for it
                         # are still in flight; fetching them again duplicates the work.
                         #
-                        # Our own, strictly. The pool counts writers without recording
-                        # whose they are, so skipping on any writer lets one pass rely on
-                        # another's fetch -- and a pass abandoned mid-fetch unwinds without
-                        # delivering, leaving the other waiting on a delivery nobody will
-                        # make. A pass may only stand on its own outstanding work.
+                        # Our own, strictly (#75). A pass may only stand on work it can
+                        # guarantee: its own tasks end with it, whereas another pass's are
+                        # cancelled when that pass is abandoned, and a slot whose writer
+                        # unwinds without delivering leaves whoever skipped waiting on a
+                        # delivery that is not coming.
                         current_hit = key in self._fetching
                 if current_hit:
                     continue  # already resident, or on its way -- nothing for us to fetch

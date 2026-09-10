@@ -166,13 +166,12 @@ def working_set_bytes(
     spill into a chunk owned by any other block.
 
     ``releases_spill`` says the pass hands each block's chunks back as that block drains
-    (:attr:`InSituDataset.reread_spill`), so nothing is held for a later block and the split
-    no longer has to be resident. The floor is then three blocks rather than two: a block is
-    released only after the batch draining it has gathered, while the wait for the next block
-    happens before, so a batch on a boundary transiently holds the block behind it, the one it
-    gathers, and the one it awaits. The floor must match what the pass will actually hold --
-    under-provisioning starves it mid-epoch, which fails like a hang rather than like a
-    shortage.
+    (:attr:`InSituDataset.reread_spill`), so the floor is three blocks and the split itself
+    is not charged. Three because a block is released only after the batch draining it has
+    gathered, while the wait for the next block happens before: a batch on a boundary holds
+    the block behind it, the one it gathers, and the one it awaits. The floor must match what
+    the pass will actually hold -- under-provisioning starves it mid-epoch, which fails like
+    a hang rather than like a shortage.
 
     Charged with :func:`~insitubatch.pool.slot_charge_bytes`, which is what the pool will
     actually charge -- sizing from the assembled shape while the pool charges stored tiles
