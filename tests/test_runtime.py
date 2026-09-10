@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
+from typing import get_args
 
 import numpy as np
 import pytest
@@ -31,6 +32,7 @@ from insitubatch.runtime import (
     RESIDENCY_YIELD,
     SEPARATION,
     STARVED_ENOUGH,
+    Stage,
     StatsCollector,
     format_pass,
 )
@@ -408,16 +410,41 @@ def test_a_slow_consumer_is_named_as_the_bottleneck(write_zarr):
     assert ds.last_pass.depths.fed_frac > 0.5
 
 
-def test_a_heavy_chunk_transform_is_attributed_to_decode(write_zarr):
+def test_a_heavy_chunk_transform_is_billed_to_the_decode_timers(write_zarr):
+    """A chunk transform's cost reaches `assemble_s`, and the pass reaches a verdict.
+
+    Which stage `assemble_s` then names is settled deterministically by
+    `test_a_starved_queue_accuses_the_dominant_stage`, which parametrizes every timer
+    including this one. Asserting the verdict here too would re-test the rule through a
+    measurement -- and that measurement compares the transform against the *store*, whose
+    speed belongs to whoever's disk the suite runs on. In CI a read costs 0.55s where it
+    costs 0.035s here, which brought the two inside `SEPARATION` and returned `unknown`:
+    the rule declining a coin flip, correctly, on a fixture that had promised it would not
+    have to.
+
+    What only an end-to-end pass can show is that the time is billed to the right timer at
+    all, and that is what this asserts -- against the other producer *compute*, never
+    against IO.
+    """
     ds = _dataset(write_zarr, chunk_transforms=(lambda c: replace(c, data=_burn(c.data)),))
     for i, _ in enumerate(ds.train):
         if i == 9:
             break
     assert ds.last_pass is not None
-    assert ds.last_pass.limiting_stage == "decode", ds.last_pass.times
+    t = ds.last_pass.times
+    assert t.assemble_s > 0
+    assert t.assemble_s > t.decode_s, f"the transform, not the codec: {t}"
+    assert t.assemble_s > t.gather_s + t.batch_transform_s, f"billed to decode, not gather: {t}"
+    assert ds.last_pass.limiting_stage in get_args(Stage), "the pass reaches a verdict"
 
 
-def test_a_heavy_batch_transform_is_attributed_to_gather(write_zarr):
+def test_a_heavy_batch_transform_is_billed_to_the_gather_timers(write_zarr):
+    """The mirror of the chunk-transform case: the cost reaches `batch_transform_s`.
+
+    `test_a_starved_queue_accuses_the_dominant_stage` owns the mapping from that timer to
+    `gather`; this owns only that the time gets there.
+    """
+
     def heavy(batch):
         for k, v in batch.arrays.items():
             batch.arrays[k] = _burn(v)
@@ -428,7 +455,10 @@ def test_a_heavy_batch_transform_is_attributed_to_gather(write_zarr):
         if i == 9:
             break
     assert ds.last_pass is not None
-    assert ds.last_pass.limiting_stage == "gather", ds.last_pass.times
+    t = ds.last_pass.times
+    assert t.batch_transform_s > 0
+    assert t.batch_transform_s > t.decode_s + t.assemble_s, f"billed to gather, not decode: {t}"
+    assert ds.last_pass.limiting_stage in get_args(Stage), "the pass reaches a verdict"
 
 
 def test_assemble_time_is_not_lost_across_the_await(write_zarr):
