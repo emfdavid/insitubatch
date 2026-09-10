@@ -8,6 +8,7 @@ assert "store-bound" is testing the fixture. The integration tests below check t
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from dataclasses import replace
@@ -529,3 +530,72 @@ def test_a_saturated_inflight_budget_says_the_store_may_be_the_floor():
     stage, why = bottleneck(stats)
     assert stage == "store"
     assert "the store or the network is the floor" in why
+
+
+# -- a pass's report is about that pass --------------------------------------
+
+
+def test_concurrent_passes_report_their_own_residency(write_zarr) -> None:
+    """Two iterations share a pool; neither may report the other's work as its own.
+
+    Every counter behind `PassStats` used to live on the `ChunkPool`, which several
+    iterations hold at once, and the reset that made them per-epoch ran at each pass's
+    *start* -- so the second pass zeroed the first's totals mid-flight and then reported the
+    union under its own split's name. Measured before the fix: a `val` pass whose true
+    residency peak is 4 reported 35, the pool's.
+
+    The interleaving is what makes it a shared pool, so the assertion is on attribution
+    rather than on an exact count: a pass can never hold more than it alone touched.
+    """
+    url, _ = write_zarr(n=512, spc=4, inner=(8, 8))
+    geometries = open_geometries(obstore_store(url))
+    manifest = split_by_chunk(geometries["t2m"], fractions=(0.8, 0.1, 0.1))
+
+    def solo(split: str) -> tuple[int, int]:
+        ds = InSituDataset(
+            obstore_store(url), manifest, geometries=geometries, batch_size=8, block_chunks=2
+        )
+        try:
+            ds.set_epoch(0)
+            for _batch in getattr(ds, split):
+                pass
+            assert ds.last_pass is not None
+            return ds.last_pass.cache_misses, ds.last_pass.depths.resident_peak
+        finally:
+            ds.close()
+
+    val_misses, val_peak = solo("val")
+
+    ds = InSituDataset(
+        obstore_store(url),
+        manifest,
+        geometries=geometries,
+        batch_size=8,
+        block_chunks=2,
+        cache_budget_bytes=200 * geometries["t2m"].chunk_bytes,
+    )
+    try:
+        ds.set_epoch(0)
+        train, val = iter(ds.train), iter(ds.val)
+        with contextlib.suppress(StopIteration):
+            while True:
+                next(train)
+                next(val)
+        train.close()
+        val.close()
+        assert ds.last_pass is not None
+        zipped = ds.last_pass
+        pool = ds._pool
+    finally:
+        ds.close()
+
+    assert zipped.depths.resident_peak <= max(val_peak, 4) * 2, (
+        f"a pass reporting {zipped.depths.resident_peak} where it alone holds ~{val_peak} is "
+        "reporting the pool"
+    )
+    assert zipped.depths.resident_peak < pool.max_resident, (
+        "with two passes live the pool holds more than either of them; a pass reporting the "
+        "pool's peak is the defect"
+    )
+    assert zipped.cache_misses <= pool.misses
+    assert val_misses > 0

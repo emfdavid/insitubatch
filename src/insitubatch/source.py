@@ -40,7 +40,7 @@ import numpy as np
 from zarr.abc.store import Store
 
 from .buffers import HostAllocator
-from .pool import ChunkPool, output_geometry, validate_scopes
+from .pool import ChunkPool, PassCounters, output_geometry, validate_scopes
 from .runtime import Depths, PassStats, StatsCollector, format_pass
 from .scheduler import Scheduler, SchedulerConfig
 from .shuffle import DrawOrder, block_shuffled_order, sequential_order
@@ -633,9 +633,13 @@ class InSituDataset:
                             out_q.get(timeout=0.05)
                     producer.join(timeout=10)  # publishes the producer's stage timers
                     pool = sched.pool
-                    self.resident_peak = pool.max_resident  # peak residency this epoch
-                    self.cache_hits = pool.hits
-                    self.cache_misses = pool.misses
+                    # This pass's own counters, not the pool's: with a second iteration live
+                    # the pool's totals are both passes' work, and labelling them with one
+                    # split's name says something false about both (#81).
+                    mine = pool.counters(owner)
+                    self.resident_peak = mine.max_resident  # peak residency this pass
+                    self.cache_hits = mine.hits
+                    self.cache_misses = mine.misses
                     self.bad_chunks = list(sched.bad_chunks)  # tiles NaN-filled this epoch
                     # Was unreachable before: it lives on the Scheduler, which is created inside
                     # this method and torn down with the pass, so unlike the three above nothing
@@ -651,24 +655,24 @@ class InSituDataset:
                         max_inflight=self.scheduler_config.max_inflight,
                         decode_queue_peak=stats.decode_queue_peak,
                         decode_threads=sched.decode_threads,
-                        resident_peak=pool.max_resident,
-                        resident_peak_bytes=pool.max_resident_bytes,
+                        resident_peak=mine.max_resident,
+                        resident_peak_bytes=mine.max_resident_bytes,
                         budget_bytes=pool.budget_bytes,
                     )
-                    self._log_epoch_summary(pool, split)
+                    self._log_epoch_summary(mine, pool, split)
                     # Persistence was asked for but served nothing, and the cache *was*
                     # consulted (entries existed and every revive failed) -> almost certainly
                     # a stale cache_dir or changed data/transforms. Loud once per epoch; a
                     # plain miss (no persisted entry for a chunk) is silent (normal).
-                    failed_revives = pool.revive_mismatch + pool.revive_missing
-                    if self._persist and pool.hits == 0 and failed_revives:
+                    failed_revives = mine.revive_mismatch + mine.revive_missing
+                    if self._persist and mine.hits == 0 and failed_revives:
                         logger.warning(
                             "persist=True but 0 of %d persisted chunks were served this epoch "
                             "(%d shape/dtype mismatches, %d missing/unreadable) -- stale cache_dir "
                             "or changed data/transforms?",
                             pool.manifest_entries,
-                            pool.revive_mismatch,
-                            pool.revive_missing,
+                            mine.revive_mismatch,
+                            mine.revive_missing,
                         )
         finally:
             # Drop this pass's references (and any partial its cancelled fetches
@@ -707,7 +711,9 @@ class InSituDataset:
                 logger.info("%s", format_pass(self.last_pass))
             self._pool.release_owner(owner)
 
-    def _log_epoch_summary(self, pool: ChunkPool, split: SplitName | None) -> None:
+    def _log_epoch_summary(
+        self, mine: PassCounters, pool: ChunkPool, split: SplitName | None
+    ) -> None:
         """One INFO line per epoch *per split*: what the chunk cache and the batch buffers did.
 
         Tagged with the split because a training run iterates more than one of them per epoch
@@ -728,23 +734,23 @@ class InSituDataset:
         """
         if not logger.isEnabledFor(logging.INFO):
             return  # skip the snapshot, which takes the buffer pool's lock
-        reads = pool.hits + pool.misses
+        reads = mine.hits + mine.misses
         # Re-reads and evictions appear whenever they are non-zero, not only under a released
         # spill: a chunk taken twice in one pass, or a ready slot dropped to make room, is the
         # budget being too small for the working set -- and a hit rate alone cannot show it,
         # because a re-read served from cache_dir counts as a hit.
         churn = ""
-        if pool.rereads or pool.evictions:
+        if mine.rereads or mine.evictions:
             why = " (spill released per block, revived from the cache)" if self.reread_spill else ""
-            churn = f", {pool.rereads} re-read{why}, {pool.evictions} evicted"
+            churn = f", {mine.rereads} re-read{why}, {mine.evictions} evicted"
         logger.info(
             "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s%s; batch buffers %s",
             self._epoch,
             split or "all",
-            pool.hits,
+            mine.hits,
             reads,
-            100 * pool.hits / reads if reads else 0.0,
-            pool.max_resident,
+            100 * mine.hits / reads if reads else 0.0,
+            mine.max_resident,
             churn,
             f", {len(self.bad_chunks)} bad chunks" if self.bad_chunks else "",
             pool.buffer_stats().summary(),
