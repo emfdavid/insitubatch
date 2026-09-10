@@ -633,9 +633,8 @@ class InSituDataset:
                             out_q.get(timeout=0.05)
                     producer.join(timeout=10)  # publishes the producer's stage timers
                     pool = sched.pool
-                    # This pass's own counters, not the pool's: with a second iteration live
-                    # the pool's totals are both passes' work, and labelling them with one
-                    # split's name says something false about both (#81).
+                    # This pass's own counters. The pool's totals cover every iteration
+                    # sharing it, and this line names a single split.
                     mine = pool.counters(owner)
                     self.resident_peak = mine.max_resident  # peak residency this pass
                     self.cache_hits = mine.hits
