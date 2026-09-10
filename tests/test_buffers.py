@@ -404,19 +404,25 @@ def test_epoch_summary_reports_buffer_state(write_zarr, caplog) -> None:  # type
         return int(m[1])
 
     (lent0, alloc0), (lent1, alloc1) = counts(lines[0]), counts(lines[1])
-    # 8 batches: batches are cut over the whole epoch order, so 40 rows at batch_size 5 give
-    # 8 full ones and no remainder -- the blocks (16/16/8 rows) do not each end in a short
-    # batch. One buffer lent per batch, every epoch. This read 10 while batches were cut
-    # per block; see tests/test_source.py's draw-policy section.
-    assert lent0 == lent1 == 8
-    # The point of the line. Epoch 0 allocates however many are genuinely in flight -- 3 or 4
-    # here, decided by producer/consumer timing, so it is not a fixed number. What must hold is
-    # that a warm pool stops allocating: were buffers failing to come back, this would climb
-    # toward one per batch and the pool would be a growing memory floor.
+    # 8 batches per epoch: batches are cut over the whole epoch order, so 40 rows at
+    # batch_size 5 give 8 full ones and no remainder -- the blocks (16/16/8 rows) do not each
+    # end in a short batch. One buffer lent per batch.
+    #
+    # These are the *pool's* running totals, not this epoch's: one buffer pool serves every
+    # iteration open on the dataset, so a per-pass reset made the number belong to no
+    # particular pass once two ran at once (#84). Cumulatively, the second line reads twice
+    # the first.
+    assert lent0 == 8
+    assert lent1 == 16
+    # The point of the line, in the form a running total takes: allocations must *stop rising*
+    # once the pool has converged. Epoch 0 allocates however many are genuinely in flight -- 3
+    # or 4 here, decided by producer/consumer timing, so it is not a fixed number. Were buffers
+    # failing to come back, the delta would stay near one per batch and the pool would be a
+    # growing memory floor.
     assert alloc0 >= 1
     # `sys._is_gil_enabled` is 3.13+; on 3.12 the GIL is always on, so default to True.
     if getattr(sys, "_is_gil_enabled", lambda: True)():
-        assert alloc1 <= 1, f"warm epoch still allocating: {lines[1]}"
+        assert alloc1 - alloc0 <= 1, f"warm epoch still allocating: {lines[1]}"
     else:
         # Free-threading cannot hold the tight bound, and the reason is the open question
         # `buffers.py` documents: `sys.getrefcount` may read stale. Reading *high* makes a
@@ -430,7 +436,9 @@ def test_epoch_summary_reports_buffer_state(write_zarr, caplog) -> None:  # type
         # liveness guard raised zero times. So assert what the tight bound is a proxy for:
         # the pool is not degenerating toward one buffer per batch, which is what an actual
         # "buffers never come back" regression looks like and what makes it a memory floor.
-        assert held(lines[1]) < lent1, f"pool grew toward one buffer per batch: {lines[1]}"
+        # Against the batches in one epoch, not the pool's cumulative lends: those now cover
+        # both epochs, so comparing to them would let the bound slacken as the run gets longer.
+        assert held(lines[1]) < 8, f"pool grew toward one buffer per batch: {lines[1]}"
 
 
 def test_exported_torch_tensor_holds_the_buffer() -> None:

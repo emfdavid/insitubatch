@@ -480,7 +480,6 @@ class InSituDataset:
         # done here: it happens in our own teardown below, so an abandoned pass cleans up
         # after itself instead of relying on the next pass's prologue -- which, now that
         # references are owner-scoped, would be a different owner and could not.
-        self._pool.reset_epoch_counters()
 
         out_q: queue.Queue = queue.Queue(maxsize=self.prefetch_depth)
         stop = threading.Event()
@@ -713,11 +712,16 @@ class InSituDataset:
     def _log_epoch_summary(
         self, mine: PassCounters, pool: ChunkPool, split: SplitName | None
     ) -> None:
-        """One INFO line per epoch *per split*: what the chunk cache and the batch buffers did.
+        """One INFO line per epoch *per split*: what this pass did, and what the pools hold.
 
         Tagged with the split because a training run iterates more than one of them per epoch
         (train, then val) over the same pools, and two lines reading "epoch 1" with different
         numbers is a puzzle rather than a report.
+
+        The chunk figures are this pass's own (:class:`~insitubatch.pool.PassCounters`). The
+        batch-buffer figures are the pool's, marked as such in the line: one buffer pool serves
+        every iteration open on the dataset, so `lent` and `allocated` are totals across all of
+        them.
 
         Enabled the standard way -- ``logging.getLogger("insitubatch").setLevel(logging.INFO)``
         -- rather than through a constructor flag, so there is nothing to thread through the
@@ -725,11 +729,14 @@ class InSituDataset:
         libraries do not configure logging for their callers.
 
         The two numbers worth watching are ``allocated`` and the hit rate. Allocations should
-        fall to zero once the pool has converged on the in-flight batch count; a nonzero count
-        in a later epoch means buffers are not coming back -- retained batches (which is
-        legitimate, but it is a memory floor) or a changing batch geometry. The ``x pinned``
-        term is the only confirmation available from a training log that page-locked buffers
-        are actually in use, since the fallback to pageable memory is otherwise silent here.
+        stop rising once the pool has converged on the in-flight batch count; one that keeps
+        climbing epoch after epoch means buffers are not coming back -- retained batches (which
+        is legitimate, but it is a memory floor) or a changing batch geometry. Read it as a
+        total that settles, not a per-epoch count that returns to zero: a running total is the
+        only form of the number that means the same thing however many iterations share the
+        pool. The ``x pinned`` term is the only confirmation available from a training log that
+        page-locked buffers are actually in use, since the fallback to pageable memory is
+        otherwise silent here.
         """
         if not logger.isEnabledFor(logging.INFO):
             return  # skip the snapshot, which takes the buffer pool's lock
@@ -743,7 +750,8 @@ class InSituDataset:
             why = " (spill released per block, revived from the cache)" if self.reread_spill else ""
             churn = f", {mine.rereads} re-read{why}, {mine.evictions} evicted"
         logger.info(
-            "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s%s; batch buffers %s",
+            "epoch %d (%s): chunks %d/%d hit (%.0f%%), peak resident %d%s%s; "
+            "batch buffers (pool) %s",
             self._epoch,
             split or "all",
             mine.hits,
