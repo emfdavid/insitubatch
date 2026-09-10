@@ -485,6 +485,11 @@ class PassCounters:
     resident_bytes: int = 0
     max_resident: int = 0
     max_resident_bytes: int = 0
+    # Chunks this pass has taken once already, so a second take is a re-read. Per chunk and
+    # per live iteration -- the most expensive structure here, for a statistic (#82). It is
+    # derivable rather than discoverable: under a released spill a chunk is admitted once per
+    # block that reads it, so re-reads over the drained blocks are the sum of the block key
+    # counts less the size of their union, both of which the plan already holds.
     seen: set[tuple[str, int]] = field(default_factory=set)
 
     def _note_resident(self) -> None:
