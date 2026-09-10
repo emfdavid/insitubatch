@@ -293,6 +293,26 @@ tiles — so for anything but a single-variable run, ask
 [`describe()`](api.md#insitubatch.InSituDataset.describe), which reports the number the
 engine will actually use rather than one you assembled by hand.
 
+### Two iterations at once are refused, not left to stall
+
+Every active iteration holds its own references, so N of them need N floors. The budget is
+sized for one, because the engine cannot know how many you intend to run. Starting a second
+one the budget cannot hold now raises there, naming the number to pass:
+
+```
+cache_budget_bytes=49152 cannot hold 2 concurrent iterations: each needs 49152 bytes
+co-resident, so 2 need 98304. ... Pass cache_budget_bytes=98304 or more, or iterate the
+splits one after another rather than together.
+```
+
+`zip(ds.train, ds.val)` and two `DataLoader`s both count as two. Iterating the splits one
+after another — the ordinary epoch — never has two live at once, however many passes it runs.
+
+The arithmetic is complete when the second iteration starts, so it is answered there rather
+than left to starve mid-epoch: whether an under-sized pool reaches the stall at all depends on
+how the two interleave, so the same configuration would otherwise succeed and fail on
+consecutive runs.
+
 ### Windowed and shuffled: hold the split, or release and re-read
 
 A windowed view reads `anchor + offset`, and shuffle permutes chunk order, so a chunk one

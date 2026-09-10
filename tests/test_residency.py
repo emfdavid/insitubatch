@@ -170,16 +170,25 @@ def test_slow_consumer_is_not_mistaken_for_starvation(small_store, run_by) -> No
         assert run_by(DEADLINE, lambda: drain(sched)) == geom.n_chunks
 
 
-def test_starvation_names_concurrent_iterations_as_the_cause(small_store, run_by) -> None:
-    """Under-sizing for concurrent iterations must say so, not just "raise the budget".
+def test_a_second_iteration_the_budget_cannot_hold_is_refused_at_the_boundary(
+    small_store, run_by
+) -> None:
+    """Under-sizing for concurrent iterations must fail at the start, and say why.
 
-    Sizing for one iteration is the deliberate default (the engine cannot know how many
-    you intend to run), so the *diagnostic* is what has to carry the cost. Every resident
-    chunk here is legitimately referenced -- by one of two iterations -- which is exactly
-    the case a caller cannot infer from "every one of them pinned or in flight".
+    Sizing for one iteration is the deliberate default -- the engine cannot know how many
+    you intend to run -- so the *diagnostic* is what has to carry the cost. Every resident
+    chunk in this case is legitimately referenced, by one of two iterations, which is
+    exactly what a caller cannot infer from "every one of them pinned or in flight".
 
-    Guards the number too: reporting a count means it has to be the count of distinct
-    owners, not of pins or of resident chunks.
+    Refused when the second iteration starts, rather than left to starve mid-epoch. The
+    arithmetic is complete at that point: N iterations need N floors, and the budget either
+    covers it or does not. Waiting for the stall instead makes the outcome depend on how
+    the two interleave -- the same configuration then succeeds and fails on consecutive
+    runs, which is worse to debug than either result on its own.
+
+    `Scheduler._starvation` is not replaced by this and keeps its own tests: it catches
+    what the arithmetic cannot predict, such as a floor that under-estimates a windowed or
+    non-uniformly chunked pass.
     """
     geoms = open_geometries(obstore_store(small_store))
     geom = geoms["t2m"]
@@ -206,12 +215,35 @@ def test_starvation_names_concurrent_iterations_as_the_cause(small_store, run_by
             for it in (a, b):
                 it.close()
 
-    with pytest.raises(RuntimeError, match="residency budget exhausted") as exc:
+    with pytest.raises(RuntimeError, match="cannot hold 2 concurrent iterations") as exc:
         run_by(DEADLINE, interleave)
 
     msg = str(exc.value)
-    assert "2 iterations are sharing this pool" in msg, (
-        "the diagnostic must name concurrent iterations as the cause -- every chunk is "
-        f"legitimately referenced, so 'raise the budget' alone is not actionable: {msg}"
-    )
     assert "zip(ds.train, ds.val)" in msg, "point at the pattern that produces this"
+    assert "cache_budget_bytes=" in msg, (
+        f"naming the budget to pass is what makes this actionable rather than a refusal: {msg}"
+    )
+
+
+def test_one_iteration_at_a_time_is_never_refused(small_store) -> None:
+    """The control: the check must count *concurrent* iterations, not passes ever made.
+
+    An owner is released at its pass's teardown, so iterating the splits one after another
+    -- the ordinary training epoch -- never has two live at once however many it runs.
+    """
+    geoms = open_geometries(obstore_store(small_store))
+    geom = geoms["t2m"]
+    manifest = split_by_chunk(geom, fractions=(1.0, 0.0, 0.0))
+    ds = InSituDataset(
+        obstore_store(small_store),
+        manifest,
+        shuffle=False,
+        batch_size=geom.sample_chunk_size,
+        block_chunks=2,
+    )
+    try:
+        for epoch in range(3):
+            ds.set_epoch(epoch)
+            assert sum(int(b.arrays["t2m"].shape[0]) for b in ds.train) > 0
+    finally:
+        ds.close()

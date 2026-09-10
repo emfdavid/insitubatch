@@ -32,6 +32,15 @@
   coming and the other pass waiting on it forever. Two concurrent iterations sharing a pool
   is the ordinary case, and either may be abandoned by an early `break`.
 
+  Starting a second concurrent iteration the budget cannot hold now raises there, naming the
+  budget to pass, instead of running until one of them starves. Under-sizing for concurrent
+  iterations already raised (it is why `zip(ds.train, ds.val)` on an auto budget has always
+  been a configuration error), but *whether* an under-sized pool reached the stall depended on
+  how the two interleaved -- and releasing the spill makes the floor small enough that the
+  same configuration began succeeding and failing on consecutive runs. The arithmetic is
+  complete when the second iteration starts, so it is answered there. `Scheduler._starvation`
+  stays as the backstop for what arithmetic cannot predict.
+
   The per-epoch line now reports re-reads and evictions whenever they are non-zero. A hit rate
   alone cannot show this -- a re-read served from the cache counts as a hit -- so rising
   re-reads at a steady hit rate are the signal that a budget is churning rather than holding.

@@ -517,6 +517,7 @@ class ChunkPool:
         chunk_transforms: Sequence[ChunkTransform] = (),
         backing_dir: str | Path | None = None,
         budget_bytes: int | None = None,
+        iteration_bytes: int = 0,
         persist: bool = False,
         readonly_cache: bool = False,
         reset_stale_cache: bool = False,
@@ -666,6 +667,10 @@ class ChunkPool:
         # wrong-data bug. See BatchBuffers' own docstring.
         self._buffers = BatchBuffers()
         self._budget = budget_bytes  # None => unbounded (never self-evicts)
+        # What ONE iteration needs co-resident, so a second one can be refused at the
+        # boundary instead of stalling mid-epoch. 0 disables the check (a pool built
+        # without a floor cannot say what a second iteration would cost).
+        self._iteration_bytes = iteration_bytes
         self._bytes = 0
         # OrderedDict in recency order (LRU front -> MRU back). Eviction targets only
         # a *ready, unreferenced* slot: a not-ready slot is an in-flight fetch, and a
@@ -874,9 +879,41 @@ class ChunkPool:
         and threads it through; nothing in the public API names an owner.
         """
         with self._cv:
+            self._refuse_if_budget_cannot_hold(len(self._owners) + 1)
             self._owner_seq += 1
             self._owners.add(self._owner_seq)
             return self._owner_seq
+
+    def _refuse_if_budget_cannot_hold(self, iterations: int) -> None:  # call under the lock
+        """Raise when the budget cannot hold ``iterations`` working sets at once.
+
+        Every active iteration holds its own references, so N of them need N floors. When
+        the budget cannot cover that, the pass does not fail cleanly -- it runs until one
+        iteration's admission finds every slot pinned by the other and reports starvation,
+        somewhere mid-epoch. Whether it gets there at all depends on how the two interleave,
+        so the same configuration can succeed and fail on consecutive runs.
+
+        The arithmetic is known when the second iteration starts, so it is answered there.
+        This does not replace :meth:`Scheduler._starvation`, which still catches what the
+        arithmetic cannot predict -- a floor that under-estimates, or a third iteration
+        appearing later.
+        """
+        if iterations < 2 or not self._iteration_bytes or self._budget is None:
+            return
+        if iterations * self._iteration_bytes <= self._budget:
+            return
+        raise RuntimeError(
+            f"cache_budget_bytes={self._budget} cannot hold {iterations} concurrent "
+            f"iterations: each needs {self._iteration_bytes} bytes co-resident, so "
+            f"{iterations} need {iterations * self._iteration_bytes}. The budget is sized "
+            "for one iteration because the engine cannot know how many you intend to run. "
+            f"Pass cache_budget_bytes={iterations * self._iteration_bytes} or more, or "
+            "iterate the splits one after another rather than together (`zip(ds.train, "
+            "ds.val)` and two DataLoaders both count as two). Raised here rather than as "
+            "starvation mid-epoch: whether an under-sized pool reaches the stall depends on "
+            "how the iterations interleave, and a run that fails only sometimes is worse "
+            "than one that fails at the boundary."
+        )
 
     def _refs(self, key: tuple[str, int]) -> int:  # call under the lock
         """Total outstanding references to ``key`` across every owner."""
