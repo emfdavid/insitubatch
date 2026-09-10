@@ -510,8 +510,13 @@ class Scheduler:
                     current_hit = self.pool.pin_if_ready(read.array, read.chunk_index, self._owner)
                     if not current_hit:
                         await self._admit(read.array, read.chunk_index)  # may await an unpin
+                        # A chunk two blocks read is admitted once per block, and the second
+                        # admission can land while the first block's tiles are still in
+                        # flight. Their writers will publish the slot; fetching it again
+                        # would duplicate the fetch and the decode.
+                        current_hit = self.pool.delivery_underway(read.array, read.chunk_index)
                 if current_hit:
-                    continue  # cross-epoch hit: prepped chunk already resident, no fetch
+                    continue  # already resident, or on its way -- nothing for us to fetch
                 task = asyncio.create_task(self._one(read))
                 self._tasks.add(task)
                 self._tiles.add(task)

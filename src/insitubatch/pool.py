@@ -1088,6 +1088,25 @@ class ChunkPool:
             self.max_resident_bytes = max(self.max_resident_bytes, self._bytes)
             return True
 
+    def delivery_underway(self, array: str, chunk_index: int) -> bool:
+        """Is this slot already filled, or being filled by a writer that will publish it?
+
+        When the spill is released, a chunk two shuffle-blocks read is admitted once per
+        block, and the second admission can land while the first block's tiles are still in
+        flight -- the driver is allowed to run several blocks ahead of its consumer. Fetching
+        those tiles again would pay the fetch and the decode a second time for bytes already
+        on their way, which is exactly the cost the released spill is trying to avoid.
+
+        A slot FILLING with **no** writer is not underway: that is an abandoned partial left
+        by a cancelled pass, and it will never complete unless somebody fetches it. Nor is a
+        FAILED one, which quiesces and is dropped so a later pass can refetch.
+        """
+        with self._cv:
+            slot = self._slots.get((array, chunk_index))
+            if slot is None or slot.state is SlotState.FAILED:
+                return False
+            return slot.state is SlotState.READY or slot.writers > 0
+
     def is_ready(self, array: str, chunk_index: int) -> bool:
         """True if the chunk is resident, fully assembled, and not failed (a hit)."""
         with self._cv:
