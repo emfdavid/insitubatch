@@ -127,6 +127,11 @@ class BufferStats(NamedTuple):
         Formatted here rather than in the caller so the field names in a docstring and the
         words in the line cannot drift, and so the reuse-off case reads as a sentence instead
         of an interjection inside the arithmetic.
+
+        Every field is the buffer pool's, and one pool serves every iteration open on the
+        dataset, so ``lent`` and ``allocated`` are running totals across all of them. The
+        caller labels the segment for that reason; saying it twice would put two trailing
+        clauses on one arithmetic phrase.
         """
         line = (
             f"{self.n_buffers} x {self.kind} = {self.nbytes / 2**20:.1f} MiB, "

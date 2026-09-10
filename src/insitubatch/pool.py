@@ -1359,19 +1359,6 @@ class ChunkPool:
             self._per_owner.pop(owner, None)
             self._cv.notify_all()  # freed budget may unpark an admission
 
-    def reset_epoch_counters(self) -> None:
-        """Zero the batch-buffer counters at a pass boundary.
-
-        The chunk counters are deliberately *not* reset here: they are the pool's running
-        totals, and a pool is shared by every iteration open on it, so they mean something
-        only cumulatively. A pass's own figures come from its :class:`PassCounters`, minted
-        with its owner and dropped with it.
-
-        ``manifest_entries`` is load-time state and deliberately survives.
-        """
-        with self._cv:
-            self._buffers.reset_counters()
-
     def _pin(self, key: tuple[str, int], owner: int) -> None:  # call under the lock
         owners = self._pinned.setdefault(key, {})
         first = owners.get(owner, 0) == 0

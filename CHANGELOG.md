@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **The batch-buffer figures in the epoch line were the pool's, printed under one split's name
+  (#84).** One buffer pool serves every iteration open on a dataset, and its counters were reset
+  at each pass's *start* -- so with `zip(ds.train, ds.val)` a pass that drew 7 batches reported
+  14 lends, each pass reporting the pool's running total at its own finish. Unlike the chunk
+  counters (#81) these are not per-pass quantities to begin with: four of the six fields are
+  pool properties already, and `allocated` is only useful as one. So the line labels the segment
+  `(pool)` and the counters run cumulatively, which is the only form that means the same thing
+  however many iterations share it. The guidance changes with it -- watch `allocated` stop
+  rising rather than return to zero.
+
 - **A pass's report described the pool, not the pass (#81).** Every counter behind `PassStats`
   and the per-epoch line -- hits, misses, residency peak, re-reads, evictions -- lived on the
   `ChunkPool`, which several iterations hold at once, and `reset_epoch_counters()` ran at each

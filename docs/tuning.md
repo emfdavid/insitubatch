@@ -153,13 +153,18 @@ give it back afterwards. If the burst fit, the floor fits.
 
 `close()` is the only release, and it drops the cross-epoch chunk cache and store session with
 it — so size the budget for your burst rather than planning to reclaim between phases. The
-per-epoch log line reports the pool directly, and `allocated` staying nonzero after the first
-epoch is the signal that batches are not coming back:
+per-epoch log line reports the pool directly, and `allocated` continuing to climb after the
+first epoch is the signal that batches are not coming back:
 
 ```
 epoch 3 (train): chunks 151/151 hit (100%), peak resident 51;
-                 batch buffers 17 x pinned = 544.0 MiB, 100 lent, 0 allocated
+                 batch buffers (pool) 17 x pinned = 544.0 MiB, 400 lent, 17 allocated
 ```
+
+The chunk figures are that pass's own; the buffer figures are the pool's running totals, marked
+`(pool)` because one buffer pool serves every iteration open on the dataset. Read `allocated` as
+a number that *settles* — 17 after four epochs of 100 batches each is a pool that converged
+after the first — rather than one that returns to zero each epoch.
 
 Under `pin_host_buffers` / `as_torch(..., device=...)` the floor is page-locked, which the
 kernel cannot reclaim — so it is bounded separately at RAM/8 by default. Past that the loader
