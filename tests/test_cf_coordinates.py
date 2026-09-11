@@ -24,8 +24,8 @@ def test_coordinates_and_grid_mapping_are_not_variables(write_cf_zarr, v3):
 
 
 def test_the_quickstart_call_works_on_a_cf_store(write_cf_zarr):
-    """The README's own form -- ``open_geometries(store)`` with no variables -- must survive
-    contact with a store written by xarray."""
+    """``open_geometries(store)`` with no ``variables`` must survive contact with a store
+    written by xarray: it is the shortest form, so it is the one tried first."""
     url, srcs = write_cf_zarr()
     store = obstore_store(url)
     geoms = open_geometries(store)

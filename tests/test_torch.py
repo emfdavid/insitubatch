@@ -51,9 +51,9 @@ def test_as_torch_dataloader_roundtrip(write_zarr) -> None:
 def test_as_torch_accepts_a_device(write_zarr) -> None:
     """`as_torch(view, device=...)` must not raise on the way in.
 
-    `device=` is the documented route to page-locked buffers (docs/benchmarks.md), but every
-    `as_torch` call in the tests, the README and docs/index.md omits it -- so the branch that
-    decides whether to pin had never been executed. It names `torch`, which this module
+    `device=` is the documented route to page-locked buffers, and the branch that decides
+    whether to pin is reachable only through it -- so it is exercised here rather than left to
+    whichever call sites happen to pass one. It names `torch`, which this module
     imports only under `TYPE_CHECKING`, so any non-None device raised
     `NameError: name 'torch' is not defined` before a single batch was drawn.
 

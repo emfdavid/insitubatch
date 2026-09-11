@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- **The README was a strong pitch and a weak manual, and a cold-agent test measured how weak.**
+  Two agents with no prior context were each given an unfamiliar public store and one
+  documentation surface — README alone, or README plus `docs/tuning.md` — and told to build a
+  working iterator. Both got there; neither got there from the page. The README-only arm made
+  **sixteen** signature and docstring inspections, every one driven by a question the page did
+  not answer, and concluded that "nearly everything I needed to *operate* the library came from
+  parameter signatures, docstrings and error strings". The other arm, on different docs and a
+  different dataset, hit the identical wall in the identical place — which is what makes it the
+  page's defect rather than one agent's bad luck.
+
+  What the page got wrong was concentrated and consequential. The only end-to-end example was
+  single-variable, because the demo store has one array, and nothing said how to select
+  variables — so both agents opened **every** array in their store and were quoted residency
+  budgets of 5 493 GiB and 10 935 GiB for variables they never asked for. The transforms
+  section named `chunk_transform` / `batch_transform` four times in bold; the parameters are
+  plural and take a sequence, and the page never showed either being passed, so the one place
+  the names appeared was the place that got them wrong. `applies(...)` was absent entirely,
+  and with it the warning that lives only in its docstring: gating inside a transform body
+  instead makes unaffected arrays "gathered as truncated prefixes of themselves ... with no
+  exception raised". `sample_range`, `readonly_cache` and `reset_stale_cache` did not appear;
+  `cache_dir` appeared once, in the Windows row of the platform table. And following the page
+  verbatim the loader ran in silence, because nothing mentioned `logging.basicConfig`.
+
+  The page is rewritten around what it is for. The API now starts at 18% of the page rather
+  than 54%; the quickstart is a runnable multi-variable recipe that was executed verbatim to
+  confirm it (it previously could not run at all — `n_epochs` was undefined); caching and
+  diagnostics get sections of their own, the first being this release's headline behaviour and
+  the second — `ds.last_pass`, `limiting_stage`, `print_debug_info()` — having had no README
+  coverage whatsoever. The free-threading essay and the milestone inventory are gone, the
+  latter because `DESIGN.md` is the single source of truth for status and the README was
+  mirroring it.
+
+- **Status is now Beta, and all three places that state it agree for the first time.** The
+  PyPI classifier said `2 - Pre-Alpha`, the README said alpha, and `DESIGN.md` — the declared
+  single source of truth — said Alpha: two steps apart, on the page a new user lands on.
+  Beta is claimed on instrumentation rather than on an absence of bugs: the O(chunks) invariant
+  is pinned by a test with a companion control that fails loudly if the counter comes unwired,
+  byte fingerprints and a model-free persistence baseline cover the silently-plausible-data
+  class, and the CUDA-gated buffer-lifetime tests now run green on an L4 with the instrument
+  validated first. The API is still pre-1.0 and breaking changes are still allowed.
+
 - **A JAX run on a GPU box trained on the CPU, at exact values, with nothing raised.**
   `to_jax` was `jnp.from_dlpack(array)`, which imports a *host* buffer and therefore commits
   its result to `cpu:0` — and `jax.jit` does not move a committed array. So every JAX user

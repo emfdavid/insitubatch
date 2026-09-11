@@ -7,229 +7,169 @@
 
 **Train in place on n-dimensional cloud tensors.**
 
-`insitubatch` is the data-loader orchestration layer that sits on top of
-*already-solved* async cloud IO (obstore / zarr v3 / icechunk) for PyTorch,
-Jax and TensorFlow. It turns an existing Zarr archive into a shuffled,
-split-aware data source built to **keep the GPU fed** — **with no reshard**
-— and a Python hot path that scales with **chunks, not samples**.
+`insitubatch` is a data-loader orchestration layer for PyTorch, JAX and TensorFlow, built on
+top of *already-solved* async cloud IO (obstore / zarr v3 / icechunk).
 
-It is **domain-general**: the sample axis is a *role*, not a fixed dimension. The same engine
-trains on ERA5/weather over time, segments **OME-NGFF microscopy** volumes over `Z`
-([example](examples/microscopy/) — raw image + label mask co-batched with no reshard), and
-trains on **astronomy straight out of FITS** — Hubble frames ([example](examples/hubble/)) and
-SDSS galaxy spectra ([example](examples/sdss/)) indexed as virtual byte-range references, no
-pixels moved. One contract, *any* single sample axis, variables that chunk it differently.
-(It also maps cleanly onto **radio-astronomy** MSv4 visibilities — a
-[documented mapping](docs/architecture.md), not yet a built example.)
+Between a dataset small enough to hold in memory and one worth building a purpose-built ETL
+pipeline for, there is a wide middle: archives too large to load, not yours to rewrite, or
+read in ways that keep changing.
 
-The SDSS reference stores are **published and readable by anyone**, so you can stream real
-spectra without building anything:
-[`gs://insitubatch-bench-insitubatch/astronomy/`](https://storage.googleapis.com/insitubatch-bench-insitubatch/astronomy/README.md)
-(`python -m examples.sdss.train_torch --source published`).
+`insitubatch` is a loader for that middle: it turns a Zarr archive — in the layout it already
+has, wherever it already lives — into a shuffled, split-aware stream of ready-to-train
+tensors, without copying or rewriting the archive.
 
-> The IO race is over (obstore/icechunk saturate the NIC). The *loader* race is
-> open. `insitubatch` builds the layer that projects like light-speed-io and
-> hypergrib stopped one step short of. See [DESIGN.md](DESIGN.md).
+The design rests on two invariants:
 
-## Why
+- **A stored chunk is fetched and decoded exactly once**, however many samples, batches or
+  epochs reference it — one async event loop streams chunks under a single concurrency budget
+  into a bounded pool that is both the residency tier and the cache.
+- **Python work scales with the chunks a batch touches, not the samples it contains** —
+  planning and assembly are vectorized numpy, and the torch surface runs `num_workers=0`.
 
-The classic PyTorch `DataLoader` spreads work across worker **processes**, each
-running a *synchronous* `__getitem__`. Against cloud Zarr that means no shared
-chunk cache (every worker re-reads the same chunk), read concurrency that reaches no
-further than one sample, and dask thread pools nested inside forked workers.
-`insitubatch` **inverts** it: one async event loop streams stored chunks under a single
-concurrency budget into a bounded pool that holds them and assembles batches on
-demand — the pool doubles as the cache; torch runs `num_workers=0`.
+The sample axis is a **role**, not a fixed dimension, so one engine covers ERA5 forecasting,
+OME-NGFF microscopy segmentation over `Z`, and Hubble and SDSS archives read straight out of
+FITS as virtual byte-range references — see
+[Examples](https://emfdavid.github.io/insitubatch/examples/).
 
-The payoff is a **two-regime** story against the worker-process `DataLoader`. On a
-**well-chunked** store it **matches a hand-tuned worker/xbatcher pool** (swept to 32 workers)
-while running in **one process at bounded memory**, reaching first batch in a fraction of a
-second rather than the seconds a worker pool spends starting. When the chunk layout **isn't
-sample-optimized** — fat time-chunks, overlapping windows, verification grids — it pulls
-**far ahead of even a tuned pool**: read planning decodes each shared chunk **once** where a
-per-sample `__getitem__` re-reads it, so the win **grows with samples-per-chunk** (to ~25× at the fat end of the ERA5 sweep) and cross-epoch
-caching compounds it. The **honest boundary**: at the one-sample-per-chunk (GRIB) end there is
-nothing to amortize, so a tuned pool edges ahead on single-pass throughput, and against an
-*unbounded* concurrent gather on large fields bounded-inflight streaming trails per byte — the
-sweet spot is streaming with bounded memory, not a universal speed win. Full comparison:
-[Benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/).
+What it asks of a store is **many chunks along the sample axis** — splits and shuffling are
+both chunk-granular, so chunks are the unit of each. A sample must also sit inside one chunk
+on that axis; it may span every other axis freely.
 
-## Status
+**Status: Beta** — feature-complete for the documented scope and validated on real cloud IO
+(S3, GCS, and an L4 GPU). Pre-1.0, so breaking changes are still allowed. Open work is tracked
+in [issues](https://github.com/emfdavid/insitubatch/issues), and the
+[contributing guide](https://emfdavid.github.io/insitubatch/contributing/) covers scope,
+governance, and what a change has to carry to land.
 
-🚧 **alpha, but validated on real cloud IO.** On an in-region S3 run
-(`c6id.8xlarge`, 32 vCPU, coarsened ERA5 `361×720` fields), at fat chunks
-(`sample_chunk=16`) insitubatch delivers **~19× the throughput** of a *tuned*
-`xbatcher`/worker `DataLoader` baseline (swept to 32 workers), in **~8× less
-memory**, and reaches its first batch **~22× sooner** (0.7 s vs 15.6 s) — the
-map-style baseline re-decodes a whole chunk per sample; insitubatch reads each
-chunk once. That is the *fat* end of the sweep, where the advantage is largest;
-at one sample per chunk there is nothing to amortize and a tuned pool edges ahead
-on single-pass throughput. Full numbers + methodology:
-[the benchmarks page](https://emfdavid.github.io/insitubatch/benchmarks/).
-
-The engine is the **decoupled fetch scheduler**: reads flatten to *stored chunks*
-under one `max_inflight` budget (no nested inner/outer concurrency caps), decoded
-stored chunks are adopted **by reference** into a **`ChunkPool`** that is the
-residency tier *and* the cache (byte budget + pin/LRU, heap or mmap-on-NVMe); `gather`
-places each one straight into its rectangle of the batch. **Read concurrency and
-residency/shuffle span are independent dials** — the decoupling reaches ~1 GB/s at
-flat, low memory (validated on S3; see below). Built: planner + chunk-aligned
-splits, async obstore reads, the scheduler + pool (with **decode-once caching**,
-cross-epoch and **cross-run** via `persist=True`), chunk/batch **transforms** (incl. a
-fitted `StandardScaler`), **prefetch**, the torch / JAX / TF surfaces, and runnable
-[examples](examples/); validated free-threading-correct on 3.13t. Not yet built:
-`Regrid` + the **GPU/device** transform stage — see the roadmap in [DESIGN.md](DESIGN.md).
-
-📖 **Docs:** <https://emfdavid.github.io/insitubatch/>
-(see [Tuning](https://emfdavid.github.io/insitubatch/tuning/) for the
-chunks↔concurrency↔memory model).
+📖 **Docs:** <https://emfdavid.github.io/insitubatch/> —
+[Tuning](https://emfdavid.github.io/insitubatch/tuning/) for the chunks↔concurrency↔memory
+model, and [Architecture](https://emfdavid.github.io/insitubatch/architecture/) for how the
+pieces fit together.
 
 ## Install
 
 ```bash
-pip install insitubatch              # core engine (numpy Batch; no framework)
-pip install "insitubatch[torch]"     # + torch DLPack adapter (insitubatch.frameworks)
-pip install "insitubatch[jax]"       # + JAX adapter
-pip install "insitubatch[tf]"        # + TensorFlow adapter
+pip install insitubatch                  # core engine (numpy Batch; no framework)
+pip install "insitubatch[torch]"         # + torch DLPack adapter
+pip install "insitubatch[jax]"           # + JAX adapter (CPU wheel)
+pip install "insitubatch[jax-cuda]"      # + JAX adapter on CUDA (jax[cuda12])
+pip install "insitubatch[tf]"            # + TensorFlow adapter
+pip install "insitubatch[cache]"         # stronger cross-run cache invalidation -- see Caching
+pip install "insitubatch[icechunk]"      # icechunk_store()
+pip install "insitubatch[arraylake]"     # arraylake_store()
+pip install "insitubatch[gpu]"           # CUDA box only: cupy + kvikio
 ```
 
-For development:
+Install **one** framework adapter per environment: torch, JAX and TensorFlow load duplicate
+OpenMP/XLA/protobuf runtimes and crash when co-installed (TF pulls JAX in via Keras 3). The
+core engine imports no framework, and importing `insitubatch` pulls none in.
 
-```bash
-uv sync                  # core engine + dev tools
-uv sync --extra torch    # add the torch handoff (frameworks.as_torch)
-uv sync --extra jax      # add the JAX handoff (frameworks.to_jax)
-uv sync --extra tf       # add the TF handoff (frameworks.as_tf_dataset)
-uv sync --extra gpu      # CUDA box only: cupy + kvikio zero-copy path
-```
+## Quickstart
 
-### Platform support
+`InSituDataset` is a **framework-neutral source of numpy `Batch` objects**. You iterate its
+split *views* — `ds.train` shuffled, `ds.val` / `ds.test` / `ds.all` deterministic — which
+all share **one** pool, so a chunk two splits both read is decoded once.
 
-| platform | status |
-|---|---|
-| **Linux** | supported, and the only thing CI proves — every job is `ubuntu-latest` |
-| **macOS** | expected to work; **untested** — no CI job, no regular local runs |
-| **Windows** | **untested**, and unarbitrated: there is no POSIX advisory locking, so two processes sharing a `cache_dir` cannot be stopped from corrupting each other. The loader warns at construction |
-
-*Untested* is not *unsupported*: there is no evidence either way. Reports — or a CI job —
-are welcome.
-
-## Tests
-
-```bash
-uv run pytest -q                              # the suite
-uv run ruff check src tests bench             # lint
-uv run mypy src                               # types
-```
-
-The torch-handoff tests skip unless torch is installed (`uv sync --extra torch`);
-the same is enforced in CI.
-
-> **One framework per environment.** torch, JAX and TensorFlow cannot coexist in one
-> Python process — together they load duplicate OpenMP/XLA/protobuf runtimes and the
-> process crashes (`SIGSEGV` / abort). Separate pytest *processes* in one env are not
-> enough: TF (via its bundled Keras 3) transitively imports JAX whenever JAX is
-> *installed*, so the two collide even if only the TF tests are selected. So install
-> just one adapter at a time when running the framework tests:
-> ```bash
-> uv sync --extra torch && uv run pytest -q   # torch adapter + core
-> uv sync --extra jax   && uv run pytest -q   # JAX adapter (others importorskip-skip)
-> uv sync --extra tf    && uv run pytest -q   # TF adapter
-> ```
-> CI does exactly this — one job per framework, each with a single adapter installed,
-> plus a separate lint/types job that installs every extra but runs no pytest (mypy
-> doesn't import the frameworks, so co-installation is harmless there). This is a
-> framework-coexistence limitation, not an insitubatch one — the core engine and each
-> adapter are independent.
-
-### Free-threaded (3.13t)
-
-The `ChunkPool` is free-threading-correct **by construction**: a delivering thread does its
-write **before** the lock — each tile is its own key, so writers never collide — and
-publishes readiness **under** it, so the lock, not the GIL, is the happens-before edge
-to the consuming gather. The race probe is
-`test_pool_concurrent_scatter_is_race_free` (64 tiles, 32 threads).
-
-The batch-buffer pool is *enforced* rather than structural, and the distinction is worth
-knowing: it decides a buffer is free by reading `sys.getrefcount` on the buffer's owner
-against a calibrated idle baseline, and a refcount read off-GIL can be stale. Reading
-*high* only wastes a buffer (the pool allocates another). Reading *low* would hand live
-memory to a second writer, so the pool treats a below-baseline count as impossible and
-**raises** rather than lending — see `buffers.py`. That guard is what makes the mechanism
-safe on 3.13t; it is not the same claim as the pool scatter's.
-
-Run the suite GIL-free on a free-threaded interpreter:
-
-```bash
-uv python install 3.13t
-# Separate env so the default .venv stays put. numcodecs has no free-threaded
-# wheel yet, so it compiles from sdist (needs a C/C++ compiler: Xcode CLT on
-# macOS, gcc/gcc-c++ on Linux). torch/bench have no FT wheels -> core deps only.
-UV_PROJECT_ENVIRONMENT=.venv-ft uv sync --python 3.13t
-
-# numcodecs re-enables the GIL on import (not yet declared GIL-safe), so force it
-# off and confirm it took before trusting the run:
-PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t \
-  python -c "import sys, zarr, numcodecs; assert not sys._is_gil_enabled(); print('GIL-free OK')"
-PYTHON_GIL=0 UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.13t pytest -q
-```
-
-CI mirrors this: a `{3.12, 3.13}` matrix plus a `3.13t` job that asserts the GIL is
-actually off before testing. Throughput is **GIL-independent by design** — fetch
-(obstore/Rust), decode (numcodecs zstd, C), and gather (vectorized numpy) all
-release the GIL — so 3.13t runs at the **same speed** as the GIL build, not faster. The
-free-threading work is **correctness + future-proofing, not a speedup**; *not depending*
-on the GIL is the point (see [DESIGN.md](DESIGN.md)).
-
-## Shape of the API
-
-The core `InSituDataset` is a **framework-neutral source of numpy `Batch` objects** — it
-inherits nothing framework-specific. You iterate its split *views* (`ds.train` shuffled,
-`ds.val` / `ds.test` / `ds.all` deterministic), which all share **one** pool, so a chunk
-two splits both read decodes once. Handoff to torch / JAX / TF is a thin, optional DLPack
-adapter (re-exported from the package root; defined in `insitubatch.frameworks`) — the core
-imports no framework, and importing `insitubatch` pulls none in.
+**This runs as written** — the store is public, and the window is deliberately small, about
+2 GB of reads:
 
 ```python
+import logging
 from insitubatch import InSituDataset, obstore_store, open_geometries, split_by_chunk
 
-# The engine reads a zarr Store; build one per backend. obstore_store covers
-# file://, s3://, gs://, az://. (fsspec_store reaches GCS Rapid/requester-pays;
-# icechunk_store opens an Icechunk repo by URL — icechunk_store(url, anonymous=True)
-# for a public one; arraylake_store opens an Arraylake-hosted repo by catalog name.
-# All of them return a Store, and the same InSituDataset below reads any of them.)
-store = obstore_store("gs://insitubatch-bench-insitubatch/era5_c16.zarr", skip_signature=True)
-geoms = open_geometries(store)  # {var: ArrayGeometry} from zarr metadata
-# contiguous chunk blocks by default (no time-series leakage);
-# pass contiguous=False for exchangeable samples (independent scenes)
-manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1))
+logging.basicConfig(level=logging.INFO)  # the per-epoch line is the main diagnostic
+n_epochs = 2
 
-ds = InSituDataset(store, manifest, batch_size=32, block_chunks=16)
+# One Store per backend, all read by the same InSituDataset: obstore_store (file://, s3://,
+# gs://, az://), icechunk_store (an Icechunk repo by URL), fsspec_store (GCS Rapid,
+# requester-pays), arraylake_store (Arraylake-hosted). This one is a public benchmark store:
+# full-resolution 721x1440 ERA5-shaped t2m, where era5_c{1,2,4,8,16,32} differ only in how
+# many samples one chunk holds (values are random numbers - not real data!).
+store = obstore_store("gs://insitubatch-bench-insitubatch/era5_c16.zarr", skip_signature=True)
+
+# `variables=` SELECTS. Omit it and you open every array in the store -- on a 25-variable
+# archive that is a 25-variable run and a residency budget to match.
+geoms = open_geometries(store, variables=["t2m"])
+
+# The manifest carries the SPLIT, not the selection. Contiguous chunk blocks by default
+# (no time-series leakage); pass contiguous=False for exchangeable samples. `sample_range`
+# restricts to a slice of the sample axis -- the way to try a large store cheaply. Widen it
+# (or drop it) for real work; 640 samples is 40 chunks, of which train gets 32.
+manifest = split_by_chunk(geoms["t2m"], fractions=(0.8, 0.1, 0.1), sample_range=(0, 640))
+
+# Passing `geometries=` is what scopes the run to those variables.
+ds = InSituDataset(store, manifest, geometries=geoms, batch_size=32, block_chunks=16)
 
 for epoch in range(n_epochs):
     ds.set_epoch(epoch)
     for batch in ds.train:  # numpy Batch: {var: np.ndarray} + sample_indices
         ...
-    for batch in ds.val:  # deterministic; shares the pool with train
+    for batch in ds.val:    # deterministic; shares the pool with train
         ...
 ```
 
-That store is one of the public benchmark stores, readable by anyone
-(`gs://insitubatch-bench-insitubatch/era5_c{1,2,4,8,16,32}.zarr` — the same
-`era5_c*` chunk-size family the [benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/)
-sweep, full-resolution `721×1440` ERA5-shaped `t2m`, differing only in samples per chunk).
+The second epoch's log line reports a **cache hit rate** against the first: that is
+decode-once across epochs, from the pool alone, with no `cache_dir` configured.
 
-### What it will cost, before it costs it
+Two behaviours of that loop are worth knowing before you widen it. Splits are
+**chunk-granular** — you subset whole chunks, never individual samples — so a `sample_range`
+landing mid-chunk pulls that edge chunk in whole, and a split that rounds to zero chunks yields
+nothing rather than raising (`print_summary()` will show it, and it is worth checking if a
+validation curve comes out suspiciously flat). And shuffling is **block-local** rather than
+global: samples are drawn from a window of `block_chunks` chunks, which is what keeps residency
+bounded, so widening the window costs memory while `describe()["shuffle_quality"]` scores how
+close the result gets to a global shuffle.
+
+### Handing off to a framework
+
+The `Batch` above is numpy, and the adapter to each framework is thin: **zero-copy on CPU via
+DLPack** for torch and JAX, while TF takes one CPU copy (its experimental DLPack is
+unreliable).
+
+Device placement differs by framework, and the difference is one sentence each. **torch**
+takes a `device=` on `as_torch` / `to_torch`, which also page-locks the batch buffers and
+issues the copy itself. **JAX** lands on `jax.devices()[0]`, like any other jax array, with
+`device=` to override. **TF** places by its own policy — on a GPU box, `/GPU:0`. Page-locking
+is torch-only: JAX cannot consume pinned host memory and exposes no event to gate buffer
+recycling on, so `to_torch(device=)` is the only path that owns its transfer.
+
+Pick the one line for your framework — these are **alternatives, not a script**, since torch,
+JAX and TensorFlow cannot share a process:
+
+```python
+# torch -- parallelism is in our event loop, so num_workers=0, batch_size=None
+from insitubatch import as_torch
+from torch.utils.data import DataLoader
+
+loader = DataLoader(as_torch(ds.train, device="cuda"), batch_size=None, num_workers=0)
+for batch in loader:  # {var: torch.Tensor} on the GPU; omit device= to stay on CPU
+    ...
+```
+
+```python
+# JAX -- iterate a view and convert each batch
+from insitubatch import to_jax
+
+for batch in ds.train:
+    jbatch = to_jax(batch)  # {var: jax.Array} on jax.devices()[0]
+```
+
+```python
+# TensorFlow -- wraps a view via from_generator
+from insitubatch import as_tf_dataset
+
+tfds = as_tf_dataset(ds.val)  # a tf.data.Dataset
+```
+
+## What it will cost — before, and after
 
 `ds.print_summary()` answers from **geometry and configuration alone** — it opens no store,
-fetches nothing, and runs no pass. That is what makes it usable in the situation it exists
-for: finding out that a configuration needs 5 GiB, or that concurrency and memory are welded
-together by the chunk layout, *before* waiting an hour to discover it.
+fetches nothing and runs no pass. This is the real output for the `ds` built above. That is
+the point: a report that had to touch the store
+would be useless in exactly the situation you want it.
 
 ```console
 >>> ds.print_summary()
-insitubatch dataset
-
 variables
   t2m
     6000x721x1440 float32   chunks 16x721x1440   sample axis 0
@@ -238,8 +178,8 @@ variables
 
 configuration (resolved)
   batch_size 32   block_chunks 16   max_inflight 32   prefetch_depth 2
-  shuffle on (seed 0, quality 0.96)   window no   shuffle pool 256 samples for a 32-sample batch
-  splits (chunks)  train 300  val 38  test 37
+  shuffle on (seed 0, quality 0.99)   window no   shuffle pool 256 samples for a 32-sample batch
+  splits (chunks)  train 32  val 4  test 4
   cache backing heap
 
 memory, accounted, for 1 concurrent iteration(s)
@@ -248,7 +188,7 @@ memory, accounted, for 1 concurrent iteration(s)
   batch queue    380.2 MiB   (prefetch_depth + 1) x batch
   accounted       4.33 GiB   sum of the rows above
   ESTIMATED       5.41 GiB   accounted x 1.25 -- plan for this
-  ...
+  [... two paragraphs on allocator retention, and on sizing concurrent iterations ...]
 
 notes
   [t2m] one stored chunk per outer chunk at 63.4 MiB: concurrency and memory are coupled here,
@@ -256,85 +196,158 @@ notes
       them.
 ```
 
-The **notes** section is the part that earns the call. Here it caught the *fat, single-inner*
-regime: because the whole `721×1440` field is one stored chunk, every one of the 32 reads in
-flight costs a full 63.4 MiB — so `max_inflight` and memory are welded together, and the fix
-is at write time (inner-chunk the field), not in the loader config. `describe()` returns the
-same report as data if you would rather assert on it in CI than read it, and
-`describe(iterations=N)` sizes the budget for `N` passes sharing the pool.
+The **notes** earn the call: here every one of the 32 reads in flight costs a full 63.4 MiB,
+so `max_inflight` and memory are welded together by the layout, not by the config. The unit
+throughout is the **stored chunk** — what one `store.get` returns, which on a **sharded**
+array is the *shard*, not zarr's inner `chunks`; `ArrayGeometry.chunk_bytes` reports what one
+really costs. The [memory model](https://emfdavid.github.io/insitubatch/tuning/) has the
+arithmetic, including what an allocating `chunk_transform` adds.
 
-Hand off to a framework — **zero-copy on CPU via DLPack for torch and JAX**; TF takes one
-CPU copy (its experimental DLPack is unreliable — see `frameworks.to_tf`). The ecosystems
-differ — torch needs a `Dataset` subclass, JAX iterates directly, TF wraps via
-`from_generator`:
+`describe()` returns the same report as data; `describe(iterations=N)` sizes the budget for
+`N` passes sharing the pool, since the auto budget covers **one** — so `zip(ds.train,
+ds.val)` has to say so.
+
+Where `describe()` predicts, **`ds.last_pass` reports**. Every producer-side problem presents
+identically, as an empty batch queue, and slow storage / a saturated decode pool / too small a
+residency budget want opposite fixes — so `ds.last_pass.limiting_stage` applies a rule to the
+sampled depths and per-stage times and names *one* stage, or `"unknown"` rather than guessing.
+With logging on, the per-epoch INFO line ends in `limited by: <stage> -- <what to do>` and
+reports re-reads and evictions whenever they are non-zero: rising re-reads at a steady hit rate
+mean a budget that is churning rather than holding. For bug reports,
+`insitubatch.print_debug_info()` prints the storage stack, the installed framework adapter and
+the free-threading state.
+
+## Transforms
+
+Two hooks, placed by cost. A **`chunk_transform`** `(DecodedChunk) -> DecodedChunk` runs per
+decoded chunk of one variable *before* the cache boundary, so its output is **cached** — the
+home for scaling, unit conversion, dtype casts and regrids. A **`batch_transform`**
+`(Batch) -> Batch` runs per assembled batch with all variables aligned, **uncached** — for
+cross-variable derived fields and per-sample random augmentation. Both take a **sequence**,
+and both must be vectorized numpy that releases the GIL (a per-element Python loop serializes
+the decode pool).
 
 ```python
-from insitubatch import as_tf_dataset, as_torch, to_jax
-from torch.utils.data import DataLoader
+from insitubatch import applies
 
-# torch: parallelism is in our event loop, so num_workers=0, batch_size=None
-loader = DataLoader(as_torch(ds.train), batch_size=None, num_workers=0)  # {var: torch.Tensor}
-
-for batch in ds.train:      # JAX: iterate a view, convert each batch
-    jbatch = to_jax(batch)  # {var: jax.Array}
-
-tfds = as_tf_dataset(ds.val)  # a tf.data.Dataset
+ds = InSituDataset(
+    store, manifest, geoms,
+    chunk_transforms=[applies(["2m_temperature"], kelvin_to_celsius)],
+    batch_transforms=[wind_speed],
+)
 ```
 
-## Transforms — and checking one before you train
+**Scope a chunk transform with `applies(...)`, not with an `if` inside its body.** An in-body
+test is invisible to the engine, which folds a reshaping transform's declared `output_inner`
+into *every* array's geometry; the unaffected arrays are then gathered as truncated prefixes
+of themselves and can never revive from cache — **with no exception raised**. A bare
+transform applies to everything, and a name matching no array raises at construction.
 
-Two hooks, placed by cost: a **`chunk_transform`** `(DecodedChunk) -> DecodedChunk` runs per
-decoded chunk (one variable), before the cache boundary, so its output is **cached** — the home
-for scaling, unit conversion, dtype cast, regrid; and a **`batch_transform`** `(Batch) -> Batch`
-runs per assembled batch (all variables aligned), **uncached** — for cross-variable derived
-fields and per-sample random augmentation. Both are pure numpy; see
-[`examples/transforms.py`](examples/transforms.py) (K→C chunk stage + windspeed batch stage).
+A **reshaping** transform (regrid) must declare `output_inner(geom) -> (inner_shape, dtype)`
+so the cache can size its slot; returning a shape that disagrees with it now raises. Check
+both against **one chunk of your real store** before training:
 
-A `chunk_transform` must be **vectorized numpy that releases the GIL** (a per-element Python
-loop serializes the decode pool), and a **reshaping** one (regrid) must declare
-`output_inner(geom) -> (inner_shape, dtype)` so the cache can size its slot. Check both against
-**one chunk of your real store** before training:
-
-```console
-$ insitubatch-check-transform \
-    gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr \
-    --var 2m_temperature --transform examples/transforms.py:kelvin_to_celsius --skip-signature
-
-  sample axis : 92040 samples, 40/chunk, 2301 chunks
-  chunk 0    : 40 samples -> source shape (40, 128, 64) = 1.3 MB decoded
-transform output:
-  (40, 128, 64) float32  ->  (40, 128, 64) float32   shape- and dtype-preserving
-cacheability: shape/dtype-preserving, no output_inner needed -> cacheable as-is.
-GIL-release probe (thread-scaling, 4 threads):
-  speedup 3.50x (>= 2.40) -> releases the GIL (vectorized).
-PASS: chunk_transform checks all passed.
+```bash
+insitubatch-check-transform \
+    "gs://weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_with_poles_conservative.zarr" \
+    --var 2m_temperature \
+    --transform examples/transforms.py:kelvin_to_celsius --skip-signature
 ```
 
-The target is `module:attr` or `path/to/file.py:attr` (a transform class is instantiated).
-It reports the chunk geometry, validates a declared `output_inner` against the real output
-(catching the mismatch the cache would later reject), and gives a GIL-release verdict — a
-non-zero exit gates a pre-commit hook. Pass `--no-gil-probe` for a fast structural-only check;
-the GIL probe needs a realistically-sized chunk (a toy array is dominated by call overhead). For
-the **reshaping** path, try `--transform examples/transforms.py:Coarsen` — a chunk-local regrid
-that halves the grid and declares `output_inner`, so the report shows the validated shape change.
+It reports the chunk geometry, validates a declared `output_inner` against the real output,
+and gives a GIL-release verdict. It exits non-zero on failure, so you can gate your own
+pre-commit hook or CI step on it. Worked examples:
+[`examples/transforms.py`](https://github.com/emfdavid/insitubatch/blob/main/examples/transforms.py).
+
+## Caching
+
+The pool is already a cache **within** a run and **across epochs**. `cache_dir` spills chunks
+to disk, and `persist=True` keeps them for **later runs** — on a windowed shuffled pass it
+also releases each block's chunks as it drains and re-reads them from the cache, taking
+residency from the whole split to a three-block floor.
+
+```python
+ds = InSituDataset(store, manifest, geoms, cache_dir="/mnt/nvme/cache", persist=True)
+```
+
+What a reader has to know before pointing two jobs at one cache:
+
+- **One writer per `cache_dir`.** The pool holds an advisory `flock` for its lifetime, so a
+  second writer **fails fast** naming the holder's PID and host. There is no such thing as a
+  stale lock — the kernel releases it when the process dies, `SIGKILL` included — so there is
+  no cleanup step, and **deleting the lockfile is actively harmful**: it releases nothing and
+  makes the next two processes lock different inodes.
+- **`readonly_cache=True` for readers.** Any number coexist with the writer, they write
+  nothing, and **a cache miss raises** — which is what makes it a contract ("this cache is
+  complete for what I am about to read") rather than a slow path that silently refetches.
+- **Editing a chunk transform invalidates only the arrays it is scoped to.** The error names
+  them and `reset_stale_cache=True` rebuilds just those; an array with no entries is *cold*,
+  not stale, so adding a variable is not a cache reset.
+- **Install `insitubatch[cache]` if a transform is parameterized by data.** Without
+  cloudpickle the fingerprint hashes a transform's source plus its `repr`, and numpy
+  summarizes any array over 1000 elements — so a re-fitted `StandardScaler` can reopen a cache
+  as a **hit** and serve the previous statistics, with no error. It also takes a `cache_key`
+  you bump per fit.
+- A network `cache_dir`, or a platform without POSIX locking, is **unarbitrated** — both warn
+  at construction.
+
+## How it works, and where it wins
+
+The classic PyTorch `DataLoader` spreads work across worker **processes**, each running a
+synchronous `__getitem__` — so against cloud zarr there is no shared chunk cache (every worker
+re-reads the same chunk), read concurrency reaches no further than one sample, and dask thread
+pools end up nested inside forked workers. `insitubatch` inverts it: one async event loop, one
+concurrency budget, one bounded pool that doubles as the cache.
+
+The payoff is **two-regime**. On a well-chunked store it *matches* a hand-tuned
+xbatcher/worker pool (swept to 32 workers) while running in one process at bounded memory.
+Where the layout is not sample-optimized — fat time chunks, overlapping windows, verification
+grids — it pulls far ahead, because each shared chunk decodes once where a per-sample
+`__getitem__` re-reads it, and the advantage grows with samples per chunk.
+
+**Time to first batch is the exception to the two regimes.** There is no worker pool to
+start, no fork, and no store to reopen per worker, so insitubatch is serving batches while a
+worker stack is still coming up — and it wins cold start at *every* chunk size measured,
+including the one where it loses on throughput. That is what makes it usable for inference,
+where a service cannot keep a hot 32-worker pool alive between requests.
+
+The **honest boundary** is three things. Shuffling is block-local, not global. At one sample
+per chunk there is nothing to amortize, so a tuned worker pool edges ahead on single-pass
+throughput. And **if the array fits in memory, load it** — reading it whole and indexing it in
+RAM beats any streaming loader, this one included; the benchmark suite measures exactly that
+and calls it the ceiling. What insitubatch buys is bounded memory, not raw speed. Numbers,
+hardware and methodology: [Benchmarks](https://emfdavid.github.io/insitubatch/benchmarks/).
+
+### Platform support
+
+| platform | status |
+|---|---|
+| **Linux** | supported, and the only thing CI proves — every job is `ubuntu-latest` |
+| **macOS** | expected to work; **untested** — no CI job, no regular local runs |
+| **Windows** | **untested**, and unarbitrated: no POSIX advisory locking, so two processes sharing a `cache_dir` cannot be stopped from corrupting each other. The loader warns at construction |
+
+*Untested* is not *unsupported*: there is no evidence either way. Reports — or a CI job — are
+welcome.
+
+The engine is validated **free-threading-correct** on 3.13t, which is a correctness and
+future-proofing claim, not a speedup: fetch, decode and gather all release the GIL already,
+so 3.13t runs at the same speed as the GIL build.
 
 ## Contributing
 
-insitubatch is maintained by one person today, and that is a transitional state rather than the
-intent — the project is being built to be worked on by several people, with the governance
-written down *before* it is strictly needed so that the next maintainers have a framework to
-build on. Bug reports, performance reports, docs and new-domain examples are all
-real contributions, and the path into the core developer group is merit-based and public.
+insitubatch is maintained by one person today, and that is a transitional state rather than
+the intent — the governance is written down *before* it is strictly needed. Bug reports,
+performance reports, docs and new-domain examples are all real contributions, and the path
+into the core developer group is merit-based and public.
 
-Start with the [contributing guide](https://emfdavid.github.io/insitubatch/contributing/): it
-covers the dev setup, the scope limits that decide whether a change can land, the
-one-framework-per-environment test caveat, what a performance claim has to carry, and the
-policy on AI-assisted contributions. Then [GOVERNANCE.md](GOVERNANCE.md) for how decisions get
-made, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), which applies to maintainers first.
-
+Start with the [contributing guide](https://emfdavid.github.io/insitubatch/contributing/):
+dev setup, the five commands CI enforces, the scope limits that decide whether a change can
+land, and the policy on AI-assisted contributions. Then
+[GOVERNANCE.md](https://github.com/emfdavid/insitubatch/blob/main/GOVERNANCE.md) and
+[CODE_OF_CONDUCT.md](https://github.com/emfdavid/insitubatch/blob/main/CODE_OF_CONDUCT.md).
 For anything larger than a bug fix, please
 [open an issue](https://github.com/emfdavid/insitubatch/issues/new/choose) first.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/emfdavid/insitubatch/blob/main/LICENSE).
