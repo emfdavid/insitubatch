@@ -916,8 +916,8 @@ complementary to — not a replacement for — the chunk-dedup planner.
 
 ## Status
 
-**Maturity: Alpha** — validated on real cloud IO; API is pre-1.0 (breaking changes
-allowed). This section is the single source of truth for **our** delivery status; other
+**Maturity: Beta** — feature-complete for the documented scope and validated on real cloud
+IO (S3, GCS, and an L4 GPU); API is pre-1.0 (breaking changes allowed). This section is the single source of truth for **our** delivery status; other
 pages link here. (Live state of upstream zarr / VirtualiZarr work is tracked outside this
 repo — see the section above for the design dependencies that matter.)
 
