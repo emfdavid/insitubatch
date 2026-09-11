@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **A JAX run on a GPU box trained on the CPU, at exact values, with nothing raised.**
+  `to_jax` was `jnp.from_dlpack(array)`, which imports a *host* buffer and therefore commits
+  its result to `cpu:0` — and `jax.jit` does not move a committed array. So every JAX user
+  with a GPU got a pipeline that was correct, silent, and entirely on the wrong device;
+  measured on an L4, `to_jax` returned `cpu:0` with `jax.devices() == [CudaDevice(id=0)]`, and
+  `jit(x * 2)` on that array stayed on the CPU. Nothing in the docs said so, because the
+  adapter had no device story at all: `device=` exists on `as_torch`/`to_torch` only, and
+  `to_jax` took no such argument.
+
+  The batch is now placed on `jax.devices()[0]`, which is where every other jax
+  array-creation path puts one — `jnp.from_dlpack` was the anomaly, not the fix. Pass
+  `device=` to choose another. On a CPU-only build the put is a **pass-through that still
+  aliases** the exported buffer, so it costs nothing there, and the transfer needs no new
+  machinery on GPU: JAX keeps the source referenced across an async `device_put`, so the
+  pool's liveness poll already defers reclaim (DESIGN.md, "the pool is sound for every
+  adapter"). This does not make JAX own its transfer the way `to_torch(device=)` does —
+  JAX cannot consume pinned host memory ([jax#22346](https://github.com/jax-ml/jax/issues/22346))
+  and exposes no event to gate recycling on, so pinning stays torch-only.
+
+- **`--extra jax` on a CUDA box installed a JAX that could not see the GPU.** Bare
+  `jax>=0.4.30` resolves to the CPU wheel, so the one command a GPU user would run left them
+  on the CPU before `to_jax` was even reached. A new **`jax-cuda`** extra pins `jax[cuda12]`.
+  It is a separate extra rather than a change to `jax` so `--extra jax` stays resolvable on
+  any machine, which CI depends on; one framework per environment still applies.
+
 - **The batch-buffer figures in the epoch line were the pool's, printed under one split's name
   (#84).** One buffer pool serves every iteration open on a dataset, and its counters were reset
   at each pass's *start* -- so with `zip(ds.train, ds.val)` a pass that drew 7 batches reported

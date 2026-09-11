@@ -60,6 +60,16 @@ jax = [
     "flax>=0.8",
     "optax>=0.2",
 ]
+# JAX on an NVIDIA GPU. Bare `jax` resolves to the *CPU* wheel, so `--extra jax` on a CUDA
+# box yields a JAX that cannot see the GPU at all -- silently, since nothing fails. This
+# pins the CUDA build instead; it is a separate extra rather than a change to `jax` so that
+# `--extra jax` stays resolvable everywhere, which CI depends on. One framework per
+# environment still applies.
+jax-cuda = [
+    "jax[cuda12]>=0.4.30",
+    "flax>=0.8",
+    "optax>=0.2",
+]
 tf = [
     "tensorflow>=2.16",
 ]
