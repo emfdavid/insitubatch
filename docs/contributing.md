@@ -293,6 +293,55 @@ How decisions get made — lazy consensus, when a change needs an explicit one, 
 decides — is written down in
 [GOVERNANCE.md](https://github.com/emfdavid/insitubatch/blob/main/GOVERNANCE.md).
 
+## Cutting a release
+
+A maintainer task. Every step below has caught something at least once, and they are in order.
+
+1. **Group the changelog.** Contributors append flat bullets under `## Unreleased` — there is
+   deliberately no category to choose while developing. The release cut is where they get
+   sorted under the `###` headings, by whoever is already in the file renaming the heading to
+   `## X.Y.Z — YYYY-MM-DD`. Update `### Upgrading` with anything that breaks an existing
+   install: a manifest bump that invalidates a `cache_dir` belongs there, not buried inside
+   the entry that caused it.
+
+2. **Make the three maturity statements agree.** The `Development Status` classifier in
+   `pyproject.toml`, the status line in `README.md`, and `Maturity:` in `DESIGN.md` drift
+   apart easily, and the classifier is the one PyPI shows in the sidebar. `DESIGN.md` is the
+   source of truth; the other two follow it.
+
+3. **Run the five gates** from [Running the tests](#running-the-tests), plus
+   `uv run --extra docs mkdocs build --strict`.
+
+4. **Run the GPU gate on a CUDA box.** Tests behind a `needs_cuda` skip pass vacuously
+   everywhere else, and they cover the buffer lifetime that prevents a batch buffer being
+   reused while a device copy is still reading it — whose failure mode is silently wrong
+   numbers, not a crash. Confirm they *ran*: a green file that skipped every CUDA test looks
+   identical to a pass. Validate the instrument first — with `CUDA_VISIBLE_DEVICES=""` the
+   same file should skip exactly those tests and no others.
+
+5. **Execute every runnable block in the docs, rather than reading them.** Extract each one
+   and run it. Console transcripts should be regenerated from a real run of the configuration
+   the page builds, not edited by hand; a transcript carried over from an earlier
+   configuration is indistinguishable from a current one at the moment of reading.
+
+6. **Run the docs-usability test.** Give someone with no prior context — a person or an agent
+   — an unfamiliar public store and *only* the published docs, and ask them to report the
+   store's geometry, build a working batch iterator, add a chunk-stage and a batch-stage
+   transform, and exercise the cache cold, warm, and from a second process. The deliverable is
+   the friction log: where they were stuck, what they guessed, what they believed that was
+   wrong, and which docs they wanted. "The docs were enough" is a legitimate finding. It is
+   the only test that measures the documentation rather than the code.
+
+7. **Inspect the built artifact.** `uv build`, then look inside the wheel and the sdist rather
+   than assuming. `README.md` is the only prose that ships, and it is what PyPI renders — so
+   its relative links resolve against `pypi.org` and break. Anything a reader must be able to
+   reach needs an absolute URL.
+
+8. **Check the model-independent fingerprints.** The examples that print one — the advection
+   persistence RMSE, for instance — must report the same value as the previous release over
+   the same store. Throughput and model skill both move for innocent reasons; a fingerprint
+   that moves means the loader is returning different bytes.
+
 ## Becoming a maintainer
 
 insitubatch is currently maintained by one person, and that is a transitional state rather
