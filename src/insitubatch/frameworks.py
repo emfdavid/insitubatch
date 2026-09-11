@@ -244,19 +244,34 @@ def to_torch(batch: Batch, device: str | torch.device | None = None) -> dict[str
     return out
 
 
-def to_jax(batch: Batch) -> dict[str, Any]:
-    """Convert a numpy ``Batch`` to a dict of ``jax.Array`` (DLPack).
+def to_jax(batch: Batch, device: Any | None = None) -> dict[str, Any]:
+    """Convert a numpy ``Batch`` to a dict of ``jax.Array`` (DLPack), on JAX's default device.
 
     Zero-copy only when the batch buffer sits on a 128-byte boundary: XLA:CPU requires that
     alignment and silently falls back to a copy otherwise. numpy guarantees only 16, so with
     today's per-batch ``np.empty`` roughly half of batches are copied (measured 20/40 —
     ``bench/probe_batch_buffers.py --arms jax``). Correct either way, just not free.
+
+    ``jnp.from_dlpack`` imports a *host* buffer, so its result is committed to ``cpu:0`` --
+    and ``jax.jit`` does not move a committed array. Returning that directly meant a GPU run
+    trained on the CPU at full correctness with nothing raised to say so, so the batch is
+    placed on ``jax.devices()[0]`` here, which is where every other jax array-creation path
+    puts it. Pass ``device`` to choose another. On a CPU-only build the put is a
+    pass-through that still aliases the exported buffer, so it costs nothing there.
+
+    The transfer is asynchronous -- JAX documents it so -- but JAX keeps the source
+    *referenced* across it, so the pool's liveness poll cannot reclaim a buffer mid-DMA
+    (``bench/probe_batch_buffers.py --arms all`` is what keeps that honest; see DESIGN.md).
+    Unlike :func:`to_torch` this adapter does not *own* the transfer: JAX cannot consume
+    pinned host memory (jax#22346) and exposes no event to gate recycling on.
     """
     try:
+        import jax
         import jax.numpy as jnp
     except ImportError as exc:  # pragma: no cover - jax-less installs
         raise _missing("JAX", "jax") from exc
-    return {k: jnp.from_dlpack(v) for k, v in batch.arrays.items()}
+    target = jax.devices()[0] if device is None else device
+    return {k: jax.device_put(jnp.from_dlpack(v), target) for k, v in batch.arrays.items()}
 
 
 def to_tf(batch: Batch) -> dict[str, Any]:

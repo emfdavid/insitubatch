@@ -109,7 +109,8 @@ Extras, one at a time (see the framework caveat below):
 
 ```bash
 uv sync --extra torch      # torch handoff (frameworks.as_torch)
-uv sync --extra jax        # JAX handoff (frameworks.to_jax)
+uv sync --extra jax        # JAX handoff (frameworks.to_jax) -- CPU wheel
+uv sync --extra jax-cuda   # the same, on a CUDA box (jax[cuda12])
 uv sync --extra tf         # TF handoff (frameworks.as_tf_dataset)
 uv sync --extra bench      # benchmark suite (xbatcher baseline + plotly + py-spy)
 uv sync --extra docs       # MkDocs site
