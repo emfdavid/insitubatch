@@ -2,94 +2,20 @@
 
 ## Unreleased
 
-- **The README was a strong pitch and a weak manual, and a cold-agent test measured how weak.**
-  Two agents with no prior context were each given an unfamiliar public store and one
-  documentation surface — README alone, or README plus `docs/tuning.md` — and told to build a
-  working iterator. Both got there; neither got there from the page. The README-only arm made
-  **sixteen** signature and docstring inspections, every one driven by a question the page did
-  not answer, and concluded that "nearly everything I needed to *operate* the library came from
-  parameter signatures, docstrings and error strings". The other arm, on different docs and a
-  different dataset, hit the identical wall in the identical place — which is what makes it the
-  page's defect rather than one agent's bad luck.
+### Upgrading
 
-  What the page got wrong was concentrated and consequential. The only end-to-end example was
-  single-variable, because the demo store has one array, and nothing said how to select
-  variables — so both agents opened **every** array in their store and were quoted residency
-  budgets of 5 493 GiB and 10 935 GiB for variables they never asked for. The transforms
-  section named `chunk_transform` / `batch_transform` four times in bold; the parameters are
-  plural and take a sequence, and the page never showed either being passed, so the one place
-  the names appeared was the place that got them wrong. `applies(...)` was absent entirely,
-  and with it the warning that lives only in its docstring: gating inside a transform body
-  instead makes unaffected arrays "gathered as truncated prefixes of themselves ... with no
-  exception raised". `sample_range`, `readonly_cache` and `reset_stale_cache` did not appear;
-  `cache_dir` appeared once, in the Windows row of the platform table. And following the page
-  verbatim the loader ran in silence, because nothing mentioned `logging.basicConfig`.
+**An existing `cache_dir` is rejected and rebuilt.** The persisted-chunk manifest format is
+bumped twice in this release: to **3**, because chunks are now stored tile-major, and to **4**,
+because cache identity is per array rather than per run. Either bump rejects an older cache
+with the usual stale-cache error. Delete the directory or pass `reset_stale_cache=True`, and
+budget for a re-warm — a version-2 file read as tile-major would be plausible-looking garbage,
+so it is refused rather than reinterpreted.
 
-  The page is rewritten around what it is for. The API now starts at 18% of the page rather
-  than 54%; the quickstart is a runnable multi-variable recipe that was executed verbatim to
-  confirm it (it previously could not run at all — `n_epochs` was undefined); caching and
-  diagnostics get sections of their own, the first being this release's headline behaviour and
-  the second — `ds.last_pass`, `limiting_stage`, `print_debug_info()` — having had no README
-  coverage whatsoever. The free-threading essay and the milestone inventory are gone, the
-  latter because `DESIGN.md` is the single source of truth for status and the README was
-  mirroring it.
+**`block_shuffled_order` and `sequential_order` return a `DrawOrder`**, not a bare array. Its
+`.rows` is the array they used to return, and `sequential_order` now takes `block_chunks`, so
+both orders carry one definition of a block.
 
-- **Status is now Beta, and all three places that state it agree for the first time.** The
-  PyPI classifier said `2 - Pre-Alpha`, the README said alpha, and `DESIGN.md` — the declared
-  single source of truth — said Alpha: two steps apart, on the page a new user lands on.
-  Beta is claimed on instrumentation rather than on an absence of bugs: the O(chunks) invariant
-  is pinned by a test with a companion control that fails loudly if the counter comes unwired,
-  byte fingerprints and a model-free persistence baseline cover the silently-plausible-data
-  class, and the CUDA-gated buffer-lifetime tests now run green on an L4 with the instrument
-  validated first. The API is still pre-1.0 and breaking changes are still allowed.
-
-- **A JAX run on a GPU box trained on the CPU, at exact values, with nothing raised.**
-  `to_jax` was `jnp.from_dlpack(array)`, which imports a *host* buffer and therefore commits
-  its result to `cpu:0` — and `jax.jit` does not move a committed array. So every JAX user
-  with a GPU got a pipeline that was correct, silent, and entirely on the wrong device;
-  measured on an L4, `to_jax` returned `cpu:0` with `jax.devices() == [CudaDevice(id=0)]`, and
-  `jit(x * 2)` on that array stayed on the CPU. Nothing in the docs said so, because the
-  adapter had no device story at all: `device=` exists on `as_torch`/`to_torch` only, and
-  `to_jax` took no such argument.
-
-  The batch is now placed on `jax.devices()[0]`, which is where every other jax
-  array-creation path puts one — `jnp.from_dlpack` was the anomaly, not the fix. Pass
-  `device=` to choose another. On a CPU-only build the put is a **pass-through that still
-  aliases** the exported buffer, so it costs nothing there, and the transfer needs no new
-  machinery on GPU: JAX keeps the source referenced across an async `device_put`, so the
-  pool's liveness poll already defers reclaim (DESIGN.md, "the pool is sound for every
-  adapter"). This does not make JAX own its transfer the way `to_torch(device=)` does —
-  JAX cannot consume pinned host memory ([jax#22346](https://github.com/jax-ml/jax/issues/22346))
-  and exposes no event to gate recycling on, so pinning stays torch-only.
-
-- **`--extra jax` on a CUDA box installed a JAX that could not see the GPU.** Bare
-  `jax>=0.4.30` resolves to the CPU wheel, so the one command a GPU user would run left them
-  on the CPU before `to_jax` was even reached. A new **`jax-cuda`** extra pins `jax[cuda12]`.
-  It is a separate extra rather than a change to `jax` so `--extra jax` stays resolvable on
-  any machine, which CI depends on; one framework per environment still applies.
-
-- **The batch-buffer figures in the epoch line were the pool's, printed under one split's name
-  (#84).** One buffer pool serves every iteration open on a dataset, and its counters were reset
-  at each pass's *start* -- so with `zip(ds.train, ds.val)` a pass that drew 7 batches reported
-  14 lends, each pass reporting the pool's running total at its own finish. Unlike the chunk
-  counters (#81) these are not per-pass quantities to begin with: four of the six fields are
-  pool properties already, and `allocated` is only useful as one. So the line labels the segment
-  `(pool)` and the counters run cumulatively, which is the only form that means the same thing
-  however many iterations share it. The guidance changes with it -- watch `allocated` stop
-  rising rather than return to zero.
-
-- **A pass's report described the pool, not the pass (#81).** Every counter behind `PassStats`
-  and the per-epoch line -- hits, misses, residency peak, re-reads, evictions -- lived on the
-  `ChunkPool`, which several iterations hold at once, and `reset_epoch_counters()` ran at each
-  pass's *start*. So with `zip(ds.train, ds.val)` the second pass zeroed the first's totals
-  mid-flight and then reported the union under its own split's name: a `val` pass whose true
-  residency peak is 4 reported 35, and a `train` split that misses 102 chunks alone reported 29.
-  Those are the numbers someone sizing a budget acts on.
-
-  Each iteration now carries its own `PassCounters`, minted with its owner and dropped with it,
-  and the report reads those. The pool keeps its totals -- a genuinely different question, and
-  the only one an eviction or a peak co-residency belongs to -- but they are cumulative now
-  rather than reset by whichever pass started last.
+### Correctness and liveness
 
 - **A released spill could unpin a chunk out from under the block that still needed it (#79).**
   The driver decides admission once per *run* of tiles naming one chunk, since reads are
@@ -115,68 +41,6 @@
   `drawable_samples` per split, `print_summary()` shows it beside the chunk count on windowed
   runs, and a split with chunks but nothing to draw is a `split-yields-nothing` warning naming
   the offsets responsible. A split asked to be empty is not a finding and is not warned about.
-
-- **`examples/advection` trained a whole epoch before finding it had nothing to score (#71).**
-  `--n-steps 192` on the default 10% split gives the val split no chunks; `--n-steps 256` gives
-  it a chunk whose every anchor the 24-step target drops. Either way the run built the store,
-  trained, validated, and only then raised from `evaluate` -- discarding all of it to report a
-  fact its arguments had already fixed. Both are now refused at setup, from the engine's own
-  `drawable_samples`, and the message names the smallest sample-axis length that works, solved
-  against the same split and window arithmetic rather than quoted as a constant.
-
-- **A loop with no training step could be told its training step was the bottleneck.**
-  `bottleneck()` read the batch queue before asking whether the caller's loop body did any
-  work, so a `for batch in ds.train: pass` whose queue happened to look fed was answered with
-  "the loader kept up and your training step is the constraint" -- advice to tune a knob that
-  is not there. The `consumer_idle` branch below it was guarded by the premise that such a
-  loop *cannot* keep the queue fed; on a free-threaded build it can, because a GIL-releasing
-  `chunk_transform` runs alongside the consumer. It presented as a test that passed and
-  failed on identical code, with a 19-microsecond loop body reported as the constraint. The
-  idle case is known before the queue is consulted, so it is answered first, and the verdict
-  no longer depends on how the producer threads interleave.
-
-- **A windowed, shuffled pass held close to the whole train split resident (#66).** A windowed
-  view reads `anchor + offset` and shuffle permutes chunk order, so a chunk one block reads can
-  be needed again most of an epoch later; held from first use to last, residency was the split
-  rather than two blocks. That is decode-once, and it is the right trade only while the split
-  fits. With `persist=True` each block now hands its chunks back as it drains and a later block
-  re-admits them from the on-disk cache. Measured on a 256-chunk split: the floor falls from 259
-  chunks to 12 for a three-chunk lead, and 316 to 18 for leads `{0, 24, 240}`, delivering the
-  same samples.
-
-  A rule rather than a knob, and it keys on `persist` rather than on `cache_dir` -- only a
-  persisted slot survives its own eviction as a revivable file. With `cache_dir` alone the
-  backing is unlinked when the slot is evicted, so the same 249 re-reads were served 2% from
-  cache instead of 49%, which is the opposite of the trade the policy assumes. The floor had to
-  learn the policy too: a released chunk is only *evictable*, so sized for retention nothing is
-  ever evicted and releasing buys nothing.
-
-  A chunk two blocks read is admitted once per block, and the driver may run three blocks
-  ahead of its consumer, so the second admission can land while the first block's tiles are
-  still in flight -- which had it fetching them a second time, 2.3% of all fetches on a
-  16-tile-per-chunk geometry. Never a correctness problem (a slot publishes only when
-  quiescent, so the duplicate's own writer holds it open until it lands), but a duplicate
-  fetch is a refetch, and avoiding refetches is the whole point of the policy. The driver
-  now skips a chunk it already has tile tasks outstanding for, which removes all of them.
-
-  Its own tasks, strictly. `ChunkPool` records how many writers a slot has and not whose
-  they are, so skipping on any writer lets one pass rely on another's fetch -- and a pass
-  abandoned mid-fetch unwinds without delivering, leaving the slot FILLING with nothing
-  coming and the other pass waiting on it forever. Two concurrent iterations sharing a pool
-  is the ordinary case, and either may be abandoned by an early `break`.
-
-  Starting a second concurrent iteration the budget cannot hold now raises there, naming the
-  budget to pass, instead of running until one of them starves. Under-sizing for concurrent
-  iterations already raised (it is why `zip(ds.train, ds.val)` on an auto budget has always
-  been a configuration error), but *whether* an under-sized pool reached the stall depended on
-  how the two interleaved -- and releasing the spill makes the floor small enough that the
-  same configuration began succeeding and failing on consecutive runs. The arithmetic is
-  complete when the second iteration starts, so it is answered there. `Scheduler._starvation`
-  stays as the backstop for what arithmetic cannot predict.
-
-  The per-epoch line now reports re-reads and evictions whenever they are non-zero. A hit rate
-  alone cannot show this -- a re-read served from the cache counts as a hit -- so rising
-  re-reads at a steady hit rate are the signal that a budget is churning rather than holding.
 
 - **A shuffle-block's chunks were reconstructed from the draw order, and on any windowed
   view the reconstruction was wrong (#68).** `_partition_blocks` re-derived block membership
@@ -213,16 +77,6 @@
   one happened to be mid-wait. Measured over a 48-cell residency matrix on GCS, 8 cells
   went from `ok` to raising, every one of them a `zip` cell; no single-iteration cell was
   affected. The permit stall now asks only about its own waiters.
-
-- **`as_torch(view, device=...)` raised `NameError: name 'torch' is not defined` before
-  drawing a batch.** The branch deciding whether to page-lock the batch buffers tests
-  `torch.device(device).type == "cuda"`, but `frameworks.py` imports `torch` only under
-  `TYPE_CHECKING` -- the other functions in the module each import it locally, and this one
-  did not. Any non-`None` device failed, `"cpu"` included; `device=None` was unaffected,
-  which is why it survived a month. Every `as_torch` call in the tests, the README and
-  `docs/index.md` omits `device=`, so the one form under test was the one form that worked,
-  while `docs/benchmarks.md` points at `device=` as the way to get pinned buffers. Present
-  since the buffer-liveness fix in v0.1.x; found running the GPU examples on an L4.
 
 - **A fetch-ahead permit deficit hung the pass with nothing to read.** Bounded read-ahead
   takes one permit per chunk and gets it back from the consumer's `unpin_block`, so a
@@ -302,7 +156,6 @@
   and a variable chunked finer than the reference grid contributes several chunks per
   anchor chunk. Each of those found the rule by hanging the suite, and each now has a test.
 
-
 - **A healthy run could be killed with "residency budget exhausted ... this would hang".**
   `Scheduler._starvation` turns an admission stall into a raise rather than a hang, and it
   proves the stall terminal from three facts, the third being "a consumer is blocked in
@@ -350,49 +203,6 @@
   `5b8fae4`, which did not introduce the over-pinning: it removed the over-broad
   `unpin_all()` that had been quietly wiping it at every epoch boundary (#34).
 
-- **A benchmark run whose *subject* failed exited 0 with a tidy table.** Every engine
-  failure was caught and skipped so one flaky baseline could not kill an hours-long S3
-  sweep -- but that made a run in which `insitu` never ran indistinguishable from a
-  complete one, which is how the `c1` starvation above reached a results file as *absence*
-  rather than as a failure. Skips are now summarised at the end, and a skip of the engine
-  under test raises -- after every row is on disk, because re-running an S3 sweep to
-  recover the configs that did work is expensive. A failing baseline stays non-fatal: that
-  is a gap in the comparison, not a dead run.
-
-- **Six documented benchmark commands could not be pasted.** The suite dropped `--storage`
-  when it started deriving storage from the URL scheme, and the S3 invocations in
-  `docs/benchmarks.md` and `bench/benchmark_plan.md` kept passing it -- so the runbook for
-  a benchmark that costs an EC2 box and hours of reads died on `unrecognized arguments`
-  before the first byte. The flag is gone from those commands, and `tests/test_bench_docs.py`
-  now parses every documented `python -m bench` command against the real parser, so the
-  docs and the CLI cannot drift apart silently again.
-
-- **Sharded zarr-v3 arrays could not be read at all, and said so with a checksum error.**
-  On a sharded array zarr reports two shapes: `metadata.chunks` is the *inner* chunk (read
-  granularity inside a shard) and `chunk_grid.chunk_shape` is the shard — the thing a chunk
-  key actually addresses. We planned reads, sized the `ArraySpec` and built geometry from the
-  former, so we asked the store for a key holding a shard and then decoded it as though it
-  were one inner chunk. The `ShardingCodec` sized its index from the wrong spec, read the
-  wrong trailing bytes, and raised `ValueError: Stored and computed checksum do not match` —
-  which says nothing about sharding. **Every dataset in the dynamical.org catalog is sharded**
-  (NOAA GFS/GEFS/HRRR/MRMS, ECMWF AIFS/IFS, DWD ICON-EU, NASA IMERG, ECCC HRDPS), so none of
-  it was readable; WeatherBench2 and ARCO are not sharded, which is why every benchmark,
-  example and test missed it. There is now one spelling of "the shape of one stored object",
-  read through `ChunkGrid.from_metadata` so zarr-v2 keeps working without a deprecated
-  accessor. ([#56](https://github.com/emfdavid/insitubatch/issues/56))
-
-- **`open_geometries(store)` crashed on any CF store — including the form the README
-  teaches.** A CF/xarray-written group holds coordinate arrays and a 0-D `spatial_ref` whose
-  attributes carry the CRS, alongside the data variables. Taking every array in the group
-  made the 0-D one raise `sample_axis 0 out of range for 0-D array`, and — quieter, and
-  worse — returned `time`/`latitude`/`longitude` as variables to batch, with sample-axis
-  lengths that cannot agree with any variable's. Coordinates and grid mappings are now
-  skipped, detected from `dimension_names` (v3) or xarray's `_ARRAY_DIMENSIONS` (v2). The
-  inference is deliberately narrow — only a *self-named* 1-D array is a coordinate, so a
-  station series over `('time',)` is still data — and naming an array in `variables=`
-  bypasses it entirely. A group with nothing batchable left raises, listing what it skipped
-  and pointing at the explicit route.
-
 - **A `cache_budget_bytes` too small for the run now raises instead of being silently raised
   to the floor.** Handing back ten times what was asked for is indistinguishable from
   honouring it, until the kernel intervenes. On an archive that chunks the sample axis deeply
@@ -400,31 +210,6 @@
   between running and being OOM-killed, and the floor is computable from geometry before any
   IO. The error names the floor, the knob, and the `block_chunks` that set it. Passing no
   budget still sizes itself automatically.
-
-- **`icechunk_store(url)` opens an Icechunk repository by URL**, public
-  (`anonymous=True`) or with your own cloud credentials — `s3://`, `gs://`, `file://`.
-  Icechunk is the format most new public archives are published in, and our only route to one
-  was `arraylake_store`, which authenticates through Arraylake and cannot address a repo that
-  is simply sitting in a bucket. The two are not alternatives: where the repository lives
-  decides which you use, and the module docstring says so.
-
-- Tests that read a live public bucket are marked `remote` and skipped unless `--remote` is
-  given. The sharded-decode defect lived in an Icechunk store and no synthetic fixture would
-  have found it, but a public store going away must not turn into a red build for a
-  contributor who changed nothing.
-
-- **`ArrayGeometry.chunk_bytes` reports what one chunk costs — and the docs were teaching
-  a formula that under-reported it by 19%.** Sizing `cache_budget_bytes` means knowing the
-  per-chunk residency, and `docs/tuning.md` said to compute it as
-  `sample_chunk_size × prod(inner_shape) × itemsize`. That is wrong whenever the inner axes
-  are gridded, which is the ARCO/ERA5 norm: residency is the stored *tiles*, kept whole, and
-  a grid that does not divide the array evenly still stores full-size edge chunks. On NOAA
-  GFS analysis the hand-rolled product gives 5.98 GB against a real charge of **7.37 GB**
-  (eight whole 1440×400×400 tiles), so a budget sized that way under-provisions and the pool
-  starves mid-epoch — a hang-shaped failure, not an error. The property is the same
-  expression `slot_charge_bytes` charges, so the two cannot drift, and the tuning page now
-  documents the pattern: ask the geometry, compare against `free -h`, and use `describe()`
-  once more than one variable or a `chunk_transform` is in play.
 
 - **The "O(chunks), not O(samples)" invariant is now pinned by tests, having been load-bearing
   and unguarded.** A read path that degrades to one store read per *sample* is the failure
@@ -437,6 +222,94 @@
   several byte-range calls for one key. A companion control drives a case known to amplify
   through the same counter, so that a counter which has come unwired fails loudly instead of
   reporting "no redundant reads" — which is indistinguishable from a pass.
+
+- **The chunk pool's "safe to take away" predicate is now true, not approximately true.**
+  Eviction eligibility was spread across five loosely-coupled fields, and each one could
+  lie. `fail()` had to set `ready = True` to wake a waiter — the only lever available —
+  which simultaneously declared a half-written slot a finished cache entry while sibling
+  tile tasks were still writing into it, and left the poisoned slot resident so the *next*
+  epoch re-raised the stale error forever instead of refetching (#33). `unpin_all()`
+  cleared the pin map globally, so with two producers over one pool (`zip(ds.train,
+  ds.val)`, a documented configuration) one iteration's epoch boundary stripped the
+  other's pins and its in-use chunks became eviction candidates mid-gather (#34). And
+  `claimed` was a single bool, so one iteration's claim satisfied another's `wait_ready`
+  — that iteration then gathered a chunk it never referenced and its release decremented
+  someone else's count (#35). All three produced *plausible* data, which throughput,
+  shapes and smoke tests all pass; only byte fingerprints catch them.
+  A slot now carries one explicit `SlotState` (`FILLING → ASSEMBLED → READY`, `FAILED`
+  terminal) advanced in exactly one place, plus two counters that answer one question
+  each: `writers` (tile tasks *running*, so eviction is never racing a live write) and
+  `pending` (tiles not yet delivered, so completeness is separate from quiescence).
+  References are owner-scoped, and a reference *is* that owner's claim, so `claimed` is
+  gone. `Scheduler` takes the pool's obligation off the caller: every tile write happens
+  inside `pool.tile_write`, whose scope releases on **every** exit path — including
+  cancellation at an `await`, which no explicit call site can cover.
+  `ASSEMBLED` is a real state, not a formality: the chunk transform and the persist
+  write-back run outside the lock between the last tile landing and the slot being
+  published, and a predicate derived only from a tile counter would call that window
+  evictable.
+
+- **Fixed: a batch wider than a shuffle-block deadlocked the loader.** A batch draws from
+  every block it spans and holds them until it has gathered, so `batch_size >
+  2 × block_chunks × samples-per-chunk` needed more blocks resident than the budget floor
+  provides: the fetch driver parked on admission, the consumer parked waiting for a chunk that
+  could never be admitted, and **no batch was delivered at all**. It bit one-sample-per-chunk
+  stores at the shipped defaults (`batch_size=64`, `block_chunks=16`) — per-frame and
+  per-spectrum archives — and presented as slow storage rather than an error.
+  `InSituDataset` now raises `block_chunks` to `⌈batch_size / samples-per-chunk⌉` (capped at
+  the array's chunk count) and logs when it does, so a block always holds a batch. Coarsely
+  chunked stores are unaffected: the requested `block_chunks` is a floor, never lowered.
+
+- **Added: admission starvation raises instead of hanging.** If a working set exceeds its
+  budget anyway, the scheduler now detects the *provably* terminal state — nothing in flight,
+  every resident slot pinned, and a consumer blocked in `wait_ready` — and raises with the
+  residency arithmetic and the offending chunk. The test is structural, not a timeout, so a
+  merely slow consumer is never mistaken for a deadlock.
+
+### Cache, transforms, and multi-process
+
+- **A windowed, shuffled pass held close to the whole train split resident (#66).** A windowed
+  view reads `anchor + offset` and shuffle permutes chunk order, so a chunk one block reads can
+  be needed again most of an epoch later; held from first use to last, residency was the split
+  rather than two blocks. That is decode-once, and it is the right trade only while the split
+  fits. With `persist=True` each block now hands its chunks back as it drains and a later block
+  re-admits them from the on-disk cache. Measured on a 256-chunk split: the floor falls from 259
+  chunks to 12 for a three-chunk lead, and 316 to 18 for leads `{0, 24, 240}`, delivering the
+  same samples.
+
+  A rule rather than a knob, and it keys on `persist` rather than on `cache_dir` -- only a
+  persisted slot survives its own eviction as a revivable file. With `cache_dir` alone the
+  backing is unlinked when the slot is evicted, so the same 249 re-reads were served 2% from
+  cache instead of 49%, which is the opposite of the trade the policy assumes. The floor had to
+  learn the policy too: a released chunk is only *evictable*, so sized for retention nothing is
+  ever evicted and releasing buys nothing.
+
+  A chunk two blocks read is admitted once per block, and the driver may run three blocks
+  ahead of its consumer, so the second admission can land while the first block's tiles are
+  still in flight -- which had it fetching them a second time, 2.3% of all fetches on a
+  16-tile-per-chunk geometry. Never a correctness problem (a slot publishes only when
+  quiescent, so the duplicate's own writer holds it open until it lands), but a duplicate
+  fetch is a refetch, and avoiding refetches is the whole point of the policy. The driver
+  now skips a chunk it already has tile tasks outstanding for, which removes all of them.
+
+  Its own tasks, strictly. `ChunkPool` records how many writers a slot has and not whose
+  they are, so skipping on any writer lets one pass rely on another's fetch -- and a pass
+  abandoned mid-fetch unwinds without delivering, leaving the slot FILLING with nothing
+  coming and the other pass waiting on it forever. Two concurrent iterations sharing a pool
+  is the ordinary case, and either may be abandoned by an early `break`.
+
+  Starting a second concurrent iteration the budget cannot hold now raises there, naming the
+  budget to pass, instead of running until one of them starves. Under-sizing for concurrent
+  iterations already raised (it is why `zip(ds.train, ds.val)` on an auto budget has always
+  been a configuration error), but *whether* an under-sized pool reached the stall depended on
+  how the two interleaved -- and releasing the spill makes the floor small enough that the
+  same configuration began succeeding and failing on consecutive runs. The arithmetic is
+  complete when the second iteration starts, so it is answered there. `Scheduler._starvation`
+  stays as the backstop for what arithmetic cannot predict.
+
+  The per-epoch line now reports re-reads and evictions whenever they are non-zero. A hit rate
+  alone cannot show this -- a re-read served from the cache counts as a hit -- so rising
+  re-reads at a steady hit rate are the signal that a budget is churning rather than holding.
 
 - **`applies(...)` scopes a `chunk_transform` to named variables — and the in-body name test
   it replaces was silently truncating data.** `chunk_transforms` is one list run on every
@@ -550,6 +423,66 @@
   Part 1 of #42. Per-variable cache identity (part 2) needs a manifest bump and is
   unchanged; this fixes the corruption without invalidating anybody's cache.
 
+- **Persisted chunks are stored tile-major.** A cache entry's `.npy` now holds
+  `(n_tiles, *tile_shape)` — each stored tile contiguous, in `inner_index` order — instead of
+  one assembled array. File count per chunk is unchanged. This is what keeps one code path:
+  a revived chunk comes back as zero-copy views of the mapping, tiled exactly like a freshly
+  fetched one, so `gather` never asks "assembled or tiled?". Contiguous-on-disk tiles also
+  make a future `decode(out=)` usable on the mmap tier, not just the heap.
+  **Breaking:** the manifest format is bumped to 3, so an existing `cache_dir` is rejected
+  with the usual stale-cache error and rebuilt (`reset_stale_cache=True`, or delete it). A
+  version-2 file read as tile-major would be plausible-looking garbage, so this is refused
+  rather than reinterpreted.
+
+### Diagnostics and reporting
+
+- **The batch-buffer figures in the epoch line were the pool's, printed under one split's name
+  (#84).** One buffer pool serves every iteration open on a dataset, and its counters were reset
+  at each pass's *start* -- so with `zip(ds.train, ds.val)` a pass that drew 7 batches reported
+  14 lends, each pass reporting the pool's running total at its own finish. Unlike the chunk
+  counters (#81) these are not per-pass quantities to begin with: four of the six fields are
+  pool properties already, and `allocated` is only useful as one. So the line labels the segment
+  `(pool)` and the counters run cumulatively, which is the only form that means the same thing
+  however many iterations share it. The guidance changes with it -- watch `allocated` stop
+  rising rather than return to zero.
+
+- **A pass's report described the pool, not the pass (#81).** Every counter behind `PassStats`
+  and the per-epoch line -- hits, misses, residency peak, re-reads, evictions -- lived on the
+  `ChunkPool`, which several iterations hold at once, and `reset_epoch_counters()` ran at each
+  pass's *start*. So with `zip(ds.train, ds.val)` the second pass zeroed the first's totals
+  mid-flight and then reported the union under its own split's name: a `val` pass whose true
+  residency peak is 4 reported 35, and a `train` split that misses 102 chunks alone reported 29.
+  Those are the numbers someone sizing a budget acts on.
+
+  Each iteration now carries its own `PassCounters`, minted with its owner and dropped with it,
+  and the report reads those. The pool keeps its totals -- a genuinely different question, and
+  the only one an eviction or a peak co-residency belongs to -- but they are cumulative now
+  rather than reset by whichever pass started last.
+
+- **A loop with no training step could be told its training step was the bottleneck.**
+  `bottleneck()` read the batch queue before asking whether the caller's loop body did any
+  work, so a `for batch in ds.train: pass` whose queue happened to look fed was answered with
+  "the loader kept up and your training step is the constraint" -- advice to tune a knob that
+  is not there. The `consumer_idle` branch below it was guarded by the premise that such a
+  loop *cannot* keep the queue fed; on a free-threaded build it can, because a GIL-releasing
+  `chunk_transform` runs alongside the consumer. It presented as a test that passed and
+  failed on identical code, with a 19-microsecond loop body reported as the constraint. The
+  idle case is known before the queue is consulted, so it is answered first, and the verdict
+  no longer depends on how the producer threads interleave.
+
+- **`ArrayGeometry.chunk_bytes` reports what one chunk costs — and the docs were teaching
+  a formula that under-reported it by 19%.** Sizing `cache_budget_bytes` means knowing the
+  per-chunk residency, and `docs/tuning.md` said to compute it as
+  `sample_chunk_size × prod(inner_shape) × itemsize`. That is wrong whenever the inner axes
+  are gridded, which is the ARCO/ERA5 norm: residency is the stored *tiles*, kept whole, and
+  a grid that does not divide the array evenly still stores full-size edge chunks. On NOAA
+  GFS analysis the hand-rolled product gives 5.98 GB against a real charge of **7.37 GB**
+  (eight whole 1440×400×400 tiles), so a budget sized that way under-provisions and the pool
+  starves mid-epoch — a hang-shaped failure, not an error. The property is the same
+  expression `slot_charge_bytes` charges, so the two cannot drift, and the tuning page now
+  documents the pattern: ask the geometry, compare against `free -h`, and use `describe()`
+  once more than one variable or a `chunk_transform` is in play.
+
 - **`InSituDataset.last_pass` — which stage was the bottleneck, and what to do about it.**
   Every producer-side problem presents the same way, as an empty batch queue: slow storage,
   a saturated decode pool, and a residency budget too small to admit the next chunk are
@@ -634,6 +567,107 @@
   Runtime observability — queue depths, per-stage timing, cache hits, peak residency — is a
   different surface with a different cost model and is tracked separately (#45).
 
+- **Under-sizing the budget for concurrent iterations now says so.** One `InSituDataset`
+  owns one chunk pool and every active iteration shares it — `zip(ds.train, ds.val)`, or
+  two `DataLoader`s — but each holds its *own* chunk references, so residency is the sum
+  of their working sets, not the maximum. The auto-sized default covers one iteration and
+  deliberately stays that way: the engine cannot know how many you intend to run, and
+  guessing high would cost memory in the single-iteration case that is almost every case.
+  What was missing was the diagnostic. Starvation previously advised "raise
+  cache_budget_bytes, or lower batch_size / block_chunks" — correct but not actionable
+  when *every* resident chunk is legitimately referenced and the caller has no way to see
+  why. It now names how many iterations are sharing the pool, and the pattern that
+  produces that. Owners count from mint to release rather than from their first pin,
+  because the iteration that starves before it can pin anything is exactly the one that
+  needs naming. `docs/tuning.md` gains the sizing rule.
+
+- **Added: `insitubatch.print_debug_info()` — one paste instead of a dozen version questions.**
+  Reports the storage stack (zarr / obstore / numpy / xarray), whichever framework adapter is
+  actually installed, and the **free-threading state** — both the build flag and whether an
+  import has since switched the GIL back on, which are not the same thing and have explained
+  more than one "works for me". Nothing is imported to report on it (versions come from
+  distribution metadata), because importing torch and JAX in one process crashes — a debug
+  helper that took the process down while someone was reporting a bug would be worse than
+  none. `debug_info()` returns the same facts as a dict. The new bug and performance issue
+  forms ask for its output.
+
+### Stores, geometry, and framework adapters
+
+- **A JAX run on a GPU box trained on the CPU, at exact values, with nothing raised.**
+  `to_jax` was `jnp.from_dlpack(array)`, which imports a *host* buffer and therefore commits
+  its result to `cpu:0` — and `jax.jit` does not move a committed array. So every JAX user
+  with a GPU got a pipeline that was correct, silent, and entirely on the wrong device;
+  measured on an L4, `to_jax` returned `cpu:0` with `jax.devices() == [CudaDevice(id=0)]`, and
+  `jit(x * 2)` on that array stayed on the CPU. Nothing in the docs said so, because the
+  adapter had no device story at all: `device=` exists on `as_torch`/`to_torch` only, and
+  `to_jax` took no such argument.
+
+  The batch is now placed on `jax.devices()[0]`, which is where every other jax
+  array-creation path puts one — `jnp.from_dlpack` was the anomaly, not the fix. Pass
+  `device=` to choose another. On a CPU-only build the put is a **pass-through that still
+  aliases** the exported buffer, so it costs nothing there, and the transfer needs no new
+  machinery on GPU: JAX keeps the source referenced across an async `device_put`, so the
+  pool's liveness poll already defers reclaim (DESIGN.md, "the pool is sound for every
+  adapter"). This does not make JAX own its transfer the way `to_torch(device=)` does —
+  JAX cannot consume pinned host memory ([jax#22346](https://github.com/jax-ml/jax/issues/22346))
+  and exposes no event to gate recycling on, so pinning stays torch-only.
+
+- **`--extra jax` on a CUDA box installed a JAX that could not see the GPU.** Bare
+  `jax>=0.4.30` resolves to the CPU wheel, so the one command a GPU user would run left them
+  on the CPU before `to_jax` was even reached. A new **`jax-cuda`** extra pins `jax[cuda12]`.
+  It is a separate extra rather than a change to `jax` so `--extra jax` stays resolvable on
+  any machine, which CI depends on; one framework per environment still applies.
+
+- **`as_torch(view, device=...)` raised `NameError: name 'torch' is not defined` before
+  drawing a batch.** The branch deciding whether to page-lock the batch buffers tests
+  `torch.device(device).type == "cuda"`, but `frameworks.py` imports `torch` only under
+  `TYPE_CHECKING` -- the other functions in the module each import it locally, and this one
+  did not. Any non-`None` device failed, `"cpu"` included; `device=None` was unaffected,
+  which is why it survived a month. Every `as_torch` call in the tests, the README and
+  `docs/index.md` omits `device=`, so the one form under test was the one form that worked,
+  while `docs/benchmarks.md` points at `device=` as the way to get pinned buffers. Present
+  since the buffer-liveness fix in v0.1.x; found running the GPU examples on an L4.
+
+- **Sharded zarr-v3 arrays could not be read at all, and said so with a checksum error.**
+  On a sharded array zarr reports two shapes: `metadata.chunks` is the *inner* chunk (read
+  granularity inside a shard) and `chunk_grid.chunk_shape` is the shard — the thing a chunk
+  key actually addresses. We planned reads, sized the `ArraySpec` and built geometry from the
+  former, so we asked the store for a key holding a shard and then decoded it as though it
+  were one inner chunk. The `ShardingCodec` sized its index from the wrong spec, read the
+  wrong trailing bytes, and raised `ValueError: Stored and computed checksum do not match` —
+  which says nothing about sharding. **Every dataset in the dynamical.org catalog is sharded**
+  (NOAA GFS/GEFS/HRRR/MRMS, ECMWF AIFS/IFS, DWD ICON-EU, NASA IMERG, ECCC HRDPS), so none of
+  it was readable; WeatherBench2 and ARCO are not sharded, which is why every benchmark,
+  example and test missed it. There is now one spelling of "the shape of one stored object",
+  read through `ChunkGrid.from_metadata` so zarr-v2 keeps working without a deprecated
+  accessor. ([#56](https://github.com/emfdavid/insitubatch/issues/56))
+
+- **`open_geometries(store)` crashed on any CF store — including the form the README
+  teaches.** A CF/xarray-written group holds coordinate arrays and a 0-D `spatial_ref` whose
+  attributes carry the CRS, alongside the data variables. Taking every array in the group
+  made the 0-D one raise `sample_axis 0 out of range for 0-D array`, and — quieter, and
+  worse — returned `time`/`latitude`/`longitude` as variables to batch, with sample-axis
+  lengths that cannot agree with any variable's. Coordinates and grid mappings are now
+  skipped, detected from `dimension_names` (v3) or xarray's `_ARRAY_DIMENSIONS` (v2). The
+  inference is deliberately narrow — only a *self-named* 1-D array is a coordinate, so a
+  station series over `('time',)` is still data — and naming an array in `variables=`
+  bypasses it entirely. A group with nothing batchable left raises, listing what it skipped
+  and pointing at the explicit route.
+
+- **`icechunk_store(url)` opens an Icechunk repository by URL**, public
+  (`anonymous=True`) or with your own cloud credentials — `s3://`, `gs://`, `file://`.
+  Icechunk is the format most new public archives are published in, and our only route to one
+  was `arraylake_store`, which authenticates through Arraylake and cannot address a repo that
+  is simply sitting in a bucket. The two are not alternatives: where the repository lives
+  decides which you use, and the module docstring says so.
+
+- Tests that read a live public bucket are marked `remote` and skipped unless `--remote` is
+  given. The sharded-decode defect lived in an Icechunk store and no synthetic fixture would
+  have found it, but a public store going away must not turn into a red build for a
+  contributor who changed nothing.
+
+### Architecture and internals
+
 - **The pool's buffer unit is now the stored chunk, and the scheduler runs on zarr's loop.**
   Two changes that had to land together, because both rewrite `Scheduler._one`. A slot used
   to be one assembled ndarray that every decoded tile was memcpy'd into; it is now the
@@ -668,17 +702,6 @@
   2/3, 3/3 or 0/3 across runs — which is why they are pinned by tests rather than left to
   review. A scheduler now cancels only the tasks it created and tears down nothing else.
 
-- **Persisted chunks are stored tile-major.** A cache entry's `.npy` now holds
-  `(n_tiles, *tile_shape)` — each stored tile contiguous, in `inner_index` order — instead of
-  one assembled array. File count per chunk is unchanged. This is what keeps one code path:
-  a revived chunk comes back as zero-copy views of the mapping, tiled exactly like a freshly
-  fetched one, so `gather` never asks "assembled or tiled?". Contiguous-on-disk tiles also
-  make a future `decode(out=)` usable on the mmap tier, not just the heap.
-  **Breaking:** the manifest format is bumped to 3, so an existing `cache_dir` is rejected
-  with the usual stale-cache error and rebuilt (`reset_stale_cache=True`, or delete it). A
-  version-2 file read as tile-major would be plausible-looking garbage, so this is refused
-  rather than reinterpreted.
-
 - **A ragged chunk grid is now charged for the padding it actually holds.** A stored chunk
   decodes whole, and we keep it whole rather than clipping edge tiles — one buffer unit, one
   shape, which a fixed-shape arena will later need to reuse anything. So residency is
@@ -701,71 +724,74 @@
   property of the machine, not of a dataset, so one number per process is the honest shape —
   and two datasets in one process should not run two pools competing for the same cores.
 
-- **Under-sizing the budget for concurrent iterations now says so.** One `InSituDataset`
-  owns one chunk pool and every active iteration shares it — `zip(ds.train, ds.val)`, or
-  two `DataLoader`s — but each holds its *own* chunk references, so residency is the sum
-  of their working sets, not the maximum. The auto-sized default covers one iteration and
-  deliberately stays that way: the engine cannot know how many you intend to run, and
-  guessing high would cost memory in the single-iteration case that is almost every case.
-  What was missing was the diagnostic. Starvation previously advised "raise
-  cache_budget_bytes, or lower batch_size / block_chunks" — correct but not actionable
-  when *every* resident chunk is legitimately referenced and the caller has no way to see
-  why. It now names how many iterations are sharing the pool, and the pattern that
-  produces that. Owners count from mint to release rather than from their first pin,
-  because the iteration that starves before it can pin anything is exactly the one that
-  needs naming. `docs/tuning.md` gains the sizing rule.
+### Docs, examples, and project
 
-- **The chunk pool's "safe to take away" predicate is now true, not approximately true.**
-  Eviction eligibility was spread across five loosely-coupled fields, and each one could
-  lie. `fail()` had to set `ready = True` to wake a waiter — the only lever available —
-  which simultaneously declared a half-written slot a finished cache entry while sibling
-  tile tasks were still writing into it, and left the poisoned slot resident so the *next*
-  epoch re-raised the stale error forever instead of refetching (#33). `unpin_all()`
-  cleared the pin map globally, so with two producers over one pool (`zip(ds.train,
-  ds.val)`, a documented configuration) one iteration's epoch boundary stripped the
-  other's pins and its in-use chunks became eviction candidates mid-gather (#34). And
-  `claimed` was a single bool, so one iteration's claim satisfied another's `wait_ready`
-  — that iteration then gathered a chunk it never referenced and its release decremented
-  someone else's count (#35). All three produced *plausible* data, which throughput,
-  shapes and smoke tests all pass; only byte fingerprints catch them.
-  A slot now carries one explicit `SlotState` (`FILLING → ASSEMBLED → READY`, `FAILED`
-  terminal) advanced in exactly one place, plus two counters that answer one question
-  each: `writers` (tile tasks *running*, so eviction is never racing a live write) and
-  `pending` (tiles not yet delivered, so completeness is separate from quiescence).
-  References are owner-scoped, and a reference *is* that owner's claim, so `claimed` is
-  gone. `Scheduler` takes the pool's obligation off the caller: every tile write happens
-  inside `pool.tile_write`, whose scope releases on **every** exit path — including
-  cancellation at an `await`, which no explicit call site can cover.
-  `ASSEMBLED` is a real state, not a formality: the chunk transform and the persist
-  write-back run outside the lock between the last tile landing and the slot being
-  published, and a predicate derived only from a tile counter would call that window
-  evictable.
+- **The README was a strong pitch and a weak manual, and a cold-agent test measured how weak.**
+  Two agents with no prior context were each given an unfamiliar public store and one
+  documentation surface — README alone, or README plus `docs/tuning.md` — and told to build a
+  working iterator. Both got there; neither got there from the page. The README-only arm made
+  **sixteen** signature and docstring inspections, every one driven by a question the page did
+  not answer, and concluded that "nearly everything I needed to *operate* the library came from
+  parameter signatures, docstrings and error strings". The other arm, on different docs and a
+  different dataset, hit the identical wall in the identical place — which is what makes it the
+  page's defect rather than one agent's bad luck.
 
-- **Added: `insitubatch.print_debug_info()` — one paste instead of a dozen version questions.**
-  Reports the storage stack (zarr / obstore / numpy / xarray), whichever framework adapter is
-  actually installed, and the **free-threading state** — both the build flag and whether an
-  import has since switched the GIL back on, which are not the same thing and have explained
-  more than one "works for me". Nothing is imported to report on it (versions come from
-  distribution metadata), because importing torch and JAX in one process crashes — a debug
-  helper that took the process down while someone was reporting a bug would be worse than
-  none. `debug_info()` returns the same facts as a dict. The new bug and performance issue
-  forms ask for its output.
+  What the page got wrong was concentrated and consequential. The only end-to-end example was
+  single-variable, because the demo store has one array, and nothing said how to select
+  variables — so both agents opened **every** array in their store and were quoted residency
+  budgets of 5 493 GiB and 10 935 GiB for variables they never asked for. The transforms
+  section named `chunk_transform` / `batch_transform` four times in bold; the parameters are
+  plural and take a sequence, and the page never showed either being passed, so the one place
+  the names appeared was the place that got them wrong. `applies(...)` was absent entirely,
+  and with it the warning that lives only in its docstring: gating inside a transform body
+  instead makes unaffected arrays "gathered as truncated prefixes of themselves ... with no
+  exception raised". `sample_range`, `readonly_cache` and `reset_stale_cache` did not appear;
+  `cache_dir` appeared once, in the Windows row of the platform table. And following the page
+  verbatim the loader ran in silence, because nothing mentioned `logging.basicConfig`.
 
-- **Fixed: a batch wider than a shuffle-block deadlocked the loader.** A batch draws from
-  every block it spans and holds them until it has gathered, so `batch_size >
-  2 × block_chunks × samples-per-chunk` needed more blocks resident than the budget floor
-  provides: the fetch driver parked on admission, the consumer parked waiting for a chunk that
-  could never be admitted, and **no batch was delivered at all**. It bit one-sample-per-chunk
-  stores at the shipped defaults (`batch_size=64`, `block_chunks=16`) — per-frame and
-  per-spectrum archives — and presented as slow storage rather than an error.
-  `InSituDataset` now raises `block_chunks` to `⌈batch_size / samples-per-chunk⌉` (capped at
-  the array's chunk count) and logs when it does, so a block always holds a batch. Coarsely
-  chunked stores are unaffected: the requested `block_chunks` is a floor, never lowered.
-- **Added: admission starvation raises instead of hanging.** If a working set exceeds its
-  budget anyway, the scheduler now detects the *provably* terminal state — nothing in flight,
-  every resident slot pinned, and a consumer blocked in `wait_ready` — and raises with the
-  residency arithmetic and the offending chunk. The test is structural, not a timeout, so a
-  merely slow consumer is never mistaken for a deadlock.
+  The page is rewritten around what it is for. The API now starts at 18% of the page rather
+  than 54%; the quickstart is a runnable multi-variable recipe that was executed verbatim to
+  confirm it (it previously could not run at all — `n_epochs` was undefined); caching and
+  diagnostics get sections of their own, the first being this release's headline behaviour and
+  the second — `ds.last_pass`, `limiting_stage`, `print_debug_info()` — having had no README
+  coverage whatsoever. The free-threading essay and the milestone inventory are gone, the
+  latter because `DESIGN.md` is the single source of truth for status and the README was
+  mirroring it.
+
+- **Status is now Beta, and all three places that state it agree for the first time.** The
+  PyPI classifier said `2 - Pre-Alpha`, the README said alpha, and `DESIGN.md` — the declared
+  single source of truth — said Alpha: two steps apart, on the page a new user lands on.
+  Beta is claimed on instrumentation rather than on an absence of bugs: the O(chunks) invariant
+  is pinned by a test with a companion control that fails loudly if the counter comes unwired,
+  byte fingerprints and a model-free persistence baseline cover the silently-plausible-data
+  class, and the CUDA-gated buffer-lifetime tests now run green on an L4 with the instrument
+  validated first. The API is still pre-1.0 and breaking changes are still allowed.
+
+- **`examples/advection` trained a whole epoch before finding it had nothing to score (#71).**
+  `--n-steps 192` on the default 10% split gives the val split no chunks; `--n-steps 256` gives
+  it a chunk whose every anchor the 24-step target drops. Either way the run built the store,
+  trained, validated, and only then raised from `evaluate` -- discarding all of it to report a
+  fact its arguments had already fixed. Both are now refused at setup, from the engine's own
+  `drawable_samples`, and the message names the smallest sample-axis length that works, solved
+  against the same split and window arithmetic rather than quoted as a constant.
+
+- **A benchmark run whose *subject* failed exited 0 with a tidy table.** Every engine
+  failure was caught and skipped so one flaky baseline could not kill an hours-long S3
+  sweep -- but that made a run in which `insitu` never ran indistinguishable from a
+  complete one, which is how the `c1` starvation above reached a results file as *absence*
+  rather than as a failure. Skips are now summarised at the end, and a skip of the engine
+  under test raises -- after every row is on disk, because re-running an S3 sweep to
+  recover the configs that did work is expensive. A failing baseline stays non-fatal: that
+  is a gap in the comparison, not a dead run.
+
+- **Six documented benchmark commands could not be pasted.** The suite dropped `--storage`
+  when it started deriving storage from the URL scheme, and the S3 invocations in
+  `docs/benchmarks.md` and `bench/benchmark_plan.md` kept passing it -- so the runbook for
+  a benchmark that costs an EC2 box and hours of reads died on `unrecognized arguments`
+  before the first byte. The flag is gone from those commands, and `tests/test_bench_docs.py`
+  now parses every documented `python -m bench` command against the real parser, so the
+  docs and the CLI cannot drift apart silently again.
+
 - **Project: a contributor and governance model, adopted before it is strictly needed.**
   insitubatch is maintained by one person today and that is a transitional state, so the rules
   are now written down rather than improvised at the moment they are first contested. A
