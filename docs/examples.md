@@ -12,6 +12,7 @@ has an offline synthetic `--source` so you can run it with no network or cloud c
 |---|---|---|---|
 | [`advection/`](#advection-a-24-hour-forecast-in-three-frameworks) | Weather — WeatherBench2 ERA5 (`gs://`, anonymous), Arraylake/Icechunk, or synthetic | Input at *t*, target at *t+24 h* as **offset views of one array** | Windowed multi-offset sampling; one dataset → **torch, JAX and TF** |
 | [`microscopy/`](#microscopy-cell-segmentation-over-z) | Bio-imaging — IDR OME-NGFF `(T,C,Z,Y,X)` on `s3://idr` | Samples a **middle** axis (`sample_axis=2`); two co-registered variables chunked **1 vs 30 planes** deep | Arbitrary sample axis + per-variable chunk size — the engine is not weather-specific |
+| [`dynamical/`](#dynamical-downscaling-on-a-deep-chunked-archive) | Weather — dynamical.org's NOAA GFS analysis, an Icechunk repo on `s3://dynamical-noaa-gfs` | **1440 samples inside one stored chunk**, which assembles to 6.87 GiB resident | Decode-once at its most valuable, and what a shard's size costs a loader |
 | [`hubble/`](#hubble-denoising-real-telescope-frames-from-fits) | Astronomy — Hubble WFC3/IR frames of M16 on MAST's `s3://stpubdata` | **FITS, not zarr** — indexed as virtual byte-range references; one frame *is* one chunk | Training in place over an archival format; streaming value without decode amortization |
 | [`sdss/`](#sdss-reconstructing-galaxy-spectra-streamed-in-place) | Astronomy — SDSS DR17 `spPlate` spectra, or our **public reference stores** | **FITS binary-image tables** re-chunked by byte arithmetic; two layouts from the same bytes | Both regimes from one dataset: many-fibers-per-chunk *decode amortization* vs one-fiber-per-chunk *archive-scale streaming* |
 | [WB2 pair](#the-weatherbench2-cold-start-pair) | Weather — WeatherBench2 ERA5 | The same task on **two engines** | The cold-start / memory trade-off vs an xbatcher worker stack |
@@ -68,6 +69,32 @@ The task is per-plane foreground segmentation and the baseline is a global **Ots
 threshold — the segmentation analogue of persistence. Otsu reads each pixel's intensity
 alone, so a smooth autofluorescence haze gradient defeats it; a tiny CNN that reads the
 neighbourhood beats it. Each run prints held-out foreground IoU, model vs Otsu.
+
+## dynamical — downscaling on a deep-chunked archive
+
+The deep-chunk showcase: the geometry where fetch-and-decode-once is worth the most.
+[`dynamical/`](https://github.com/emfdavid/insitubatch/blob/main/examples/dynamical/data.py)
+reads surface solar irradiance from [dynamical.org](https://dynamical.org)'s public NOAA GFS
+analysis, where one stored chunk holds **1440 consecutive hourly global fields**. One fetch and
+one decode serve all of them.
+
+```bash
+uv sync --extra torch
+uv run python -m examples.dynamical.train_torch                  # synthetic irradiance (offline)
+uv sync --extra torch --extra icechunk
+uv run python -m examples.dynamical.train_torch --source gfs     # the real GFS archive (streamed)
+```
+
+The task is spatial downscaling over a European window, and the baseline is bilinear
+upsampling — everything the coarse field gives you with no model, and a data fingerprint
+besides. Each run prints held-out RMSE in W/m², model vs bilinear.
+
+The example reads **one variable**, because the geometry prices the second one. A stored chunk
+is 878.9 MiB and assembles to 6.87 GiB resident, the residency floor is two blocks of them, so
+a variable costs ~13.7 GiB whatever the batch size — and a shrinking `chunk_transform` cannot
+buy it back, since the pool holds the source tiles until the fill completes. `--print-summary`
+reports the whole budget before a byte moves; on the defaults `--source gfs` estimates
+19.78 GiB of peak. This is the case the [memory model](tuning.md) is for.
 
 ## hubble — denoising real telescope frames from FITS
 

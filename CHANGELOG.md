@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **A worked example on a deep-chunked cloud archive, where the memory bill is the lesson
+  (`examples/dynamical/`).** dynamical.org publishes ML-shaped weather Zarr with no published
+  path into a training loop, and the first thing a reader tries — pointing the README
+  quickstart at one — fails three ways before a byte moves: the stores are Icechunk rather
+  than plain Zarr, `variables=` stops being optional at 25 to 146 arrays per store, and the
+  quickstart's `block_chunks=16` is sized to a 63 MiB chunk where NOAA GFS analysis has a
+  6.87 GiB one. Nothing raises; `print_summary()` truthfully reports the 860 GiB of estimated
+  peak that three variables at those defaults ask for. The example is single-variable because
+  the geometry prices the second one at another 13.7 GiB, and it says so rather than quietly
+  picking a small store that would have hidden it.
+
 ## 0.2.0 — 2026-09-11
 
 ### Upgrading
