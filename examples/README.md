@@ -105,6 +105,51 @@ prints the held-out foreground IoU, model vs Otsu.
 Only `train_torch.py` ships here — framework-neutrality is the advection example's job; this
 example's job is to prove the *geometry* generalizes.
 
+## dynamical/ — downscaling on a deep-chunked archive (1440 samples per chunk)
+
+The **deep-chunk** showcase: the geometry where decode-once is worth the most.
+[`dynamical/`](dynamical/data.py) reads surface solar irradiance from
+[dynamical.org](https://dynamical.org)'s public NOAA GFS analysis — an Icechunk repository whose
+stored chunk holds **1440 consecutive hourly fields**. One fetch and one decode serve every one
+of them; a per-sample `__getitem__` would re-read the same object 1440 times.
+
+```bash
+uv sync --extra torch
+uv run python -m examples.dynamical.train_torch                     # synthetic irradiance (offline)
+uv sync --extra torch --extra icechunk
+uv run python -m examples.dynamical.train_torch --source gfs        # the real GFS archive (streamed)
+```
+
+The task is **spatial downscaling** over a European window: the field is block-averaged to a
+coarse grid and the model must put the fine structure back. The baseline is **bilinear
+upsampling** — everything the coarse field gives you for free — and it doubles as a data
+fingerprint, since its RMSE depends only on the data the loader handed over. On the synthetic
+store the sub-grid structure is a deterministic function of the smooth field, so a CNN beats
+bilinear by construction; on the real archive the claim is "same pipeline, real data, no
+reshard", not SOTA downscaling. Each run prints held-out RMSE in W/m², model vs bilinear.
+
+**The example is single-variable by necessity, and that is the lesson.** A stored chunk here is
+878.9 MiB and assembles to **6.87 GiB resident**; the residency floor is two blocks of them, so
+each variable costs ~13.7 GiB however small the batch. A *shrinking* `chunk_transform` does not
+help — the pool holds the source tiles until the fill completes, so the charge is the larger of
+the two and peak goes up. `--print-summary` reports all of it before a byte moves, which is the
+only reason the archive is approachable at all; `--source gfs` estimates **19.78 GiB** of peak on
+the defaults, so check before you commit a box to it.
+
+### Data sources (`--source`)
+
+| `--source` | store | notes |
+| --- | --- | --- |
+| `synthetic` *(default)* | offline **irradiance archive** written to a temp zarr | a clear-sky diurnal cycle under an advecting cloud field, shaped like the real one: deep sample chunks, a tiled field, and a tile grid that does not divide it; `--n-steps` / `--nlat` / `--nlon` / `--sample-chunk` size it |
+| `gfs` | dynamical.org's **NOAA GFS analysis** Icechunk repo on `s3://dynamical-noaa-gfs` | streamed anonymously (needs `--extra icechunk`); `--sample-range` defaults to 4 chunks = 5760 hourly analyses. **~20 GiB of RAM** |
+
+`dynamical_catalog.get_store("noaa-gfs-analysis")` returns the same zarr Store if you would
+rather address the archive by catalog id than by URL — the engine reads either. Note that the
+catalog's `*-virtual` datasets carry GRIB2 byte references and need the `gribberish` codec, which
+this example does not pull in.
+
+Only `train_torch.py` ships here — framework-neutrality is the advection example's job.
+
 ## hubble/ — denoising real telescope frames from FITS (no reshard)
 
 The **archival-format** showcase: the data never was zarr. [`hubble/`](hubble/data.py) indexes
