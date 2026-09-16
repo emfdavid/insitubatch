@@ -6,20 +6,33 @@
 
 Measurements over the first ``--max-chunks`` chunks (quick on a 25 GB store):
 
-  1. insitu throughput vs ``decode_threads`` (1,2,4,8,auto) — where decode parallelism
-     saturates; flat past N cores => decode isn't the limit.
-  1b. **The V2 decoupling headline**: insitu throughput + peak residency vs
+  1. **The V2 decoupling headline**: insitu throughput + peak residency vs
      ``max_inflight``, with ``block_chunks`` fixed small. V2 dials network
      concurrency with ``max_inflight`` alone; throughput should rise to the network
      knee and then stay *flat* (not fall, as v1's nested caps did when oversubscribed)
-     while residency stays pinned at ``2*block_chunks`` — independent of concurrency.
-  2. raw obstore concurrent GET MB/s vs concurrency (1,4,8,16,32) — pure fetch, no
-     decode.
+     while residency stays **pinned** — independent of concurrency. Pinned is the
+     claim, not a particular number: a plain single-variable pass sits at
+     ``2*block_chunks``, and a windowed one (``--window``) sits higher, because a
+     chunk feeds every block whose anchors reach it and is released only at the last.
+  2. raw concurrent GET MB/s vs concurrency (1,4,8,16,32) — pure fetch, no decode.
   3. (synthetic only) insitu compressed vs uncompressed — the codec's share.
 
-Diagnosis: if raw GET (2) far exceeds insitu (1/1b), we're decode/loop-limited and
+Diagnosis: if raw GET (2) far exceeds insitu (1), we're decode/loop-limited and
 ``max_inflight`` / the decode pool is the lever; if raw GET also caps near insitu,
 it's the network/endpoint (more/bigger parallel streams, in-region S3, the gateway).
+
+**Comparing (1) against (2) assumes the data barely compresses.** insitu MB/s counts
+*decoded* bytes; raw GET counts the *stored* bytes it moved. On the synthetic store
+those agree, deliberately — ``make_dataset`` writes ``standard_normal`` f32, which zstd
+does not shrink (see ``bench/benchmark_plan.md``). On a real ``--url`` they do not: ERA5
+compresses ~2-4x, so raw GET is understated against insitu by that ratio, which biases
+the diagnosis *toward* "not decode-limited". Divide insitu's MB/s by the store's
+compression ratio before reading the gap.
+
+``decode_threads`` is a **process-wide** setting, not a sweep: the decode pool is built
+once, by the first dataset in the process, and a later different value is ignored. Set
+``--decode-threads`` and run the probe again to compare -- one value per process is the
+only way to measure it honestly.
 """
 
 from __future__ import annotations
@@ -44,6 +57,7 @@ import obstore
 import zarr
 
 from insitubatch import SplitManifest, SplitName, close_store, open_geometries, split_by_chunk
+from insitubatch.scheduler import decode_pool_workers
 from insitubatch.source import InSituDataset
 
 from ._profile import record_pyspy
@@ -213,6 +227,31 @@ def _insitu_cache(
     return cold, warm
 
 
+def stored_chunk_keys(store: Any, var: str, max_chunks: int) -> list[str]:
+    """Every stored-object key under the first ``max_chunks`` OUTER chunks of ``var``.
+
+    The grid comes from ``ChunkGrid.from_metadata`` and the key from the array's own
+    ``encode_chunk_key`` -- the same "one spelling of the shape of one stored object" the
+    engine plans reads with. Neither is cosmetic. ``metadata.chunks`` is the *inner* chunk
+    on a sharded array while a key addresses the *shard*, so building the grid from
+    ``chunks`` enumerates keys that do not exist (every dynamical.org archive is sharded);
+    and the ``c/i/j`` layout is zarr-v3's, while v2 writes ``i.j`` (WeatherBench2 ARCO is
+    v2). Either way a hand-built key 404s on exactly the stores the engine reads fine.
+    """
+    from zarr.core.chunk_grids import ChunkGrid
+
+    arr = zarr.open_array(store=store, path=var, mode="r")
+    meta = arr.metadata
+    stored = tuple(ChunkGrid.from_metadata(meta).chunk_shape)  # the shard, if sharded
+    n_outer = min(max_chunks, math.ceil(arr.shape[0] / stored[0]))
+    inner_ranges = [range(math.ceil(s / c)) for s, c in zip(arr.shape[1:], stored[1:], strict=True)]
+    return [
+        f"{var}/" + meta.encode_chunk_key((oi, *inner))
+        for oi in range(n_outer)
+        for inner in itertools.product(*inner_ranges)
+    ]
+
+
 def _raw_get_mb_s(
     url: str, var: str, kw: dict[str, Any], concurrency: int, max_chunks: int, backend: str
 ) -> float:
@@ -221,21 +260,12 @@ def _raw_get_mb_s(
     concurrent gcsfs ``cat_file``. Comparing the two is the cleanest "what does the
     Python fsspec layer cost" number, isolated from decode/gather/loop.
 
-    Enumerates the *real* stored-chunk grid (outer x inner) from the array's chunks, so
-    it's correct for spatially-chunked arrays. max_chunks bounds the number of OUTER
-    chunks; every inner chunk under them is fetched, concurrency threads at a time.
+    Reads the *real* stored-chunk grid via :func:`stored_chunk_keys`, so it is correct for
+    spatially-chunked, sharded and zarr-v2 arrays alike. max_chunks bounds the number of
+    OUTER chunks; every stored object under them is fetched, concurrency threads at a time.
     """
     meta_store = build_store(backend, url, **kw)
-    arr = zarr.open_array(store=meta_store, path=var, mode="r")  # for the chunk grid
-    n_outer = min(max_chunks, math.ceil(arr.shape[0] / arr.chunks[0]))
-    inner_ranges = [
-        range(math.ceil(s / c)) for s, c in zip(arr.shape[1:], arr.chunks[1:], strict=True)
-    ]
-    keys = [
-        f"{var}/c/{oi}/" + "/".join(map(str, inner))
-        for oi in range(n_outer)
-        for inner in itertools.product(*inner_ranges)
-    ]
+    keys = stored_chunk_keys(meta_store, var, max_chunks)
 
     if backend == "fsspec":
         import fsspec
@@ -275,18 +305,25 @@ def main() -> None:
         "--backend",
         default="obstore",
         choices=["obstore", "fsspec"],
-        help="store backend for the fetch-sensitive sections (1b, 2): obstore or fsspec/gcsfs",
+        help="store backend for the fetch-sensitive sections (1, 2): obstore or fsspec/gcsfs",
     )
     p.add_argument("--max-chunks", type=int, default=64, help="chunks to probe (bounds the cost)")
     p.add_argument("--repeats", type=int, default=3, help="runs per point; report median (min-max)")
-    p.add_argument("--decode-threads", default="1,2,4,8,0", help="sec 1 sweep (0=auto)")
+    p.add_argument(
+        "--decode-threads",
+        type=int,
+        default=0,
+        help="size the process-wide decode pool (0 = auto = min(32, cpu+4)). Applied to "
+        "the first dataset this process builds, which is the only one that can set it; "
+        "to compare thread counts, run the probe once per value.",
+    )
     p.add_argument(
         "--block-chunks",
         type=int,
         default=2,
-        help="fixed shuffle window / residency for the max_inflight sweep (sec 1b)",
+        help="fixed shuffle window / residency for the max_inflight sweep (sec 1)",
     )
-    p.add_argument("--max-inflight", default="8,16,32,64", help="sec 1b sweep (the V2 dial)")
+    p.add_argument("--max-inflight", default="8,16,32,64", help="sec 1 sweep (the V2 dial)")
     p.add_argument(
         "--window",
         type=int,
@@ -301,22 +338,16 @@ def main() -> None:
         nargs="?",
         const="probe-profile.svg",
         default=None,
-        help="record a py-spy --native flamegraph of the sec 1b sweep to PATH "
+        help="record a py-spy --native flamegraph of the sec 1 sweep to PATH "
         "(default probe-profile.svg; .json => speedscope). Needs ptrace_scope=0 "
         "or sudo; see bench/_profile.py.",
     )
     p.add_argument(
         "--cache-dir",
         default=None,
-        help="run the cross-epoch cache test (sec 1c): cold vs cached epoch, mmap slots here",
+        help="run the cross-epoch cache test (sec 1b): cold vs cached epoch, mmap slots here",
     )
     p.add_argument("--no-raw", action="store_true", help="skip sec 2 (raw GET re-reads the data)")
-    p.add_argument(
-        "--no-decode-sweep",
-        action="store_true",
-        help="skip sec 1 (the decode_threads sweep) -- a one-time decode-saturation "
-        "check; redundant when you only want the sec-1b max_inflight sawtooth",
-    )
     p.add_argument(
         "--no-warm",
         action="store_true",
@@ -348,17 +379,20 @@ def main() -> None:
 
     # Prewarm: a cold S3 prefix is rate-limited and obstore's TLS pool is empty, so
     # the first sweep point otherwise eats the ramp-up and reads at ~1 stream. One
-    # throwaway burst at the top fixes it for every section below (and makes 1c's
+    # throwaway burst at the top fixes it for every section below (and makes 1b's
     # "cold" epoch S3-warm/pool-cold, isolating decode+pool reuse from the S3 ramp).
     if not a.no_warm:
         mi_warm = max(int(x) for x in a.max_inflight.split(","))
         print(f"0) prewarm: {a.max_chunks} chunks @ max_inflight={mi_warm} (discarded) ...")
         try:
+            # Also where decode_threads lands: the pool is process-wide and the first
+            # dataset built sizes it, so passing it only to the sections below would be
+            # ignored -- with a warning, under a table that still looked like a result.
             _insitu(
                 a.url,
                 a.var,
                 kw,
-                decode_threads=0,
+                decode_threads=a.decode_threads,
                 max_chunks=a.max_chunks,
                 block_chunks=bc,
                 max_inflight=mi_warm,
@@ -372,25 +406,10 @@ def main() -> None:
     if a.window:
         print(f"(windowed: anchor input + {a.window} shifted target view(s); MB/s = input bytes)\n")
 
-    if not a.no_decode_sweep:
-        print(f"1) insitu MB/s vs decode_threads (median of {a.repeats}, block_chunks={bc}):")
-        for dt in (int(x) for x in a.decode_threads.split(",")):
-            show(
-                f"decode_threads={dt or 'auto':>4}",
-                partial(
-                    _insitu_mb,
-                    a.url,
-                    a.var,
-                    kw,
-                    decode_threads=dt,
-                    max_chunks=a.max_chunks,
-                    block_chunks=bc,
-                    window=a.window,
-                    backend=a.backend,
-                ),
-            )
-
-    print(f"\n1b) insitu MB/s + peak residency vs max_inflight (block_chunks={bc}, decode auto):")
+    print(
+        f"\n1) insitu MB/s + peak residency vs max_inflight (block_chunks={bc}, "
+        f"decode pool={decode_pool_workers() or 'unbuilt'} threads):"
+    )
     print("    V2 wants throughput flat (not falling) past the knee, residency pinned.")
     profile = record_pyspy(a.profile) if a.profile else contextlib.nullcontext()
     with profile:  # profile scope = the V2 acceptance sweep (insitu only, no raw-GET)
@@ -400,7 +419,7 @@ def main() -> None:
                     a.url,
                     a.var,
                     kw,
-                    decode_threads=0,
+                    decode_threads=a.decode_threads,
                     max_chunks=a.max_chunks,
                     block_chunks=bc,
                     max_inflight=mi,
@@ -417,7 +436,7 @@ def main() -> None:
             )
 
     if a.cache_dir:
-        print(f"\n1c) cross-epoch cache ({a.max_chunks} chunks, budget holds all, mmap):")
+        print(f"\n1b) cross-epoch cache ({a.max_chunks} chunks, budget holds all, mmap):")
         cold, warm = _insitu_cache(
             a.url,
             a.var,
@@ -449,11 +468,18 @@ def main() -> None:
             variables=["t2m"],
             compress=False,
         )
-        print("\n3) codec cost (synthetic, compressed vs uncompressed, auto decode_threads):")
+        print("\n3) codec cost (synthetic, compressed vs uncompressed):")
         for label, u in (("compressed", a.url), ("uncompressed", none_url)):
             show(
                 f"{label:12}",
-                partial(_insitu_mb, u, "t2m", {}, decode_threads=0, max_chunks=a.max_chunks),
+                partial(
+                    _insitu_mb,
+                    u,
+                    "t2m",
+                    {},
+                    decode_threads=a.decode_threads,
+                    max_chunks=a.max_chunks,
+                ),
             )
 
 

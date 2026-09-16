@@ -185,8 +185,14 @@ future via `call_soon_threadsafe`. What crosses the boundary is a Python object 
 ```
 insitu-prefetch          zarr_io  (ONE loop, shared with all zarr sync work)   insitu-dec (N)
      │                       │                                                      │
-     │                  _drive ──► _admit ──► pool.try_admit    [_cv, brief]         │
-     │                  _one, holding one `max_inflight` permit:                     │
+     │                  _drive, per chunk — a block boundary ends the run, so        │
+     │                  each block claims what it reads on its own reference:        │
+     │                    ⓪ _take_ahead — ONE read-ahead permit, taken before        │
+     │                       we reference anything; back on consumer unpin_block     │
+     │                    ─► pin_if_ready — a hit is pinned and permitted alike,     │
+     │                       and costs no fetch                                      │
+     │                    ─► _admit ─► pool.try_admit    [_cv, brief]                │
+     │                  _one, per tile, holding one `max_inflight` slot:             │
      │                       │                                                      │
      │                  ① await store.get(key) ──── obstore / gcsfs, inline ──┐      │
      │                       │   coroutine SUSPENDS, loop runs other tasks    │      │
@@ -218,7 +224,13 @@ may sit on a loop shared with the rest of the process.
 
 `max_inflight` is what bounds the executor: a `ThreadPoolExecutor` queue is unbounded, and
 the semaphore is held across ①②③, so in-flight tiles, queued decode work and decoded-tile
-residency are all bounded by that one dial.
+residency are all bounded by that one dial. (It bounds *tiles*; read-ahead permits bound
+*chunks*. Two resources, two units — see the prefetch section.)
+
+A persisted slot stores its tiles **tile-major** — `(n_tiles, *tile_shape)`, each stored tile
+contiguous, in `inner_index` order — which is what keeps ③ to one code path: a revived chunk
+comes back as zero-copy views of the mapping, tiled exactly like a freshly fetched one, so
+`gather` never has to ask whether a slot was assembled or delivered.
 
 #### Built on zarr's abstractions
 
@@ -292,6 +304,13 @@ Every physical axis of a zarr array has one **role**:
   (`inner_shape`). Field axes may be *inner-chunked* (the ARCO/ERA5 norm); the engine
   fetches each field axis's tiles and assembles them, decode-once, into the sample's
   slot.
+
+`open_geometries(store)` takes the group's **data variables** and skips coordinates and
+grid mappings, detected from `dimension_names` (v3) or xarray's `_ARRAY_DIMENSIONS` (v2) —
+a CF/xarray-written group carries `time`/`latitude`/`longitude` and a 0-D `spatial_ref`
+alongside the data, and none of them has a sample axis to draw along. The inference is
+deliberately narrow: only a *self-named* 1-D array is a coordinate, so a station series over
+`('time',)` is still data, and naming an array in `variables=` bypasses the test entirely.
 
 `ArrayGeometry.shape`/`chunks` are in **physical** (zarr) order — they mirror the
 array metadata. The engine works in a *logical* view where the sample axis leads; the
@@ -400,6 +419,7 @@ flowchart LR
     Q --> CONS["consumer __iter__<br/>pops finished batches"]
     CONS --> STEP[("train / infer step")]
     Q -.->|"full ⇒ producer blocks<br/>(backpressure)"| ASM
+    CONS -.->|"unpin_block ⇒ read-ahead permit returns<br/>(bounds how far ahead)"| ASM
 ```
 
 - **Producer** starts the scheduler over the epoch's chunks, then walks the epoch's
@@ -408,17 +428,50 @@ flowchart LR
   `queue.Queue(maxsize=d)`.
 - **Consumer** (`__iter__`) just pops finished batches → the train/infer step
   overlaps with IO+decode+assembly of the next `d` batches.
-- **Backpressure / memory bound** — queue depth `d` + the pool's byte budget cap
-  residency; a full queue pauses the consumer, a full budget pauses admission.
+- **Backpressure — two bounds, two questions.** *How far ahead* the producer may run
+  is bounded by **read-ahead permits**: it takes one per chunk and gets it back when the
+  consumer releases that chunk, so a pass runs at most its own working set ahead of its own
+  consumer. *How much is resident* is bounded by the pool's byte budget. A full queue pauses
+  the consumer, exhausted permits pause admission, and a full budget evicts unpinned-LRU to
+  admit a miss.
+- **The permit bound is computed, never configured** (`read_ahead_bound`): everything
+  still live at a block — first read at or before it, last read at or after it — plus the
+  whole of the next one, which the driver may work on while the consumer gathers this one.
+  It counts the read-unions the consumer actually waits on rather than `block_chunks`,
+  because a windowed variable's chunk feeds several blocks and is released only at the last
+  of them, and a variable chunked finer than the reference grid contributes several chunks
+  per anchor chunk. Below the bound a pass deadlocks against its own limit; above it one
+  iteration can claim the whole pool and starve another sharing it.
 - **Continuous fetch** — the scheduler keeps `max_inflight` tiles in flight across
-  block boundaries, and the budget (sized to ~two blocks) lets it admit the next
-  block while the current one drains, so block-boundary IO overlaps compute. (At
-  zero per-batch compute the loader is IO-throughput-bound, so the boundary is only
-  smoothed, not removed — the network ceiling, not a scheduling gap.)
+  block boundaries, and the bound covers the next block as well as the live set, so it
+  admits the next block while the current one drains and block-boundary IO overlaps
+  compute. (At zero per-batch compute the loader is IO-throughput-bound, so the boundary is
+  only smoothed, not removed — the network ceiling, not a scheduling gap.)
 - **Lifecycle** — early consumer exit sets a stop flag and drains the queue so a
   producer parked on a full `put` can exit before the scheduler is closed.
 - **Knobs:** `prefetch_depth` (queue depth `d`), `max_inflight`, `block_chunks`,
-  `cache_budget_bytes`.
+  `cache_budget_bytes`. Read-ahead depth is **not** one — it is computed per pass.
+
+**One pool, many iterations.** One `InSituDataset` owns one `ChunkPool`, and every
+iteration open on it — `ds.train` and `ds.val` under `zip`, or two `DataLoader`s — is an
+independent **owner** inside it, minted when the iteration starts and dropped when it ends.
+Four things follow, and they are the same fact four times:
+
+- read-ahead permits belong to one owner and come back only from *that* owner's
+  `unpin_block`, so another pass being mid-wait says nothing about this one;
+- residency is the **sum** of the owners' working sets, not the maximum — the auto budget
+  covers one iteration deliberately (the engine cannot know how many you intend, and
+  guessing high costs memory in the single-iteration case that is almost every case), so a
+  second iteration the budget cannot hold raises when it starts rather than starving later;
+- a pass's report reads its **own** counters (`PassCounters`) while the pool keeps
+  cumulative totals, because a hit rate belongs to a pass and an eviction or a peak
+  co-residency belongs to the pool;
+- the driver may skip a chunk whose tiles are already in flight only when they are **its
+  own** tasks — an abandoned pass's tasks are cancelled, so anyone standing on them waits
+  on a delivery that is not coming.
+
+Sizing for concurrent iterations is on the
+[tuning page](tuning.md#several-iterations-at-once-multiply-the-budget).
 
 Same shape as `torchdata.nodes.Prefetcher`, but async-native. This is what turns a
 throughput win into a *GPU-fed* win.
@@ -480,10 +533,13 @@ The pipeline holds two guarantees, and they are **orthogonal** — batch size to
 
 - **read-once** — a stored tile is fetched and decoded exactly once, however many samples
   and batches reference it (the read plan dedups; the `ChunkPool` keeps it resident; gather
-  reads from the slot). Across **epochs** it holds only while the tile stays resident: the
-  default budget is the working set, which is read-once *per epoch*; raise
-  `cache_budget_bytes` past it and an unevicted chunk is a cross-epoch hit too
-  (see [The caching continuum](#the-caching-continuum)).
+  reads from the slot). It is bounded by residency, so it holds for as long as the tile stays
+  resident: the default budget is the working set, which is read-once *per epoch*; raise
+  `cache_budget_bytes` past it and an unevicted chunk is a cross-epoch hit too. One policy
+  trades it deliberately — a windowed, shuffled pass with `persist=True` releases each block's
+  chunks as it drains and re-admits them later **from the on-disk cache**, which is a re-read
+  but neither a re-fetch nor a re-decode (see
+  [The caching continuum](#the-caching-continuum)).
 - **sample-once** — each valid sample lands in exactly one batch.
 
 `order` is the ledger for sample-once: an `(N, 2)` array of `[chunk_id, within]`, one row per
@@ -559,16 +615,13 @@ the decode-once suite.
 steps-per-epoch is `⌈N / bs⌉` and every batch is full except the last — the ordinary
 data-loader contract. A batch may therefore span a shuffle-block boundary, which the producer
 handles with two monotone frontiers over the block list: wait every block a batch draws from,
-and release a block once a batch has consumed its last row. Peak co-residency stays at **two
-blocks**, which is already the budget floor (the working set is sized at the current block plus
-one read-ahead block) — and when `bs` divides a block's row count no batch straddles at all, so
-the frontier costs nothing.
+and release a block once a batch has consumed its last row. On a non-windowed pass peak
+co-residency is **two blocks**, which is already the budget floor (the working set is sized at
+the current block plus one read-ahead block) — and when `bs` divides a block's row count no
+batch straddles at all, so the frontier costs nothing. A windowed view widens both terms: its
+chunks live from the first block that reads them to the last, which is what `working_set_bytes`
+sizes the floor from and what `read_ahead_bound` counts permits over.
 
-Batches used to be cut *within* each block's row range, which made the last batch of **every**
-block short whenever `block_chunks × spc` was not a multiple of `batch_size`. Sample-once held
-either way, so nothing failed loudly; what it broke was fixed-shape consumers — `torch.compile`
-and `jax.jit` retrace per shape, and with the epoch's own short final block that was up to
-*three* shapes, so the retrace cache never settled.
 
 There is deliberately no `drop_last`. Dropping the epoch's short tail is the caller's choice
 and `len(batch)` is the whole implementation:
@@ -654,12 +707,10 @@ that halves `t2m` and no-ops on `u10` therefore makes the engine believe `u10` i
 too, and `u10` is gathered as a truncated prefix of itself, its cache file permanently
 unable to revive — with nothing raised. Right shape, right dtype, wrong numbers.
 
-The division of labour: "subtract 273.15" is a fact about Kelvin, "`2m_temperature` is in
-Kelvin" is a fact about your store. A transform may be *parameterized* by variable — a
-fitted `StandardScaler`'s statistics legitimately are, and it validates a declared scope
-against its own stats dict — but it must not decide whether it runs. Configuration inside,
-control flow outside. sklearn's `ColumnTransformer`, NVTabular's `cols >> Op()` and
-xarray's subset-then-`map` all place the selector the same way.
+The division of labour: a transform may be *parameterized* by variable — a fitted
+`StandardScaler`'s statistics legitimately are, and it validates a declared scope against its
+own stats dict — but it must not decide whether it runs. **Configuration inside, control flow
+outside.**
 
 Scope also buys two smaller things: the engine skips the call entirely for arrays outside
 it, and cache invalidation is per array — see
@@ -808,7 +859,7 @@ two train chunks shares its neighbours' weather). Set `contiguous=False` only wh
 ```python
 from insitubatch import obstore_store, open_geometries, split_by_chunk
 
-store = obstore_store(url)                 # or fsspec_store / arraylake_store
+store = obstore_store(url)                 # or fsspec_store / icechunk_store / arraylake_store
 geom = open_geometries(store)[var]
 # time series (default): contiguous blocks, no cross-boundary leakage
 manifest = split_by_chunk(geom, fractions=(0.8, 0.1, 0.1))
@@ -872,17 +923,27 @@ object, the `ChunkPool`, parameterized by a byte budget:
 | layer | reuse scope | how |
 |---|---|---|
 | read-plan dedup | within a request | a chunk's tiles are fetched once, held by one slot |
-| residency | within an epoch | a small budget (the working set, ~2 blocks) |
+| residency | within an epoch | a small budget (the working set — `working_set_bytes`) |
 | cache | across epochs | a large budget retains drained chunks |
 
-A chunk is **pinned** while the current epoch needs it; once its shuffle-block is
-drained it becomes **unpinned** — LRU-evictable but not dropped. The pool drops
-unpinned chunks only under budget pressure (evicting LRU to admit a miss). With a
-small budget that is prompt — the read-once buffer, where each chunk is still
-read+decoded **once per epoch** (a naive per-batch eviction would re-read chunks
-whose samples scatter across a shuffle block). Raise the budget past the working set
-and drained chunks linger, so a still-resident prepped chunk is a cross-epoch hit:
-the same machinery becomes the cache by *"don't evict."*
+A chunk is **pinned** until the last block that reads it has drained; then it becomes
+**unpinned** — LRU-evictable but not dropped. The pool drops unpinned chunks only under
+budget pressure (evicting LRU to admit a miss). With a small budget that is prompt — the
+read-once buffer, where each chunk is still read+decoded **once per epoch** (a naive
+per-batch eviction would re-read chunks whose samples scatter across a shuffle block). Raise
+the budget past the working set and drained chunks linger, so a still-resident prepped chunk
+is a cross-epoch hit: the same machinery becomes the cache by *"don't evict."*
+
+**Holding to the last use is the right trade only while the split fits.** A windowed view
+reads `anchor + offset` and shuffle permutes chunk order, so a chunk one block reads can be
+wanted again most of an epoch later — held first-use to last-use, residency is the *split*
+rather than two blocks. With `persist=True` a windowed, shuffled pass instead hands each
+block's chunks back as it drains and re-admits them later from the on-disk cache: on a
+256-chunk split the floor falls from 259 chunks to 12 for a three-chunk lead, and from 316 to
+18 for leads `{0, 24, 240}`, delivering the same samples. It is a rule rather than a knob, and
+it keys on `persist` rather than on `cache_dir` because only a persisted slot survives its own
+eviction as a revivable file — with `cache_dir` alone the backing is unlinked on eviction and
+the re-read goes back to the store, which is the opposite of the trade the policy assumes.
 
 Backing is **heap or mmap** (`cache_dir` → mmap'd `.npy` on local NVMe): a heap slot
 adopts the decoded tile, and the mmap tier writes it straight into its tile-major slice and
@@ -895,30 +956,6 @@ is the working set (read-once); raise `cache_budget_bytes` to cache.
 fat-chunk regime (one chunk → many batches); scoring/verification (reference chunks
 reused across metrics, lead times, models); datasets that fit in RAM/NVMe
 (effectively in-memory at GPU-fed speed after the first pass).
-
-### Two cache models: chunks vs batches
-
-insitubatch and xbatcher both cache — they cache *different things*, and each choice
-buys something real. [xbatcher](https://github.com/xarray-contrib/xbatcher) serializes
-**assembled batches** to a zarr store; insitubatch retains **decoded, chunk-transformed
-chunks** in the pool. Caching whole batches is a deliberate design choice, not a
-shortcut: it is exactly what lets xbatcher's cache survive process exit today.
-
-| dimension | insitubatch — chunk pool | xbatcher — batch cache |
-|---|---|---|
-| unit cached | decoded + chunk-transformed **chunk** (deduped) | **assembled batch**, in batch layout |
-| extra copy | none beyond the batch — `gather` copies rows from the slot straight into it | the batch, **plus** a separate materialized copy in the cache |
-| key | `(array, chunk_index)` | batch index → zarr store |
-| backing | heap or mmap'd `.npy` (reclaimable NVMe page cache) | zarr store (local dir or cloud) |
-| cross-epoch reuse | intrinsic (just don't evict) | yes |
-| cross-run persistence | **yes** — `persist=True` (see below) | **yes** — survives restarts |
-| shuffle | sits *before* shuffle: sample→batch membership re-drawn every epoch | batch composition frozen; only batch *order* reshuffles |
-| sweet spot | many samples per chunk, fat-chunk, multi-epoch, scoring reuse | one-sample-per-chunk, stable batch defs reused across runs |
-
-Both persist across runs now; the distinction is the **unit**. insitu caches deduped
-decoded chunks (stored once, with nothing staged between slot and batch) and keeps a stronger
-per-epoch shuffle because the cache is *upstream* of shuffling; xbatcher caches
-materialized batches with frozen composition. Pick by regime, not by a missing feature.
 
 ### Cross-run persistence
 
@@ -973,24 +1010,11 @@ lives in an array rather than in its source.
 
 **The fingerprint is per *array*, over the transforms scoped to it.** `chunk_transforms`
 is one ordered list, but a transform restricted with `applies` contributes only to the
-arrays it names, so each array's entries carry their own 16-hex `pipeline` hash. Editing a
-transform scoped to `t2m` marks `t2m` stale and leaves `u10`/`v10` — whose bytes did not
-change — valid. Staleness is therefore a *partial* answer, with three behaviours worth
-knowing:
-
-- the error **names which arrays** are stale, and `reset_stale_cache=True` deletes exactly
-  those arrays' `.npy` files, not the directory;
-- an array with **no entries** is *cold*, not stale — adding a variable to a configuration
-  is not a cache wipe;
-- an array **this run does not read** is left entirely alone, entries and files, so two
-  configurations can share one `cache_dir`. Dropping a variable is not an edit to it: a
-  feature-importance or ablation sweep can run variable subsets over one warm cache all day,
-  and every array it omits is still there, valid, when a later run asks for it.
-
-Scope does *not* enter a transform's own token: narrowing `applies(["t2m", "u10"], f)` to
-`applies(["t2m"], f)` invalidates `u10` (it lost a transform) and leaves `t2m` valid (its
-pipeline is unchanged). The log is compacted — written to a temp name and renamed — when a
-load drops entries, which is safe because one writer holds the `cache_dir` lock.
+arrays it names, so each array's entries carry their own 16-hex `pipeline` hash. Staleness
+is therefore a *partial* answer: editing a transform scoped to `t2m` invalidates `t2m` and
+leaves `u10`/`v10` — whose bytes did not change — valid. Which edits invalidate what, the
+two cases that deliberately are *not* stale, and what narrowing a scope does are on the
+[tuning page](tuning.md#what-a-transform-edit-invalidates).
 
 Only the manifest **format** is still all-or-nothing: a log we cannot parse tells us
 nothing about any individual array, so an older format resets the whole cache.
@@ -1011,8 +1035,10 @@ isn't working is loud, not silent.
 - **Crash-safe:** each *completed* chunk is appended to the log as it finishes (flushed to
   the OS page cache, which survives process death), so a killed run keeps everything it
   decoded. The log is self-deduplicating (a re-completed chunk across epochs/runs is not
-  re-appended) and bounded to one line per cached chunk — no compaction needed. A `.npy`
-  left half-written by a crash was never logged, so it's simply overwritten on re-decode.
+  re-appended) and holds one line per cached chunk. It is compacted — written to a temp name
+  and `rename`d — only when a load drops entries, so a reset is not re-read and re-rejected on
+  every later open; that is safe because one writer holds the `cache_dir` lock. A `.npy` left
+  half-written by a crash was never logged, so it's simply overwritten on re-decode.
 
 **What you must ensure (the guarantee boundary):**
 
@@ -1023,11 +1049,34 @@ isn't working is loud, not silent.
   that you bump when the **source data** changes — content/etag drift is deliberately
   not detected.
 - **`chunk_transforms` must be deterministic** (they are baked into the cached chunk).
-  When you edit one, its fingerprint changes and the cache goes stale — construction then
-  **raises** until you pass `reset_stale_cache=True` (wipe + rebuild) or delete the dir.
+  When you edit one, the fingerprint of every array it is scoped to changes and those arrays
+  go stale — construction then **raises**, naming them, until you pass
+  `reset_stale_cache=True` (which deletes just those arrays' files and rebuilds them cold) or
+  delete the dir.
   For the fingerprint to *notice* a change, install the `cache` extra (cloudpickle) or set
   an explicit `transform.cache_key`; the source-only fallback can miss closure/global
   changes (and would then wrongly serve the old cache as a hit).
+
+**One writer per `cache_dir`.** The pool takes an advisory `flock` on the cache directory
+for its lifetime, so a second *writing* process fails fast — with the holder's PID and host —
+instead of quietly disagreeing with the first. It keys on `cache_dir` being set, not on
+`persist=True`, because ephemeral spill writes the same filenames. Chunk files are written
+under a temp name and `rename`d into place, so a mapping another process already holds keeps
+its inode and its data no matter who re-admits the chunk.
+
+`readonly_cache=True` is the workload this is shaped around — one job warms a cache, several
+score against it. It takes the lock **shared**, so any number coexist; it writes nothing; and
+a cache miss **raises**, naming the array and chunk. That is what makes it a contract — *this
+cache is complete for what I am about to read* — rather than a slow path that silently
+re-fetches whatever the warming run's split or transforms left out.
+
+Two consequences worth stating outright. There is no such thing as a stale `flock` — the
+kernel releases it when the process dies, `SIGKILL` and spot preemption included — so there
+is no cleanup procedure, and **deleting the lockfile is actively harmful**: it releases
+nothing and makes the next two processes lock different inodes. And a network `cache_dir`
+(where `flock` may be emulated per client) or a platform without POSIX locking is
+unarbitrated; both warn at construction, because that is the one configuration where two
+writers can still corrupt each other.
 
 **Reshaping transforms.** A **reshaping** `chunk_transform` (e.g. `Regrid`, or a dtype
 recast) is a first-class cacheable stage on every backing including the persistent mmap
@@ -1061,6 +1110,10 @@ adds over the store-swap is the **loader**:
 - **Read-plan dedup across a request** — ensembles, lead times, and overlapping verification
   windows touch the same chunks repeatedly; the plan collapses them to one read each.
 - **Prefetch overlap** for sequential/autoregressive rollout, and split + shuffle for training.
+- **Device placement belongs to the adapter** — `to_torch(device=)` owns its H2D copy out of
+  page-locked host memory; `to_jax` places on `jax.devices()[0]`, where every other JAX
+  array-creation path puts one, and takes `device=` to choose another. On a CPU-only build
+  that put is a pass-through that still aliases the exported buffer, so it costs nothing.
 
 A reference integration — an Earth2Studio `DataSource` backed by `InSituDataset` — is in
 [emfdavid/earth2studio#1](https://github.com/emfdavid/earth2studio/pull/1).

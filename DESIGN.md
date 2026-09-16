@@ -456,6 +456,25 @@ The shape above wasn't the first cut. The pivots that got here, and the roads no
   configurations are **slower than plain zarr-python in every row** (e.g. 1.93 s vs 1.10 s
   reading a 2 GB array) at **~2× the peak memory** (4.3 GB vs 2.4 GB) — and that is on local
   NVMe, without the forked-worker nesting that makes it worse for us.
+- **Batches cut over the epoch, not within each block.** Batches were once cut inside each
+  block's row range, which made the last batch of *every* block short whenever
+  `block_chunks x spc` was not a multiple of `batch_size`. Sample-once held either way, so
+  nothing failed loudly; what it broke was fixed-shape consumers — `torch.compile` and
+  `jax.jit` retrace per shape, and with the epoch's own short final block that was up to
+  *three* shapes, so the retrace cache never settled. Cutting over the whole epoch `order`
+  leaves exactly one short batch — the ordinary data-loader contract — and costs two monotone
+  frontiers over the block list.
+- **Transform scope at the call site, not inside the body.** The convention was for a
+  `chunk_transform` to test `chunk.read.array` and no-op on the rest. `output_geometry` cannot
+  see a test inside a function body, so it folded *every* transform's declared `output_inner`
+  into *every* variable's geometry: a regrid gated by an `if` to `t2m` also made the engine
+  believe `u10` was regridded, and `u10` was gathered as a truncated prefix of itself with
+  nothing raised. `applies(["t2m"], f)` puts the selector where the engine can read it.
+  "Subtract 273.15" is a fact about Kelvin; "`2m_temperature` is in Kelvin" is a fact about
+  your store — the old pattern welded them together, which is why one unit conversion had to
+  enumerate two archives' naming conventions and silently skipped a third. Configuration
+  inside, control flow outside: the same placement as sklearn's `ColumnTransformer`,
+  NVTabular's `cols >> Op()` and xarray's subset-then-`map`.
 - **No reshard.** The usual fix — rewrite the archive to one-sample-per-file — is a second
   copy that discards the chunk locality the store already has. We train in place and pay for
   it with an *approximate* shuffle instead.
@@ -962,7 +981,7 @@ measurements live in [docs/benchmarks.md](docs/benchmarks.md).
   removes all backpressure and the driver eagerly fetches the *whole* resident set,
   starving the current block and inflating cold TTFB (observed: ~7 s → ~50 s with
   `--cache-resident`). The stopgap — a low `--max-inflight` doubling as a throttle —
-  couples two dials. **Fix:** a fetch-ahead semaphore released on the consumer's `unpin`,
+  couples two dials. **Fix:** a read-ahead semaphore released on the consumer's `unpin`,
   bounding how far ahead of the consumer the driver admits, independent of retention. Then
   the cache retains consumed chunks (fast warm epochs) without eager whole-split fetching
   (fast cold TTFB). Applies to the V2 engine and the M-W residency path alike.

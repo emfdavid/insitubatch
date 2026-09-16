@@ -134,11 +134,17 @@ stable median. Each family member is ~3.2 GB; the fat grids ~3.3 GB each.
 > **What the `make_dataset` print reports — and what we measure.** The
 > `~N MB uncompressed` line is the *logical* size (`n_samples × inner × 4`),
 > printed for a quick sanity check — not a `stat` of the written store. The values
-> are `standard_normal` f32, which is **incompressible**, so `compress=auto` (zstd)
-> shrinks them ~0% and the **on-disk footprint ≈ this number**. That is deliberate:
-> bytes-moved ≈ uncompressed keeps the MB/s and "% of raw-GET ceiling" math clean,
-> and the codec still runs on the decode path (zstd decompress per chunk) so the
-> decode-cost story is real. Caveat: real ERA5 compresses ~2–4×, so this synthetic
+> are `standard_normal` f32, which zstd still compresses by **~7.6%** (`compress=auto`),
+> and zarr pads edge chunks to full size, which adds **~0.8%** back whenever the inner
+> dims are not a multiple of `inner_chunks` (the `361 → 4×91` grids here). What matters
+> downstream is neither of those alone but their product, the **logical-to-stored ratio**
+> — ≈**1.08×** on these grids, measured per store, never assumed. It is load-bearing for
+> exactly one metric: insitu's MB/s counts *decoded* bytes while a raw GET moves *stored*
+> bytes, so any "% of raw-GET ceiling" must divide by that ratio before the two are
+> comparable. `bench/probe_ceiling.py` measures it via `HEAD` on the objects the raw sweep
+> fetches and reports the corrected figure; take it from there rather than from this line.
+> The codec runs on the decode path either way (zstd decompress
+> per chunk), so the decode-cost story is real. Caveat: real ERA5 compresses ~2–4×, so this synthetic
 > data moves *more* bytes/sample than production (conservative for the network
 > ceiling) — see the `make_dataset` docstring ("synthetic-but-realistic").
 

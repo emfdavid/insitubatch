@@ -1053,7 +1053,7 @@ class ChunkPool:
         ``owner`` narrows it to one pass, and which of the two a caller wants follows from
         what it is waiting on. The byte budget is shared, so an admission stall is rightly
         judged against every owner: another iteration's blocked consumer is holding budget
-        we need. A fetch-ahead permit is not shared -- it belongs to one
+        we need. A read-ahead permit is not shared -- it belongs to one
         :class:`~insitubatch.scheduler.Scheduler` and comes back only from that pass's own
         ``unpin_block`` -- so a permit stall must ask only about its own waiters
         (:meth:`Scheduler._ahead_starvation`).
