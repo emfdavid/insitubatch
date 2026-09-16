@@ -1144,8 +1144,10 @@ pretending to be a general compute graph.
   and memory-optimal partial-field residency — is a reserved extension (see the
   axis-role contract). The shipped random-crop example (`examples/wb2_dataloader.py`)
   does exactly this — crops in a `batch_transform` over the whole-field cache, so the
-  crop re-randomizes each epoch for free — but its crop is a per-sample Python loop,
-  illustrative rather than vectorized.
+  crop re-randomizes each epoch for free — and its crop is vectorized: one batched RNG
+  draw for every sample's window origin, then a single `sliding_window_view` gather, so
+  each window copies as a block rather than walking the axes element by element. What a
+  whole-field read costs is bytes, not Python — the crop is cheap, the read is not.
 - **Not a compute framework.** No general task graph, no cross-chunk reductions on
   the hot path, no lazy dask-style evaluation — by design (dask on the hot path is
   the thing we route around). Reductions like fitting a scaler run *over the loader*
