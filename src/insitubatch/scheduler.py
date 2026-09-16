@@ -12,11 +12,20 @@ quantization of the fetch (reading one outer chunk per ``getitem`` and letting z
 stitch the inner grid under a second cap is what couples them). See
 [docs/architecture.md] for the full pipeline.
 
-Two bounded resources, deliberately distinct:
+Three bounded resources, deliberately distinct -- and they are bounded in different
+units, so no one of them can stand in for another:
 
-* **in-flight** (``max_inflight``, an ``asyncio.Semaphore``) -- tiles in flight; a
+* **in-flight** (``max_inflight``, an ``asyncio.Semaphore``) -- *tiles* in flight; a
   slot is held from fetch-start to delivery, spanning fetch + decode + deliver. It is
   also what bounds the decode pool's queue, which is otherwise unbounded.
+* **read-ahead** (``read_ahead_chunks``, an ``asyncio.Semaphore``) -- *chunks* this
+  iteration may hold ahead of its own consumer. One permit is taken per chunk before it
+  is referenced and handed back by that consumer's ``unpin_block``, so a pass runs at most
+  its own working set ahead. Computed by
+  :func:`~insitubatch.source.read_ahead_bound`, never configured. It is what keeps one
+  iteration from claiming the whole pool and starving another sharing it (#64); the byte
+  budget cannot do that job, because a driver far ahead of its own consumer is holding
+  chunks that are legitimately referenced.
 * **residency** (the pool's byte budget) -- admission (``pool.try_admit``) evicts
   ready-and-unreferenced LRU to make room and *references* (refcounted pin) the chunk,
   so it stays resident from in-flight fetch through to the consumer's release; when the
@@ -323,7 +332,7 @@ class Scheduler:
         self._loop = _get_loop()
         self._inflight: asyncio.Semaphore | None = None
         self._capacity: asyncio.Event | None = None  # set on unpin -> wakes a parked admit
-        self._ahead: asyncio.Semaphore | None = None  # fetch-ahead permits (read_ahead_chunks)
+        self._ahead: asyncio.Semaphore | None = None  # read-ahead permits (read_ahead_chunks)
         # Outstanding tile tasks per chunk, this scheduler's only. A second block reading a
         # chunk we are still fetching does not fetch it again.
         self._fetching: dict[tuple[str, int], int] = {}
@@ -466,7 +475,7 @@ class Scheduler:
             self._loop.call_soon_threadsafe(self._release_ahead, len(keys))
 
     def _release_ahead(self, n: int) -> None:  # on the loop
-        """Hand back `n` fetch-ahead permits, one per chunk the consumer released."""
+        """Hand back `n` read-ahead permits, one per chunk the consumer released."""
         assert self._ahead is not None
         for _ in range(n):
             self._ahead.release()
@@ -592,7 +601,7 @@ class Scheduler:
             self._fetching.pop(key, None)
 
     async def _take_ahead(self, array: str, chunk_index: int) -> None:
-        """Take a fetch-ahead permit, proving a stall terminal rather than waiting forever.
+        """Take a read-ahead permit, proving a stall terminal rather than waiting forever.
 
         Permits come back from the consumer's ``unpin_block``, so a consumer that cannot
         reach its next unpin never returns one -- the same shape as an admission stall, and

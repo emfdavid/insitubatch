@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased
+
+- **`bench/probe_decode.py`'s decode-thread sweep had stopped measuring anything, and printed
+  a clean scaling curve anyway.** The decode pool went process-wide in 0.2.0 — built once by
+  the first dataset in the process, a later different value ignored with a warning — and the
+  probe's own prewarm built it at auto *before* the sweep began. So every point ran on the
+  same pool. The warnings went to stderr above the report; the table below still read as a
+  result, and on an 8-vCPU box it came back `756 -> 808 -> 921 MB/s` across
+  `decode_threads=1,2,8`: run-to-run noise on one 20-thread pool, arranged in the most
+  convincing shape it could have taken. The documented diagnosis for a flat sweep is "decode
+  isn't the limit", so the failure pointed *away* from itself. The sweep is gone.
+  `--decode-threads` stays as a single value, applied to the first dataset the probe builds —
+  the only one that can set it — and the section header now reports the pool's *effective*
+  thread count (`decode_pool_workers()`), so a number that never applied cannot be quoted.
+  Sweeping thread counts means one run per value, which the docstring says.
+
+- **The probe's raw-GET ceiling could not be measured on a sharded or a zarr-v2 store: every
+  key 404'd.** `_raw_get_mb_s` hand-built chunk keys from `metadata.chunks` in zarr-v3's
+  `c/i/j/k` layout. On a sharded array `chunks` is the *inner* chunk while a key addresses the
+  shard (the #56 distinction), so half the keys named nothing; on zarr-v2 the separator is `.`
+  with no `c/` prefix, so none of them did. It raised rather than returning a wrong number,
+  but it meant the insitu-vs-raw comparison — the probe's whole diagnosis — was unavailable on
+  every dynamical.org archive (all sharded) and on WeatherBench2 ARCO (v2), which are the
+  stores the module docstring offers as example invocations and the ones the engine has read
+  since #56. The grid now comes from `ChunkGrid.from_metadata` and the key from the array's
+  own `encode_chunk_key`: one spelling, the same one the engine plans reads with. Verified
+  against all three layouts, and the sharded case now correctly charges the shard.
+
+- **Every published "% of raw-GET ceiling" figure was computed in mixed units, and the premise
+  that licensed it is false.** insitu's MB/s counts *decoded* bytes; a raw GET moves *stored*
+  bytes. Dividing one by the other overstates "% kept" by exactly the **logical-to-stored
+  ratio**, and `bench/benchmark_plan.md` licensed the division by asserting the synthetic
+  stores are **incompressible** — `standard_normal` f32, so zstd "shrinks them ~0%" and
+  bytes-moved ≈ logical size. It is not incompressible: zstd level 0 takes **~7.6% off it
+  (1.082×)**. The error is small, one-directional and flattering, which is why it survived —
+  a ratio of two plausible MB/s numbers has nothing visibly wrong with it. `docs/benchmarks.md`
+  story 4's **81% / 84% are each inflated ~6 points** — the honest figures are ~75% / ~78% —
+  as is the 25 Gb/s scaling table, which used the same method. Those pages are **not**
+  corrected here.
+
+  The quantity `bench/probe_ceiling.py` now measures per store is deliberately **not** the
+  compression ratio but logical-to-stored, because that is the conversion "% kept" actually
+  needs — and the two differ. Zarr stores edge chunks padded to full size (the benchmark
+  geometry's 361 inner rows occupy 4×91 = 364 stored rows), so ~0.8% of every pass is padding
+  the user never sees. On that geometry the two effects nearly cancel and the ratio lands at
+  **1.081×**. Validated against exact known answers before being used to correct anything: a
+  store with no edge padding and no codec reports **exactly 1.000000**, and a padded
+  uncompressed one **exactly 361/364**, with `HEAD`-derived bytes equal to the filesystem's on
+  every store.
+
+- **The probe's residency claim was right about the mechanism and wrong about the number.**
+  Residency is *pinned* — the decoupling headline — but it is `2*block_chunks` only on a plain
+  pass. A windowed one sits higher, because a chunk feeds every block whose anchors reach it
+  and is released at the last (measured: 6 chunks at `block_chunks=2 --window 2`).
+
+- **The architecture page still described the pre-0.2.0 engine, and a reader sizing a budget
+  would have acted on it.** Eight claims were false rather than merely dated. Admission is
+  bounded by read-ahead permits and not by the byte budget, so "a full budget pauses
+  admission" and "the budget (sized to ~two blocks) lets it admit the next block" both named
+  the wrong mechanism. Peak co-residency was stated as two blocks unconditionally, which a
+  windowed view is not. Read-once was stated as a flat guarantee, which release-and-re-read
+  deliberately trades. And the persistence section said the cache log needs no compaction and
+  that a stale cache is a whole-directory wipe — on a page that 40 lines earlier described
+  per-array staleness correctly.
+
+  Both diagrams were worse off than the prose, because nobody greps a mermaid block: the
+  producer/consumer figure showed queue depth as the only backpressure path, omitting the
+  permit that returns on `unpin_block`, and the handoff figure showed `_drive -> _admit` with
+  neither the read-ahead permit nor the `pin_if_ready` hit check that now precede it, nor the
+  block boundary that ends an admission run.
+
+  The mechanisms 0.2.0 added are now documented where they were missing: the permit protocol,
+  one pool with many accountable iteration owners (which is the single parent of permit
+  ownership, budget-as-a-sum, per-pass counters and the own-tasks-only fetch skip), per-block
+  release, the one-writer `cache_dir` contract and `readonly_cache`. The vocabulary is single
+  again — "read-ahead permits" throughout, matching `read_ahead_bound` and the `read-ahead
+  permits exhausted` error, where the page had used one word for both that bound and
+  `max_inflight`. `scheduler.py` claimed "two bounded resources"; there are three.
+
+  Paid for by deletion rather than growth: the xbatcher cache comparison duplicated
+  `DESIGN.md`, the transform-fingerprint prose duplicated `docs/tuning.md`, and two rationale
+  blocks — the per-block batch-cutting history and the in-body-gating precedents — moved to
+  `DESIGN.md`, where a superseded design belongs. Net one heading fewer.
+
 ## 0.2.0 — 2026-09-11
 
 ### Upgrading
