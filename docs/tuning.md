@@ -53,6 +53,22 @@ The corollary for the other two axes: **`block_chunks` is a training knob** (it 
 quality, and only `.train` shuffles — eval views are deterministic), and the **cross-epoch
 cache is a training knob** (single-pass scoring never reads a chunk twice).
 
+!!! note "`block_chunks` guidance on this page is under revision"
+
+    This page presents `block_chunks` as a shuffle-and-residency knob — the sizing advice
+    below, and the per-regime rows at the end, all follow from that. It also affects
+    **throughput**, by a mechanism the page does not yet describe: a batch may draw from any
+    chunk in its shuffle-block, so the whole block must be co-resident to gather, and on a
+    store whose read latency has a long tail one slow read can hold the concurrency window
+    open for the rest of the block. Wider blocks amortise that; on a pass already saturated
+    downstream of admission they only cost residency.
+
+    Which way it lands is therefore a property of the store and the box, not of the loader,
+    and the guidance here is not yet conditioned on it. Until it is, treat the `block_chunks`
+    sizing advice below as **necessary but not sufficient** — correct about RAM and shuffle
+    quality, silent about read-latency tails — and measure both ends of your range rather
+    than taking a default from this page.
+
 ## The knobs you set
 
 All of these are `InSituDataset(...)` arguments except the last, which is fixed when the
