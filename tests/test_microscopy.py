@@ -90,3 +90,29 @@ def test_idr_store_streams_the_real_image() -> None:
     group = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(batch.arrays["raw"], np.moveaxis(group[IDR_RAW][:, :, z], 2, 0))
     np.testing.assert_array_equal(batch.arrays["mask"], np.moveaxis(group[IDR_MASK][:, :, z], 2, 0))
+
+
+@pytest.mark.parametrize("n_planes", [2, 5])
+def test_a_stack_too_shallow_to_score_is_refused_at_setup(tmp_path, n_planes) -> None:
+    """Below six one-plane chunks the 0.1 val fraction rounds to none, and the run would only
+    find out in ``evaluate``, after training. Refused at setup instead, naming 6: the boundary
+    measured by draining val on stores of 2-12 planes, not one this code worked out itself."""
+    url = f"file://{tmp_path}/shallow.zarr"
+    make_cells_store(url, n_planes=n_planes, size=16, mask_chunk=4, seed=0)
+
+    with pytest.raises(ValueError, match="the val split has nothing to draw") as exc:
+        segmentation_dataset(obstore_store(url), batch_size=4)
+    assert "Use at least 6 samples" in str(exc.value)
+    assert "--n-planes" in str(exc.value), "the refusal names the knob to turn"
+
+
+def test_the_depth_the_refusal_names_actually_works(tmp_path) -> None:
+    """The control: a stack at the named depth drains a non-empty val split."""
+    url = f"file://{tmp_path}/six.zarr"
+    make_cells_store(url, n_planes=6, size=16, mask_chunk=4, seed=0)
+    ds = segmentation_dataset(obstore_store(url), batch_size=4, shuffle=False)
+    try:
+        ds.set_epoch(0)
+        assert sum(int(b.arrays["raw"].shape[0]) for b in ds.val) > 0
+    finally:
+        ds.close()

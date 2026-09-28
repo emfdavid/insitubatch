@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import bench.advection_sweep as sweep
 import bench.probe_batch_buffers as probe
 import insitubatch.buffers as core_buffers
 from bench.advection_sweep import PersistenceCheck, store_key
@@ -417,3 +418,29 @@ def test_a_failing_baseline_does_not_fail_the_suite(tmp_path, monkeypatch) -> No
 
     results = _suite(tmp_path, engines=("naive", "insitu"))
     assert {r.engine for r in results} == {"insitu"}
+
+
+def test_sweep_refuses_a_trajectory_its_child_would_refuse(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """192 steps is three 64-step chunks: val rounds to none, and the 24-step target leaves
+    nothing to draw until six. The child refuses below 384, so the parent must too -- at
+    argparse, before an hour of runs, and without a subprocess traceback on top."""
+
+    def no_children(*_a: object, **_k: object) -> None:
+        raise AssertionError("the precheck must refuse before any child runs")
+
+    monkeypatch.setattr(sweep.subprocess, "run", no_children)
+    monkeypatch.setattr(
+        "sys.argv", ["advection_sweep", "--sweeps", "size", "--device", "cpu", "--n-steps", "192"]
+    )
+    with pytest.raises(SystemExit):
+        sweep.main()
+    err = capsys.readouterr().err
+    assert "the val split has nothing to draw" in err
+    assert "Use at least 384 samples" in err
+
+
+def test_sweep_default_trajectory_clears_every_config() -> None:
+    """The stricter precheck must not refuse the sweep as documented."""
+    every = {"inflight", "size", "chunk", "inner", "payload"}
+    for cfg in sweep._configs(every, wb2_range="0,4000"):
+        sweep.require_scorable(cfg, sweep.SYNTH_STEPS)

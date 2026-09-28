@@ -89,7 +89,11 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from insitubatch import InSituDataset
+import numpy as np
+
+from examples._splits import require_drawable_splits
+from examples.advection.data import FRACTIONS, SYNTH_HORIZON
+from insitubatch import ArrayGeometry, InSituDataset
 
 DEFAULT_OUT = Path(__file__).parent / "results" / "advection_sweep.jsonl"
 
@@ -185,6 +189,23 @@ def _configs(
         for bs in payload_batch_sizes:
             cfg = _synth(256, 64, None)
             yield {**cfg, "sweep": "payload", "batch_size": bs, "geom": f"{cfg['store']}b{bs}"}
+
+
+def require_scorable(cfg: dict[str, Any], n_steps: int) -> None:
+    """Raise ``ValueError`` if a synthetic config's child would refuse ``n_steps`` at setup.
+
+    The child's own rule, applied to a stand-in geometry of the store it would write -- the
+    same split fractions and forecast horizon, so the parent cannot pass a trajectory the
+    child then rejects an hour into the sweep. Real-store configs are the child's to check.
+    """
+    if cfg["source"] != "synthetic":
+        return
+    size, sc = cfg["size"], cfg["sample_chunk"]
+    ic = cfg["inner_chunk"] or size
+    geom = ArrayGeometry(
+        path="t2m", shape=(n_steps, size, size), chunks=(sc, ic, ic), dtype=np.dtype("f4")
+    )
+    require_drawable_splits(geom, FRACTIONS, knob="--n-steps", offsets=(0, SYNTH_HORIZON))
 
 
 def store_key(cfg: dict[str, Any]) -> str:
@@ -444,14 +465,13 @@ def main() -> None:
     configs = list(
         _configs(sweeps, wb2_range=args.wb2_range, payload_batch_sizes=args.payload_batch_sizes)
     )
-    # A 0.8/0.1/0.1 split needs >=3 sample-axis chunks, so the synthetic trajectory must be a
-    # few chunks long; catch a too-short --n-steps here rather than as an empty-val crash later.
+    # Catch a too-short --n-steps here, with the child's own rule, rather than as a refused
+    # child (and a CalledProcessError on top of its message) partway through the sweep.
     for cfg in configs:
-        if cfg["source"] == "synthetic" and args.n_steps < 3 * cfg["sample_chunk"]:
-            p.error(
-                f"--n-steps {args.n_steps} too short for sample_chunk {cfg['sample_chunk']} "
-                f"(need >= 3 chunks to split; use --n-steps >= {3 * cfg['sample_chunk']})"
-            )
+        try:
+            require_scorable(cfg, args.n_steps)
+        except ValueError as e:
+            p.error(f"{cfg['sweep']} {cfg['geom']} (sample_chunk {cfg['sample_chunk']}): {e}")
         # A batch never crosses a shuffle block, so an oversized batch_size is silently clipped
         # to the block -- which on the payload sweep would collapse two payload points onto one
         # while still labelling them apart. Fail instead.

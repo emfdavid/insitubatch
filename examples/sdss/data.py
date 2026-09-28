@@ -54,11 +54,14 @@ from insitubatch import (
     split_by_chunk,
 )
 
+from .._splits import require_drawable_splits
+
 FLUX_VAR = "flux"
 SDSS_HOST = "https://data.sdss.org"
 REDUX = "/sas/dr17/sdss/spectro/redux/26"  # legacy (DR8-era) reduction; spPlate lives per-plate
 LATENT_DIM = 16  # bottleneck / PCA components -- the reconstruction budget both methods share
 NOISE_SIGMA = 0.3  # per-sample input noise (normalized units), added in the batch stage
+FRACTIONS = (0.7, 0.15, 0.15)  # train / val / test, by chunk (a plate, synthetically)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_URIS = HERE / "dr17_plate_uris.json"
@@ -436,14 +439,21 @@ def reconstruct_dataset(
     """One reconstruction dataset over the SDSS store: iterate ``.train`` / ``.val`` / ``.test``.
 
     Each batch carries ``noisy`` and ``clean`` ``(B, W)`` spectra. Split is by chunk (plate), so no
-    fiber leaks across train/val/test. ``max_inflight`` is unset by default (``data.sdss.org`` over
-    HTTPS is not an anonymous-S3 throttler like MAST); raise/cap it to tune read-ahead.
+    fiber leaks across train/val/test; a store too small to give train and val a chunk each is
+    refused here, naming the size that works. ``max_inflight`` is unset by default
+    (``data.sdss.org`` over HTTPS is not an anonymous-S3 throttler like MAST); raise/cap it to
+    tune read-ahead.
     """
     geoms = open_geometries(store, variables=[FLUX_VAR], sample_axis=0)
+    require_drawable_splits(
+        geoms[FLUX_VAR],
+        FRACTIONS,
+        knob="--n-plates for the synthetic store (one plate is one chunk), --plates for a real one",
+    )
     chunk_transforms: list[ChunkTransform] = [normalize]
     return InSituDataset(
         store,
-        split_by_chunk(geoms[FLUX_VAR], fractions=(0.7, 0.15, 0.15)),
+        split_by_chunk(geoms[FLUX_VAR], fractions=FRACTIONS),
         geometries=geoms,
         batch_size=batch_size,
         shuffle=shuffle,

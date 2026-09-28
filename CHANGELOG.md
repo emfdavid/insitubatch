@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Shrinking an example until a split came up empty gave an error that named neither the
+  cause nor the knob to turn. Resolves #87.** Tuning an example down is usually the first thing
+  a new user does, and three paths still failed the way #71 fixed for `examples/advection`:
+  - `examples.sdss.train_torch --n-plates 3` (one plate is one chunk, so the 0.15 val
+    fraction rounds to none) raised `empty dataset: cannot infer spectrum width` from a width
+    probe.
+  - `bench.advection_sweep --n-steps 192` passed its own precheck, which claimed to catch
+    exactly this, and then died in the child with a `CalledProcessError` stacked on top of the
+    real message. The precheck's `3 * sample_chunk` bound ignored the 24-step horizon; the true
+    minimum is 384.
+  - `examples.microscopy` with fewer than 6 Z-planes (`--n-planes`, or a narrow
+    `--sample-range` on the IDR image) trained a full run and only then refused in `evaluate`.
+
+  #71's solver now lives in one place (`examples/_splits.py`). All three examples refuse at
+  setup and name the smallest size that works, and the sweep applies the child's exact rule
+  at argparse, before any run starts. The move also fixes a latent bug in #71's solver: its
+  stand-in geometry lengthened axis 0 rather than the sample axis, so on a middle-axis layout
+  like the IDR mask (Z-chunk 30 behind a T axis chunked 1) it named 30 samples where 180 are
+  needed. No example hit this yet, because only advection (axis 0) called it.
+
 - **The microscopy example's `--source idr` would have stopped working when EMBL-EBI retires
   its `uk1s3.embassy.ebi.ac.uk` S3 endpoint (#97).** The IDR image has moved to
   `livingobjects.ebi.ac.uk`: same `idr` bucket, same key layout, same path-style anonymous
