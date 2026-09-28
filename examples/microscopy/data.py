@@ -44,7 +44,7 @@ from .._logging import add_log_level, configure_logging
 # A public OME-NGFF (zarr v0.1) image in the EMBL-EBI Image Data Repository: a 3D two-channel
 # confocal stack with an expert instance-segmentation label. Read anonymously off the IDR S3.
 IDR_URL = "s3://idr/zarr/v0.1/6001240.zarr"
-IDR_ENDPOINT = "https://uk1s3.embassy.ebi.ac.uk"
+IDR_ENDPOINT = "https://livingobjects.ebi.ac.uk"
 IDR_RAW = "0"  # full-resolution image (T=1, C=2, Z=236, Y=275, X=271), Z-chunk 1
 IDR_MASK = "labels/masks/0"  # the label (T=1, C=1, Z=236, Y=275, X=271), Z-chunk 30, Y/X tiled
 

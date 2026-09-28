@@ -8,12 +8,15 @@ model beats the Otsu (global-threshold) baseline it can only beat by reading spa
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
+import zarr
 
 from examples.microscopy.data import (
     IDR_MASK,
     IDR_RAW,
     SAMPLE_AXIS,
+    _idr_store,
     inputs_and_targets,
     iou,
     make_cells_store,
@@ -70,3 +73,20 @@ def test_torch_beats_otsu(cells_store) -> None:
 
     model_iou, otsu_iou = train(segmentation_dataset(obstore_store(cells_store)), epochs=12)
     assert model_iou > otsu_iou
+
+
+@pytest.mark.remote
+def test_idr_store_streams_the_real_image() -> None:
+    """The ``--source idr`` path reads the live public IDR image, and a batch matches zarr."""
+    store = _idr_store()
+    geoms = open_geometries(store, variables=[IDR_RAW, IDR_MASK], sample_axis=SAMPLE_AXIS)
+    assert geoms[IDR_RAW].n_samples == geoms[IDR_MASK].n_samples == 236
+    assert geoms[IDR_RAW].sample_chunk_size == 1
+    assert geoms[IDR_MASK].sample_chunk_size == 30
+
+    ds = segmentation_dataset(store, sample_range=(0, 30), batch_size=4, shuffle=False)
+    batch = next(iter(ds.all))
+    z = batch.sample_indices
+    group = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(batch.arrays["raw"], np.moveaxis(group[IDR_RAW][:, :, z], 2, 0))
+    np.testing.assert_array_equal(batch.arrays["mask"], np.moveaxis(group[IDR_MASK][:, :, z], 2, 0))

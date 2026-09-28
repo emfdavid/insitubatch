@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **The microscopy example's `--source idr` would have stopped working when EMBL-EBI retires
+  its `uk1s3.embassy.ebi.ac.uk` S3 endpoint (#97).** The IDR image has moved to
+  `livingobjects.ebi.ac.uk`: same `idr` bucket, same key layout, same path-style anonymous
+  access, byte-identical metadata. So the fix is the endpoint constant alone. Nothing
+  exercised the real-IDR path, so the retirement would have gone unnoticed until someone ran
+  the example. It now has a `remote` test that streams a batch and checks it against a
+  direct zarr read.
+
 - **`bench/probe_decode.py`'s decode-thread sweep had stopped measuring anything, and printed
   a clean scaling curve anyway.** The decode pool went process-wide in 0.2.0 — built once by
   the first dataset in the process, a later different value ignored with a warning — and the
