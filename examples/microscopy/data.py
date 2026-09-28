@@ -40,6 +40,7 @@ from insitubatch import (
 )
 
 from .._logging import add_log_level, configure_logging
+from .._splits import require_drawable_splits
 
 # A public OME-NGFF (zarr v0.1) image in the EMBL-EBI Image Data Repository: a 3D two-channel
 # confocal stack with an expert instance-segmentation label. Read anonymously off the IDR S3.
@@ -52,6 +53,7 @@ IDR_MASK = "labels/masks/0"  # the label (T=1, C=1, Z=236, Y=275, X=271), Z-chun
 # (leading T=1) so one code path serves both sources.
 SAMPLE_AXIS = 2
 LABELS = ("raw", "mask")  # canonical labels (store-independent)
+FRACTIONS = (0.8, 0.1, 0.1)  # train / val / test, by raw chunk (one Z-plane)
 
 
 def _idr_store() -> Store:
@@ -204,13 +206,20 @@ def segmentation_dataset(
     store; the dataset's labels are always ``raw, mask`` so the model code is store-agnostic.
     Both share the Z (sample) axis *length* but may chunk it differently -- the engine maps the
     single sample grid (the ``raw`` chunking, one plane per anchor) onto each variable's own
-    chunks. ``sample_range`` restricts the split to a finite Z window. Iterate the returned
-    dataset's ``.train`` / ``.val`` views.
+    chunks. ``sample_range`` restricts the split to a finite Z window; a window too shallow to
+    give train and val a plane each is refused here, naming the depth that works. Iterate the
+    returned dataset's ``.train`` / ``.val`` views.
     """
     opened = open_geometries(store, variables=[raw_var, mask_var], sample_axis=sample_axis)
     geoms = {"raw": opened[raw_var], "mask": opened[mask_var]}
     # The raw (one plane per chunk) is the reference sample grid: one Z-plane = one sample.
-    manifest = split_by_chunk(opened[raw_var], fractions=(0.8, 0.1, 0.1), sample_range=sample_range)
+    require_drawable_splits(
+        opened[raw_var],
+        FRACTIONS,
+        knob="--n-planes for the synthetic store, --sample-range for the real one",
+        sample_range=sample_range,
+    )
+    manifest = split_by_chunk(opened[raw_var], fractions=FRACTIONS, sample_range=sample_range)
     return InSituDataset(
         store,
         manifest,

@@ -10,6 +10,8 @@ insitubatch changes. No network, no FITS stack.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 
@@ -138,3 +140,38 @@ def test_torch_beats_baseline(synth_store) -> None:
     model = train(ds, n_wave=spectrum_width(ds), epochs=25)
     # A nonlinear conv autoencoder beats linear PCA at the same latent dim on the redshift manifold.
     assert evaluate(model, ds) < base
+
+
+@pytest.mark.parametrize("n_plates", [2, 3])
+def test_a_store_too_small_to_score_is_refused_at_setup(tmp_path, n_plates) -> None:
+    """One plate is one chunk, so the 0.15 val fraction rounds to zero plates below four.
+
+    The run would otherwise raise from a width probe that names neither the split nor the
+    knob. Refused at setup instead, naming the size that works: 4 plates, the boundary
+    measured by hand on the example (#87), not one this code worked out for itself.
+    """
+    url = f"file://{tmp_path}/small.zarr"
+    make_synthetic_store(url, n_plates=n_plates, fibers_per_plate=32, n_wave=64, seed=0)
+
+    with pytest.raises(ValueError, match="the val split has nothing to draw") as exc:
+        reconstruct_dataset(obstore_store(url), batch_size=8)
+    assert "Use at least 128 samples" in str(exc.value)  # 4 plates x 32 fibers
+    assert "--n-plates" in str(exc.value), "the refusal names the knob to turn"
+
+
+def test_the_size_the_refusal_names_actually_works(tmp_path) -> None:
+    """The control: a store at the named size drains a non-empty val split."""
+    small = f"file://{tmp_path}/small.zarr"
+    make_synthetic_store(small, n_plates=3, fibers_per_plate=32, n_wave=64, seed=0)
+    with pytest.raises(ValueError) as exc:
+        reconstruct_dataset(obstore_store(small), batch_size=8)
+    named = int(re.search(r"Use at least (\d+) samples", str(exc.value)).group(1))
+
+    big = f"file://{tmp_path}/big.zarr"
+    make_synthetic_store(big, n_plates=named // 32, fibers_per_plate=32, n_wave=64, seed=0)
+    ds = reconstruct_dataset(obstore_store(big), batch_size=8)
+    try:
+        ds.set_epoch(0)
+        assert sum(int(b.arrays["clean"].shape[0]) for b in ds.val) > 0
+    finally:
+        ds.close()
